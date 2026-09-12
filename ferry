@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# ferry -- Kubernetes on a Mac, one virtual machine per pod.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Cluster state that should survive a restart: certificates and etcd.
+FERRY_HOME="${FERRY_HOME:-$HOME/.ferry}"
+# Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
+# ~104 bytes and the kubelet builds its podresources socket beneath --root-dir,
+# so a long home directory would break it.
+FERRY_RUN="${FERRY_RUN:-/tmp/ferry-run}"
+FERRY_SOCK="${FERRY_SOCK:-/tmp/ferry-cri.sock}"
+NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
+POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
+POD_CPUS="${FERRY_POD_CPUS:-2}"
+POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
+
+KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
+
+# macOS pgrep does not count reliably with -c, so count lines.
+count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
+
+usage() {
+  cat <<EOF
+ferry -- Kubernetes on a Mac, one virtual machine per pod
+
+  ferry doctor      check that this machine can run ferry
+  ferry build       build the kubelet, the runtime, and fetch the guest kernel
+  ferry up          start the cluster
+  ferry down        stop the cluster
+  ferry status      show what is running
+  ferry logs <c>    tail a component log (ferry-cri, kubelet, apiserver, etcd)
+  ferry kubeconfig  print the path to the admin kubeconfig
+
+Environment:
+  FERRY_HOME             cluster state, default ~/.ferry
+  FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
+  FERRY_POD_CPUS         cpus per pod VM, default 2
+  FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
+EOF
+}
+
+cmd_doctor() {
+  bold "ferry doctor"
+  local fatal=0
+
+  if [ "$(uname -m)" = "arm64" ]; then ok "Apple silicon"
+  else bad "Apple silicon required (found $(uname -m))"; fatal=1; fi
+
+  local major; major="$(sw_vers -productVersion | cut -d. -f1)"
+  if [ "$major" -ge 26 ] 2>/dev/null; then ok "macOS $(sw_vers -productVersion)"
+  else
+    bad "macOS 26 or newer required (found $(sw_vers -productVersion))"
+    warn "per-pod networking uses VZVmnetNetworkDeviceAttachment, which is macOS 26+"
+    fatal=1
+  fi
+
+  if command -v swift >/dev/null; then
+    local sv; sv="$(swift --version 2>&1 | grep -oE 'version [0-9]+\.[0-9]+' | head -1 | cut -d' ' -f2)"
+    if [ "$(printf '%s\n6.2\n' "$sv" | sort -V | head -1)" = "6.2" ]; then ok "Swift $sv"
+    else
+      bad "Swift 6.2+ required (found $sv)"
+      warn 'softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"'
+      fatal=1
+    fi
+  else bad "Swift not found"; fatal=1; fi
+
+  if command -v go >/dev/null; then ok "$(go version | cut -d' ' -f3)"
+  else bad "Go 1.24+ required, needed to build the kubelet"; fatal=1; fi
+
+  if command -v kubectl >/dev/null; then ok "kubectl present"
+  else warn "kubectl not found; you will want it to talk to the cluster"; fi
+
+  # A pod is a VM, and every other VM on the Mac takes one of ferry's 128 slots.
+  local vms; vms="$(count_vms)"
+  local docker; docker="$(pgrep -f "com.docker.virtualization" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$docker" -gt 0 ]; then
+    warn "Docker Desktop is running and holds one of the 128 VM slots"
+  fi
+  ok "$vms virtual machines running (ceiling is 128, shared with all apps)"
+
+  local free; free="$(df -g "$HOME" | tail -1 | awk '{print $4}')"
+  if [ "$free" -ge 20 ]; then ok "${free}G free disk"
+  else warn "${free}G free disk; images and pod root filesystems need room"; fi
+
+  echo
+  if [ "$fatal" -eq 0 ]; then bold "ready -- run: ferry build && ferry up"; return 0
+  else bold "not ready"; return 1; fi
+}
+
+cmd_build() {
+  bold "building ferry"
+  "$here/experiments/03-vm-ceiling/fetch-kernel.sh" || return 1
+  echo
+  if [ ! -x "$here/bin/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
+    "$here/build-kubelet.sh" || return 1
+  else
+    echo "==> kubelet present (FERRY_REBUILD=1 to force)"
+  fi
+  echo
+  ( cd "$here/ferry-cri" && ./build.sh ) || return 1
+  echo
+  bold "built -- run: ferry up"
+}
+
+running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
+
+cmd_up() {
+  for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$KERNEL"; do
+    [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
+  done
+  if running ferry-cri || running kubelet; then
+    warn "ferry is already up; run 'ferry down' first"; return 1
+  fi
+
+  mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
+  rm -f "$FERRY_SOCK"
+
+  bold "starting ferry"
+
+  "$here/bin/ferry-cri" \
+    --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
+    --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-cri.pid"
+
+  local ready=
+  for _ in $(seq 1 90); do
+    if [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then ready=1; break; fi
+    running ferry-cri || break
+    sleep 1
+  done
+  [ -n "$ready" ] || { bad "runtime failed to start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
+  ok "runtime on $(grep -oE 'network .*' "$FERRY_RUN/logs/ferry-cri.log" | tail -1)"
+
+  # The API server must advertise the gateway of the subnet the runtime actually
+  # obtained, which is not always the one requested -- vmnet networks can stay
+  # claimed by an earlier run.
+  local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null)"
+  [ -n "$gateway" ] || { bad "runtime did not publish a pod gateway"; return 1; }
+
+  STATE="$FERRY_HOME" POD_GATEWAY="$gateway" NODE_NAME="$NODE_NAME" \
+    "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
+    || { bad "control plane failed"; tail -5 "$FERRY_RUN/logs/control-plane.log"; return 1; }
+  ok "control plane advertising $gateway"
+
+  cat > "$FERRY_RUN/kubelet.yaml" <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+podLogsDir: $FERRY_RUN/podlogs
+containerRuntimeEndpoint: unix://$FERRY_SOCK
+imageServiceEndpoint: unix://$FERRY_SOCK
+volumePluginDir: $FERRY_RUN/volume-plugins
+# The upstream hard-eviction defaults are sized for small cloud nodes; on a
+# laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
+# node taints itself NoSchedule.
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "5%"
+  imagefs.available: "5%"
+  nodefs.inodesFree: "5%"
+cgroupsPerQOS: false
+enforceNodeAllocatable: []
+failSwapOn: false
+readOnlyPort: 0
+clusterDomain: cluster.local
+# A pod is a VM here, and a VM takes longer to appear than a container does.
+runtimeRequestTimeout: 10m
+authentication:
+  x509: {clientCAFile: $FERRY_HOME/pki/ca.crt}
+  anonymous: {enabled: false}
+  webhook: {enabled: true}
+authorization: {mode: Webhook}
+EOF
+
+  FERRY_CONTAINER_LOGS_DIR="$FERRY_RUN/containerlogs" \
+  "$here/bin/kubelet" \
+    --config="$FERRY_RUN/kubelet.yaml" --kubeconfig="$FERRY_HOME/kubelet.conf" \
+    --hostname-override="$NODE_NAME" --root-dir="$FERRY_RUN/kubelet" \
+    --cert-dir="$FERRY_RUN/pki" --v=2 >"$FERRY_RUN/logs/kubelet.log" 2>&1 &
+  echo $! > "$FERRY_RUN/kubelet.pid"
+
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  for _ in $(seq 1 60); do
+    [ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] && break
+    running kubelet || break
+    sleep 1
+  done
+  if [ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
+    ok "node $NODE_NAME Ready"
+  else
+    bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
+  fi
+
+  echo
+  bold "ferry is up"
+  echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+}
+
+cmd_down() {
+  bold "stopping ferry"
+  for component in kubelet ferry-cri; do
+    local pidfile="$FERRY_RUN/$component.pid"
+    [ -f "$pidfile" ] || continue
+    local pid; pid="$(cat "$pidfile")"
+    rm -f "$pidfile"
+    kill -TERM "$pid" 2>/dev/null || continue
+    # ferry-cri must finish releasing its vmnet network before another run can
+    # claim the same subnet.
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$pid" 2>/dev/null
+    ok "$component stopped"
+  done
+  STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
+  rm -f "$FERRY_SOCK"
+}
+
+cmd_status() {
+  bold "ferry status"
+  for component in ferry-cri kubelet; do
+    if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
+    else bad "$component"; fi
+  done
+  for component in etcd kube-apiserver kube-controller-manager kube-scheduler; do
+    if [ -f "$FERRY_HOME/$component.pid" ] && kill -0 "$(cat "$FERRY_HOME/$component.pid")" 2>/dev/null
+    then ok "$component"; else bad "$component"; fi
+  done
+  echo "  $(count_vms) pod VMs running"
+  if [ -f "$FERRY_HOME/admin.conf" ] && running kubelet; then
+    echo
+    KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes 2>/dev/null
+  fi
+}
+
+cmd_logs() {
+  local which="${1:-}"
+  case "$which" in
+    ferry-cri|kubelet|control-plane) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
+    etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
+  esac
+}
+
+case "${1:-}" in
+  doctor)     shift; cmd_doctor "$@" ;;
+  build)      shift; cmd_build "$@" ;;
+  up)         shift; cmd_up "$@" ;;
+  down)       shift; cmd_down "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  logs)       shift; cmd_logs "$@" ;;
+  kubeconfig) echo "$FERRY_HOME/admin.conf" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "unknown command: $1"; echo; usage; exit 1 ;;
+esac
