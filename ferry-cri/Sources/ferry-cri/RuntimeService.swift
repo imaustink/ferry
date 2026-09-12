@@ -243,8 +243,14 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         return response
     }
 
+    /// Called after the kubelet rotates a log file. Without reopening, the
+    /// runtime keeps writing into the rotated file and `kubectl logs` goes
+    /// quiet.
     func reopenContainerLog(request: Runtime_V1_ReopenContainerLogRequest, context: ServerContext) async throws -> Runtime_V1_ReopenContainerLogResponse {
-        Runtime_V1_ReopenContainerLogResponse()
+        do {
+            try await runtime.reopenContainerLog(request.containerID)
+            return Runtime_V1_ReopenContainerLogResponse()
+        } catch { throw failed(error) }
     }
 
     func updateContainerResources(request: Runtime_V1_UpdateContainerResourcesRequest, context: ServerContext) async throws -> Runtime_V1_UpdateContainerResourcesResponse {
