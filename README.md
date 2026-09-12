@@ -110,9 +110,11 @@ it.
 
 ### Limits worth knowing
 
-- **Single-container pods.** `Virtualization.framework` cannot hotplug, so a
-  pod's containers must all exist before its VM boots. Init containers and
-  sidecars do not work yet.
+- **No sidecars.** `Virtualization.framework` cannot hotplug, so a container
+  cannot join a pod whose VM is already running. **Init containers do work** —
+  each exits before the next is created, so the VM is rebuilt between them and
+  shared volumes carry state across. Two containers running *at once* in one pod
+  does not work.
 - **No Services yet.** DNS resolves Service names, but a ClusterIP does not
   route — nothing programs `10.96.0.0/16`. Pods reach each other and the API
   server by IP. See [docs/SERVICES.md](docs/SERVICES.md).
