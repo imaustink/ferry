@@ -1,7 +1,27 @@
 # Services on ferry — design
 
-**Status: designed, not implemented.** Pods run and are routable
-(experiment 05); ClusterIPs are not yet.
+**Status: implemented and verified.** `ferry-proxy` binds each ClusterIP on the
+host and forwards to a ready endpoint.
+
+```
+from the Mac      curl http://<clusterIP>/            -> hello from pod VM
+from a pod        wget -O- http://backend/            -> hello from pod VM
+                  wget -O- http://backend.default.svc.cluster.local/
+in-cluster        KUBERNETES_SERVICE_HOST=10.96.0.1:443 + SA token -> API server
+```
+
+The last one matters most: that is what client-go does by default, so
+Kubernetes-native workloads now run unmodified.
+
+### One quirk worth knowing
+
+The vmnet gateway interface only exists on the host while at least one pod VM is
+attached. With no pods running, the API server's advertised address is not
+locally reachable and the `kubernetes` Service cannot be served -- the proxy
+accepts the connection and then times out dialling the backend. It recovers as
+soon as any pod starts. CoreDNS keeps its `KUBERNETES_SERVICE_HOST` override for
+the same reason: it must be able to start before Services work, including when
+ferry is running without root.
 
 ## The problem
 

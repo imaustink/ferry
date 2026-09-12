@@ -59,6 +59,10 @@ cost time.
   default capabilities; ferry's kubelet derives that code path for darwin.
   A pod with `limits.memory: 300Mi` now gets `memory.max=314572800` in its
   guest cgroup, and `NET_ADMIN` reaches the container.
+- ✅ **Services route.** `ferry-proxy` binds each ClusterIP on the host and
+  forwards to a ready endpoint, so `http://backend/` works from a pod and
+  in-cluster config (`10.96.0.1:443` + ServiceAccount token) reaches the API
+  server. See [docs/SERVICES.md](docs/SERVICES.md).
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
@@ -120,9 +124,12 @@ it.
   each exits before the next is created, so the VM is rebuilt between them and
   shared volumes carry state across. Two containers running *at once* in one pod
   does not work.
-- **No Services yet.** DNS resolves Service names, but a ClusterIP does not
-  route — nothing programs `10.96.0.0/16`. Pods reach each other and the API
-  server by IP. See [docs/SERVICES.md](docs/SERVICES.md).
+- **Services need root** for now. With the NAT-capable guest kernel
+  (`ferry kernel`) pods can program their own Service rules, which would remove
+  both the root requirement and the extra hop; that work is not done yet.
+  Meanwhile `ferry up` asks for sudo once so `ferry-proxy` can bind ClusterIPs
+  and listen on 443. Without it pods, DNS and everything else still work — only
+  ClusterIP routing is skipped.
 - **No `kubectl exec` / `port-forward`** yet. `kubectl logs` works.
 - **128 pods, shared.** The VM ceiling belongs to the machine, so every other
   VM — Docker Desktop included — takes one of ferry's slots.
