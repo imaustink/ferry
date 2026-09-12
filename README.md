@@ -35,10 +35,12 @@ Early. Two things are proven, one is being built, one is unmeasured.
   [experiments/02-node-registration](experiments/02-node-registration/FINDINGS.md).
 - 🔨 **`k5s-cri`** — a CRI implementation backed by Apple's Containerization
   framework. Not started.
-- ❓ **Concurrent VM ceiling.** How many simultaneous Linux VMs
-  `Virtualization.framework` permits is unmeasured, and it bounds the pods per
-  cluster. This is the open question that decides whether this is a tool or a
-  demo.
+- ✅ **The VM ceiling is 128, and Kubernetes' default is 110.** One VM per pod
+  fits, with 18 to spare. Guests boot to userspace in ~0.12s and VM memory is
+  lazily backed — 64 GiB configured cost 1.6 GiB resident. See
+  [experiments/03-vm-ceiling](experiments/03-vm-ceiling/FINDINGS.md).
+- ❓ **vmnet interface limits.** Every pod needs a network interface. If vmnet
+  caps below 128, that becomes the real pod ceiling. Needs macOS 26.
 
 ## Why this can work
 
@@ -60,6 +62,7 @@ patches/kubelet/                     platform implementations, mirroring upstrea
 control-plane/                       PKI + up/down for the native control plane
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
+experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
 bin/                                 build output (gitignored)
 ```
 
