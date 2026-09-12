@@ -54,6 +54,9 @@ cost time.
 - ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
   ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
   that authenticates to the API server with its own token.
+- ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
+  any pod can take it, so the kubelet can be told where DNS lives before DNS
+  exists. Pods resolve external names and cluster names.
 
 ## Why this can work
 
@@ -110,8 +113,9 @@ it.
 - **Single-container pods.** `Virtualization.framework` cannot hotplug, so a
   pod's containers must all exist before its VM boots. Init containers and
   sidecars do not work yet.
-- **No Services or DNS yet.** Pods reach each other and the API server by IP.
-  See [docs/SERVICES.md](docs/SERVICES.md).
+- **No Services yet.** DNS resolves Service names, but a ClusterIP does not
+  route — nothing programs `10.96.0.0/16`. Pods reach each other and the API
+  server by IP. See [docs/SERVICES.md](docs/SERVICES.md).
 - **No `kubectl exec` / `port-forward`** yet. `kubectl logs` works.
 - **128 pods, shared.** The VM ceiling belongs to the machine, so every other
   VM — Docker Desktop included — takes one of ferry's slots.

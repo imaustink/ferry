@@ -1,0 +1,102 @@
+# Cluster DNS.
+#
+# Two things differ from a stock CoreDNS install, both because Services do not
+# route yet:
+#
+#   * KUBERNETES_SERVICE_HOST/PORT point at the API server directly rather than
+#     at the kubernetes ClusterIP, so CoreDNS's in-cluster client can reach it.
+#   * the pod claims ferry's reserved DNS address by annotation, so it lands on
+#     the address the kubelet was already configured to use. Without that, the
+#     kubelet would have to learn CoreDNS's address after the fact and restart.
+#
+# dnsPolicy: Default is the usual CoreDNS arrangement and matters here too --
+# CoreDNS must not resolve through itself, so it inherits the host's resolvers
+# and forwards external names upstream.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:coredns
+rules:
+  - apiGroups: [""]
+    resources: [endpoints, services, pods, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:coredns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:coredns
+subjects:
+  - kind: ServiceAccount
+    name: coredns
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        kubernetes __CLUSTER_DOMAIN__ in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+        }
+        forward . __UPSTREAM_DNS__
+        cache 30
+        loop
+        reload
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels: {k8s-app: kube-dns}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {k8s-app: kube-dns}
+  strategy:
+    # One pod, one reserved address: a rolling update would need the new pod to
+    # hold the address while the old one still has it.
+    type: Recreate
+  template:
+    metadata:
+      labels: {k8s-app: kube-dns}
+      annotations:
+        ferry.sh/reserved-address: dns
+    spec:
+      serviceAccountName: coredns
+      dnsPolicy: Default
+      containers:
+        - name: coredns
+          image: __COREDNS_IMAGE__
+          args: ["-conf", "/etc/coredns/Corefile"]
+          env:
+            - {name: KUBERNETES_SERVICE_HOST, value: "__APISERVER_HOST__"}
+            - {name: KUBERNETES_SERVICE_PORT, value: "__APISERVER_PORT__"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/coredns, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: coredns
+            items: [{key: Corefile, path: Corefile}]

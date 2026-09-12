@@ -39,7 +39,7 @@ enum RuntimeFailure: Error, CustomStringConvertible {
 
 struct SandboxRecord {
     let id: String
-    let pod: LinuxPod
+    var pod: LinuxPod
     let name: String
     let uid: String
     let namespace: String
@@ -54,6 +54,11 @@ struct SandboxRecord {
     /// so containers must all be added before `create()`; the VM is therefore
     /// booted lazily on the first StartContainer rather than at RunPodSandbox.
     var booted: Bool = false
+    var usesReservedAddress: Bool = false
+    /// Kept so the VM can be rebuilt if every container in it has stopped --
+    /// see createContainer.
+    let interface: any Interface
+    let config: Runtime_V1_PodSandboxConfig
 }
 
 struct ContainerRecord {
@@ -87,6 +92,17 @@ actor PodRuntime {
     private var initfs: Containerization.Mount!
     private var network: VmnetNetwork!
 
+    /// An address held back for cluster DNS. CoreDNS has to live at an address
+    /// the kubelet can be configured with before CoreDNS exists, so one is
+    /// reserved at startup and handed to whichever sandbox asks for it by
+    /// annotation. Without this the kubelet's clusterDNS would have to be
+    /// guessed, or changed after the fact and the kubelet restarted.
+    private var dnsInterface: (any Interface)?
+    private var dnsInterfaceInUse = false
+
+    /// Annotation a pod sets to claim the reserved DNS address.
+    static let reservedAddressAnnotation = "ferry.sh/reserved-address"
+
     private var sandboxes: [String: SandboxRecord] = [:]
     private var containers: [String: ContainerRecord] = [:]
 
@@ -95,6 +111,10 @@ actor PodRuntime {
     /// the image again.
     private var rootfsCache: [String: Containerization.Mount] = [:]
     private var pulledImages: [String: Runtime_V1_Image] = [:]
+    /// The image's own entrypoint, cmd, env and working directory. The kubelet
+    /// sends only the pod's overrides, so without this a container built around
+    /// an ENTRYPOINT gets its arguments alone and fails to exec.
+    private var imageConfigs: [String: ContainerizationOCI.ImageConfig] = [:]
 
     private var idCounter: UInt64 = 0
 
@@ -141,6 +161,15 @@ actor PodRuntime {
         try? "\(chosen.ipv4Gateway)\n".write(
             to: config.stateDir.appending(component: "gateway"),
             atomically: true, encoding: .utf8)
+
+        // Reserve and publish the cluster DNS address before any pod can take it.
+        if let reserved = try? self.network.createInterface("ferry-dns") {
+            self.dnsInterface = reserved
+            let address = "\(reserved.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
+            try? "\(address)\n".write(
+                to: config.stateDir.appending(component: "dns"),
+                atomically: true, encoding: .utf8)
+        }
     }
 
     var gateway: String { "\(network.ipv4Gateway)" }
@@ -168,8 +197,19 @@ actor PodRuntime {
 
     func runPodSandbox(config cfg: Runtime_V1_PodSandboxConfig) async throws -> String {
         let id = nextID("sandbox")
-        guard let interface = try network.createInterface(id) else {
-            throw RuntimeFailure.invalid("pod network exhausted; no address available")
+
+        // A pod may claim the reserved DNS address by annotation, so cluster
+        // DNS lands where the kubelet was already told to look.
+        let wantsReserved = cfg.annotations[Self.reservedAddressAnnotation] == "dns"
+        let interface: any Interface
+        if wantsReserved, let reserved = dnsInterface, !dnsInterfaceInUse {
+            interface = reserved
+            dnsInterfaceInUse = true
+        } else {
+            guard let fresh = try network.createInterface(id) else {
+                throw RuntimeFailure.invalid("pod network exhausted; no address available")
+            }
+            interface = fresh
         }
         let ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
 
@@ -177,7 +217,25 @@ actor PodRuntime {
         // the VM is sized from defaults here and containers are bounded inside
         // it by cgroups. Right-sizing the VM from the pod's aggregate requests
         // is a worthwhile refinement, not a correctness issue.
-        let pod = try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs)) { c in
+        let pod = try makePod(id: id, interface: interface, cfg: cfg)
+        // Deliberately not created yet. CRI adds containers after the sandbox
+        // exists, and on this hypervisor a container can only be added before
+        // the VM boots -- see startContainer.
+
+        sandboxes[id] = SandboxRecord(
+            id: id, pod: pod,
+            name: cfg.metadata.name, uid: cfg.metadata.uid,
+            namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
+            labels: cfg.labels, annotations: cfg.annotations,
+            ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
+            usesReservedAddress: wantsReserved && dnsInterfaceInUse,
+            interface: interface, config: cfg
+        )
+        return id
+    }
+
+    private func makePod(id: String, interface: any Interface, cfg: Runtime_V1_PodSandboxConfig) throws -> LinuxPod {
+        try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs)) { c in
             c.cpus = config.defaultCPUs
             c.memoryInBytes = config.defaultMemoryBytes
             c.interfaces = [interface]
@@ -189,18 +247,6 @@ actor PodRuntime {
                             options: cfg.dnsConfig.options)
             }
         }
-        // Deliberately not created yet. CRI adds containers after the sandbox
-        // exists, and on this hypervisor a container can only be added before
-        // the VM boots -- see startContainer.
-
-        sandboxes[id] = SandboxRecord(
-            id: id, pod: pod,
-            name: cfg.metadata.name, uid: cfg.metadata.uid,
-            namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
-            labels: cfg.labels, annotations: cfg.annotations,
-            ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now()
-        )
-        return id
     }
 
     func stopPodSandbox(_ id: String) async throws {
@@ -222,7 +268,13 @@ actor PodRuntime {
         for containerID in containers.values.filter({ $0.sandboxID == id }).map(\.id) {
             containers.removeValue(forKey: containerID)
         }
-        try? network.releaseInterface(id)
+        // The reserved DNS address stays reserved across CoreDNS restarts; only
+        // ordinary pod addresses go back to the allocator.
+        if sandboxes[id]?.usesReservedAddress == true {
+            dnsInterfaceInUse = false
+        } else {
+            try? network.releaseInterface(id)
+        }
         sandboxes.removeValue(forKey: id)
     }
 
@@ -249,25 +301,69 @@ actor PodRuntime {
         }
 
         if sandbox.booted {
-            throw RuntimeFailure.unsupported("""
-                cannot add a container to a pod whose VM is already running: \
-                Virtualization.framework does not support hotplug, so every \
-                container in a pod must be created before the first one starts
-                """)
+            // The kubelet retries CreateContainer after a container fails to
+            // start, and this hypervisor cannot add one to a running VM. If
+            // nothing is running in the pod there is nothing to preserve, so
+            // rebuild the VM rather than leaving the pod permanently stuck.
+            let live = containers.values.contains { $0.sandboxID == sandboxID && $0.state == .running }
+            if live {
+                throw RuntimeFailure.unsupported("""
+                    cannot add a container to a pod that is already running: \
+                    Virtualization.framework does not support hotplug, so every \
+                    container in a pod must be created before the first one starts
+                    """)
+            }
+            try? await sandbox.pod.stop()
+            for stale in containers.values.filter({ $0.sandboxID == sandboxID }) {
+                try? FileManager.default.removeItem(
+                    atPath: config.stateDir.appending(component: "\(stale.id).ext4").path())
+                containers.removeValue(forKey: stale.id)
+            }
+            let rebuilt = try makePod(id: sandboxID, interface: sandbox.interface, cfg: sandbox.config)
+            sandboxes[sandboxID]?.pod = rebuilt
+            sandboxes[sandboxID]?.booted = false
+        }
+        // Re-read: the record may have just been rebuilt.
+        guard let sandbox = sandboxes[sandboxID] else {
+            throw RuntimeFailure.notFound("sandbox \(sandboxID)")
         }
 
         let id = nextID("ctr")
         // Each container needs a writable root of its own; the cached unpack is
-        // shared and must stay pristine.
+        // shared and must stay pristine. Clear any leftover at the destination
+        // first: clone fails if it exists, and it can exist because container
+        // ids restart from zero when ferry-cri does, while the files under the
+        // state directory persist.
         let clonePath = config.stateDir.appending(component: "\(id).ext4").path()
+        try? FileManager.default.removeItem(atPath: clonePath)
         let rootfs = try base.clone(to: clonePath)
 
-        // Immutable so the value can cross into the configuration closure,
-        // which runs concurrently.
-        let combined = cfg.command + cfg.args
+        // Merge the pod's overrides with the image's own configuration, the way
+        // Kubernetes defines it: `command` replaces ENTRYPOINT, `args` replaces
+        // CMD, and anything not overridden comes from the image.
+        let imageConfig = imageConfigs[imageRef]
+        let entrypoint = cfg.command.isEmpty ? (imageConfig?.entrypoint ?? []) : cfg.command
+        let commandArgs: [String]
+        if !cfg.args.isEmpty {
+            commandArgs = cfg.args
+        } else if cfg.command.isEmpty {
+            // Only inherit CMD when the pod overrode neither; a pod that sets
+            // `command` alone must not pick up the image's CMD.
+            commandArgs = imageConfig?.cmd ?? []
+        } else {
+            commandArgs = []
+        }
+        let combined = entrypoint + commandArgs
         let arguments = combined.isEmpty ? ["/bin/sh"] : combined
-        let environment = cfg.envs.map { "\($0.key)=\($0.value)" }
-        let workingDir = cfg.workingDir
+
+        // Image environment first so the pod's values win on conflict.
+        var mergedEnv = imageConfig?.env ?? []
+        for entry in cfg.envs { 
+            mergedEnv.removeAll { $0.hasPrefix("\(entry.key)=") }
+            mergedEnv.append("\(entry.key)=\(entry.value)")
+        }
+        let environment = mergedEnv
+        let workingDir = cfg.workingDir.isEmpty ? (imageConfig?.workingDir ?? "") : cfg.workingDir
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
@@ -428,6 +524,11 @@ actor PodRuntime {
             if !image.digest.isEmpty { rootfsCache[image.digest] = mount }
         }
 
+        if let imageConfig = try? await image.config(for: platform).config {
+            imageConfigs[reference] = imageConfig
+            if !image.digest.isEmpty { imageConfigs[image.digest] = imageConfig }
+        }
+
         // The kubelet rejects an image whose id or size is unset -- it reports
         // ImageInspectError and the pod never starts. Size is taken from the
         // unpacked root filesystem, which is the thing that actually occupies
@@ -468,6 +569,11 @@ actor PodRuntime {
         }
         sandboxes.removeAll()
         containers.removeAll()
+    }
+
+    func dnsAddress() -> String? {
+        guard let dnsInterface else { return nil }
+        return "\(dnsInterface.ipv4Address)".split(separator: "/").first.map(String.init)
     }
 
     func stateDirPath() -> String { config.stateDir.path() }
