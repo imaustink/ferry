@@ -40,9 +40,10 @@ cost time.
   [experiments/03-vm-ceiling](experiments/03-vm-ceiling/FINDINGS.md).
   The ceiling is invariant to devices: 128 bare, 128 with a NIC each, 128 with
   a NIC and a rootfs block device each.
-- ❓ **Routable per-pod addressing.** NAT attachment proves capacity, but each
-  pod needs a stable address reachable from the host and from other pods. This
-  is the remaining macOS 26 question.
+- ✅ **Routable per-pod networking works.** A `VmnetNetwork` allocates an address
+  per pod with the Mac as gateway; a real Alpine pod boots in **0.33s**, answers
+  ping from the host in **0.34ms**, and reaches another pod directly. No root
+  required. See [experiments/04-pod-networking](experiments/04-pod-networking/FINDINGS.md).
 - 🔨 **`ferry-cri`** — a CRI implementation in Swift backed by Apple's
   Containerization framework. Not started; it needs the Swift 6.2 toolchain.
   Design sketch in [docs/HANDOFF.md](docs/HANDOFF.md).
@@ -68,6 +69,7 @@ control-plane/                       PKI + up/down for the native control plane
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
+experiments/04-pod-networking/       routable per-pod addressing, host and pod to pod
 bin/                                 build output (gitignored)
 ```
 

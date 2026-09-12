@@ -235,6 +235,13 @@ inside the guest.
 block devices used as container rootfs. `initBlock` builds the init filesystem.
 No containerd, no snapshotters.
 
+### Entitlements
+
+Ad-hoc signing with `com.apple.security.virtualization` is sufficient and works
+unprivileged. **Do not add `com.apple.vm.networking`** — it is restricted, and an
+ad-hoc binary claiming it is SIGKILLed at launch with no output. Sign the binary
+at its final path, not inside `.build` and then copy.
+
 ### Carry-over warning
 
 **A real CRI must honour the filters on `ListContainers` and `ListPodSandbox`.**
@@ -251,12 +258,11 @@ listings.
 2. ~~Build Apple's Containerization framework.~~ In progress.
 3. ~~Re-run `experiments/03-vm-ceiling` on macOS 26.~~ **Done** — 128 holds, and
    the cap turned out to be system-wide.
-4. **Measure vmnet properly.** The remaining unknown: routable per-pod
-   addressing. `VZNATNetworkDeviceAttachment` proved capacity, but each pod needs
-   a stable address reachable from the host and from other pods.
+4. ~~Measure vmnet properly.~~ **Done** — experiment 04. Per-pod IPAM, host→pod
+   0.34ms, pod→pod verified, no root needed, 0.33s to boot a real Alpine pod.
 5. Change `ADVERTISE` in `control-plane/up.sh` from the LAN IP to the vmnet
-   gateway (`192.168.64.1`). It is already in the cert SANs from `pki.sh`.
-6. Start `ferry-cri`.
+   gateway. It is already in the cert SANs from `pki.sh`; the subnet must agree.
+6. **Start `ferry-cri`.** Every dependency is now proven.
 
 ---
 
