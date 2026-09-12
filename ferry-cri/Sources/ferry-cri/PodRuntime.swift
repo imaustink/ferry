@@ -47,6 +47,7 @@ struct SandboxRecord {
     let labels: [String: String]
     let annotations: [String: String]
     let ip: String
+    let logDirectory: String
     let createdAt: Int64
     var ready: Bool = true
     /// Whether the VM has been booted. Virtualization.framework cannot hotplug,
@@ -71,6 +72,8 @@ struct ContainerRecord {
     var exitCode: Int32 = 0
     var state: ContainerRunState = .created
     var reason: String = ""
+    var logWriters: [ContainerLogWriter] = []
+    var logFile: ContainerLogFile?
 }
 
 enum ContainerRunState {
@@ -195,7 +198,7 @@ actor PodRuntime {
             name: cfg.metadata.name, uid: cfg.metadata.uid,
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
-            ip: ip, createdAt: Self.now()
+            ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now()
         )
         return id
     }
@@ -292,8 +295,33 @@ actor PodRuntime {
         // Immutable so it can cross into the configuration closure.
         let shares = collected
 
+        // CRI gives a log path relative to the sandbox's log directory; the
+        // kubelet reads exactly this file for `kubectl logs`.
+        var writers: [ContainerLogWriter] = []
+        var logFile: ContainerLogFile?
+        var stdoutWriter: ContainerLogWriter?
+        var stderrWriter: ContainerLogWriter?
+        // ContainerConfig.logPath is relative to the sandbox log directory, but
+        // ContainerStatus.logPath must be absolute -- the kubelet resolves the
+        // latter directly, and a relative value makes `kubectl logs` fail with
+        // a confusing lstat error.
+        var absoluteLogPath = ""
+        if !cfg.logPath.isEmpty && !sandbox.logDirectory.isEmpty {
+            let full = URL(filePath: sandbox.logDirectory).appending(path: cfg.logPath).path()
+            absoluteLogPath = full
+            let file = try ContainerLogFile(path: full)
+            logFile = file
+            stdoutWriter = ContainerLogWriter(file: file, stream: .stdout)
+            stderrWriter = ContainerLogWriter(file: file, stream: .stderr)
+            writers = [stdoutWriter!, stderrWriter!]
+        }
+        let outWriter = stdoutWriter
+        let errWriter = stderrWriter
+
         try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
             c.process.arguments = arguments
+            if let outWriter { c.process.stdout = outWriter }
+            if let errWriter { c.process.stderr = errWriter }
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
@@ -308,7 +336,8 @@ actor PodRuntime {
             name: cfg.metadata.name, attempt: cfg.metadata.attempt,
             image: imageRef, imageRef: imageRef,
             labels: cfg.labels, annotations: cfg.annotations,
-            logPath: cfg.logPath, createdAt: Self.now()
+            logPath: absoluteLogPath, createdAt: Self.now(),
+            logWriters: writers, logFile: logFile
         )
         return id
     }
@@ -342,6 +371,9 @@ actor PodRuntime {
 
     private func recordExit(_ id: String, code: Int32) {
         guard containers[id] != nil else { return }
+        // Flush whatever the container wrote without a trailing newline.
+        for writer in containers[id]?.logWriters ?? [] { try? writer.close() }
+        containers[id]?.logFile?.close()
         containers[id]?.state = .exited
         containers[id]?.exitCode = code
         containers[id]?.finishedAt = Self.now()
@@ -361,6 +393,11 @@ actor PodRuntime {
         if record.state == .running { try? await stopContainer(id, timeout: 0) }
         try? FileManager.default.removeItem(atPath: config.stateDir.appending(component: "\(id).ext4").path())
         containers.removeValue(forKey: id)
+    }
+
+    func reopenContainerLog(_ id: String) throws {
+        guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
+        try record.logFile?.reopen()
     }
 
     func container(_ id: String) throws -> ContainerRecord {
