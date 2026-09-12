@@ -15,15 +15,20 @@ CLUSTER_CIDR="${CLUSTER_CIDR:-10.244.0.0/16}"
 
 # The endpoint reconciler writes this address into the kubernetes Endpoints
 # object, which every in-cluster client resolves 10.96.0.1 to. It may not be
-# loopback. Once pods are VMs this must be the vmnet gateway; until then the
-# LAN address is the only routable choice.
-ADVERTISE="${ADVERTISE:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)}"
+# loopback, and it must be reachable from inside a pod -- so it is the vmnet
+# gateway, not the LAN address, which changes with the network the Mac is on.
+#
+# The gateway interface only materialises once a pod VM attaches to the network,
+# which is after the API server starts. That is fine: the server binds 0.0.0.0
+# and only needs the advertised address to be non-loopback, not yet present.
+POD_GATEWAY="${POD_GATEWAY:-192.168.66.1}"
+ADVERTISE="${ADVERTISE:-$POD_GATEWAY}"
 if [ -z "$ADVERTISE" ]; then
   echo "no non-loopback address found; set ADVERTISE=" >&2; exit 1
 fi
 
 mkdir -p "$STATE/logs" "$STATE/etcd"
-PKI_DIR="$PKI_DIR" NODE_NAME="$NODE_NAME" "$here/pki.sh"
+PKI_DIR="$PKI_DIR" NODE_NAME="$NODE_NAME" VMNET_GW="$POD_GATEWAY" "$here/pki.sh"
 "$here/fetch-binaries.sh" >/dev/null
 
 kubeconfig() { # name certbase

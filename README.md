@@ -44,9 +44,15 @@ cost time.
   per pod with the Mac as gateway; a real Alpine pod boots in **0.33s**, answers
   ping from the host in **0.34ms**, and reaches another pod directly. No root
   required. See [experiments/04-pod-networking](experiments/04-pod-networking/FINDINGS.md).
-- 🔨 **`ferry-cri`** — a CRI implementation in Swift backed by Apple's
-  Containerization framework. Not started; it needs the Swift 6.2 toolchain.
-  Design sketch in [docs/HANDOFF.md](docs/HANDOFF.md).
+- ✅ **`ferry-cri` runs real pods.** A CRI implementation in Swift on Apple's
+  Containerization framework. `kubectl` schedules pods; each becomes its own VM
+  with its own routable IP, reachable from the Mac at ~0.4ms. The API server
+  advertises the pod gateway, so it is reachable from inside a pod. See
+  [experiments/05-real-pods](experiments/05-real-pods/FINDINGS.md).
+- 🔨 **Services.** ClusterIPs are not implemented yet; the routing substrate is
+  proven and three approaches are compared in [docs/SERVICES.md](docs/SERVICES.md).
+- 🔨 **Mounts.** `ContainerConfig.mounts` is ignored, so ServiceAccount tokens,
+  ConfigMaps and Secrets do not reach pods yet.
 
 ## Why this can work
 
@@ -70,27 +76,33 @@ experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
 experiments/04-pod-networking/       routable per-pod addressing, host and pod to pod
+experiments/05-real-pods/            the whole stack, with real VMs per pod
+ferry-cri/                           the CRI runtime: one VM per pod
 bin/                                 build output (gitignored)
 ```
 
 ## Try it
 
+Real pods, each in its own VM:
+
 ```sh
 ./build-kubelet.sh
-(cd experiments/01-kubelet-cri-surface && go build -o ../../bin/fakecri .)
-control-plane/up.sh
-experiments/02-node-registration/run.sh
+experiments/03-vm-ceiling/fetch-kernel.sh
+(cd ferry-cri && ./build.sh)
 
+experiments/05-real-pods/run.sh
 export KUBECONFIG=/tmp/ferry/admin.conf
-kubectl get nodes -o wide
-kubectl create deployment demo --image=nginx:1.27-alpine --replicas=5
 
-experiments/02-node-registration/stop.sh && control-plane/down.sh
+kubectl get nodes -o wide
+kubectl run demo --image=ghcr.io/linuxcontainers/alpine:3.20 --restart=Never \
+  --command -- /bin/sh -c "sleep 3600"
+ping "$(kubectl get pod demo -o jsonpath='{.status.podIP}')"
+
+experiments/05-real-pods/stop.sh
 ```
 
-The runtime is still the fake from experiment 01, so nothing is really executed
-— this exercises the control plane and kubelet halves. Pod networking is proven
-separately in experiment 04.
+Single-container pods only for now: `Virtualization.framework` cannot hotplug,
+so a pod's containers must all exist before its VM boots.
 
 ## Requirements
 

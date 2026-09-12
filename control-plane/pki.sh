@@ -10,7 +10,7 @@ NODE_NAME="${NODE_NAME:-ferry-mac}"
 # The kubelet reaches the API server over vmnet once pods are VMs, so the
 # gateway address is baked in from the start -- an API server certificate that
 # is only valid on today's Wi-Fi network is not worth generating.
-VMNET_GW="${VMNET_GW:-192.168.64.1}"
+VMNET_GW="${VMNET_GW:-192.168.66.1}"
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
 
 mkdir -p "$PKI_DIR"
