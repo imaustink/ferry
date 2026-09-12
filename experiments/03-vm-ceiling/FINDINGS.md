@@ -85,7 +85,7 @@ This settles a question raised earlier in the design discussion: VM-per-pod does
 *not* mean summing every pod's memory limit against physical RAM. Density is
 bounded by the 128-VM cap, not by memory.
 
-## What this means for k5s
+## What this means for ferry
 
 The thesis survives, with room to spare:
 

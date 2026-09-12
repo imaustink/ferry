@@ -1,4 +1,4 @@
-module github.com/austinkurpuis/k5s/experiments/fakecri
+module github.com/imaustink/ferry/experiments/fakecri
 
 go 1.24.0
 

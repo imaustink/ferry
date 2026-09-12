@@ -1,3 +1,3 @@
-module k5s/vmceiling-init
+module ferry/vmceiling-init
 
 go 1.24

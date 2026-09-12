@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	endpoint  = flag.String("endpoint", "/tmp/k5s-fakecri.sock", "unix socket to listen on")
+	endpoint  = flag.String("endpoint", "/tmp/ferry-fakecri.sock", "unix socket to listen on")
 	verbosity = flag.Int("log-repeats", 2, "log only the first N calls of each method; 0 logs all")
 )
 
@@ -135,7 +135,7 @@ func (r *runtimeSvc) nextID(prefix string) string {
 func (r *runtimeSvc) Version(_ context.Context, _ *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
 	return &runtimeapi.VersionResponse{
 		Version:           "0.1.0",
-		RuntimeName:       "k5s-fakecri",
+		RuntimeName:       "ferry-fakecri",
 		RuntimeVersion:    "0.1.0",
 		RuntimeApiVersion: "v1",
 	}, nil
@@ -426,7 +426,7 @@ func (i *imageSvc) RemoveImage(_ context.Context, req *runtimeapi.RemoveImageReq
 func (i *imageSvc) ImageFsInfo(_ context.Context, _ *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
 	fs := []*runtimeapi.FilesystemUsage{{
 		Timestamp:  time.Now().UnixNano(),
-		FsId:       &runtimeapi.FilesystemIdentifier{Mountpoint: "/tmp/k5s-fake-imagefs"},
+		FsId:       &runtimeapi.FilesystemIdentifier{Mountpoint: "/tmp/ferry-fake-imagefs"},
 		UsedBytes:  &runtimeapi.UInt64Value{Value: 1 << 20},
 		InodesUsed: &runtimeapi.UInt64Value{Value: 16},
 	}}

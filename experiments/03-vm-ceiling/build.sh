@@ -9,6 +9,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
 mkdir -p build/root
 
+"$here/fetch-kernel.sh"
+
 echo "==> guest init (linux/arm64, static)"
 ( cd init && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
     go build -trimpath -ldflags='-s -w' -o "$here/build/root/init" . )

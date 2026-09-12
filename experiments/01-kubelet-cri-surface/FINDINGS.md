@@ -84,5 +84,5 @@ Containerization framework, and the concurrent-VM ceiling.
 cd experiments/01-kubelet-cri-surface
 go build -o ../../bin/fakecri .
 SECS=50 ./run.sh
-cat /tmp/k5s-e01/fakecri.log
+cat /tmp/ferry-e01/fakecri.log
 ```

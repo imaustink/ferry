@@ -26,7 +26,7 @@ import "os"
 // in a terminal does not. Honour an explicit override so both work without
 // forking the path handling itself.
 func init() {
-	if dir := os.Getenv("K5S_CONTAINER_LOGS_DIR"); dir != "" {
+	if dir := os.Getenv("FERRY_CONTAINER_LOGS_DIR"); dir != "" {
 		ContainerLogsDir = dir
 	}
 }

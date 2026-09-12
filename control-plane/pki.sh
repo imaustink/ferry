@@ -4,8 +4,8 @@
 # invalidate certificates already handed out.
 set -euo pipefail
 
-PKI_DIR="${PKI_DIR:-/tmp/k5s/pki}"
-NODE_NAME="${NODE_NAME:-k5s-mac}"
+PKI_DIR="${PKI_DIR:-/tmp/ferry/pki}"
+NODE_NAME="${NODE_NAME:-ferry-mac}"
 
 # The kubelet reaches the API server over vmnet once pods are VMs, so the
 # gateway address is baked in from the start -- an API server certificate that
@@ -37,8 +37,8 @@ client() { # name CN O
   rm -f "$1.csr" "$ext"
 }
 
-newca ca "k5s-ca"
-newca front-proxy-ca "k5s-front-proxy-ca"
+newca ca "ferry-ca"
+newca front-proxy-ca "ferry-front-proxy-ca"
 
 # API server serving certificate.
 cat > apiserver.ext <<EXT
@@ -54,7 +54,7 @@ rm -f apiserver.csr apiserver.ext
 
 # Clients. The kubelet identifies as system:node:<name> in group system:nodes,
 # which is what the Node authorizer keys off.
-client admin                   "k5s-admin"                  "system:masters"
+client admin                   "ferry-admin"                  "system:masters"
 client apiserver-kubelet-client "kube-apiserver-kubelet-client" "system:masters"
 client kubelet                 "system:node:$NODE_NAME"     "system:nodes"
 client controller-manager      "system:kube-controller-manager"

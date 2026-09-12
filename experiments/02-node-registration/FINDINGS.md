@@ -14,9 +14,9 @@ actually executed — this tests the kubelet/API-server half.
 ```
 $ kubectl get nodes -o wide
 NAME      STATUS  ROLES   VERSION  INTERNAL-IP    OS-IMAGE       KERNEL-VERSION  CONTAINER-RUNTIME
-k5s-mac   Ready   <none>  v1.34.0  192.168.1.29   macOS 15.6.1   24.6.0          k5s-fakecri://0.1.0
+ferry-mac   Ready   <none>  v1.34.0  192.168.1.29   macOS 15.6.1   24.6.0          ferry-fakecri://0.1.0
 
-$ kubectl get node k5s-mac -o jsonpath='{.status.capacity}'
+$ kubectl get node ferry-mac -o jsonpath='{.status.capacity}'
 {"cpu":"16","ephemeral-storage":"0","memory":"128Gi","pods":"110"}
 
 $ kubectl create deployment fleet --image=nginx:1.27-alpine --replicas=10
@@ -31,7 +31,7 @@ by `cadvisor_darwin.go` from `sysctl`. Capacity is the real machine.
 What this exercised end to end:
 
 - **Registration** — kubelet creates its own Node object, authenticating as
-  `system:node:k5s-mac` in group `system:nodes` against the Node authorizer.
+  `system:node:ferry-mac` in group `system:nodes` against the Node authorizer.
 - **Heartbeats** — Lease objects in `kube-node-lease`, node status updates.
 - **Scheduling** — the scheduler binds pods to a macOS node like any other.
 - **Volumes** — the projected ServiceAccount volume is assembled on the Mac's
@@ -132,7 +132,7 @@ signals work; this one cannot without a host cgroup tree.
 ```sh
 control-plane/up.sh
 experiments/02-node-registration/run.sh
-export KUBECONFIG=/tmp/k5s/admin.conf
+export KUBECONFIG=/tmp/ferry/admin.conf
 kubectl get nodes -o wide
 kubectl create deployment fleet --image=nginx:1.27-alpine --replicas=10
 experiments/02-node-registration/stop.sh && control-plane/down.sh

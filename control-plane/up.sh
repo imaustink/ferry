@@ -7,9 +7,9 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="$here/../bin"
-STATE="${STATE:-/tmp/k5s}"
+STATE="${STATE:-/tmp/ferry}"
 PKI_DIR="${PKI_DIR:-$STATE/pki}"
-NODE_NAME="${NODE_NAME:-k5s-mac}"
+NODE_NAME="${NODE_NAME:-ferry-mac}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/16}"
 CLUSTER_CIDR="${CLUSTER_CIDR:-10.244.0.0/16}"
 
@@ -31,14 +31,14 @@ kubeconfig() { # name certbase
 apiVersion: v1
 kind: Config
 clusters:
-- name: k5s
+- name: ferry
   cluster:
     server: https://127.0.0.1:6443
     certificate-authority: $PKI_DIR/ca.crt
 contexts:
-- name: k5s
-  context: {cluster: k5s, user: $1}
-current-context: k5s
+- name: ferry
+  context: {cluster: ferry, user: $1}
+current-context: ferry
 users:
 - name: $1
   user:
@@ -139,7 +139,7 @@ kubectl apply -f - >/dev/null <<'YAML'
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: k5s:system-nodes
+  name: ferry:system-nodes
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

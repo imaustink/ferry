@@ -1,7 +1,7 @@
 // Measures how many Linux virtual machines macOS will run at once, and how
 // long one takes to boot.
 //
-// Both numbers bound the k5s design directly: with one VM per pod, the
+// Both numbers bound the ferry design directly: with one VM per pod, the
 // concurrent-VM limit is the pod limit for the whole node, and VM boot time is
 // pod start latency. Nothing here uses Apple's Containerization framework --
 // this is Virtualization.framework alone, so the answer is a property of the
@@ -154,7 +154,7 @@ print("""
     ceiling  attempting up to \(options.maxVMs)
 """)
 
-let queue = DispatchQueue(label: "k5s.vmceiling")
+let queue = DispatchQueue(label: "ferry.vmceiling")
 var running: [VZVirtualMachine] = []
 var failure: String?
 var bootTimes: [TimeInterval] = []

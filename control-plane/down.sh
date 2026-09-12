@@ -2,7 +2,7 @@
 # Stops the control plane. State under $STATE is left alone; use --purge to
 # drop etcd's data directory as well.
 set -uo pipefail
-STATE="${STATE:-/tmp/k5s}"
+STATE="${STATE:-/tmp/ferry}"
 # etcd and the API server do not always exit on SIGTERM promptly, so wait for
 # each one and escalate rather than reporting a stop that did not happen.
 for name in kube-scheduler kube-controller-manager kube-apiserver etcd; do

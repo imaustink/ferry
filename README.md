@@ -1,18 +1,17 @@
-# k5s
+# ferry
 
 Kubernetes on a Mac where **the pod is the virtual machine** and there is no
 Linux host anywhere in the system.
 
 The control plane runs as native Mach-O processes on macOS. Each pod is a
-lightweight VM on `Virtualization.framework` with its own kernel and its own
-routable IP. There is no node VM to size, nothing nested, and no shared kernel
-between pods.
+lightweight VM on `Virtualization.framework` with its own kernel. There is no
+node VM to size, nothing nested, and no shared kernel between pods.
 
 |  | isolation | overhead |
 |---|---|---|
 | Docker Desktop / colima / kind | one Linux VM, pods share a kernel | a VM you size up front |
 | kiac / Orchard | VM per **node**, pods share the node's kernel | 2–4 GB per node, idle or not |
-| **k5s** | VM per **pod** — every pod its own kernel | pods only |
+| **ferry** | VM per **pod** — every pod its own kernel | pods only |
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause
@@ -20,7 +19,9 @@ container, no network namespace plumbing.
 
 ## Status
 
-Early. Two things are proven, one is being built, one is unmeasured.
+Early, but the load-bearing questions are answered. **[docs/HANDOFF.md](docs/HANDOFF.md)
+is the full picture** — architecture, findings, next steps, and the gotchas that
+cost time.
 
 - ✅ **Control plane runs natively on macOS.** etcd + kube-apiserver +
   kube-controller-manager + kube-scheduler as darwin/arm64 processes. Serves
@@ -33,8 +34,6 @@ Early. Two things are proven, one is being built, one is unmeasured.
   workloads. `kubectl get nodes` reports `OS-IMAGE: macOS 15.6.1`; a 10-replica
   Deployment reaches 10/10. See
   [experiments/02-node-registration](experiments/02-node-registration/FINDINGS.md).
-- 🔨 **`k5s-cri`** — a CRI implementation backed by Apple's Containerization
-  framework. Not started.
 - ✅ **The VM ceiling is 128, and Kubernetes' default is 110.** One VM per pod
   fits, with 18 to spare. Guests boot to userspace in ~0.12s and VM memory is
   lazily backed — 64 GiB configured cost 1.6 GiB resident. See
@@ -44,6 +43,9 @@ Early. Two things are proven, one is being built, one is unmeasured.
 - ❓ **Routable per-pod addressing.** NAT attachment proves capacity, but each
   pod needs a stable address reachable from the host and from other pods. This
   is the remaining macOS 26 question.
+- 🔨 **`ferry-cri`** — a CRI implementation in Swift backed by Apple's
+  Containerization framework. Not started; it needs the Swift 6.2 toolchain.
+  Design sketch in [docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## Why this can work
 
@@ -76,13 +78,14 @@ bin/                                 build output (gitignored)
 (cd experiments/01-kubelet-cri-surface && go build -o ../../bin/fakecri .)
 control-plane/up.sh
 experiments/02-node-registration/run.sh
-export KUBECONFIG=/tmp/k5s/admin.conf
+export KUBECONFIG=/tmp/ferry/admin.conf
 kubectl get nodes -o wide
 ```
 
 ## Requirements
 
 - Apple silicon
-- macOS 26 (Tahoe). The control plane and kubelet work on macOS 15, but
-  per-pod networking needs vmnet features that macOS 15 does not expose.
-- Go 1.24+
+- macOS 26 (Tahoe). Everything here was in fact developed on macOS 15 — what
+  needs 26 is routable per-pod addressing, and the Swift 6.2 toolchain that
+  Apple's Containerization framework requires to build.
+- Go 1.24+, Swift 6.2+

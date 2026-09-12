@@ -6,9 +6,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../.."
-run="${RUNDIR:-/tmp/k5s-e01}"
+run="${RUNDIR:-/tmp/ferry-e01}"
 secs="${SECS:-45}"
-sock=/tmp/k5s-fakecri.sock
+sock=/tmp/ferry-fakecri.sock
 
 rm -rf "$run"; mkdir -p "$run/kubelet" "$run/pki" "$run/podlogs" "$run/volume-plugins" "$run/containerlogs" "$run/volume-plugins"
 
@@ -24,6 +24,15 @@ imageServiceEndpoint: unix://$sock
 # The default plugin directory is /usr/libexec/kubernetes, which macOS does not
 # permit creating even as root under SIP.
 volumePluginDir: $run/volume-plugins
+# The upstream hard-eviction defaults (nodefs.available<10%, imagefs<15%) are
+# sized for small cloud nodes. On a 926 GB laptop disk, 15% is 139 GB that must
+# sit idle or the node taints itself NoSchedule. Percentages that mean something
+# at this scale.
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "5%"
+  imagefs.available: "5%"
+  nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false
@@ -42,7 +51,7 @@ YAML
 cri=$!
 sleep 1
 
-K5S_CONTAINER_LOGS_DIR="$run/containerlogs" \
+FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
 "$root/bin/kubelet" \
   --config="$run/kubelet.yaml" \
   --root-dir="$run/kubelet" \

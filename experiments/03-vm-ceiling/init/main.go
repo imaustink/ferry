@@ -16,7 +16,7 @@ import (
 
 func main() {
 	if f, err := os.OpenFile("/dev/console", os.O_WRONLY, 0); err == nil {
-		fmt.Fprintf(f, "\nk5s-vmceiling: guest userspace up\n")
+		fmt.Fprintf(f, "\nferry-vmceiling: guest userspace up\n")
 		_ = f.Sync()
 	}
 
