@@ -269,12 +269,38 @@ actor PodRuntime {
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
 
+        // The kubelet assembles volume contents on the host -- projected
+        // ServiceAccount tokens, ConfigMaps, Secrets, emptyDir -- and passes
+        // the directories here. Share each one into the guest over virtiofs.
+        // These become VM devices, which is why they can only be attached
+        // before the pod boots.
+        var collected: [Containerization.Mount] = []
+        for mount in cfg.mounts {
+            guard !mount.hostPath.isEmpty, !mount.containerPath.isEmpty else { continue }
+            guard FileManager.default.fileExists(atPath: mount.hostPath) else {
+                // A path the kubelet has not created yet is a bug on our side
+                // if we silently skip it, so say so rather than starting a pod
+                // that is quietly missing its token.
+                throw RuntimeFailure.invalid("mount source \(mount.hostPath) does not exist")
+            }
+            collected.append(.share(
+                source: mount.hostPath,
+                destination: mount.containerPath,
+                options: mount.readonly ? ["ro"] : []
+            ))
+        }
+        // Immutable so it can cross into the configuration closure.
+        let shares = collected
+
         try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
             c.process.arguments = arguments
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
             if cpuQuota > 0 && cpuPeriod > 0 { c.cpus = max(1, Int(cpuQuota / cpuPeriod)) }
+            // Append rather than replace: the defaults carry /proc, /sys and
+            // the rest of the standard container filesystem.
+            c.mounts.append(contentsOf: shares)
         }
 
         containers[id] = ContainerRecord(
