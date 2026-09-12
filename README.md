@@ -80,14 +80,28 @@ bin/                                 build output (gitignored)
 (cd experiments/01-kubelet-cri-surface && go build -o ../../bin/fakecri .)
 control-plane/up.sh
 experiments/02-node-registration/run.sh
+
 export KUBECONFIG=/tmp/ferry/admin.conf
 kubectl get nodes -o wide
+kubectl create deployment demo --image=nginx:1.27-alpine --replicas=5
+
+experiments/02-node-registration/stop.sh && control-plane/down.sh
 ```
+
+The runtime is still the fake from experiment 01, so nothing is really executed
+— this exercises the control plane and kubelet halves. Pod networking is proven
+separately in experiment 04.
 
 ## Requirements
 
-- Apple silicon
-- macOS 26 (Tahoe). Everything here was in fact developed on macOS 15 — what
-  needs 26 is routable per-pod addressing, and the Swift 6.2 toolchain that
-  Apple's Containerization framework requires to build.
-- Go 1.24+, Swift 6.2+
+- Apple silicon, macOS 26 (Tahoe)
+- Go 1.24+
+- **Swift 6.2+.** The OS upgrade does not bring the toolchain with it — install
+  it explicitly (no sudo needed):
+  ```sh
+  softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"
+  ```
+
+Most of this was developed on macOS 15. What actually needs 26 is routable
+per-pod addressing (`VZVmnetNetworkDeviceAttachment`) and the toolchain Apple's
+Containerization framework requires to build.

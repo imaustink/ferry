@@ -95,6 +95,22 @@ controller chain all work. A 10-replica Deployment reaches 10/10.
   **1.6 GiB** resident. Density is bounded by the VM cap, not by summing pod
   limits.
 
+### Routable per-pod networking works
+
+A `VmnetNetwork` allocates one address per pod with the Mac as gateway:
+
+```
+gateway 192.168.66.1  (this Mac)
+pod up in 0.33s            <- Linux 6.12.28 + vminitd + ext4 Alpine rootfs + NIC
+host -> pod  0.343 ms, 0% loss
+pod  -> pod  YES           <- verified by the peer container's exit status
+euid 501                   <- no root
+```
+
+`createInterface` / `releaseInterface` is IPAM with address recycling. Ferry
+picks each pod's address, which is a CNI's job, and the framework configures the
+guest. This is what fixes the API server's advertise address.
+
 ---
 
 ## Repo layout
@@ -249,20 +265,35 @@ at its final path, not inside `.build` and then copy.
 kubelet tried to kill them. The kubelet derives container ownership from those
 listings.
 
-## First things after the upgrade
+## Environment
 
-1. ~~`swift --version` — needs ≥ 6.2.~~ **Done.** The OS upgrade does not bring
-   the toolchain; install it explicitly:
-   `softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"`.
-   That yields Swift 6.3.3, and needs no sudo.
-2. ~~Build Apple's Containerization framework.~~ In progress.
-3. ~~Re-run `experiments/03-vm-ceiling` on macOS 26.~~ **Done** — 128 holds, and
-   the cap turned out to be system-wide.
-4. ~~Measure vmnet properly.~~ **Done** — experiment 04. Per-pod IPAM, host→pod
-   0.34ms, pod→pod verified, no root needed, 0.33s to boot a real Alpine pod.
-5. Change `ADVERTISE` in `control-plane/up.sh` from the LAN IP to the vmnet
-   gateway. It is already in the cert SANs from `pki.sh`; the subnet must agree.
-6. **Start `ferry-cri`.** Every dependency is now proven.
+- Apple silicon, macOS 26 (Tahoe)
+- **Swift 6.2+.** The OS upgrade does *not* bring the toolchain. Install it
+  explicitly, no sudo needed:
+  `softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"`
+- Go 1.24+
+
+## Next steps
+
+Everything `ferry-cri` depends on is proven. The remaining work is the CRI
+surface itself and the two things around it.
+
+1. **Write `ferry-cri`.** Swift, on `LinuxPod` — the mapping is the table above.
+   Start with `RunPodSandbox` / `CreateContainer` / `StartContainer` /
+   `ListContainers` / `ContainerStatus`, which is enough to replace `fakecri` in
+   experiment 02 and run a pod for real end to end.
+2. **Fix the API server advertise address.** `control-plane/up.sh` still uses the
+   LAN IP, which breaks whenever the Mac changes network. It must be the vmnet
+   gateway. `pki.sh` already puts `192.168.64.1` in the certificate SANs, so the
+   vmnet subnet has to agree with it.
+3. **Decide what to do about Services.** Nothing programs `10.96.0.0/16` today.
+   Each pod is its own kernel with its own nftables, so kube-proxy could run
+   inside each pod VM; alternatively a userspace proxy on the Mac. This is the
+   next real design question after the runtime works.
+
+Further out: DNS (`LinuxPod.Configuration.dns` is unused so far), whether vmnet
+stays healthy at the 128-VM ceiling, and host routes so pod CIDRs are reachable
+from macOS without going through a pod.
 
 ---
 
@@ -291,6 +322,14 @@ listings.
   real difference from Linux worth remembering.
 - **The VM probe needs `com.apple.security.virtualization`.** `build.sh` ad-hoc
   signs it; without the entitlement the framework refuses to create a VM.
+- **Do not add `com.apple.vm.networking`.** It is restricted, it is *not*
+  required for vmnet, and an ad-hoc binary claiming it is SIGKILLed at launch —
+  exit 137, no output, nothing in the log.
+- **Sign the binary at its final path.** Signing inside `.build` and copying
+  afterwards produced binaries killed on launch.
+- **Swift buffers stdout when it is not a terminal**, so a SIGKILL discards
+  exactly the output that says how far the program got. The probes set
+  `setvbuf(stdout, nil, _IONBF, 0)`.
 
 ## Known gaps
 
