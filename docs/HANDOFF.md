@@ -275,25 +275,28 @@ listings.
 
 ## Next steps
 
-Everything `ferry-cri` depends on is proven. The remaining work is the CRI
-surface itself and the two things around it.
+`ferry-cri` runs real pods (experiment 05) and the API server advertises the
+pod-network gateway. What is left is everything a pod needs *around* the
+runtime.
 
-1. **Write `ferry-cri`.** Swift, on `LinuxPod` — the mapping is the table above.
-   Start with `RunPodSandbox` / `CreateContainer` / `StartContainer` /
-   `ListContainers` / `ContainerStatus`, which is enough to replace `fakecri` in
-   experiment 02 and run a pod for real end to end.
-2. **Fix the API server advertise address.** `control-plane/up.sh` still uses the
-   LAN IP, which breaks whenever the Mac changes network. It must be the vmnet
-   gateway. `pki.sh` already puts `192.168.64.1` in the certificate SANs, so the
-   vmnet subnet has to agree with it.
-3. **Decide what to do about Services.** Nothing programs `10.96.0.0/16` today.
-   Each pod is its own kernel with its own nftables, so kube-proxy could run
-   inside each pod VM; alternatively a userspace proxy on the Mac. This is the
-   next real design question after the runtime works.
-
-Further out: DNS (`LinuxPod.Configuration.dns` is unused so far), whether vmnet
-stays healthy at the 128-VM ceiling, and host routes so pod CIDRs are reachable
-from macOS without going through a pod.
+1. **Mounts.** `ContainerConfig.mounts` is ignored, so projected ServiceAccount
+   tokens, ConfigMaps and Secrets never reach a pod. This is the biggest gap —
+   most real workloads need the SA token. `LinuxPod.Configuration.volumes` with
+   `PodVolume.Source.tmpfs` is the intended home, and would put tokens on tmpfs
+   inside the guest, closer to Linux than the host-disk projection the fake
+   runtime produced.
+2. **DNS.** Small, independent, and unblocked: set
+   `LinuxPod.Configuration.dns` to CoreDNS's *pod* IP. That works without a
+   Service layer at all. See [SERVICES.md](SERVICES.md).
+3. **Services.** Designed, not built — three approaches compared in
+   [SERVICES.md](SERVICES.md). Recommendation is a userspace proxy on the Mac
+   first, with ferry-cri programming guest nftables as the target.
+4. **Exec, attach, port-forward, logs.** `LinuxPod.execInContainer` exists;
+   wiring it to CRI's streaming endpoints is not done. Without this
+   `kubectl logs` and `kubectl exec` do not work.
+5. **Multi-container pods.** Blocked by the hypervisor: see the hotplug note
+   below. Needs either buffering a pod's whole container set before booting, or
+   accepting single-container pods on macOS.
 
 ---
 
@@ -320,6 +323,14 @@ from macOS without going through a pod.
 - **`ServiceAccount tokens land on disk, not tmpfs.** macOS has no tmpfs. They
   are on a FileVault-encrypted volume and removed on teardown, but this is a
   real difference from Linux worth remembering.
+- **Virtualization.framework cannot hotplug.** A VM cannot gain a device once
+  booted, so a pod's containers must all be added before `create()`. ferry-cri
+  boots the VM lazily on the first `StartContainer`.
+- **vmnet networks leak permanently.** A subnet can stay claimed with no process
+  holding it. ferry-cri walks a candidate list and publishes the gateway it
+  obtained; `run.sh` feeds that to the control plane.
+- **The kubelet needs image `id` *and* `size` set**, and passes image *IDs* to
+  `CreateContainer` rather than the reference used to pull.
 - **The VM probe needs `com.apple.security.virtualization`.** `build.sh` ad-hoc
   signs it; without the entitlement the framework refuses to create a VM.
 - **Do not add `com.apple.vm.networking`.** It is restricted, it is *not*
