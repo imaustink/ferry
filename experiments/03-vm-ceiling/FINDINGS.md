@@ -39,6 +39,26 @@ as its capacity in experiment 02:
 **The hypervisor ceiling sits above the Kubernetes default with 18 to spare.**
 One VM per pod is viable at the density Kubernetes already expects from a node.
 
+### Devices do not move the ceiling
+
+Every pod needs a network interface and a root filesystem, and either could
+have been scarcer than VMs. Neither is:
+
+| VM shape | ceiling | mean start |
+|---|---|---|
+| bare | 128 | 0.091s |
+| + NIC (`VZNATNetworkDeviceAttachment`) | **128** | 0.063s |
+| + NIC + read-only rootfs block device | **128** | 0.063s |
+
+The cap is on virtual machines, not on the devices attached to them.
+
+This also corrects an assumption made earlier in the design work: the vmnet
+question was thought to need macOS 26. It does not.
+`VZNATNetworkDeviceAttachment` has existed since macOS 11, and answers "can 128
+VMs each hold an interface" today. What genuinely needs macOS 26 is *routable
+per-pod addressing* — multiple networks and stable per-container IPs — which is
+an addressing question, not a capacity one.
+
 ### Boot to userspace: ~0.12s
 
 ```
@@ -78,11 +98,13 @@ The thesis survives, with room to spare:
 - **The guest is trivial.** A 1.6 MiB initramfs and a sleeping init. A real pod
   carries an OCI rootfs, virtiofs mounts, a network interface, and a workload.
   0.12s is a floor, not a prediction.
-- **No devices attached.** No block device, no network interface, no virtiofs
-  share. Each of those adds setup cost and may carry its own limits.
-- **vmnet is unmeasured and is the next real risk.** Every pod needs a network
-  interface. If vmnet caps interfaces below 128, *that* becomes the pod ceiling,
-  not this number. Measuring it needs macOS 26.
+- **Devices are attached but unused.** The NIC is never configured by the guest
+  and the block device is never mounted. This measures how many devices can
+  *exist*, not the cost of traffic or I/O through them.
+- **No virtiofs share.** Volume sharing into the guest is still unmeasured.
+- **Routable per-pod addressing is still open.** NAT attachment proves capacity;
+  it does not give each pod a stable address reachable from the host and from
+  other pods. That is the macOS 26 question.
 - **Measured on one machine and one OS version.** 128 may differ on macOS 26.
 
 ## Reproduce
@@ -91,6 +113,7 @@ The thesis survives, with room to spare:
 ./build.sh                                  # guest init, initramfs, signed probe
 ./build/vmceiling --max 256 --memory 128    # find the ceiling
 ./build/vmceiling --max 128 --memory 512 --hold 30   # hold, to sample host memory
+./build/vmceiling --max 140 --network --disk         # realistic pod device shape
 ```
 
 `build.sh` ad-hoc signs the probe with `com.apple.security.virtualization`;

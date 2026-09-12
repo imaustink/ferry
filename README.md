@@ -39,8 +39,11 @@ Early. Two things are proven, one is being built, one is unmeasured.
   fits, with 18 to spare. Guests boot to userspace in ~0.12s and VM memory is
   lazily backed — 64 GiB configured cost 1.6 GiB resident. See
   [experiments/03-vm-ceiling](experiments/03-vm-ceiling/FINDINGS.md).
-- ❓ **vmnet interface limits.** Every pod needs a network interface. If vmnet
-  caps below 128, that becomes the real pod ceiling. Needs macOS 26.
+  The ceiling is invariant to devices: 128 bare, 128 with a NIC each, 128 with
+  a NIC and a rootfs block device each.
+- ❓ **Routable per-pod addressing.** NAT attachment proves capacity, but each
+  pod needs a stable address reachable from the host and from other pods. This
+  is the remaining macOS 26 question.
 
 ## Why this can work
 

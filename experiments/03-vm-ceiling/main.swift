@@ -18,6 +18,8 @@ struct Options {
     var cpuCount = 1
     var bootTimeout = 30.0
     var holdSeconds = 0.0
+    var network = false
+    var disk = false
 }
 
 func parseOptions() -> Options {
@@ -41,6 +43,8 @@ func parseOptions() -> Options {
         case "--cpus":     o.cpuCount = Int(value()) ?? o.cpuCount
         case "--timeout":  o.bootTimeout = Double(value()) ?? o.bootTimeout
         case "--hold":     o.holdSeconds = Double(value()) ?? o.holdSeconds
+        case "--network":  o.network = true
+        case "--disk":     o.disk = true
         default:
             FileHandle.standardError.write("unknown flag \(flag)\n".data(using: .utf8)!)
             exit(2)
@@ -112,6 +116,25 @@ func makeConfiguration(_ o: Options, console: ConsoleWatcher?) throws -> VZVirtu
         config.serialPorts = [port]
     }
 
+    // A real pod needs an interface, and interfaces may be scarcer than VMs.
+    // NAT is the attachment available without extra privileges; the routable
+    // per-pod addressing this design ultimately wants needs newer vmnet
+    // support, but the question here is only how many interfaces can exist.
+    if o.network {
+        let nic = VZVirtioNetworkDeviceConfiguration()
+        nic.attachment = VZNATNetworkDeviceAttachment()
+        config.networkDevices = [nic]
+    }
+
+    // A real pod also needs a root filesystem. Every VM attaches the same image
+    // read-only, which isolates the question of how many block devices can be
+    // open from the cost of materialising a rootfs per pod.
+    if o.disk {
+        let url = URL(fileURLWithPath: "build/rootfs.img")
+        let attachment = try VZDiskImageStorageDeviceAttachment(url: url, readOnly: true)
+        config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
+    }
+
     try config.validate()
     return config
 }
@@ -127,7 +150,7 @@ print("""
 ==> VM ceiling probe
     kernel   \(options.kernel)
     initrd   \(options.initrd)
-    each VM  \(options.cpuCount) cpu, \(options.memoryMiB) MiB
+    each VM  \(options.cpuCount) cpu, \(options.memoryMiB) MiB\(options.network ? ", 1 nic" : "")\(options.disk ? ", 1 disk" : "")
     ceiling  attempting up to \(options.maxVMs)
 """)
 
