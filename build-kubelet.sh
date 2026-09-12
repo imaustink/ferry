@@ -34,7 +34,9 @@ for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
          pkg/volume/util/hostutil/hostutil_unsupported.go \
          pkg/kubelet/cm/container_manager_unsupported.go \
          staging/src/k8s.io/mount-utils/mount_unsupported.go \
-         pkg/kubelet/config/file_unsupported.go; do
+         pkg/kubelet/config/file_unsupported.go \
+         pkg/kubelet/kuberuntime/kuberuntime_container_unsupported.go \
+         pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go; do
   if [ -f "$src/$f" ]; then
     sed -i '' \
       -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
@@ -71,6 +73,34 @@ ldflags="$(
     echo -n " -X $pkg.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   done
 )"
+
+# The kubelet only fills in ContainerConfig.Linux -- a container's resource
+# limits *and* its security context -- from applyPlatformSpecificContainerConfig,
+# which lives behind a linux build tag. On darwin the unsupported variant does
+# nothing, so every pod runs with no limits and the default capability set
+# whatever its spec says.
+#
+# The logic is portable: it populates a CRI struct, and the guest is Linux even
+# when the host is not. Go derives build constraints from the _linux.go suffix
+# as well as the tag, so the tag cannot simply be widened -- the files are copied
+# to _darwin.go instead, which also keeps them tracking upstream rather than
+# being forked into patches/.
+#
+# The only parts that genuinely do not apply are three queries about the *host*
+# cgroup hierarchy; those are redirected to the shims in ferry_cgroups_darwin.go.
+echo "==> deriving darwin container config from the linux implementation"
+for f in kuberuntime_container helpers kuberuntime_sandbox; do
+  src_file="$src/pkg/kubelet/kuberuntime/${f}_linux.go"
+  [ -f "$src_file" ] || continue
+  sed -e 's|^//go:build linux$|//go:build darwin|' \
+      -e 's|^// +build linux$|// +build darwin|' \
+      -e '/libcontainercgroups "github.com\/opencontainers\/cgroups"/d' \
+      -e 's|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g' \
+      -e 's|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g' \
+      -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
+      "$src_file" > "$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
+  echo "    + ${f}_darwin.go (from ${f}_linux.go)"
+done
 
 echo "==> building darwin/arm64 kubelet ($K8S_VERSION)"
 cd "$src"

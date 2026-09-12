@@ -11,6 +11,7 @@ import ContainerizationEXT4
 import ContainerizationError
 import ContainerizationExtras
 import ContainerizationOCI
+import ContainerizationOS
 import Foundation
 import Synchronization
 
@@ -234,6 +235,36 @@ actor PodRuntime {
         return id
     }
 
+    /// Translates a CRI security context into the framework's capability sets.
+    /// Kubernetes speaks in terms of adding to and dropping from a default set,
+    /// and "ALL" is legal on either side.
+    private static func capabilities(for security: Runtime_V1_LinuxContainerSecurityContext) -> Containerization.LinuxCapabilities {
+        if security.privileged { return .allCapabilities }
+
+        var names = Set(Containerization.LinuxCapabilities.defaultOCICapabilities.bounding)
+        let drops = security.capabilities.dropCapabilities
+        if drops.contains(where: { $0.uppercased() == "ALL" }) {
+            names.removeAll()
+        } else {
+            for drop in drops {
+                if let capability = try? CapabilityName(rawValue: drop) { names.remove(capability) }
+            }
+        }
+        let adds = security.capabilities.addCapabilities
+        if adds.contains(where: { $0.uppercased() == "ALL" }) {
+            return .allCapabilities
+        }
+        for add in adds {
+            if let capability = try? CapabilityName(rawValue: add) { names.insert(capability) }
+        }
+
+        let list = Array(names)
+        // Ambient is left empty: capabilities are granted to the container's
+        // own process, not inherited by anything it later executes.
+        return Containerization.LinuxCapabilities(
+            bounding: list, effective: list, inheritable: list, permitted: list, ambient: [])
+    }
+
     private func makePod(id: String, interface: any Interface, cfg: Runtime_V1_PodSandboxConfig) throws -> LinuxPod {
         try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs)) { c in
             c.cpus = config.defaultCPUs
@@ -364,6 +395,16 @@ actor PodRuntime {
         }
         let environment = mergedEnv
         let workingDir = cfg.workingDir.isEmpty ? (imageConfig?.workingDir ?? "") : cfg.workingDir
+
+        // Security context and resource limits, both carried in
+        // ContainerConfig.linux. The kubelet only fills that section in from
+        // applyPlatformSpecificContainerConfig, which upstream builds for linux
+        // and windows only; ferry's kubelet derives a darwin copy so pods get
+        // their limits and capabilities. See build-kubelet.sh.
+        let security = cfg.linux.securityContext
+        let capabilities = Self.capabilities(for: security)
+        let runAsUser = security.hasRunAsUser ? UInt32(security.runAsUser.value) : nil
+        let runAsGroup = security.hasRunAsGroup ? UInt32(security.runAsGroup.value) : nil
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
@@ -418,6 +459,9 @@ actor PodRuntime {
             c.process.arguments = arguments
             if let outWriter { c.process.stdout = outWriter }
             if let errWriter { c.process.stderr = errWriter }
+            c.process.capabilities = capabilities
+            if let runAsUser { c.process.user.uid = runAsUser }
+            if let runAsGroup { c.process.user.gid = runAsGroup }
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }

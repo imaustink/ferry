@@ -54,6 +54,11 @@ cost time.
 - ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
   ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
   that authenticates to the API server with its own token.
+- ✅ **Resource limits and securityContext work.** The kubelet does not send
+  `ContainerConfig.Linux` on darwin, so every pod silently ran unbounded with
+  default capabilities; ferry's kubelet derives that code path for darwin.
+  A pod with `limits.memory: 300Mi` now gets `memory.max=314572800` in its
+  guest cgroup, and `NET_ADMIN` reaches the container.
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
