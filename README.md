@@ -54,6 +54,9 @@ cost time.
 - ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
   ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
   that authenticates to the API server with its own token.
+- ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
+  any pod can take it, so the kubelet can be told where DNS lives before DNS
+  exists. Pods resolve external names and cluster names.
 
 ## Why this can work
 
@@ -84,26 +87,38 @@ bin/                                 build output (gitignored)
 
 ## Try it
 
-Real pods, each in its own VM:
-
 ```sh
-./build-kubelet.sh
-experiments/03-vm-ceiling/fetch-kernel.sh
-(cd ferry-cri && ./build.sh)
+./ferry doctor    # check this machine can run ferry
+./ferry build     # kubelet, runtime, guest kernel
+./ferry up
 
-experiments/05-real-pods/run.sh
-export KUBECONFIG=/tmp/ferry/admin.conf
-
-kubectl get nodes -o wide
+export KUBECONFIG=~/.ferry/admin.conf
 kubectl run demo --image=ghcr.io/linuxcontainers/alpine:3.20 --restart=Never \
-  --command -- /bin/sh -c "sleep 3600"
+  --command -- /bin/sh -c "echo hello from a VM; sleep 3600"
+
+kubectl get pods -o wide          # each pod has its own routable address
+kubectl logs demo
 ping "$(kubectl get pod demo -o jsonpath='{.status.podIP}')"
 
-experiments/05-real-pods/stop.sh
+./ferry status
+./ferry down
 ```
 
-Single-container pods only for now: `Virtualization.framework` cannot hotplug,
-so a pod's containers must all exist before its VM boots.
+`ferry doctor` explains what is missing if the machine is not ready — the most
+common answer being that a macOS upgrade does not bring the Swift toolchain with
+it.
+
+### Limits worth knowing
+
+- **Single-container pods.** `Virtualization.framework` cannot hotplug, so a
+  pod's containers must all exist before its VM boots. Init containers and
+  sidecars do not work yet.
+- **No Services yet.** DNS resolves Service names, but a ClusterIP does not
+  route — nothing programs `10.96.0.0/16`. Pods reach each other and the API
+  server by IP. See [docs/SERVICES.md](docs/SERVICES.md).
+- **No `kubectl exec` / `port-forward`** yet. `kubectl logs` works.
+- **128 pods, shared.** The VM ceiling belongs to the machine, so every other
+  VM — Docker Desktop included — takes one of ferry's slots.
 
 ## Requirements
 
