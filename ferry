@@ -17,6 +17,8 @@ POD_CPUS="${FERRY_POD_CPUS:-2}"
 POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 
 KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
+CLUSTER_DOMAIN="${FERRY_CLUSTER_DOMAIN:-cluster.local}"
+COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 
 # macOS pgrep does not count reliably with -c, so count lines.
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
@@ -144,6 +146,9 @@ cmd_up() {
   # claimed by an earlier run.
   local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null)"
   [ -n "$gateway" ] || { bad "runtime did not publish a pod gateway"; return 1; }
+  # The runtime reserves an address for cluster DNS before any pod can take it,
+  # so the kubelet can be told where DNS will be before CoreDNS exists.
+  local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null)"
 
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" NODE_NAME="$NODE_NAME" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
@@ -169,7 +174,8 @@ cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false
 readOnlyPort: 0
-clusterDomain: cluster.local
+clusterDomain: $CLUSTER_DOMAIN
+${dns:+clusterDNS: [$dns]}
 # A pod is a VM here, and a VM takes longer to appear than a container does.
 runtimeRequestTimeout: 10m
 authentication:
@@ -198,9 +204,46 @@ EOF
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
 
+  if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
+
   echo
   bold "ferry is up"
   echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+}
+
+# CoreDNS forwards names it does not serve. It must not forward to itself, so
+# it takes the resolvers the Mac itself uses.
+host_resolvers() {
+  local servers
+  servers="$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/ {print $3}' | sort -u | grep -v '^127\.' | head -3 | tr '\n' ' ')"
+  [ -n "$servers" ] || servers="1.1.1.1 8.8.8.8"
+  echo "$servers"
+}
+
+install_dns() { # gateway dns-address
+  local gateway="$1" dns="$2"
+  local rendered="$FERRY_RUN/coredns.yaml"
+  sed -e "s|__CLUSTER_DOMAIN__|$CLUSTER_DOMAIN|g" \
+      -e "s|__UPSTREAM_DNS__|$(host_resolvers)|g" \
+      -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
+      -e "s|__APISERVER_HOST__|$gateway|g" \
+      -e "s|__APISERVER_PORT__|6443|g" \
+      "$here/manifests/coredns.yaml" > "$rendered"
+
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f "$rendered" >/dev/null 2>&1 \
+    || { warn "could not apply CoreDNS"; return 0; }
+
+  for _ in $(seq 1 90); do
+    [ "$(KUBECONFIG=$FERRY_HOME/admin.conf kubectl get deploy coredns -n kube-system \
+        -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "1" ] && break
+    sleep 2
+  done
+  if [ "$(KUBECONFIG=$FERRY_HOME/admin.conf kubectl get deploy coredns -n kube-system \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "1" ]; then
+    ok "cluster DNS at $dns"
+  else
+    warn "CoreDNS did not become ready; pods will start without cluster DNS"
+  fi
 }
 
 cmd_down() {

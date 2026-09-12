@@ -7,10 +7,17 @@ set -euo pipefail
 PKI_DIR="${PKI_DIR:-/tmp/ferry/pki}"
 NODE_NAME="${NODE_NAME:-ferry-mac}"
 
-# The kubelet reaches the API server over vmnet once pods are VMs, so the
-# gateway address is baked in from the start -- an API server certificate that
-# is only valid on today's Wi-Fi network is not worth generating.
+# The kubelet and every pod reach the API server over the pod network gateway,
+# so that address is baked in from the start -- a certificate valid only on
+# today's Wi-Fi network is not worth generating.
+#
+# Which gateway we get is not fixed: vmnet networks can stay claimed by an
+# earlier run, so the runtime falls back through a list of subnets. The
+# certificate therefore covers every candidate gateway, rather than being
+# regenerated whenever the subnet moves. These must stay in step with
+# PodRuntime.subnetCandidates.
 VMNET_GW="${VMNET_GW:-192.168.66.1}"
+GATEWAY_CANDIDATES="${GATEWAY_CANDIDATES:-192.168.66.1 192.168.77.1 192.168.88.1 192.168.99.1 192.168.111.1 192.168.122.1 192.168.133.1 192.168.144.1 192.168.155.1 192.168.166.1 192.168.177.1 192.168.188.1 192.168.199.1 192.168.211.1 192.168.222.1}"
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
 
 mkdir -p "$PKI_DIR"
@@ -41,8 +48,13 @@ newca ca "ferry-ca"
 newca front-proxy-ca "ferry-front-proxy-ca"
 
 # API server serving certificate.
+gateway_sans=""
+for candidate in $VMNET_GW $GATEWAY_CANDIDATES; do
+  case ",$gateway_sans," in *",IP:$candidate,"*) continue;; esac
+  gateway_sans="$gateway_sans,IP:$candidate"
+done
 cat > apiserver.ext <<EXT
-subjectAltName=DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,DNS:localhost,DNS:$(hostname),IP:127.0.0.1,IP:$VMNET_GW,IP:$LAN_IP,IP:10.96.0.1
+subjectAltName=DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.cluster.local,DNS:localhost,DNS:$(hostname),IP:127.0.0.1,IP:$LAN_IP,IP:10.96.0.1$gateway_sans
 extendedKeyUsage=serverAuth
 basicConstraints=CA:FALSE
 EXT
