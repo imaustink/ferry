@@ -279,12 +279,11 @@ listings.
 pod-network gateway. What is left is everything a pod needs *around* the
 runtime.
 
-1. **Mounts.** `ContainerConfig.mounts` is ignored, so projected ServiceAccount
-   tokens, ConfigMaps and Secrets never reach a pod. This is the biggest gap —
-   most real workloads need the SA token. `LinuxPod.Configuration.volumes` with
-   `PodVolume.Source.tmpfs` is the intended home, and would put tokens on tmpfs
-   inside the guest, closer to Linux than the host-disk projection the fake
-   runtime produced.
+1. ~~Mounts.~~ **Done** — `ContainerConfig.mounts` become virtiofs shares.
+   ServiceAccount tokens, ConfigMaps and emptyDir verified, and a pod
+   authenticates to the API server with its own token. Note the tokens live on
+   the host filesystem and are shared in, rather than on tmpfs inside the guest;
+   `PodVolume.Source.tmpfs` would be the stronger form.
 2. **DNS.** Small, independent, and unblocked: set
    `LinuxPod.Configuration.dns` to CoreDNS's *pod* IP. That works without a
    Service layer at all. See [SERVICES.md](SERVICES.md).

@@ -51,8 +51,9 @@ cost time.
   [experiments/05-real-pods](experiments/05-real-pods/FINDINGS.md).
 - 🔨 **Services.** ClusterIPs are not implemented yet; the routing substrate is
   proven and three approaches are compared in [docs/SERVICES.md](docs/SERVICES.md).
-- 🔨 **Mounts.** `ContainerConfig.mounts` is ignored, so ServiceAccount tokens,
-  ConfigMaps and Secrets do not reach pods yet.
+- ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
+  ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
+  that authenticates to the API server with its own token.
 
 ## Why this can work
 
