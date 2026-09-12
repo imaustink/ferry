@@ -193,11 +193,27 @@ func (r *runtimeSvc) PodSandboxStatus(_ context.Context, req *runtimeapi.PodSand
 	return &runtimeapi.PodSandboxStatusResponse{Status: r.podSandboxStatus(s)}, nil
 }
 
-func (r *runtimeSvc) ListPodSandbox(_ context.Context, _ *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+// ListPodSandbox honours the request filter. Ignoring it is not a harmless
+// simplification: the kubelet uses these listings to decide which containers
+// belong to which pod, and an unfiltered answer makes every pod believe it owns
+// every container.
+func (r *runtimeSvc) ListPodSandbox(_ context.Context, req *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	f := req.GetFilter()
 	var items []*runtimeapi.PodSandbox
 	for _, s := range r.sandboxes {
+		if f != nil {
+			if f.Id != "" && f.Id != s.id {
+				continue
+			}
+			if st := f.GetState(); st != nil && st.State != runtimeapi.PodSandboxState_SANDBOX_READY {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, s.labels) {
+				continue
+			}
+		}
 		items = append(items, &runtimeapi.PodSandbox{
 			Id: s.id, Metadata: s.meta, State: runtimeapi.PodSandboxState_SANDBOX_READY,
 			CreatedAt: s.made, Labels: s.labels, Annotations: s.anns,
@@ -266,14 +282,29 @@ func (r *runtimeSvc) ContainerStatus(_ context.Context, req *runtimeapi.Containe
 	}}, nil
 }
 
-func (r *runtimeSvc) ListContainers(_ context.Context, _ *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+func (r *runtimeSvc) ListContainers(_ context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	f := req.GetFilter()
 	var out []*runtimeapi.Container
 	for _, c := range r.containers {
 		state := runtimeapi.ContainerState_CONTAINER_CREATED
 		if c.running {
 			state = runtimeapi.ContainerState_CONTAINER_RUNNING
+		}
+		if f != nil {
+			if f.Id != "" && f.Id != c.id {
+				continue
+			}
+			if f.PodSandboxId != "" && f.PodSandboxId != c.sandboxID {
+				continue
+			}
+			if st := f.GetState(); st != nil && st.State != state {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, c.labels) {
+				continue
+			}
 		}
 		out = append(out, &runtimeapi.Container{
 			Id: c.id, PodSandboxId: c.sandboxID, Metadata: c.meta,
@@ -334,6 +365,16 @@ func (r *runtimeSvc) ListMetricDescriptors(_ context.Context, _ *runtimeapi.List
 }
 func (r *runtimeSvc) ListPodSandboxMetrics(_ context.Context, _ *runtimeapi.ListPodSandboxMetricsRequest) (*runtimeapi.ListPodSandboxMetricsResponse, error) {
 	return &runtimeapi.ListPodSandboxMetricsResponse{}, nil
+}
+
+// matchLabels reports whether have satisfies every key in want.
+func matchLabels(want, have map[string]string) bool {
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 type imageSvc struct {

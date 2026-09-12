@@ -26,9 +26,13 @@ Early. Two things are proven, one is being built, one is unmeasured.
   kube-controller-manager + kube-scheduler as darwin/arm64 processes. Serves
   `/version` as `platform: darwin/arm64`, reconciles Deployment → ReplicaSet →
   Pods, issues ServiceAccount tokens.
-- ✅ **The kubelet works on macOS** with ~300 lines of platform glue. Drives a
+- ✅ **The kubelet works on macOS** with ~450 lines of platform glue. Drives a
   full pod lifecycle over CRI. See
   [experiments/01-kubelet-cri-surface](experiments/01-kubelet-cri-surface/FINDINGS.md).
+- ✅ **The Mac registers as a real Kubernetes node** and runs scheduled
+  workloads. `kubectl get nodes` reports `OS-IMAGE: macOS 15.6.1`; a 10-replica
+  Deployment reaches 10/10. See
+  [experiments/02-node-registration](experiments/02-node-registration/FINDINGS.md).
 - 🔨 **`k5s-cri`** — a CRI implementation backed by Apple's Containerization
   framework. Not started.
 - ❓ **Concurrent VM ceiling.** How many simultaneous Linux VMs
@@ -53,8 +57,21 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 ```
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
+control-plane/                       PKI + up/down for the native control plane
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
+experiments/02-node-registration/    the Mac as a node, against the real API
 bin/                                 build output (gitignored)
+```
+
+## Try it
+
+```sh
+./build-kubelet.sh
+(cd experiments/01-kubelet-cri-surface && go build -o ../../bin/fakecri .)
+control-plane/up.sh
+experiments/02-node-registration/run.sh
+export KUBECONFIG=/tmp/k5s/admin.conf
+kubectl get nodes -o wide
 ```
 
 ## Requirements

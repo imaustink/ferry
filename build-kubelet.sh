@@ -32,7 +32,8 @@ echo "==> applying overlay"
 echo "==> retagging superseded fallbacks"
 for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
          pkg/volume/util/hostutil/hostutil_unsupported.go \
-         pkg/kubelet/cm/container_manager_unsupported.go; do
+         pkg/kubelet/cm/container_manager_unsupported.go \
+         staging/src/k8s.io/mount-utils/mount_unsupported.go; do
   if [ -f "$src/$f" ]; then
     sed -i '' \
       -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
