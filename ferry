@@ -37,7 +37,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry up          start the cluster
   ferry down        stop the cluster
   ferry status      show what is running
-  ferry logs <c>    tail a component log (ferry-cri, kubelet, apiserver, etcd)
+  ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
   ferry kubeconfig  print the path to the admin kubeconfig
 
 Environment:
@@ -107,6 +107,10 @@ cmd_build() {
   fi
   echo
   ( cd "$here/ferry-cri" && ./build.sh ) || return 1
+  echo
+  echo "==> ferry-proxy"
+  ( cd "$here/ferry-proxy" && go build -o "$here/bin/ferry-proxy" . ) || return 1
+  echo "==> $here/bin/ferry-proxy"
   echo
   bold "built -- run: ferry up"
 }
@@ -204,6 +208,7 @@ EOF
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
 
+  start_proxy
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   echo
@@ -246,8 +251,39 @@ install_dns() { # gateway dns-address
   fi
 }
 
+# ClusterIPs have to be bound locally for the kernel to accept traffic addressed
+# to them, and the kubernetes Service listens on 443. Both need root, and
+# nothing else in ferry does.
+start_proxy() {
+  [ -x "$here/bin/ferry-proxy" ] || { warn "ferry-proxy not built; Services will not route"; return 0; }
+
+  if ! sudo -n true 2>/dev/null; then
+    echo "  ferry needs sudo once to bind ClusterIPs and listen on port 443."
+    sudo -v || { warn "no sudo; Services will not route (pods and DNS still work)"; return 0; }
+  fi
+
+  sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
+    >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
+  # The pid here is sudo's; record the child so 'ferry down' can stop it.
+  sleep 2
+  local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
+  if [ -n "$pid" ]; then
+    echo "$pid" > "$FERRY_RUN/ferry-proxy.pid"
+    ok "Service proxy running (ClusterIPs routable)"
+  else
+    warn "Service proxy did not start; see $FERRY_RUN/logs/ferry-proxy.log"
+  fi
+}
+
 cmd_down() {
   bold "stopping ferry"
+  # ferry-proxy runs as root, so stopping it does too.
+  if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
+    sudo kill -TERM "$(cat "$FERRY_RUN/ferry-proxy.pid")" 2>/dev/null \
+      && ok "Service proxy stopped"
+    rm -f "$FERRY_RUN/ferry-proxy.pid"
+    sleep 1
+  fi
   for component in kubelet ferry-cri; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -266,7 +302,7 @@ cmd_down() {
 
 cmd_status() {
   bold "ferry status"
-  for component in ferry-cri kubelet; do
+  for component in ferry-cri kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
@@ -284,7 +320,7 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
     *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;

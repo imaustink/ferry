@@ -65,6 +65,34 @@ This is the best end state and the most work: ferry-cri becomes a Service
 controller, and needs a rule-programming path into the guest that the current
 API does not obviously provide.
 
+## Measured: why option 1 is not available today
+
+Running kube-proxy inside each pod VM was tested rather than assumed, and it is
+blocked -- but not where expected.
+
+Capabilities were the first suspicion and turned out to be fixable: the kubelet
+never sent `ContainerConfig.Linux` on darwin, so `NET_ADMIN` never reached the
+guest. Deriving that code path for darwin fixed it, and a pod now gets
+`CapEff: a80435fb` -- the default set plus `CAP_NET_ADMIN`.
+
+The real blocker is the guest kernel:
+
+```
+iptables -t nat -A OUTPUT ...
+  Warning: Extension DNAT revision 0 not supported, missing kernel module?
+  DNAT rejected
+
+cat /proc/net/ip_tables_names   ->  no nat table
+```
+
+The kata-containers kernel has base netfilter compiled in but not the NAT
+extensions, and it is monolithic -- no modules can be loaded. kube-proxy cannot
+program DNAT in a pod that cannot do DNAT.
+
+This is solvable by building a kernel with `CONFIG_NF_NAT` and the NAT targets,
+which is the same road kiac walks for eBPF with its `--kernel full` option. Until
+then option 1 is unavailable and option 2 stands.
+
 ## Recommendation
 
 **Option 2 first, option 3 as the target.** Option 2 is a single component that
