@@ -293,9 +293,11 @@ runtime.
 4. **Exec, attach, port-forward, logs.** `LinuxPod.execInContainer` exists;
    wiring it to CRI's streaming endpoints is not done. Without this
    `kubectl logs` and `kubectl exec` do not work.
-5. **Multi-container pods.** Blocked by the hypervisor: see the hotplug note
-   below. Needs either buffering a pod's whole container set before booting, or
-   accepting single-container pods on macOS.
+5. **Sidecars.** Two containers running at once in one pod is blocked by the
+   hypervisor -- see the hotplug note below. Init containers already work,
+   because each exits before the next is created and the VM is rebuilt in
+   between. Concurrent containers would need the kubelet to be told the sandbox
+   is not ready until the whole container set is known, or hotplug support.
 
 ---
 
@@ -324,7 +326,9 @@ runtime.
   real difference from Linux worth remembering.
 - **Virtualization.framework cannot hotplug.** A VM cannot gain a device once
   booted, so a pod's containers must all be added before `create()`. ferry-cri
-  boots the VM lazily on the first `StartContainer`.
+  boots the VM lazily on the first `StartContainer`, and rebuilds it if a
+  container is added while nothing is running -- which is what makes init
+  containers work and what lets a pod recover from a failed container start.
 - **vmnet networks leak permanently.** A subnet can stay claimed with no process
   holding it. ferry-cri walks a candidate list and publishes the gateway it
   obtained; `run.sh` feeds that to the control plane.
