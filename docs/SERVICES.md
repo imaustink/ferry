@@ -109,9 +109,23 @@ The kata-containers kernel has base netfilter compiled in but not the NAT
 extensions, and it is monolithic -- no modules can be loaded. kube-proxy cannot
 program DNAT in a pod that cannot do DNAT.
 
-This is solvable by building a kernel with `CONFIG_NF_NAT` and the NAT targets,
-which is the same road kiac walks for eBPF with its `--kernel full` option. Until
-then option 1 is unavailable and option 2 stands.
+**This has since been fixed.** `kernel/build-kernel.sh` builds Apple's own kernel
+configuration, which enables `CONFIG_NF_NAT`, `CONFIG_NF_CONNTRACK`,
+`CONFIG_NF_TABLES` and `CONFIG_NF_NAT_MASQUERADE`. On that kernel a pod can
+program its own NAT rules:
+
+```
+kernel: 6.18.5-ferry
+DNAT RULE ACCEPTED
+-A OUTPUT -d 10.96.0.99/32 -p tcp -m tcp --dport 80 -j DNAT --to-destination 127.0.0.1:8080
+conntrack present
+```
+
+So options 1 and 3 are both available now. Option 3 remains the one worth
+building: rules computed once on the host and pushed into each pod, rather than
+a kube-proxy and an API watch in every pod. `LinuxPod.execInContainer` exists and
+host paths are already shared into pods over virtiofs, so a static rule
+programmer can be injected and run without adding a container.
 
 ## Recommendation
 

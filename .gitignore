@@ -2,3 +2,5 @@ bin/
 .run/
 experiments/03-vm-ceiling/build/
 experiments/03-vm-ceiling/assets/vmlinux-arm64
+kernel/.build/
+kernel/vmlinux-arm64
