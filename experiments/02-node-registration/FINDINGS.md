@@ -88,12 +88,43 @@ an unfiltered answer corrupts its view of the whole node.
 
 ~450 lines, five files, plus four build-tag widenings.
 
+## Follow-up: the residual issues, resolved
+
+All four were closed after the initial run.
+
+| Issue | Fix | Result |
+|---|---|---|
+| eviction manager: root cgroup stats | `ContainerInfoV2("/")` synthesises root memory from `hw.memsize` and `vm.page_free_count` | errors gone; eviction now works |
+| static pod file watching unsupported | `file_linux.go` is pure fsnotify with no Linux API — widened its build tag to `linux \|\| darwin` | errors gone, no new code |
+| CSI plugin prober wants `/usr/libexec/kubernetes` | `volumePluginDir` in KubeletConfiguration | config only, no patch |
+| `ephemeral-storage` reports 0 | node capacity comes from `ContainerManager.GetCapacity`, which the stub answers as zero. The darwin manager now wraps the stub and reports real `RootFsInfo` capacity | `971350180Ki` |
+
+Making eviction work had an immediate and correct consequence:
+
+```
+MemoryPressure=False  DiskPressure=True  PIDPressure=False  Ready=True
+node.kubernetes.io/disk-pressure=NoSchedule
+```
+
+The host disk was at 97%, below the default `nodefs.available<10%` threshold,
+so the eviction manager tainted the node and evicted all 10 pods. That is
+correct Kubernetes behaviour driven by real macOS statistics — a whole kubelet
+subsystem working, not a bug. Worth knowing when testing on a full disk.
+
+One known gap remains, and it is structural rather than a defect:
+
+```
+"Eviction manager: failed to construct signal"
+  err="system container \"pods\" not found in metrics"
+  signal="allocatableMemory.available"
+```
+
+The `allocatableMemory.available` signal is derived from the `pods` cgroup,
+which genuinely does not exist on this platform. Node-level memory and disk
+signals work; this one cannot without a host cgroup tree.
+
 ## Still outstanding
 
-- eviction manager wants root cgroup stats (retries, non-fatal)
-- static pod file watching falls back to polling (`file_unsupported.go`)
-- CSI plugin prober wants `/usr/libexec/kubernetes`
-- `ephemeral-storage` capacity reports 0 — `cadvisor_darwin.go` should fill it
 - control plane advertises the LAN IP; must become the vmnet gateway
 
 ## Reproduce

@@ -33,11 +33,26 @@ echo "==> retagging superseded fallbacks"
 for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
          pkg/volume/util/hostutil/hostutil_unsupported.go \
          pkg/kubelet/cm/container_manager_unsupported.go \
-         staging/src/k8s.io/mount-utils/mount_unsupported.go; do
+         staging/src/k8s.io/mount-utils/mount_unsupported.go \
+         pkg/kubelet/config/file_unsupported.go; do
   if [ -f "$src/$f" ]; then
     sed -i '' \
       -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
       -e 's|^// +build !linux,!windows$|// +build !linux,!windows,!darwin|' \
+      "$src/$f"
+    echo "    ~ $f"
+  fi
+done
+
+# Static pod file watching is gated to linux purely by build tag; the code
+# underneath is fsnotify, which supports darwin via kqueue and uses no
+# Linux-specific API. Widen the tag rather than fork the file.
+echo "==> widening portable fallbacks"
+for f in pkg/kubelet/config/file_linux.go; do
+  if [ -f "$src/$f" ]; then
+    sed -i '' \
+      -e 's|^//go:build linux$|//go:build linux \|\| darwin|' \
+      -e 's|^// +build linux$|// +build linux darwin|' \
       "$src/$f"
     echo "    ~ $f"
   fi

@@ -10,7 +10,7 @@ run="${RUNDIR:-/tmp/k5s-e01}"
 secs="${SECS:-45}"
 sock=/tmp/k5s-fakecri.sock
 
-rm -rf "$run"; mkdir -p "$run/kubelet" "$run/pki" "$run/podlogs" "$run/containerlogs"
+rm -rf "$run"; mkdir -p "$run/kubelet" "$run/pki" "$run/podlogs" "$run/volume-plugins" "$run/containerlogs" "$run/volume-plugins"
 
 cat > "$run/kubelet.yaml" <<YAML
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -21,6 +21,9 @@ containerRuntimeEndpoint: unix://$sock
 imageServiceEndpoint: unix://$sock
 # No cgroup hierarchy exists on the host, so every knob that would program one
 # is disabled rather than left to fail at runtime.
+# The default plugin directory is /usr/libexec/kubernetes, which macOS does not
+# permit creating even as root under SIP.
+volumePluginDir: $run/volume-plugins
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
@@ -46,11 +47,70 @@ func New(imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupsRoots 
 
 func (c *cadvisorDarwin) Start() error { return nil }
 
-// ContainerInfoV2 and GetRequestedContainersInfo describe cgroup hierarchies,
-// which do not exist here. Returning empty rather than an error keeps the
-// kubelet's stats provider from treating the whole node as unhealthy.
+// ContainerInfoV2 describes a cgroup subtree. Only the root is answerable on
+// this platform, and it has to be: the eviction manager polls the root every
+// ten seconds to decide whether the node is under memory pressure, and an
+// error there leaves eviction permanently blind. Machine-wide memory from the
+// VM statistics stands in for the root cgroup's accounting.
+//
+// Any other name is a real cgroup path, which does not exist here. Those
+// return empty rather than an error so per-container stats fall to the CRI,
+// which is the only thing that can see inside a pod's VM.
 func (c *cadvisorDarwin) ContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error) {
-	return map[string]cadvisorapiv2.ContainerInfo{}, nil
+	if name != "/" {
+		return map[string]cadvisorapiv2.ContainerInfo{}, nil
+	}
+
+	total, err := unix.SysctlUint64("hw.memsize")
+	if err != nil {
+		return nil, fmt.Errorf("read hw.memsize: %w", err)
+	}
+	used := total - freeMemoryBytes()
+
+	now := time.Now()
+	return map[string]cadvisorapiv2.ContainerInfo{
+		"/": {
+			Spec: cadvisorapiv2.ContainerSpec{
+				CreationTime: bootTime(),
+				HasMemory:    true,
+				HasCpu:       true,
+				Memory:       cadvisorapiv2.MemorySpec{Limit: total},
+			},
+			Stats: []*cadvisorapiv2.ContainerStats{{
+				Timestamp: now,
+				Cpu:       &cadvisorapi.CpuStats{},
+				Memory: &cadvisorapi.MemoryStats{
+					Usage:      used,
+					WorkingSet: used,
+					RSS:        used,
+				},
+			}},
+		},
+	}, nil
+}
+
+// freeMemoryBytes reports memory macOS considers immediately available. A
+// failed read yields zero, which makes the node look fully used -- the
+// conservative direction for an eviction decision.
+func freeMemoryBytes() uint64 {
+	pageSize, err := unix.SysctlUint32("hw.pagesize")
+	if err != nil || pageSize == 0 {
+		return 0
+	}
+	freePages, err := unix.SysctlUint32("vm.page_free_count")
+	if err != nil {
+		return 0
+	}
+	return uint64(freePages) * uint64(pageSize)
+}
+
+// bootTime reports when the machine came up, used as the root's creation time.
+func bootTime() time.Time {
+	tv, err := unix.SysctlTimeval("kern.boottime")
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(tv.Sec, int64(tv.Usec)*1000)
 }
 
 func (c *cadvisorDarwin) GetRequestedContainersInfo(containerName string, options cadvisorapiv2.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error) {

@@ -24,22 +24,52 @@ limitations under the License.
 // to VM sizing at sandbox creation, and cgroups v2 inside the guest bound the
 // containers within a pod.
 //
-// So this is the upstream stub with a working Start(). It is deliberately not
-// a port of container_manager_linux.go.
+// So this is the upstream stub, with the one piece that is not about cgroups
+// filled in: node capacity. It is deliberately not a port of
+// container_manager_linux.go.
 package cm
 
 import (
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 )
 
-func NewContainerManager(_ mount.Interface, _ cadvisor.Interface, nodeConfig NodeConfig, failSwapOn bool, recorder record.EventRecorder, kubeClient clientset.Interface) (ContainerManager, error) {
+type darwinContainerManager struct {
+	// The stub supplies the cgroup-shaped surface, all of which is inert here.
+	ContainerManager
+	cadvisor cadvisor.Interface
+}
+
+func NewContainerManager(_ mount.Interface, ci cadvisor.Interface, nodeConfig NodeConfig, failSwapOn bool, recorder record.EventRecorder, kubeClient clientset.Interface) (ContainerManager, error) {
 	if nodeConfig.CgroupsPerQOS {
 		klog.InfoS("cgroupsPerQOS is set but there is no cgroup hierarchy on darwin; pod resource limits are enforced by the runtime instead")
 	}
-	return NewStubContainerManager(), nil
+	return &darwinContainerManager{
+		ContainerManager: NewStubContainerManager(),
+		cadvisor:         ci,
+	}, nil
+}
+
+// GetCapacity reports node capacity for resources the container manager owns.
+// The stub returns zero for ephemeral storage, which makes the node advertise
+// no disk at all; report the real filesystem instead so the scheduler can
+// honour ephemeral-storage requests.
+func (cm *darwinContainerManager) GetCapacity(localStorageCapacityIsolation bool) v1.ResourceList {
+	if !localStorageCapacityIsolation {
+		return v1.ResourceList{}
+	}
+	rootfs, err := cm.cadvisor.RootFsInfo()
+	if err != nil {
+		klog.ErrorS(err, "Failed to read root filesystem capacity; reporting no ephemeral storage")
+		return v1.ResourceList{}
+	}
+	return v1.ResourceList{
+		v1.ResourceEphemeralStorage: *resource.NewQuantity(int64(rootfs.Capacity), resource.BinarySI),
+	}
 }
