@@ -83,8 +83,13 @@ controller chain all work. A 10-replica Deployment reaches 10/10.
 
 - **128 concurrent VMs**, a hard cap in `Virtualization.framework` — identical
   at 128 MiB and 512 MiB per VM, so it is a VM-count limit, not resource
-  exhaustion. **The kubelet's default `maxPods` is 110**, so the ceiling clears
-  the density Kubernetes already expects, with 18 to spare.
+  exhaustion. Confirmed on both macOS 15.6.1 and 26.6.2. **The kubelet's default
+  `maxPods` is 110**, so the ceiling clears the density Kubernetes already
+  expects, with 18 to spare.
+- **The cap is system-wide.** Docker Desktop running costs a slot (127 instead
+  of 128). Every other VM on the Mac spends one of ferry's pod slots, so the
+  usable ceiling is `128 − (other VMs)`. Ferry should count live VMs and report
+  real remaining capacity rather than letting pods fail at admission.
 - **0.12s** guest boot to userspace, cold. No degradation at VM 128.
 - **VM memory is lazily backed** — 128 VMs × 512 MiB (64 GiB configured) cost
   **1.6 GiB** resident. Density is bounded by the VM cap, not by summing pod
@@ -193,12 +198,14 @@ tried to kill them. The kubelet derives container ownership from those listings.
 
 ## First things after the upgrade
 
-1. `swift --version` — needs **≥ 6.2**. Containerization declares
-   `platforms: [.macOS("15.0")]` but requires Swift 6.2 tools; we had 6.1, which
-   is the only reason `ferry-cri` did not start.
-2. `git clone https://github.com/apple/containerization && swift build`
-3. Re-run `experiments/03-vm-ceiling` on macOS 26 — confirm 128 still holds.
-4. **Measure vmnet properly.** This is the remaining unknown: routable per-pod
+1. ~~`swift --version` — needs ≥ 6.2.~~ **Done.** The OS upgrade does not bring
+   the toolchain; install it explicitly:
+   `softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"`.
+   That yields Swift 6.3.3, and needs no sudo.
+2. ~~Build Apple's Containerization framework.~~ In progress.
+3. ~~Re-run `experiments/03-vm-ceiling` on macOS 26.~~ **Done** — 128 holds, and
+   the cap turned out to be system-wide.
+4. **Measure vmnet properly.** The remaining unknown: routable per-pod
    addressing. `VZNATNetworkDeviceAttachment` proved capacity, but each pod needs
    a stable address reachable from the host and from other pods.
 5. Change `ADVERTISE` in `control-plane/up.sh` from the LAN IP to the vmnet

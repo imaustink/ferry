@@ -11,7 +11,7 @@ OS rather than of any container tool. Each VM boots the kata-containers Linux
 binary that prints a marker and sleeps forever. VMs are started one at a time
 and kept running until one fails.
 
-Run on macOS 15.6.1, M4 Max, 128 GiB.
+Run on macOS 15.6.1 and re-run on macOS 26.6.2 (Tahoe), M4 Max, 128 GiB.
 
 ## Results
 
@@ -38,6 +38,33 @@ as its capacity in experiment 02:
 
 **The hypervisor ceiling sits above the Kubernetes default with 18 to spare.**
 One VM per pod is viable at the density Kubernetes already expects from a node.
+
+### The cap is system-wide, not per-process
+
+Re-running on macOS 26.6.2 first gave **127**, one short of the figure measured
+on macOS 15. The missing slot was Docker Desktop, which keeps a VM running
+(`com.docker.virtualization`, 16 CPU / 16 GiB) whenever it is open:
+
+| system state | ceiling |
+|---|---|
+| Docker Desktop running | 127 |
+| Docker Desktop quit | **128** |
+
+So the limit belongs to the machine, not to the process asking. **Every other
+virtual machine on the Mac — Docker Desktop, UTM, Parallels, another ferry —
+spends one of ferry's pod slots.**
+
+Two consequences for the design:
+
+- The usable pod ceiling is `128 − (other VMs running)`. Against a default
+  `maxPods` of 110 that leaves 18 slots of headroom, which is comfortable but is
+  a *shared* budget rather than ferry's alone.
+- Ferry should report this rather than let pods fail mysteriously at admission.
+  The right behaviour is to count live VMs and reflect the real remaining
+  capacity, so the scheduler stops placing pods that cannot start.
+
+The number itself is stable across OS versions: 128 on macOS 15.6.1 and 128 on
+macOS 26.6.2.
 
 ### Devices do not move the ceiling
 
@@ -105,7 +132,8 @@ The thesis survives, with room to spare:
 - **Routable per-pod addressing is still open.** NAT attachment proves capacity;
   it does not give each pod a stable address reachable from the host and from
   other pods. That is the macOS 26 question.
-- **Measured on one machine and one OS version.** 128 may differ on macOS 26.
+- **Measured on one machine.** 128 held on both macOS 15.6.1 and 26.6.2, but
+  this is one M4 Max; the cap may scale with hardware.
 
 ## Reproduce
 
