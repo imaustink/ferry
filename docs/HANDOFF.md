@@ -145,56 +145,102 @@ cd experiments/03-vm-ceiling
 ## Next: `ferry-cri`
 
 Replace `fakecri` with a real CRI implementation backed by Apple's
-Containerization framework. **Write it in Swift.**
+Containerization framework. **Write it in Swift**, and build it on `LinuxPod`.
 
-Two reasons. containerd's value is its snapshotters, which are overlayfs-shaped
-— the wrong abstraction when a rootfs is a block device for a VM, and
-`ContainerizationEXT4` already does OCI→ext4. And Apple already runs
-grpc-swift-2 in exactly this role: `vminitd`'s `SandboxContext` is grpc-swift
-over vsock. Writing CRI in Swift deletes the Go/Swift boundary entirely.
+### The framework already has pods
 
-The framework's API already models pods. From `SandboxContext.proto`:
+This was the big discovery after the macOS 26 upgrade.
+`Sources/Containerization/LinuxPod.swift` is a first-class pod abstraction, and
+its shape is startlingly close to a Kubernetes PodSpec:
 
-```protobuf
-package com.apple.containerization.sandbox.v3;
-service SandboxContext {
-  rpc Mount(MountRequest)                 // arbitrary mounts
-  rpc CreateProcess / StartProcess / KillProcess
-  rpc ContainerStatistics(...)
-  rpc IpLinkSet / IpAddrAdd / IpRouteAddLink / IpRouteAddDefault
-  rpc ConfigureDns / ConfigureHosts
-}
-message CreateProcessRequest {
-  optional string containerID = 2;      // processes scoped per container
-  optional string ociRuntimePath = 6;   // runs an OCI runtime in-guest
-}
-message ContainerStatisticsRequest {
-  repeated string container_ids = 1;    // "Empty = all containers"
+```swift
+public final class LinuxPod: Sendable {
+    public struct Configuration {
+        public var cpus: Int
+        public var memoryInBytes: UInt64
+        public var interfaces: [any Interface]
+        public var shareProcessNamespace: Bool     // = spec.shareProcessNamespace
+        public var hostname: String?
+        public var dns: DNS?
+        public var hosts: Hosts?
+        public var volumes: [PodVolume]
+    }
+    public struct ContainerConfiguration {
+        public var process: LinuxProcessConfiguration
+        public var cpus: Int?                      // per-container limits
+        public var memoryInBytes: UInt64?
+        public var sysctl: [String: String]
+        public var mounts: [Mount]
+        public var maskedPaths: [String]           // OCI runtime spec
+        public var readonlyPaths: [String]
+    }
 }
 ```
 
-The service is named **`SandboxContext`**; CRI's word for a pod is
-**PodSandbox**. Multiple containers per VM is first-class. One-container-per-VM
-is the `container` CLI's policy, not a framework limit. `vminitd` also ships
-`Cgroup2Manager.swift`, so containers *within* a pod get real cgroups v2 — VM
-sizing bounds the pod, cgroups bound the containers inside it.
+`addContainer` hotplugs into a **running** pod, which is exactly CRI's ordering
+(`RunPodSandbox`, then `CreateContainer` later). The mapping is close to 1:1:
 
-Rough mapping:
-
-| CRI | Implementation |
+| CRI | LinuxPod |
 |---|---|
-| `RunPodSandbox` | boot a VM; configure its interface via `IpAddrAdd`/`IpRouteAddDefault` |
-| `CreateContainer` | `Mount` the container's rootfs, `CreateProcess` with its `containerID` |
-| `StartContainer` | `StartProcess` |
-| `ContainerStats` | `ContainerStatistics` |
-| image pull | `ContainerizationOCI` + `ContainerizationEXT4` → block device |
-| `Exec`/`Attach`/`PortForward` | `CreateProcess` / `ProxyVsock` |
+| `RunPodSandbox` | `LinuxPod(id:vmm:configuration:)` + `create()` |
+| `CreateContainer` | `addContainer(id, rootfs:configuration:)` |
+| `StartContainer` | `startContainer(_:)` |
+| `StopContainer` | `stopContainer(_:)` |
+| `ListContainers` | `listContainers()` |
+| `ContainerStats` | `statistics(containerIDs:categories:)` |
+| `ExecSync` / `Exec` | `execInContainer(...)` |
+| container exit | `waitContainer(_:timeoutInSeconds:)` → `ExitStatus` |
+| TTY resize | `resizeContainer(_:to:)` |
+| `StopPodSandbox` | `stop()` |
+
+Apple's own `Sources/Integration/PodTests.swift` is a working example of a
+multi-container pod: one VM, one rootfs per container, started independently.
+
+### Networking is solved too
+
+`Sources/Containerization/VmnetNetwork.swift`, gated `@available(macOS 26.0, *)`,
+is the piece that was missing on macOS 15:
+
+```swift
+public struct VmnetNetwork: Network {
+    public let subnet: CIDRv4
+    public var ipv4Gateway: IPv4Address
+    public mutating func createInterface(_ id: String) throws -> Interface?
+    public mutating func releaseInterface(_ id: String) throws
+}
+```
+
+That is **IPAM** — per-pod address allocation from a routable subnet, with the
+Mac as the gateway, attached via `VZVmnetNetworkDeviceAttachment`. So:
+
+- `RunPodSandbox` → `createInterface(podID)` → pass the result to
+  `Configuration.interfaces`
+- `RemovePodSandbox` → `releaseInterface(podID)`
+- pods are reachable from the Mac and from each other; the API server is
+  reachable at the gateway address
+
+`Interface` is a pure value type describing guest-side IP config, so **ferry
+chooses each pod's address** — which is precisely a CNI's job.
+
+### Volumes
+
+`PodVolume.Source` is `.nbd`, `.diskImage`, or **`.tmpfs`**. The tmpfs case
+closes a gap recorded earlier: on Linux, projected ServiceAccount tokens live on
+tmpfs and never touch a disk. A pod-VM tmpfs restores exactly that property,
+inside the guest.
+
+### Images
+
+`ImageStore` pulls OCI images; `ContainerizationEXT4` converts them to ext4
+block devices used as container rootfs. `initBlock` builds the init filesystem.
+No containerd, no snapshotters.
+
+### Carry-over warning
 
 **A real CRI must honour the filters on `ListContainers` and `ListPodSandbox`.**
-`fakecri` ignored them and every pod believed it owned every container, then
-tried to kill them. The kubelet derives container ownership from those listings.
-
----
+`fakecri` ignored them, every pod believed it owned every container, and the
+kubelet tried to kill them. The kubelet derives container ownership from those
+listings.
 
 ## First things after the upgrade
 
