@@ -49,6 +49,9 @@ type gpuPublisher struct {
 	failures int
 	// What the node currently advertises, so an unchanged value costs nothing.
 	advertised string
+	// Set once a pod annotation is refused, so a node credential that may not
+	// write pod metadata does not retry forever.
+	annotationsDenied bool
 }
 
 func newGPUPublisher(kubeconfig, nodeName, socket string) (*gpuPublisher, error) {
@@ -87,6 +90,7 @@ func (g *gpuPublisher) run(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		g.reconcile(ctx)
+		g.reconcilePods(ctx)
 		select {
 		case <-ctx.Done():
 			return

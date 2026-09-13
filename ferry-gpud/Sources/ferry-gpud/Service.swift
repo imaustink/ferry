@@ -13,6 +13,13 @@ struct PodRegistration: Codable, Sendable {
     var uid: String
     var namespace: String?
     var name: String?
+    /// When the socket was bound, ISO8601. Carried so something that knows what
+    /// pods actually exist can tell a grant that has outlived its pod from one
+    /// made a moment ago for a pod it has not seen yet.
+    var grantedAt: String?
+    /// From the pod's PriorityClass. Persisted with the grant so a restarted
+    /// daemon does not quietly demote every pod to ordinary.
+    var priority: Int32?
 }
 
 struct PodEntry: Encodable {
@@ -20,6 +27,8 @@ struct PodEntry: Encodable {
     var namespace: String?
     var name: String?
     var socket: String
+    var grantedAt: String?
+    var priority: Int32
     var usage: PodUsage
 }
 
@@ -92,6 +101,8 @@ final class Service: @unchecked Sendable {
                 return self.entry(uid: registration.uid, registration: existing.registration)
             }
             guard pods.count < limit else { throw ServiceError.full(limit) }
+            var registration = registration
+            registration.grantedAt = ISO8601DateFormatter().string(from: Date())
             try bind(registration)
             log("granted \(describe(registration)) -> \(socketPath(uid: registration.uid))")
             return self.entry(uid: registration.uid, registration: registration)
@@ -100,8 +111,10 @@ final class Service: @unchecked Sendable {
         return entry
     }
 
-    /// Called with the lock held.
+    /// Called with the lock held. Binds the socket and tells the scheduler what
+    /// this pod is worth, before it can ask for anything.
     private func bind(_ registration: PodRegistration) throws {
+        scheduler.setPriority(registration.priority ?? 0, for: registration.uid)
         let path = socketPath(uid: registration.uid)
         let server = UnixHTTPServer(path: path, identity: registration.uid) { [weak self] request, identity in
             self?.handlePod(request, identity: identity) ?? .error("shutting down", status: 503)
@@ -197,7 +210,8 @@ final class Service: @unchecked Sendable {
     /// Called with the lock held.
     private func entry(uid: String, registration: PodRegistration) -> PodEntry {
         PodEntry(uid: uid, namespace: registration.namespace, name: registration.name,
-                 socket: socketPath(uid: uid), usage: scheduler.usage(for: uid))
+                 socket: socketPath(uid: uid), grantedAt: registration.grantedAt,
+                 priority: registration.priority ?? 0, usage: scheduler.usage(for: uid))
     }
 
     private func describe(_ registration: PodRegistration) -> String {
@@ -228,6 +242,9 @@ final class Service: @unchecked Sendable {
 
         case ("GET", ["stats"]):
             return .json(scheduler.stats)
+
+        case ("GET", ["metrics"]):
+            return metrics()
 
         case ("POST", ["pods"]):
             do {
@@ -297,6 +314,48 @@ final class Service: @unchecked Sendable {
         default:
             return .error("no route for \(request.method) \(request.path)", status: 404)
         }
+    }
+
+    /// The same numbers as /stats, in the format anything that scrapes metrics
+    /// already understands. Nothing in ferry scrapes it -- this is here so that
+    /// what the GPU is doing is not knowledge trapped inside one daemon.
+    private func metrics() -> HTTPResponse {
+        var lines = [
+            "# HELP ferry_gpu_capacity Pods that may hold the GPU at once.",
+            "# TYPE ferry_gpu_capacity gauge",
+            "ferry_gpu_capacity \(capacity.limit)",
+            "# HELP ferry_gpu_granted Pods holding a GPU socket.",
+            "# TYPE ferry_gpu_granted gauge",
+            "ferry_gpu_granted \(capacity.granted)",
+            "# HELP ferry_gpu_pending Requests queued or running.",
+            "# TYPE ferry_gpu_pending gauge",
+            "ferry_gpu_pending \(capacity.pending)",
+            "# HELP ferry_gpu_seconds_total Seconds spent holding the device, by pod.",
+            "# TYPE ferry_gpu_seconds_total counter",
+            "# HELP ferry_gpu_queued_seconds_total Seconds spent waiting for it, by pod.",
+            "# TYPE ferry_gpu_queued_seconds_total counter",
+            "# HELP ferry_gpu_requests_total Requests, by pod.",
+            "# TYPE ferry_gpu_requests_total counter",
+            "# HELP ferry_gpu_failures_total Requests that failed, by pod.",
+            "# TYPE ferry_gpu_failures_total counter",
+            "# HELP ferry_gpu_yields_total Times a pod's work was preempted for another.",
+            "# TYPE ferry_gpu_yields_total counter",
+        ]
+        // The pod uid is the only label: names come and go, uids do not, and a
+        // label per anything else would be cardinality for its own sake.
+        let held = lock.withLock { pods }
+        for (uid, usage) in scheduler.stats.sorted(by: { $0.key < $1.key }) {
+            let pod = held[uid]?.registration
+            let labels = "pod=\"\(pod?.name ?? "")\",namespace=\"\(pod?.namespace ?? "")\",uid=\"\(uid)\""
+            lines.append("ferry_gpu_seconds_total{\(labels)} \(usage.gpuSeconds)")
+            lines.append("ferry_gpu_queued_seconds_total{\(labels)} \(usage.queuedSeconds)")
+            lines.append("ferry_gpu_requests_total{\(labels)} \(usage.requests)")
+            lines.append("ferry_gpu_failures_total{\(labels)} \(usage.failures)")
+            lines.append("ferry_gpu_yields_total{\(labels)} \(usage.yields)")
+        }
+        return HTTPResponse(status: 200,
+                            headers: ["Content-Type": "text/plain; version=0.0.4"],
+                            body: Data((lines.joined(separator: "\n") + "\n").utf8))
     }
 
     /// Puts one request through the scheduler and turns whatever comes back

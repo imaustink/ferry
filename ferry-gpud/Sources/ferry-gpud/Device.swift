@@ -133,15 +133,21 @@ final class GPU: @unchecked Sendable {
             warmUp.waitUntilCompleted()
         }
 
-        let start = Date()
+        // Timed per pass and summed, rather than end-to-end: a preempted request
+        // spends wall time waiting its turn again, and counting that against the
+        // arithmetic would report a throughput the device never had.
+        var computeSeconds = 0.0
         var completed = 0
         for _ in 0..<iterations {
             // Between passes, not within one: a committed command buffer runs
             // to completion whatever anyone wants, so this is the only place
-            // the work can notice a deadline or a deleted pod. It is also why
-            // a single enormous pass is capped by size rather than by time.
-            try job.checkpoint()
+            // the work can notice a deadline, a deleted pod, or another pod
+            // waiting for its turn. It is also why a single enormous pass is
+            // capped by size rather than by time -- one pass is the longest
+            // anyone else can be made to wait.
+            try job.yieldIfNeeded()
 
+            let pass = Date()
             guard let commands = queue.makeCommandBuffer() else {
                 throw GPUError.failed("could not create a command buffer")
             }
@@ -150,9 +156,10 @@ final class GPU: @unchecked Sendable {
             commands.commit()
             commands.waitUntilCompleted()
             if let error = commands.error { throw GPUError.failed("\(error)") }
+            computeSeconds += Date().timeIntervalSince(pass)
             completed += 1
         }
-        let seconds = Date().timeIntervalSince(start)
+        let seconds = computeSeconds
 
         // 2*n^3 flops per multiply-accumulate pass.
         let flops = 2.0 * pow(Double(size), 3) * Double(completed)

@@ -107,6 +107,8 @@ struct SandboxRecord {
     var initContainerNames: [String] = []
     /// Containers in this pod that asked for ferry.dev/gpu, from its spec.
     var gpuContainerNames: [String] = []
+    /// What this pod is worth against other pods waiting for the GPU.
+    var priority: Int32 = 0
     /// Whether ferry-gpud has bound a socket for this pod, so it can be handed
     /// back when the pod goes away.
     var gpuGranted: Bool = false
@@ -430,7 +432,8 @@ actor PodRuntime {
             interface: interface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers,
-            gpuContainerNames: expected.gpuContainers
+            gpuContainerNames: expected.gpuContainers,
+            priority: expected.priority
         )
         return id
     }
@@ -484,15 +487,16 @@ actor PodRuntime {
     /// not fatal: without it single-container pods behave exactly as before,
     /// only sidecars are lost.
     private func podContainers(namespace: String, name: String) async
-        -> (initContainers: [String], containers: [String], gpuContainers: [String])
+        -> (initContainers: [String], containers: [String], gpuContainers: [String], priority: Int32)
     {
-        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], []) }
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0) }
         do {
             let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
             let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
-            return (decoded.initContainers ?? [], decoded.containers ?? [], decoded.gpuContainers ?? [])
+            return (decoded.initContainers ?? [], decoded.containers ?? [],
+                    decoded.gpuContainers ?? [], decoded.priority ?? 0)
         } catch {
-            return ([], [], [])
+            return ([], [], [], 0)
         }
     }
 
@@ -857,7 +861,8 @@ actor PodRuntime {
         // two containers in one pod may both have asked.
         let grant = try GPUClient(controlSocket: socket).grant(
             uid: sandbox.uid.isEmpty ? sandboxID : sandbox.uid,
-            namespace: sandbox.namespace, name: sandbox.name)
+            namespace: sandbox.namespace, name: sandbox.name,
+            priority: sandbox.priority)
         sandboxes[sandboxID]?.gpuGranted = true
         print("    gpu       \(sandbox.namespace)/\(sandbox.name) -> \(grant.socket)")
         return grant.socket

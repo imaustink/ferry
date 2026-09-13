@@ -59,6 +59,32 @@ struct HTTPFailure: Error, CustomStringConvertible {
     init(_ description: String) { self.description = description }
 }
 
+/// Whether a unix socket at this path has a live listener behind it, as opposed
+/// to being a file a dead process left there.
+func isListening(_ path: String) -> Bool {
+    guard FileManager.default.fileExists(atPath: path) else { return false }
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { Darwin.close(fd) }
+
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let bytes = Array(path.utf8)
+    guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else { return false }
+    withUnsafeMutablePointer(to: &address.sun_path) { raw in
+        raw.withMemoryRebound(to: CChar.self, capacity: bytes.count + 1) { dst in
+            for (i, byte) in bytes.enumerated() { dst[i] = CChar(bitPattern: byte) }
+            dst[bytes.count] = 0
+        }
+    }
+    var limit = timeval(tv_sec: 1, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+    let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+    return withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, size) == 0 }
+    }
+}
+
 /// Serves one unix socket. `identity` is carried to the handler untouched: it
 /// is how a per-pod socket tells the router which pod is calling, and the
 /// reason the relay is worth using at all.
@@ -101,6 +127,15 @@ final class UnixHTTPServer: @unchecked Sendable {
             atPath: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         chmod(directory, 0o700)
+
+        // Unlinking whatever is at the path is how a stale socket from a crashed
+        // instance gets cleared -- but done blindly it also lets a second daemon
+        // quietly steal the first one's socket, after which half the pods talk
+        // to one process and half to the other. So ask first: something that
+        // accepts a connection is alive and this is not our path to take.
+        if isListening(path) {
+            throw HTTPFailure("something is already listening on \(path)")
+        }
         unlink(path)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

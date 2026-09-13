@@ -49,6 +49,12 @@ type podContainers struct {
 	// so the runtime cannot see this from the request it is handed. It is
 	// reported here because this handler already has the pod spec open.
 	GPUContainers []string `json:"gpuContainers"`
+	// What the pod is worth relative to other pods, from PriorityClass. The
+	// admission plugin resolves priorityClassName into spec.priority, so this is
+	// set on every pod -- 0 when nobody said otherwise. It travels with the GPU
+	// request because sharing one device is exactly the situation where "this
+	// pod matters more" has to mean something.
+	Priority int32 `json:"priority"`
 }
 
 // wantsGPU reports whether a container asked for the GPU resource. Limits only:
@@ -77,6 +83,9 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 			return
 		}
 		out := podContainers{}
+		if pod.Spec.Priority != nil {
+			out.Priority = *pod.Spec.Priority
+		}
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}

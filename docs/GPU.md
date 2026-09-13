@@ -107,6 +107,11 @@ Second: a service on the pod gateway is reachable by **every** pod, whether or
 not it asked for a GPU. The relay is reachable only by the pods ferry gave it
 to. Gating happens at pod creation rather than in the service.
 
+Both arguments got stronger when the Mac joined the pod network
+([docs/POD-NETWORK.md](POD-NETWORK.md)). A host listener there is now plainly
+reachable from every pod in the cluster, so "only the pods that asked" would
+have to be enforced by the service itself, on a source address, forever.
+
 The honest cost: **vsock is not covered by NetworkPolicy.** A pod with
 deny-all egress still reaches `ferry-gpud`, because the relay is not on the pod
 network at all. That is the correct behaviour for a device -- a NetworkPolicy
@@ -202,6 +207,8 @@ no package graph to fetch and no weights to ship before a pod can use it.
 | `POST /v1/matmul` | a square matrix multiply on the GPU, `{size, iterations}` |
 | `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}` |
 | `GET /v1/usage` | this pod's own accounting, and no one else's |
+
+The control socket adds `/capacity`, `/pods`, `/stats` and `/metrics`.
 
 `matmul` is not a demo of the protocol -- it is the thing that proves, from
 inside a pod, that the Mac's GPU did arithmetic the pod asked for. It returns
@@ -320,8 +327,8 @@ boundary is the gate, not the file mode.
 ## Sharing it
 
 One GPU, many pods, so something has to decide the order -- and a plain lock
-decides it badly. `ferry-gpud` runs one worker behind a queue that is bounded,
-fair, deadlined and cancellable.
+decides it badly. `ferry-gpud` hands out a device token behind a queue that is
+bounded, fair, deadlined, preemptible and cancellable.
 
 **Fair across pods, not across requests.** The queue rotates over pods rather
 than running first-come-first-served, because FIFO is fair to *requests* and
@@ -336,16 +343,72 @@ b1 finished at +6.76s  <- b overtakes a's backlog
 a3 finished at +9.04s
 ```
 
+**Preemptible**, which is what ordering alone cannot give you. A queue only
+helps when jobs are short: one 30-second matmul makes every other pod wait 30
+seconds however fair the order is. So a request holding the device gives it up
+at a checkpoint once its slice is spent and another pod is waiting, and picks up
+where it left off. Two pods, one submitting ~35 seconds of work and the other
+asking for a fraction of a second:
+
+```
+quick round 1: waited 0.1s for 5 passes
+quick round 2: waited 0.6s for 5 passes     <- while the hog held 35s of work
+quick round 3: waited 0.6s for 5 passes
+quick round 4: waited 0.6s for 5 passes
+hog   round 1: waited 35.4s for 3000 passes
+```
+
+The work runs on the caller's own thread, so a job's progress is just that
+thread's stack: handing the device over and taking it back costs nothing but the
+handoff. Nothing is re-run and no progress is serialised anywhere.
+
+What **cannot** be preempted is a single Metal command buffer, which runs to
+completion whatever anyone wants. That is the real floor on how long a co-tenant
+waits -- one pass of whatever is running, which at the largest allowed matmul is
+about 0.9s -- and it is why size is capped as well as time.
+
+The slice is 0.5s by default (`FERRY_GPU_SLICE`), which is roughly the worst
+wait a co-tenant sees. It was picked by measuring rather than taste: at 2s a
+waiting pod waited 2.1s, at 0.5s it waited 0.6s, and the hog's own time on the
+device did not measurably change.
+
+### Not every turn is worth the same
+
+Kubernetes already has the word for this. `PriorityClass` is a first-class API,
+and the admission plugin resolves `priorityClassName` into `spec.priority` on
+every pod -- 0 when nobody said otherwise. ferry already reads the pod spec to
+find the GPU request, so priority comes along beside it and needs nothing new
+invented.
+
+A pod that outranks the holder does not wait out its slice: the holder yields at
+its next checkpoint, which is one command buffer away. Measured, with the same
+hog and the same waiter, changing only the priorities:
+
+| waiter against the hog | four consecutive waits |
+|---|---|
+| outranks it (100000 vs 0) | 0.11s 0.10s 0.10s 0.10s |
+| same priority (0 vs 0) | 0.10s 0.64s 0.59s 0.60s |
+| outranked by it (0 vs 100000) | 5.20s 5.16s 5.18s 5.16s |
+
+Strict priority starves, so it is bounded. Anything that has waited longer than
+the starvation guard -- 5s by default -- goes next whatever anyone's priority,
+which is the third row: served last, but served. **Priority decides who goes
+first, not who goes at all.**
+
+The rescue has to be protected to mean anything. A pod let in by the guard would
+otherwise hit its first checkpoint, see the pod that outranks it still waiting,
+and hand the device straight back without doing any work -- admitted by the
+guard and evicted by priority, forever. So a pod rescued *from a pod that
+outranks it* keeps the device for its slice. A pod that merely waited a long
+time on a busy device is not rescued from anyone and gets no protection, or a
+high-priority arrival would be delayed a slice for nothing.
+
 **Every request has a deadline**, queue time included -- a client that asked for
-120s means 120s, not 120s once it is its turn. A matmul checks between passes,
-which is the only place it can: a committed Metal command buffer runs to
-completion whatever anyone wants. Generation is raced against the deadline
-instead, which bounds the waiting rather than the work.
+120s means 120s, not 120s once it is its turn. Verified both while running (504
+at 5.00s against a 5s budget) and while queued.
 
 **A deleted pod takes its work with it.** Revoking a grant cancels that pod's
-queued *and* running requests; an 8-second job stops within milliseconds of the
-pod going away, and the caller gets a 499. Without this the GPU keeps working
-for a container that no longer exists while the next pod waits behind it.
+queued *and* running requests, and the caller gets a 499 rather than waiting.
 
 **The queue is bounded** -- 64 waiting by default, 8 from any one pod -- and a
 full queue is a 503 rather than an unbounded backlog. A request may allocate at
@@ -356,21 +419,49 @@ denial of service against the Mac rather than against the pod.
 | flag | default | |
 |---|---|---|
 | `--capacity` | 1 | pods that may hold a socket at once |
+| `--time-slice` | 0.5 | seconds before a waiting pod gets a turn |
+| `--starvation-guard` | 5 | seconds before it gets one regardless of priority |
 | `--request-timeout` | 120 | seconds per request, queue time included |
 | `--queue-depth` | 64 | requests waiting for the device |
 | `--pod-queue-depth` | 8 | of those, from any one pod |
 | `--memory-fraction` | 0.25 | of the working set, per request |
 | `--drain-timeout` | 10 | seconds to finish in-flight work on the way down |
 
+### More than one pod at a time
+
+`FERRY_GPU_CAPACITY` above 1 is a supported configuration rather than a
+theoretical one: preemption, fair queueing and deadlines are what it was waiting
+on. It does not make the Mac faster -- it lets more pods share one device, each
+of them slower, with a bounded wait. The numbers above were measured at
+capacity 2.
+
 ## Accounting
 
-`GET /stats` on the control socket reports per pod: requests, failures, seconds
-on the device, and seconds spent waiting for it. A pod can read its own, and
-only its own, at `GET /v1/usage`.
+Per pod: requests, failures, seconds on the device, seconds spent waiting for it,
+and how often its work was preempted for someone else.
 
-The queue-wait number is the one worth watching -- it says whether `--capacity`
-is set higher than what these pods actually do. `kubectl top` will still never
-show any of this.
+```
+$ kubectl get pods -o custom-columns='NAME:.metadata.name,\
+    GPU-SEC:.metadata.annotations.ferry\.dev/gpu-seconds,\
+    QUEUED:.metadata.annotations.ferry\.dev/gpu-queued-seconds'
+NAME        GPU-SEC   QUEUED
+gpu-hog     35.1      0.3
+gpu-quick   0.3       1.5
+```
+
+`ferry-streamer` writes those onto the pod, because `kubectl top` will never
+show them -- it reads the kubelet's summary API, which knows about CPU and
+memory and nothing else. The pod object is the nearest place the cluster can
+see. Writes only happen when a value actually moves, so an idle pod costs
+nothing; a node credential that is not allowed to annotate pods logs once and
+stops trying.
+
+The same numbers are on the control socket at `GET /stats`, as Prometheus text
+at `GET /metrics`, and a pod can read its own -- and only its own -- at
+`GET /v1/usage`.
+
+The queue-wait number is the one worth watching: it says whether `--capacity` is
+set higher than what these pods actually do.
 
 ## When things die
 
@@ -380,6 +471,22 @@ socket paths. The relay dials on demand, so a pod that was running throughout
 simply works again -- verified by SIGKILLing the daemon under a live pod, which
 kept its GPU without restarting. `ferry up` deletes that file, because there the
 pods really are gone.
+
+**Two daemons.** Starting a second one on a live socket is refused rather than
+silently taking it over, which would leave half the pods talking to one process
+and half to the other. A socket with nothing behind it is still cleared, so a
+crash does not block the next start.
+
+**A pod that went away while the daemon was down.** Restoring grants would
+otherwise re-bind a socket for a pod that no longer exists, and nothing would
+ever release it -- the node's only slot, held by a ghost. ferry-cri cannot fix
+this, since its own view of sandboxes does not survive a restart either. The API
+server knows, so `ferry-streamer` revokes any grant older than a minute whose
+pod is gone or finished:
+
+```
+gpu: revoked default/ghost -- its pod is gone
+```
 
 **The capacity.** `ferry-streamer` asks the daemon what it will serve every ten
 seconds and keeps `ferry.dev/gpu` matching the answer. That covers the two ways
@@ -398,14 +505,12 @@ daemon and it is back within a tick.
 
 ## Open questions
 
-- **Preemption.** A long request delays the next one; nothing interrupts work in
-  progress except cancellation of its own pod. Deadlines bound the damage rather
-  than removing it.
-- **Capacity above 1** is now safe to raise -- fair queueing, deadlines and
-  cancellation are what it was waiting on -- but it remains a policy choice
-  about how much slower every GPU pod should be, not a way to get more GPU.
-- **`kubectl top` and friends** still report nothing. The accounting exists on
-  the control socket and nowhere the cluster can see it.
+- **One pass is the floor.** A co-tenant's worst wait is the time slice plus
+  whatever command buffer is already running, and the second half of that is not
+  ours to interrupt. At the largest allowed matmul it is about 0.9s.
+- **Generation cannot yield.** `/v1/generate` is opaque to us once the model has
+  the prompt, so it holds the device for its whole run and is bounded only by the
+  request deadline. A matmul submitted alongside waits for it.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 
@@ -413,4 +518,6 @@ daemon and it is back within a tick.
 
 Another backend behind `/v1/generate` -- MLX or llama.cpp with real weights, for
 a model larger than the one the OS ships. The endpoint was shaped so that lands
-without the pod noticing.
+without the pod noticing, and it is also where the yielding question gets
+interesting: a token loop has an obvious checkpoint between tokens, which the
+system model's API does not give us.

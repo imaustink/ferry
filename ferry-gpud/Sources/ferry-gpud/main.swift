@@ -28,6 +28,16 @@ let requestTimeout = TimeInterval(option("--request-timeout", "120")) ?? 120
 // and how many any one pod may have among them.
 let queueDepth = max(1, Int(option("--queue-depth", "64")) ?? 64)
 let perPodDepth = max(1, Int(option("--pod-queue-depth", "8")) ?? 8)
+// How long a request may hold the device before handing it to another pod that
+// is waiting, and so roughly the worst wait a co-tenant sees. It resumes where
+// it left off, so the cost of a handoff is one command buffer of latency rather
+// than any of the work done so far -- which is why this is short. Measured
+// against a pod hogging the device: 2s made a waiting pod wait 2.1s, 0.5s made
+// it wait 0.6s, and the hog's own time on the device did not measurably change.
+let timeSlice = max(0.05, TimeInterval(option("--time-slice", "0.5")) ?? 0.5)
+// Nothing waits longer than this, whatever anyone's PriorityClass says. Strict
+// priority would otherwise let an important pod starve an ordinary one forever.
+let starvationGuard = max(timeSlice, TimeInterval(option("--starvation-guard", "5")) ?? 5)
 // The largest share of the GPU's recommended working set one request may
 // allocate.
 let memoryFraction = min(max(Double(option("--memory-fraction", "0.25")) ?? 0.25, 0.01), 1.0)
@@ -55,7 +65,8 @@ do {
     exit(1)
 }
 
-let scheduler = GPUScheduler(queueDepth: queueDepth, perPodDepth: perPodDepth)
+let scheduler = GPUScheduler(queueDepth: queueDepth, perPodDepth: perPodDepth,
+                             slice: timeSlice, starvationGuard: starvationGuard)
 let service = Service(gpu: gpu, scheduler: scheduler, socketDirectory: socketDirectory,
                       limit: limit, requestTimeout: requestTimeout)
 
@@ -67,6 +78,8 @@ let model = Generator().status
 print("    model     \(model.available ? "on-device model available" : (model.reason ?? "unavailable"))")
 print("    capacity  \(limit) pod\(limit == 1 ? "" : "s"), "
       + "\(Int(requestTimeout))s per request, \(queueDepth) queued (\(perPodDepth) per pod)")
+print("    slice     \(timeSlice)s before a waiting pod gets a turn, "
+      + "\(Int(starvationGuard))s before it gets one regardless of priority")
 print("    control   unix://\(controlSocket)")
 print("    pods      \(socketDirectory)/<uid>.sock")
 
