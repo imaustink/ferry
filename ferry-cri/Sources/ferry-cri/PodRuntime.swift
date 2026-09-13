@@ -348,6 +348,9 @@ actor PodRuntime {
 
     func listSandboxes() -> [SandboxRecord] { Array(sandboxes.values) }
 
+    /// The pod's address, for port forwarding. ferry-streamer dials it directly.
+    func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
+
     // MARK: - Containers
 
     func createContainer(

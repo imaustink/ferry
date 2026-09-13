@@ -59,6 +59,9 @@ cost time.
   default capabilities; ferry's kubelet derives that code path for darwin.
   A pod with `limits.memory: 300Mi` now gets `memory.max=314572800` in its
   guest cgroup, and `NET_ADMIN` reaches the container.
+- ✅ **`kubectl port-forward` works.** Unusually simple here: pod IPs are
+  routable from the Mac, so there is no namespace to enter — the streamer dials
+  the pod directly.
 - ✅ **Sidecars work.** Containers in a pod share one VM, and therefore one
   network stack: a process in one reaches a listener in another over
   `127.0.0.1`. The hypervisor cannot add a container to a running VM, so the
@@ -140,7 +143,8 @@ it.
   Meanwhile `ferry up` asks for sudo once so `ferry-proxy` can bind ClusterIPs
   and listen on 443. Without it pods, DNS and everything else still work — only
   ClusterIP routing is skipped.
-- **No `kubectl port-forward`** yet. `kubectl logs` and `kubectl exec` work.
+- **No `kubectl attach`** — it means reattaching to an already-running process,
+  which the framework has no way to do. `logs`, `exec` and `port-forward` work.
 - **128 pods, shared.** The VM ceiling belongs to the machine, so every other
   VM — Docker Desktop included — takes one of ferry's slots.
 
