@@ -21,7 +21,12 @@ enum ExecChannel: UInt8 {
 }
 
 struct ExecHeader: Decodable {
-    let containerID: String
+    /// "exec" runs a command; "podip" just reports a sandbox's address, which
+    /// is all port forwarding needs -- pod IPs are routable from the Mac, so
+    /// ferry-streamer dials the pod directly rather than piping through here.
+    var op: String?
+    var containerID: String?
+    var sandboxID: String?
     var cmd: [String]?
     var tty: Bool?
     var stdin: Bool?
@@ -184,10 +189,22 @@ final class ExecServer: @unchecked Sendable {
               let header = try? JSONDecoder().decode(ExecHeader.self, from: line)
         else { return }
 
+        if header.op == "podip" {
+            let ip = await runtime.sandboxAddress(header.sandboxID ?? "")
+            let reply = ["ip": ip ?? ""]
+            if let encoded = try? JSONSerialization.data(withJSONObject: reply) {
+                var line = encoded
+                line.append(0x0A)
+                _ = line.withUnsafeBytes { Darwin.write(socket.descriptor, $0.baseAddress, $0.count) }
+            }
+            return
+        }
+
+        guard let containerID = header.containerID else { return }
         let stdinStream = (header.stdin ?? false) ? FrameReaderStream() : nil
         do {
             let process = try await runtime.exec(
-                containerID: header.containerID,
+                containerID: containerID,
                 command: header.cmd ?? [],
                 tty: header.tty ?? false,
                 stdin: stdinStream,

@@ -323,7 +323,17 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         throw unimplemented("Attach")
     }
     func portForward(request: Runtime_V1_PortForwardRequest, context: ServerContext) async throws -> Runtime_V1_PortForwardResponse {
-        throw unimplemented("PortForward")
+        do {
+            let url = try streamer.url(path: "/portforward", body: [
+                "pod_sandbox_id": request.podSandboxID,
+                "port": request.port,
+            ])
+            var response = Runtime_V1_PortForwardResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
     func checkpointContainer(request: Runtime_V1_CheckpointContainerRequest, context: ServerContext) async throws -> Runtime_V1_CheckpointContainerResponse {
         throw unimplemented("CheckpointContainer")

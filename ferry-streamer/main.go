@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -75,6 +76,19 @@ func main() {
 				return
 			}
 			resp, err := server.GetExec(&req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"url": resp.Url})
+		})
+		mux.HandleFunc("/portforward", func(w http.ResponseWriter, r *http.Request) {
+			var req runtimeapi.PortForwardRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			resp, err := server.GetPortForward(&req)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -140,8 +154,64 @@ func (p *podRuntime) Attach(ctx context.Context, containerID string, in io.Reade
 	return p.stream(ctx, execHeader{ContainerID: containerID, TTY: tty, Stdin: in != nil}, in, out, errOut, resize)
 }
 
+// PortForward is unusually simple here because pod IPs are routable from the
+// Mac: there is no namespace to enter and nothing to proxy through ferry-cri.
+// It only needs the pod's address, then it dials and splices.
 func (p *podRuntime) PortForward(ctx context.Context, sandboxID string, port int32, stream io.ReadWriteCloser) error {
-	return fmt.Errorf("port forwarding is not implemented yet")
+	address, err := p.podAddress(sandboxID)
+	if err != nil {
+		return err
+	}
+	target := net.JoinHostPort(address, strconv.Itoa(int(port)))
+
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	upstream, err := dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		return fmt.Errorf("reach %s: %w", target, err)
+	}
+	defer upstream.Close()
+
+	done := make(chan error, 2)
+	go func() { _, err := io.Copy(upstream, stream); done <- err }()
+	go func() { _, err := io.Copy(stream, upstream); done <- err }()
+
+	// One direction closing ends the forward, which is what kubectl expects
+	// when either side hangs up.
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// podAddress asks ferry-cri which address a sandbox has. Only ferry-cri knows,
+// since it allocated it.
+func (p *podRuntime) podAddress(sandboxID string) (string, error) {
+	conn, err := net.Dial("unix", p.execSocket)
+	if err != nil {
+		return "", fmt.Errorf("reach ferry-cri: %w", err)
+	}
+	defer conn.Close()
+
+	request, err := json.Marshal(map[string]string{"op": "podip", "sandboxID": sandboxID})
+	if err != nil {
+		return "", err
+	}
+	if _, err := conn.Write(append(request, '\n')); err != nil {
+		return "", err
+	}
+
+	var reply struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		return "", fmt.Errorf("read pod address: %w", err)
+	}
+	if reply.IP == "" {
+		return "", fmt.Errorf("sandbox %s has no address", sandboxID)
+	}
+	return reply.IP, nil
 }
 
 func (p *podRuntime) stream(ctx context.Context, header execHeader, in io.Reader, out, errOut io.WriteCloser, resize <-chan remotecommand.TerminalSize) error {
