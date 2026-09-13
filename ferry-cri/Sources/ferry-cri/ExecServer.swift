@@ -295,3 +295,37 @@ final class ExecServer: @unchecked Sendable {
         }
     }
 }
+
+/// Delivers a fixed payload as a process's stdin, then closes it.
+final class DataReaderStream: ReaderStream, @unchecked Sendable {
+    private let payload: Data
+    init(_ payload: Data) { self.payload = payload }
+
+    func stream() -> AsyncStream<Data> {
+        let payload = self.payload
+        return AsyncStream { continuation in
+            continuation.yield(payload)
+            continuation.finish()
+        }
+    }
+}
+
+/// Swallows output from processes ferry runs for its own purposes.
+final class DiscardWriter: Writer, @unchecked Sendable {
+    func write(_ data: Data) throws {}
+    func close() throws {}
+}
+
+/// Surfaces a helper process's stderr, so a failure to program Service rules
+/// says why instead of disappearing.
+final class ErrorWriter: Writer, @unchecked Sendable {
+    private let prefix: String
+    init(prefix: String) { self.prefix = prefix }
+
+    func write(_ data: Data) throws {
+        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+        FileHandle.standardError.write(Data("\(prefix): \(text)".utf8))
+    }
+
+    func close() throws {}
+}

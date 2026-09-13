@@ -23,7 +23,11 @@ let config = RuntimeConfig(
     podSubnet: option("--pod-subnet", "192.168.66.1/24"),
     initImage: option("--init-image", "ghcr.io/apple/containerization/vminit:0.45.0"),
     defaultCPUs: Int(option("--pod-cpus", "2")) ?? 2,
-    defaultMemoryBytes: (UInt64(option("--pod-memory-mib", "512")) ?? 512) * 1024 * 1024
+    defaultMemoryBytes: (UInt64(option("--pod-memory-mib", "512")) ?? 512) * 1024 * 1024,
+    netdPath: {
+        let path = option("--netd", "")
+        return path.isEmpty ? nil : path
+    }()
 )
 
 guard FileManager.default.fileExists(atPath: config.kernelPath) else {
@@ -91,6 +95,19 @@ let shutdownSignals = [SIGTERM, SIGINT].map { sig -> DispatchSourceSignal in
     return source
 }
 _ = shutdownSignals
+
+if let netdPath = config.netdPath {
+    print("    services  in-guest rules via \(netdPath)")
+    // Poll rather than subscribe: the ruleset is small, changes are rare, and
+    // this keeps ferry-cri free of an API client of its own.
+    Task {
+        await runtime.cacheRuleset()
+        while true {
+            try? await Task.sleep(for: .seconds(3))
+            await runtime.refreshServiceRules()
+        }
+    }
+}
 
 print("    serving")
 try await server.serve()
