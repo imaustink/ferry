@@ -13,6 +13,9 @@ package main
 // port, because the pod's own portmap rule is what rewrites it -- the chain
 // stays intact instead of being short-circuited here.
 //
+// The pod is dialled at its own address. This node's vmnet network is its slice
+// of the cluster CIDR and the Mac is on it, so there is nothing to translate.
+//
 // ferry-cri writes the file; this reads it. The format is one mapping per line:
 //
 //	<host address or *> <port> <tcp|udp> <address the Mac can reach the pod at>
@@ -25,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -45,10 +49,11 @@ type hostPorts struct {
 
 	mu      sync.Mutex
 	current map[string]*serviceProxy
+	udp     map[string]*udpProxy
 }
 
 func newHostPorts(path string) *hostPorts {
-	h := &hostPorts{path: path, current: map[string]*serviceProxy{}}
+	h := &hostPorts{path: path, current: map[string]*serviceProxy{}, udp: map[string]*udpProxy{}}
 	if path == "" {
 		return h
 	}
@@ -94,12 +99,6 @@ func (h *hostPorts) reload() {
 	}
 	wanted := map[string]hostPortMapping{}
 	for _, mapping := range parseHostPorts(data) {
-		if mapping.protocol != "tcp" {
-			// Only TCP for now: the forwarder is a stream proxy. A UDP hostPort
-			// still works on the pod's own address, where portmap put it.
-			klog.V(2).InfoS("Ignoring a non-TCP hostPort", "port", mapping.port, "protocol", mapping.protocol)
-			continue
-		}
 		wanted[mapping.key()] = mapping
 	}
 
@@ -109,6 +108,10 @@ func (h *hostPorts) reload() {
 		if _, keep := wanted[key]; !keep {
 			proxy.close()
 			delete(h.current, key)
+			if u, ok := h.udp[key]; ok {
+				u.close()
+				delete(h.udp, key)
+			}
 			klog.InfoS("Host port released", "listen", key)
 		}
 	}
@@ -118,7 +121,11 @@ func (h *hostPorts) reload() {
 			existing.setBackends(target)
 			continue
 		}
-		proxy, err := newServiceProxy("hostPort "+key, mapping.hostIP, mapping.port)
+		protocol := corev1.ProtocolTCP
+		if mapping.protocol == "udp" {
+			protocol = corev1.ProtocolUDP
+		}
+		proxy, err := newServiceProxy("hostPort "+key, mapping.hostIP, mapping.port, protocol)
 		if err != nil {
 			// Two pods asking for the same hostPort is the scheduler's problem,
 			// not ours, and it is worth saying rather than retrying silently.
@@ -126,7 +133,18 @@ func (h *hostPorts) reload() {
 			continue
 		}
 		proxy.setBackends(target)
+		if protocol == corev1.ProtocolUDP {
+			// A UDP serviceProxy is only a backend list; the datagram listener
+			// is separate, and borrows it.
+			u, err := newUDPProxy("hostPort "+key, mapping.hostIP, mapping.port, proxy)
+			if err != nil {
+				klog.ErrorS(err, "Could not listen for a hostPort", "listen", key, "protocol", "UDP")
+				proxy.close()
+				continue
+			}
+			h.udp[key] = u
+		}
 		h.current[key] = proxy
-		klog.InfoS("Host port published", "listen", key, "pod", mapping.pod)
+		klog.InfoS("Host port published", "listen", key, "pod", mapping.pod, "protocol", mapping.protocol)
 	}
 }

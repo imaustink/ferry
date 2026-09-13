@@ -65,6 +65,7 @@ type exposure struct {
 	portName string // which of the Service's ports the endpoints come from
 	kind     string // for logging: "NodePort" or "LoadBalancer"
 	nodePort int32  // where to hand a connection whose pod lives on another Mac
+	protocol corev1.Protocol
 }
 
 // exposuresFor returns what the Mac should listen on for one Service.
@@ -73,30 +74,36 @@ func exposuresFor(service *corev1.Service, loadBalancerIP string) []exposure {
 	name := service.Namespace + "/" + service.Name
 
 	for _, port := range service.Spec.Ports {
-		if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
-			continue // UDP and SCTP are not forwarded; see docs/SERVICES.md
+		protocol := corev1.ProtocolTCP
+		if port.Protocol != "" {
+			protocol = port.Protocol
+		}
+		if protocol != corev1.ProtocolTCP && protocol != corev1.ProtocolUDP {
+			continue // SCTP has no forwarder here
 		}
 
 		// NodePort is allocated for both NodePort and LoadBalancer services.
 		if port.NodePort != 0 {
 			out = append(out, exposure{
-				key:      fmt.Sprintf("nodeport/%s:%d", name, port.NodePort),
+				key:      fmt.Sprintf("nodeport/%s:%d/%s", name, port.NodePort, protocol),
 				address:  "", // every interface: the Mac is the node
 				port:     port.NodePort,
 				portName: port.Name,
 				kind:     "NodePort",
 				nodePort: port.NodePort,
+				protocol: protocol,
 			})
 		}
 
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer && loadBalancerIP != "" {
 			out = append(out, exposure{
-				key:      fmt.Sprintf("loadbalancer/%s:%d", name, port.Port),
+				key:      fmt.Sprintf("loadbalancer/%s:%d/%s", name, port.Port, protocol),
 				address:  loadBalancerIP,
 				port:     port.Port,
 				portName: port.Name,
 				kind:     "LoadBalancer",
 				nodePort: port.NodePort,
+				protocol: protocol,
 			})
 		}
 	}

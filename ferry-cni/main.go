@@ -56,7 +56,6 @@ type options struct {
 	execTarget  string
 	capArgs     string
 	args        string
-	keep        string
 }
 
 func run(argv []string) error {
@@ -80,7 +79,6 @@ func run(argv []string) error {
 	fs.StringVar(&o.execTarget, "exec-container", "", "a running container in the pod, to exec the guest plugins in")
 	fs.StringVar(&o.capArgs, "capability-args", "", "JSON object of CNI capability arguments, e.g. portMappings")
 	fs.StringVar(&o.args, "args", "", "CNI_ARGS, as key=value;key=value")
-	fs.StringVar(&o.keep, "keep", "", "gc: comma-separated container ids whose attachments are still live")
 	if err := fs.Parse(argv[1:]); err != nil {
 		return err
 	}
@@ -88,8 +86,7 @@ func run(argv []string) error {
 	if o.conflist == "" {
 		return errors.New("--conflist is required")
 	}
-	if o.containerID == "" && command != "gc" {
-		// gc is about every attachment at once, so it names none of them.
+	if o.containerID == "" {
 		return errors.New("--container-id is required")
 	}
 	if o.cacheDir == "" {
@@ -145,8 +142,6 @@ func run(argv []string) error {
 		return add(ctx, cni, dispatch, list, rt, o)
 	case "del":
 		return del(ctx, cni, dispatch, list, rt, o)
-	case "gc":
-		return gc(ctx, cni, dispatch, list, o)
 	case "check":
 		host, guest := split(dispatch, list)
 		stage := pick(list, host, guest, o.stage)
@@ -248,34 +243,6 @@ func del(ctx context.Context, cni libcni.CNI, d *dispatcher, list *libcni.Networ
 		return nil
 	}
 	return err
-}
-
-// gc releases every attachment the runtime no longer believes in.
-//
-// It is the answer to the one thing on-disk leases cost. ferry-cri's addresses
-// used to live in memory, so a restart forgot them and handed the same address
-// to a second pod; now they are files, and the opposite is true -- a pod's VM
-// dies with the process that held it while its lease survives. CNI already has
-// a verb for exactly this, and libcni turns it into a DEL for each attachment
-// not on the valid list.
-//
-// Only the host half runs: the guest half of an attachment lives in a kernel
-// that has already stopped existing.
-func gc(ctx context.Context, cni libcni.CNI, d *dispatcher, list *libcni.NetworkConfigList,
-	o options) error {
-	host, guest := split(d, list)
-	stage := pick(list, host, guest, "host")
-	if len(stage.Plugins) == 0 {
-		return nil
-	}
-	args := &libcni.GCArgs{}
-	for _, id := range strings.Split(o.keep, ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			args.ValidAttachments = append(args.ValidAttachments,
-				types.GCAttachment{ContainerID: id, IfName: o.ifname})
-		}
-	}
-	return cni.GCNetworkList(ctx, stage, args)
 }
 
 // cachedResult reads what the host stage left behind for this attachment.

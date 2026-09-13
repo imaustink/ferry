@@ -30,7 +30,8 @@ host it could be done.
 > true: ferry runs real CNI plugins, on the Mac and inside pods, through
 > `ferry-cni`. It does not change the argument below -- the plugin that would
 > enforce policy is a Linux one, and where it runs is the pod's own kernel,
-> which is exactly where ferry already puts these rules. See
+> which is exactly where ferry already puts these rules. `firewall` is a second
+> path worth comparing against what ferry-netpol compiles today. See
 > [experiments/11-cni-on-macos](../experiments/11-cni-on-macos/FINDINGS.md).
 
 There does not need to be. Every ferry pod is a virtual machine with its own

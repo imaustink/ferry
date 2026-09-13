@@ -44,10 +44,8 @@ kubectl wait --for=condition=Ready pod/hostport-demo --timeout=180s >/dev/null |
   kubectl describe pod hostport-demo | tail -20; exit 1; }
 
 pod="$(kubectl get pod hostport-demo -o jsonpath='{.status.podIP}')"
-vmnet="$(awk -v p="$pod" '$1 == p {print $2}' "$run/cri/podmap")"
 container="$(kubectl get pod hostport-demo -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's|.*://||')"
-echo "    pod ip     $pod        (ferry's cluster network, eth1)"
-echo "    vmnet      $vmnet   (what the Mac can reach it at, eth0)"
+echo "    pod ip     $pod   -- and the Mac is on that network, so it dials it directly"
 
 # The plugin needs NET_ADMIN to program a kernel, so reading its work does too.
 # ferry-cri's exec socket is what ferry-cni itself dials; this speaks the same
@@ -74,16 +72,14 @@ fetch() {
 
 echo
 echo "==> reaching it"
-printf "    %-22s %s\n" "$vmnet:$port" "$(fetch "http://$vmnet:$port/")"
-echo "      the pod VM's own address -- portmap alone, no host involvement"
+printf "    %-22s %s\n" "$pod:$port" "$(fetch "http://$pod:$port/")"
+echo "      the pod's own address -- portmap alone, no host involvement"
 printf "    %-22s %s\n" "127.0.0.1:$port" "$(fetch "http://127.0.0.1:$port/")"
 echo "      the node -- which is this Mac, so ferry-proxy carries the last hop"
 
 echo
-echo "==> teardown releases the lease"
-before="$(ls "$run/cri/cni-leases/ferry" 2>/dev/null | grep -c '^10\.')"
+echo "==> teardown unwinds the chain"
 kubectl delete pod hostport-demo --wait=true >/dev/null
-sleep 3
-after="$(ls "$run/cri/cni-leases/ferry" 2>/dev/null | grep -c '^10\.')"
-echo "    host-local leases: $before -> $after"
+sleep 4
+printf "    %-22s %s\n" "hostports file" "$( [ -s "$run/cri/hostports" ] && cat "$run/cri/hostports" || echo '(empty)')"
 printf "    %-22s %s\n" "127.0.0.1:$port" "$(curl -s --max-time 4 "http://127.0.0.1:$port/" || echo '(closed)')"

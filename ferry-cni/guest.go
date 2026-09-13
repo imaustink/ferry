@@ -47,8 +47,12 @@ type execRequest struct {
 	Cmd         []string `json:"cmd"`
 	Env         []string `json:"env,omitempty"`
 	Caps        []string `json:"caps,omitempty"`
-	Stdin       bool     `json:"stdin"`
-	TTY         bool     `json:"tty"`
+	// A hardened pod -- non-root, every capability dropped -- cannot lend
+	// NET_ADMIN to anything, so a plugin that inherits the workload's user
+	// cannot program the pod's kernel. ferry-cri already does this for nft.
+	AsRoot bool `json:"asRoot,omitempty"`
+	Stdin  bool `json:"stdin"`
+	TTY    bool `json:"tty"`
 }
 
 func (d *dispatcher) execInPod(ctx context.Context, pluginPath string, stdinData []byte, environ []string) ([]byte, error) {
@@ -69,6 +73,7 @@ func (d *dispatcher) execInPod(ctx context.Context, pluginPath string, stdinData
 		Cmd:         []string{pluginPath},
 		Env:         guestEnviron(environ, d.guestPath),
 		Caps:        []string{"NET_ADMIN"},
+		AsRoot:      true,
 		Stdin:       true,
 	}
 	header, err := json.Marshal(request)

@@ -39,6 +39,9 @@ struct ExecHeader: Decodable {
     /// NET_ADMIN, which an ordinary pod does not ask for; granting it to a
     /// binary ferry ships and runs keeps the privilege off the workload.
     var caps: [String]?
+    /// Run as root inside the pod. A hardened pod cannot lend a capability it
+    /// does not hold, so a plugin inheriting its user cannot program a kernel.
+    var asRoot: Bool?
 }
 
 /// Forwards a container's live output to an attached client.
@@ -287,7 +290,8 @@ final class ExecServer: @unchecked Sendable {
                 stdout: FrameWriter(socket: socket, channel: .stdout),
                 stderr: FrameWriter(socket: socket, channel: .stderr),
                 capabilities: header.caps.map { PodRuntime.capabilities(adding: $0) },
-                environment: header.env
+                environment: header.env,
+                asRoot: header.asRoot ?? false
             )
             try await process.start()
 

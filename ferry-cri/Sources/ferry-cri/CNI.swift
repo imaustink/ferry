@@ -1,22 +1,27 @@
 // Pod networking, described by a CNI configuration instead of compiled in.
 //
-// ferry used to pick pod addresses itself, in Swift, and the docs called that
-// "ferry has no CNI". It was never true that CNI needs Linux: CNI is a protocol
-// -- JSON on stdin, JSON on stdout, the verb in the environment -- and whether
-// a plugin needs a kernel is a property of that plugin. Upstream's IPAM plugins
-// build native Mach-O.
+// The docs used to say "ferry has no CNI". It was never true that CNI needs
+// Linux: CNI is a protocol -- JSON on stdin, JSON on stdout, the verb in the
+// environment -- and whether a plugin needs a kernel is a property of that
+// plugin, not of CNI.
 //
 // What ferry lacked was the runtime. ferry-cni is it, and this is the other end
 // of the pipe: ferry-cri invokes it the way any runtime invokes a CNI chain,
 // once before the VM boots and once after.
 //
-// Why twice. Virtualization.framework cannot hotplug a device, so a pod's
-// address has to be chosen before the kernel starts -- and a plugin that wants
-// to touch a netns cannot run until there is a kernel to hold one. That is the
-// same line the plugin set already splits along, so the split is not a
-// compromise, it is the shape of the problem:
+// Who chooses the address. Not this. vmnet does, because this node's vmnet
+// network is its slice of the cluster CIDR and that is what puts the Mac on the
+// pod network -- see docs/POD-NETWORK.md. So the host half of the chain is
+// *told* the address rather than asked for one, through upstream's `static`
+// IPAM and CNI's own `ips` capability. That is not a workaround: a runtime that
+// already knows an address is exactly what `static` is for.
 //
-//	host    ferry-vm + host-local, forked on the Mac, before boot
+// Why the chain still runs in two halves. Virtualization.framework cannot
+// hotplug a device, so the interface has to be described before the kernel
+// starts -- and a plugin that wants to touch a netns cannot run until there is
+// a kernel to hold one:
+//
+//	host    ferry-vm + static, forked on the Mac, before boot
 //	guest   portmap and the rest, inside the pod, against its own root netns
 
 import Foundation
@@ -63,37 +68,12 @@ struct CNIRuntime: Sendable {
 
     @discardableResult
     func add(sandboxID: String, stage: Stage, execContainer: String? = nil,
-             portMappings: [CNIPortMapping] = [], requestedIP: String? = nil) async throws -> Attachment? {
-        var arguments = try invocation("add", sandboxID: sandboxID, stage: stage,
-                                       execContainer: execContainer, portMappings: portMappings)
-        if let requestedIP {
-            // host-local honours an explicit address through CNI_ARGS, which is
-            // how the cluster DNS address stays the one the kubelet was told.
-            arguments.append(contentsOf: ["--args", "IP=\(requestedIP)"])
-        }
+             portMappings: [CNIPortMapping] = [], addresses: [String] = []) async throws -> Attachment? {
+        let arguments = try invocation("add", sandboxID: sandboxID, stage: stage,
+                                       execContainer: execContainer,
+                                       portMappings: portMappings, addresses: addresses)
         let output = try await Self.run(binary, arguments)
         return Self.attachment(from: output)
-    }
-
-    /// Releases every lease except the ones named.
-    ///
-    /// ferry-cri's pods do not survive it: the VMs stop when the process that
-    /// owns them does. Their leases are files and do survive, so on startup the
-    /// only attachments that are still real are the ones this process is about
-    /// to make -- and the cluster DNS address it holds itself.
-    func gc(keep: [String]) async throws {
-        var arguments = [
-            "gc",
-            "--conflist", conflist,
-            "--ifname", Self.interfaceName,
-            "--cache-dir", cacheDir,
-            "--host-plugins", hostPlugins,
-            "--guest-plugins", guestPlugins,
-        ]
-        if !keep.isEmpty {
-            arguments.append(contentsOf: ["--keep", keep.joined(separator: ",")])
-        }
-        _ = try await Self.run(binary, arguments)
     }
 
     func del(sandboxID: String, stage: Stage, execContainer: String? = nil,
@@ -104,7 +84,8 @@ struct CNIRuntime: Sendable {
     }
 
     private func invocation(_ command: String, sandboxID: String, stage: Stage,
-                            execContainer: String?, portMappings: [CNIPortMapping]) throws -> [String] {
+                            execContainer: String?, portMappings: [CNIPortMapping],
+                            addresses: [String] = []) throws -> [String] {
         var arguments = [
             command,
             "--conflist", conflist,
@@ -123,8 +104,24 @@ struct CNIRuntime: Sendable {
             }
             arguments.append(contentsOf: ["--exec-socket", execSocket, "--exec-container", execContainer])
         }
+        // Both of these are CNI capabilities: values a runtime knows and the
+        // configuration cannot. `ips` is how the address vmnet chose reaches
+        // `static`, and `portMappings` is how a pod's hostPorts reach portmap.
+        var capabilities: [String: Any] = [:]
+        if !addresses.isEmpty { capabilities["ips"] = addresses }
         if !portMappings.isEmpty {
-            let encoded = try JSONEncoder().encode(["portMappings": portMappings])
+            capabilities["portMappings"] = portMappings.map { mapping -> [String: Any] in
+                var entry: [String: Any] = [
+                    "hostPort": mapping.hostPort,
+                    "containerPort": mapping.containerPort,
+                    "protocol": mapping.protocol,
+                ]
+                if let hostIP = mapping.hostIP { entry["hostIP"] = hostIP }
+                return entry
+            }
+        }
+        if !capabilities.isEmpty {
+            let encoded = try JSONSerialization.data(withJSONObject: capabilities, options: [.sortedKeys])
             arguments.append(contentsOf: ["--capability-args", String(decoding: encoded, as: UTF8.self)])
         }
         return arguments
@@ -213,40 +210,24 @@ struct CNIRuntime: Sendable {
 extension CNIRuntime {
     /// Writes the configuration ferry runs when none was supplied.
     ///
-    /// Everything here used to be Swift: this node's slice of the cluster, the
-    /// first usable address, the mask that makes the whole cluster on-link. Now
-    /// it is a file, which is the point -- rangeStart, several ranges and IPv6
-    /// come from editing it rather than from changing ferry.
-    ///
-    /// The subnet is the whole cluster and the range is only this node's /24.
-    /// That is not a flourish: a pod's NIC gets the subnet's mask and there is
-    /// no router on the segment, so a /24 would leave every other node's pods
-    /// unreachable. One flat segment, one slice of it per node, is exactly what
-    /// ferry already did -- said out loud for the first time.
-    static func writeDefaultConflist(at path: String, clusterCIDR: String,
-                                     nodeIndex: Int, leasesDir: String) throws {
-        let parts = clusterCIDR.split(separator: "/")
-        let octets = parts.first?.split(separator: ".") ?? []
-        guard parts.count == 2, octets.count == 4, nodeIndex >= 0, nodeIndex <= 255
-        else { throw RuntimeFailure.invalid("cluster CIDR \(clusterCIDR) is not an IPv4 network") }
-        let prefix = "\(octets[0]).\(octets[1]).\(nodeIndex)"
-
+    /// There is no `dataDir`, no range and no node arithmetic in it, because
+    /// ferry is not choosing addresses -- vmnet already did, and the runtime
+    /// hands that address to `static` per pod. What is left in the file is the
+    /// shape of the chain, which is the part worth being able to read and edit.
+    static func writeDefaultConflist(at path: String) throws {
         let conflist: [String: Any] = [
             "cniVersion": "1.0.0",
             "name": "ferry",
             "plugins": [
                 [
                     "type": "ferry-vm",
-                    "ipam": [
-                        "type": "host-local",
-                        "dataDir": leasesDir,
-                        // .1 is left out so it reads as a gateway even though
-                        // there is none, and .2 is the cluster DNS address,
-                        // reserved at startup before any pod can ask.
-                        "ranges": [[["subnet": clusterCIDR,
-                                     "rangeStart": "\(prefix).2",
-                                     "rangeEnd": "\(prefix).254"]]],
-                    ],
+                    // The address arrives as a runtime capability, because it is
+                    // per pod and nothing in a file could know it. It is
+                    // declared here rather than in the ipam section because a
+                    // capability belongs to the plugin the runtime invokes, and
+                    // the delegate reads the same configuration this one gets.
+                    "capabilities": ["ips": true],
+                    "ipam": ["type": "static"],
                 ],
                 [
                     "type": "portmap",
@@ -257,8 +238,8 @@ extension CNIRuntime {
                     // routing boundary, and turning it on makes portmap write
                     // route_localnet -- into a /proc/sys the pod mounts
                     // read-only. Nothing here needs it: a hostPort connection
-                    // arrives from the Mac over vmnet with a real source
-                    // address, never from loopback.
+                    // arrives from the Mac with a real source address, never
+                    // from loopback.
                     "snat": false,
                     "capabilities": ["portMappings": true],
                 ],
@@ -268,15 +249,4 @@ extension CNIRuntime {
                                                  options: [.prettyPrinted, .sortedKeys])
         try encoded.write(to: URL(filePath: path))
     }
-
-    /// The address cluster DNS is pinned to, and the name its lease is held
-    /// under. It is an ordinary host-local lease, so unlike the reservation it
-    /// replaces it survives a restart.
-    static func dnsAddress(clusterCIDR: String, nodeIndex: Int) -> String? {
-        let octets = clusterCIDR.split(separator: "/").first?.split(separator: ".") ?? []
-        guard octets.count == 4 else { return nil }
-        return "\(octets[0]).\(octets[1]).\(nodeIndex).2"
-    }
-
-    static let dnsLeaseID = "ferry-cluster-dns"
 }
