@@ -27,8 +27,11 @@ type backend struct {
 	address string
 }
 
-// serviceProxy listens on one ClusterIP:port and forwards to the Service's
-// ready endpoints.
+// serviceProxy listens on one address and port and forwards to a Service's
+// ready endpoints. The address is a ClusterIP, a node port on every interface,
+// or the Mac's own address standing in for a load balancer -- the forwarding is
+// the same in all three cases, because a pod is reachable from the Mac either
+// way.
 type serviceProxy struct {
 	key       string
 	listen    string
@@ -38,8 +41,8 @@ type serviceProxy struct {
 	closeOnce sync.Once
 }
 
-func newServiceProxy(key, clusterIP string, port int32) (*serviceProxy, error) {
-	listen := net.JoinHostPort(clusterIP, strconv.Itoa(int(port)))
+func newServiceProxy(key, address string, port int32) (*serviceProxy, error) {
+	listen := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err

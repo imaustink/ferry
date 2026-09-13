@@ -1,3 +1,5 @@
+<img src="assets/ferry.svg" alt="" width="72">
+
 # ferry
 
 Kubernetes on a Mac where **the pod is the virtual machine** and there is no
@@ -31,7 +33,7 @@ cost time.
   full pod lifecycle over CRI. See
   [experiments/01-kubelet-cri-surface](experiments/01-kubelet-cri-surface/FINDINGS.md).
 - ✅ **The Mac registers as a real Kubernetes node** and runs scheduled
-  workloads. `kubectl get nodes` reports `OS-IMAGE: macOS 15.6.1`; a 10-replica
+  workloads. `kubectl get nodes` reports `OS-IMAGE: macOS 26.6.2`; a 10-replica
   Deployment reaches 10/10. See
   [experiments/02-node-registration](experiments/02-node-registration/FINDINGS.md).
 - ✅ **The VM ceiling is 128, and Kubernetes' default is 110.** One VM per pod
@@ -49,8 +51,6 @@ cost time.
   with its own routable IP, reachable from the Mac at ~0.4ms. The API server
   advertises the pod gateway, so it is reachable from inside a pod. See
   [experiments/05-real-pods](experiments/05-real-pods/FINDINGS.md).
-- 🔨 **Services.** ClusterIPs are not implemented yet; the routing substrate is
-  proven and three approaches are compared in [docs/SERVICES.md](docs/SERVICES.md).
 - ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
   ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
   that authenticates to the API server with its own token.
@@ -95,20 +95,26 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 ## Layout
 
 ```
+ferry                                the CLI: doctor, build, up, down, status, logs
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 control-plane/                       PKI + up/down for the native control plane
+manifests/                           CoreDNS, rendered at 'ferry up'
+docs/                                HANDOFF.md (the full picture), SERVICES.md
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
 experiments/04-pod-networking/       routable per-pod addressing, host and pod to pod
 experiments/05-real-pods/            the whole stack, with real VMs per pod
+experiments/06-kube-proxy-on-macos/  kube-proxy's rule generation, rendered on darwin
+experiments/07-vmnet-leak/           what a refused vmnet subnet actually means
 ferry-cri/                           the CRI runtime: one VM per pod
-ferry-streamer/                      SPDY streaming for kubectl exec
+ferry-streamer/                      SPDY streaming for exec, attach and port-forward
 ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
 guest/                               nft, bundled with its loader for pods
 ferry-proxy/                         host-side ClusterIP routing (fallback)
 kernel/                              guest kernel with NAT support
+assets/                              the logo
 bin/                                 build output (gitignored)
 ```
 
@@ -127,6 +133,13 @@ kubectl get pods -o wide          # each pod has its own routable address
 kubectl logs demo
 ping "$(kubectl get pod demo -o jsonpath='{.status.podIP}')"
 
+# Services route inside the pods, using kube-proxy's own rules
+kubectl run web --image=busybox --restart=Never \
+  --command -- sh -c "echo hi from a Service > /tmp/index.html; httpd -f -p 8080 -h /tmp"
+kubectl expose pod web --port 80 --target-port 8080
+kubectl run probe --image=busybox --restart=Never --command -- sleep 3600
+kubectl exec probe -- wget -qO- http://web
+
 ./ferry status
 ./ferry down
 ```
@@ -137,11 +150,11 @@ it.
 
 ### Limits worth knowing
 
-- **No sidecars.** `Virtualization.framework` cannot hotplug, so a container
-  cannot join a pod whose VM is already running. **Init containers do work** —
-  each exits before the next is created, so the VM is rebuilt between them and
-  shared volumes carry state across. Two containers running *at once* in one pod
-  does not work.
+- **A pod's containers are fixed at boot.** `Virtualization.framework` cannot
+  hotplug, so the VM does not start until the kubelet has created every container
+  in the pod. Sidecars work and share `127.0.0.1`; init containers work, each
+  exiting before the next is created, with shared volumes carrying state across.
+  What cannot happen is a container joining a pod whose VM is already running.
 - **Services** route inside each pod using kube-proxy's own rules and need no
   privilege on the Mac — build the guest kernel with `ferry kernel` first, or
   ferry falls back to a host proxy that does need root. Conntrack is not
@@ -151,6 +164,14 @@ it.
   the container is created.
 - **128 pods, shared.** The VM ceiling belongs to the machine, so every other
   VM — Docker Desktop included — takes one of ferry's slots.
+- **Restarting in quick succession moves the pod network.** A vmnet subnet stays
+  reserved for about a minute after the run using it stops, and there are 32
+  networks across the whole Mac, so a restart takes the next free subnet. Pods
+  and Services are unaffected; CoreDNS rolls out again because the gateway is
+  part of its config. See
+  [experiments/07-vmnet-leak](experiments/07-vmnet-leak/FINDINGS.md).
+- **`ferry down` leaves the cluster's objects in etcd.** It stops processes; it
+  does not delete anything. Pods come back on the next `ferry up`.
 
 ## Requirements
 

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="256" height="256"
+     fill="#326CE5" role="img" aria-label="ferry">
+  <title>ferry</title>
+  <rect x="4.6" y="7.3" width="4.4" height="4.9" rx=".75"/>
+  <rect x="9.8" y="5.3" width="4.4" height="6.9" rx=".75"/>
+  <rect x="15" y="7.3" width="4.4" height="4.9" rx=".75"/>
+  <path d="M2 12.2h20l-1.8 4.5q-.9 2-3.2 2H7q-2.3 0-3.2-2Z"/>
+</svg>

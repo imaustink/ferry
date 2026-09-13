@@ -47,6 +47,34 @@ for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
   fi
 done
 
+# kube-proxy's nftables proxier is gated to linux by build tag, but what ferry
+# wants from it is the rule *generation*, which is portable: it talks to a
+# knftables.Interface, and knftables ships a Fake that records a transaction and
+# can Dump() it. So the tag is widened and ferry_backend_darwin.go supplies the
+# fake in place of the kernel. Only proxier.go moves -- the conntrack package
+# stays linux-only, with ferry_conntrack_darwin.go standing in for it, because
+# macOS genuinely has no connection table.
+#
+# Without this ferry-proxyd cannot be built at all, and Services do not route.
+echo "==> widening kube-proxy's nftables proxier to darwin"
+proxier="$src/pkg/proxy/nftables/proxier.go"
+if [ -f "$proxier" ]; then
+  sed -i '' \
+    -e 's|^//go:build linux$|//go:build linux \|\| darwin|' \
+    -e 's|^// +build linux$|// +build linux darwin|' \
+    "$proxier"
+  # The one seam. Upstream reaches straight for the host's nft; ferry needs that
+  # choice to depend on the platform, so it goes through a build-tagged helper
+  # that returns the real kernel on Linux and knftables' recording Fake on
+  # darwin. Everything else in proxier.go is untouched.
+  sed -i '' \
+    -e 's|nft, err := getNFTablesInterface(ipFamily)|nft, err := ferryNFTablesInterface(ipFamily)|' \
+    "$proxier"
+  echo "    ~ pkg/proxy/nftables/proxier.go"
+  grep -q 'ferryNFTablesInterface(ipFamily)' "$proxier" \
+    || { echo "    !! the nftables seam did not apply; ferry-proxyd will not work" >&2; exit 1; }
+fi
+
 # Static pod file watching is gated to linux purely by build tag; the code
 # underneath is fsnotify, which supports darwin via kqueue and uses no
 # Linux-specific API. Widen the tag rather than fork the file.

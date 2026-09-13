@@ -37,6 +37,9 @@ func main() {
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig used to read pod specs (optional)")
 	execSocket := flag.String("exec-socket", "/tmp/ferry-exec.sock", "ferry-cri's exec socket")
 	control := flag.String("control", "/tmp/ferry-streamer.sock", "socket ferry-cri asks for URLs on")
+	nodeName := flag.String("node-name", "", "this node, for advertising its switch endpoint")
+	relayEndpoint := flag.String("relay-endpoint", "", "host:port this node's pod switch listens on")
+	peersFile := flag.String("peers-file", "", "file to keep the other nodes' endpoints in")
 	flag.Parse()
 
 	baseURL, err := url.Parse("http://" + *listen + "/")
@@ -115,6 +118,14 @@ func main() {
 	// VM, because this hypervisor cannot add one afterwards. CRI never says, so
 	// the answer comes from the pod spec.
 	var pods *podLookup
+	if *kubeconfig != "" && *nodeName != "" && *relayEndpoint != "" && *peersFile != "" {
+		if publisher, err := newPeerPublisher(*kubeconfig, *nodeName, *relayEndpoint, *peersFile); err != nil {
+			fmt.Fprintf(os.Stderr, "peers: %v\n", err)
+		} else {
+			go publisher.run(context.Background())
+		}
+	}
+
 	if *kubeconfig != "" {
 		pods, err = newPodLookup(*kubeconfig)
 		if err != nil {

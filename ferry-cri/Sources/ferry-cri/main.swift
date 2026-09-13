@@ -31,6 +31,24 @@ let config = RuntimeConfig(
     proxydSocket: {
         let path = option("--proxyd-socket", "")
         return path.isEmpty ? nil : path
+    }(),
+    clusterCIDR: {
+        let cidr = option("--cluster-cidr", "")
+        return cidr.isEmpty ? nil : cidr
+    }(),
+    nodeIndex: Int(option("--node-index", "0")) ?? 0,
+    relayPort: UInt16(option("--relay-port", "0")) ?? 0,
+    peers: {
+        let list = option("--peers", "")
+        return list.isEmpty ? [] : list.split(separator: ",").map(String.init)
+    }(),
+    peersFile: {
+        let path = option("--peers-file", "")
+        return path.isEmpty ? nil : path
+    }(),
+    relayEndpoint: {
+        let endpoint = option("--relay-endpoint", "")
+        return endpoint.isEmpty ? nil : endpoint
     }()
 )
 
