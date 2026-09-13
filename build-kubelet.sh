@@ -22,6 +22,10 @@ fi
 echo "==> applying overlay"
 (cd "$here/patches/kubelet" && find . -name '*.go' -print0) \
   | while IFS= read -r -d '' f; do
+      # Make the parent first: a patch may add a directory upstream does not
+      # have -- cmd/ferry-proxyd is ferry's own -- and BSD install will not
+      # create it, so a fresh clone failed here.
+      mkdir -p "$(dirname "$src/$f")"
       install -m 0644 "$here/patches/kubelet/$f" "$src/$f"
       echo "    + ${f#./}"
     done
