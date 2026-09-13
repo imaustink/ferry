@@ -312,6 +312,17 @@ actor PodRuntime {
             c.cpus = config.defaultCPUs
             c.memoryInBytes = config.defaultMemoryBytes
             c.interfaces = [interface]
+            // SPIKE: a second NIC on ferry's own datapath, alongside vmnet.
+            if ProcessInfo.processInfo.environment["FERRY_SWITCH"] == "1" {
+                let host = "\(interface.ipv4Address)".split(separator: "/").first
+                    .flatMap { $0.split(separator: ".").last } ?? "2"
+                if let addr = try? CIDRv4("10.244.0.\(host)/24"),
+                   let sw = try? SwitchInterface(address: addr, mac: nil) {
+                    sw.observe(label: id)
+                    c.interfaces = [interface, sw]
+                    print("    pod \(id): eth1 on ferry's switch at 10.244.0.\(host)")
+                }
+            }
             c.hostname = cfg.hostname.isEmpty ? cfg.metadata.name : cfg.hostname
             if !cfg.dnsConfig.servers.isEmpty {
                 c.dns = DNS(nameservers: cfg.dnsConfig.servers,
