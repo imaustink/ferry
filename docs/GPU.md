@@ -176,6 +176,10 @@ resources a device plugin previously registered and then withdrew
 it, and `darwinContainerManager` -- which wraps `NewStubContainerManager()` and
 has no device manager -- stays as it is.
 
+That one patch is the start of it, not the whole story: ferry-streamer then
+keeps the resource matching the daemon, so the node stops advertising a GPU it
+cannot actually serve. See **When things die**.
+
 This is worth stating plainly because it is the opposite of what the device
 plugin documentation implies: ferry does not need to implement the device
 plugin API to have a schedulable GPU resource. It needs one PATCH.
@@ -197,6 +201,7 @@ no package graph to fetch and no weights to ship before a pod can use it.
 | `GET /v1/model` | whether the on-device model is usable, and why not if it is not |
 | `POST /v1/matmul` | a square matrix multiply on the GPU, `{size, iterations}` |
 | `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}` |
+| `GET /v1/usage` | this pod's own accounting, and no one else's |
 
 `matmul` is not a demo of the protocol -- it is the thing that proves, from
 inside a pod, that the Mac's GPU did arithmetic the pod asked for. It returns
@@ -225,9 +230,9 @@ curl --unix-socket /tmp/ferry-gpud.sock -XPOST http://l/pods \
 
 `POST /pods` is idempotent, because the kubelet retries and two containers in
 one pod may both have asked; a retry must not cost a second slot. `DELETE
-/pods/<uid>` hands the slot back, and `GET /pods` shows who holds one and how
-many requests they have made -- the accounting that `kubectl top` will never
-show.
+/pods/<uid>` hands the slot back and cancels anything that pod had in flight.
+`GET /pods` shows who holds one, `GET /capacity` how much is left and how deep
+the queue is, and `GET /stats` what every pod has cost.
 
 Over capacity is a 409, and `ferry-cri` fails CreateContainer rather than
 starting a pod without the socket it asked for: a pod that requested a GPU and
@@ -312,33 +317,100 @@ Inside the pod it is the opposite, and deliberately: any process in that
 container can use the socket. It has already been granted the GPU; the container
 boundary is the gate, not the file mode.
 
+## Sharing it
+
+One GPU, many pods, so something has to decide the order -- and a plain lock
+decides it badly. `ferry-gpud` runs one worker behind a queue that is bounded,
+fair, deadlined and cancellable.
+
+**Fair across pods, not across requests.** The queue rotates over pods rather
+than running first-come-first-served, because FIFO is fair to *requests* and
+that is not the same thing: ten queued jobs from one pod would push everyone
+else behind all ten. Measured, with a pod that filled its queue before a second
+pod asked for anything at all:
+
+```
+a1 finished at +2.26s     a1, a2 and a3 were all submitted
+a2 finished at +4.51s     before b1 was
+b1 finished at +6.76s  <- b overtakes a's backlog
+a3 finished at +9.04s
+```
+
+**Every request has a deadline**, queue time included -- a client that asked for
+120s means 120s, not 120s once it is its turn. A matmul checks between passes,
+which is the only place it can: a committed Metal command buffer runs to
+completion whatever anyone wants. Generation is raced against the deadline
+instead, which bounds the waiting rather than the work.
+
+**A deleted pod takes its work with it.** Revoking a grant cancels that pod's
+queued *and* running requests; an 8-second job stops within milliseconds of the
+pod going away, and the caller gets a 499. Without this the GPU keeps working
+for a container that no longer exists while the next pod waits behind it.
+
+**The queue is bounded** -- 64 waiting by default, 8 from any one pod -- and a
+full queue is a 503 rather than an unbounded backlog. A request may allocate at
+most a quarter of the GPU's recommended working set; unified memory is shared
+with the whole Mac and the allocation is the host's, so an unbounded one is a
+denial of service against the Mac rather than against the pod.
+
+| flag | default | |
+|---|---|---|
+| `--capacity` | 1 | pods that may hold a socket at once |
+| `--request-timeout` | 120 | seconds per request, queue time included |
+| `--queue-depth` | 64 | requests waiting for the device |
+| `--pod-queue-depth` | 8 | of those, from any one pod |
+| `--memory-fraction` | 0.25 | of the working set, per request |
+| `--drain-timeout` | 10 | seconds to finish in-flight work on the way down |
+
+## Accounting
+
+`GET /stats` on the control socket reports per pod: requests, failures, seconds
+on the device, and seconds spent waiting for it. A pod can read its own, and
+only its own, at `GET /v1/usage`.
+
+The queue-wait number is the one worth watching -- it says whether `--capacity`
+is set higher than what these pods actually do. `kubectl top` will still never
+show any of this.
+
+## When things die
+
+**The daemon.** Grants are written to `grants.json` beside the sockets and
+restored on startup, so a daemon that crashes or is restarted re-binds the same
+socket paths. The relay dials on demand, so a pod that was running throughout
+simply works again -- verified by SIGKILLing the daemon under a live pod, which
+kept its GPU without restarting. `ferry up` deletes that file, because there the
+pods really are gone.
+
+**The capacity.** `ferry-streamer` asks the daemon what it will serve every ten
+seconds and keeps `ferry.dev/gpu` matching the answer. That covers the two ways
+the node ends up lying: a Node object recreated without the resource, and a
+daemon that died while the node kept advertising a GPU. Three consecutive failed
+probes withdraw it -- enough tolerance that restarting the daemon by hand does
+not flap the node, little enough that a dead one is noticed:
+
+```
+t+20s: ferry.dev/gpu appears 3 time(s)
+t+30s: ferry.dev/gpu appears 0 time(s)   <- daemon killed, resource withdrawn
+```
+
+Pods then stay Pending, which is the correct way to be out of GPUs. Restart the
+daemon and it is back within a tick.
+
 ## Open questions
 
-- **Lifecycle.** The socket is handed back when the pod stops rather than when
-  it is removed -- a stopped pod is not using the GPU and should not hold the
-  node's only slot. What happens to *in-flight* work when a pod is deleted
-  mid-request is still unanswered, and matters more as capacity rises above 1.
-- **Accounting.** `GET /pods` counts requests per pod, which is better than
-  nothing and less than useful. Nothing reports GPU time to the node or the
-  pod, and `kubectl top` will never show it.
-- **Fairness.** Work is serialized, so a pod that submits a long job delays the
-  next one -- no preemption, no queue limit. At capacity 1 this is barely
-  visible; it is the first thing that breaks when it is raised.
-- **Memory.** Nothing bounds how much of the GPU's unified memory a request may
-  ask for beyond `maxBufferLength`, and the allocation is the host's rather
-  than the pod's, so it is not charged against the pod's own limit.
-- **Capacity is advertised once, at `ferry up`.** It is withdrawn at `ferry
-  down`. If the node object is deleted and recreated while ferry is running, the
-  capacity goes with it and nothing puts it back until the next restart.
+- **Preemption.** A long request delays the next one; nothing interrupts work in
+  progress except cancellation of its own pod. Deadlines bound the damage rather
+  than removing it.
+- **Capacity above 1** is now safe to raise -- fair queueing, deadlines and
+  cancellation are what it was waiting on -- but it remains a policy choice
+  about how much slower every GPU pod should be, not a way to get more GPU.
+- **`kubectl top` and friends** still report nothing. The accounting exists on
+  the control socket and nowhere the cluster can see it.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 
 ## Next step
 
-The obvious one is another backend behind `/v1/generate` -- MLX or llama.cpp
-with real weights, for a model larger than the one the OS ships. The endpoint
-was shaped so that lands without the pod noticing.
-
-The one that would change the design is **capacity above 1**, which needs the
-fairness and lifecycle answers above before it is anything but a way to make
-every pod slower at once.
+Another backend behind `/v1/generate` -- MLX or llama.cpp with real weights, for
+a model larger than the one the OS ships. The endpoint was shaped so that lands
+without the pod noticing.

@@ -69,12 +69,24 @@ actor Generator {
         }
     }
 
-    func generate(_ request: GenerateRequest) async throws -> GenerateResult {
+    /// The most a prompt may be. Generation time scales with it, and the
+    /// deadline is a blunter instrument than simply not accepting the job.
+    static let maxPromptBytes = 16 * 1024
+
+    func generate(_ request: GenerateRequest, deadline: TimeInterval) async throws -> GenerateResult {
         let status = self.status
         guard status.available else {
             throw GenerationError.unavailable(status.reason ?? "the on-device model is unavailable")
         }
         guard !request.prompt.isEmpty else { throw GenerationError.failed("prompt is required") }
+        guard request.prompt.utf8.count <= Self.maxPromptBytes else {
+            throw GenerationError.failed(
+                "prompt is \(request.prompt.utf8.count) bytes, over the \(Self.maxPromptBytes) limit")
+        }
+        if let instructions = request.instructions,
+           instructions.utf8.count > Self.maxPromptBytes {
+            throw GenerationError.failed("instructions exceed the \(Self.maxPromptBytes) byte limit")
+        }
 
         // A fresh session per request: pods do not share a conversation, and a
         // transcript that accumulated across tenants would be a leak, not a
@@ -86,11 +98,43 @@ actor Generator {
 
         let start = Date()
         do {
-            let response = try await session.respond(to: request.prompt, options: options)
-            return GenerateResult(content: response.content,
+            // Raced against the deadline rather than trusted to finish. The
+            // model has no bound of its own beyond maximumResponseTokens, and a
+            // request that never returns would hold the GPU queue behind it.
+            // `.content` is taken inside the child task: Response itself is
+            // not Sendable, and only the String needs to cross back.
+            let content = try await withDeadline(seconds: deadline) {
+                try await session.respond(to: request.prompt, options: options).content
+            }
+            return GenerateResult(content: content,
                                   seconds: Date().timeIntervalSince(start))
+        } catch let error as SchedulerError {
+            throw error
         } catch {
             throw GenerationError.failed("\(error)")
         }
+    }
+}
+
+/// Runs `work`, giving up after `seconds`.
+///
+/// The losing child is cancelled, which the model's own task honours; what it
+/// cannot do is claw back a computation already inside the framework, so this
+/// bounds the *waiting*, not the work.
+func withDeadline<T: Sendable>(
+    seconds: TimeInterval,
+    _ work: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await work() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw SchedulerError.timedOut(seconds)
+        }
+        guard let first = try await group.next() else {
+            throw SchedulerError.timedOut(seconds)
+        }
+        group.cancelAll()
+        return first
     }
 }

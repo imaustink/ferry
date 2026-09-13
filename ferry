@@ -261,7 +261,7 @@ cmd_up() {
       --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
       --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-name "$NODE_NAME" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-      --peers-file "$PEERS_FILE" \
+      --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
     for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -372,7 +372,9 @@ start_gpud() {
   # The directory is the daemon's to create -- it makes it 0700, and doing it
   # here first would leave it 0755 until the daemon caught up.
   # Pod sockets from a previous run are stale the moment that process is gone.
-  [ -n "$FERRY_GPU_DIR" ] && rm -f "$FERRY_GPU_DIR"/*.sock 2>/dev/null || true
+  # ...and the record of who held them: this is a fresh cluster, so the daemon
+  # must not restore grants for pods from the last one.
+  [ -n "$FERRY_GPU_DIR" ] && rm -f "$FERRY_GPU_DIR"/*.sock "$FERRY_GPU_DIR/grants.json" 2>/dev/null || true
   "$here/bin/ferry-gpud" --control "$FERRY_GPUD_SOCK" \
     --socket-dir "$FERRY_GPU_DIR" --capacity "$GPU_CAPACITY" \
     >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
@@ -906,7 +908,7 @@ EOF
     --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
     --kubeconfig "$FERRY_RUN/kubelet.conf" \
     --node-name "$name" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-    --peers-file "$PEERS_FILE" \
+    --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
     >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
   for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -1037,7 +1039,6 @@ cmd_image_load() {
 
 cmd_down() {
   bold "stopping ferry"
-  withdraw_gpu
   # ferry-proxy runs as root, so stopping it does too.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
     sudo kill -TERM "$(cat "$FERRY_RUN/ferry-proxy.pid")" 2>/dev/null \
@@ -1078,6 +1079,10 @@ cmd_down() {
   # way to find that out.
   pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
   sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
+
+  # After the streamer, which would otherwise put it straight back, and before
+  # the control plane, which has to be up to accept the patch.
+  withdraw_gpu
 
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK" "$PEERS_FILE"

@@ -9,7 +9,7 @@
 
 import Foundation
 
-struct PodRegistration: Decodable {
+struct PodRegistration: Codable, Sendable {
     var uid: String
     var namespace: String?
     var name: String?
@@ -20,12 +20,15 @@ struct PodEntry: Encodable {
     var namespace: String?
     var name: String?
     var socket: String
-    var requests: Int
+    var usage: PodUsage
 }
 
 struct Capacity: Encodable {
     var limit: Int
     var granted: Int
+    /// Requests queued or running right now. The number that says whether
+    /// `limit` is set too high for what these pods actually do.
+    var pending: Int
 }
 
 enum ServiceError: Error, CustomStringConvertible {
@@ -40,29 +43,39 @@ enum ServiceError: Error, CustomStringConvertible {
     }
 }
 
-/// Holds the GPU, the model, and the set of pods currently granted a socket.
+/// Holds the GPU, the model, the scheduler, and the set of pods currently
+/// granted a socket.
 final class Service: @unchecked Sendable {
     private let gpu: GPU
     private let generator = Generator()
+    private let scheduler: GPUScheduler
     private let socketDirectory: String
     /// How many pods may hold a relay at once. There is one GPU; this is a
     /// policy number, not a discovered one, and it is what the node advertises
     /// as ferry.dev/gpu.
     private let limit: Int
+    /// The longest any single request may take, queue time included.
+    private let requestTimeout: TimeInterval
 
     private let lock = NSLock()
     private var pods: [String: (registration: PodRegistration, server: UnixHTTPServer)] = [:]
-    private var requestCounts: [String: Int] = [:]
 
-    init(gpu: GPU, socketDirectory: String, limit: Int) {
+    init(gpu: GPU, scheduler: GPUScheduler, socketDirectory: String,
+         limit: Int, requestTimeout: TimeInterval) {
         self.gpu = gpu
+        self.scheduler = scheduler
         self.socketDirectory = socketDirectory
         self.limit = limit
+        self.requestTimeout = requestTimeout
     }
 
     // MARK: - Pods
 
     func socketPath(uid: String) -> String { "\(socketDirectory)/\(uid).sock" }
+
+    /// Where the set of granted pods is kept, so a daemon restart does not
+    /// silently break every pod holding a socket.
+    private var stateFile: String { "\(socketDirectory)/grants.json" }
 
     /// Binds a socket for a pod. Idempotent: the kubelet retries, and a retry
     /// must not cost a second slot or a second listener on the same path.
@@ -74,40 +87,99 @@ final class Service: @unchecked Sendable {
             throw ServiceError.badRequest("uid is not a plausible pod uid")
         }
 
-        return try lock.withLock {
+        let entry = try lock.withLock {
             if let existing = pods[registration.uid] {
-                return entry(uid: registration.uid, registration: existing.registration)
+                return self.entry(uid: registration.uid, registration: existing.registration)
             }
             guard pods.count < limit else { throw ServiceError.full(limit) }
-
-            let path = socketPath(uid: registration.uid)
-            let server = UnixHTTPServer(path: path, identity: registration.uid) { [weak self] request, identity in
-                self?.handlePod(request, identity: identity) ?? .error("shutting down", status: 503)
-            }
-            try server.start()
-            pods[registration.uid] = (registration, server)
-            requestCounts[registration.uid] = 0
-            log("granted \(describe(registration)) -> \(path)")
-            return entry(uid: registration.uid, registration: registration)
+            try bind(registration)
+            log("granted \(describe(registration)) -> \(socketPath(uid: registration.uid))")
+            return self.entry(uid: registration.uid, registration: registration)
         }
+        persist()
+        return entry
+    }
+
+    /// Called with the lock held.
+    private func bind(_ registration: PodRegistration) throws {
+        let path = socketPath(uid: registration.uid)
+        let server = UnixHTTPServer(path: path, identity: registration.uid) { [weak self] request, identity in
+            self?.handlePod(request, identity: identity) ?? .error("shutting down", status: 503)
+        }
+        try server.start()
+        pods[registration.uid] = (registration, server)
     }
 
     func revoke(uid: String) -> Bool {
-        lock.withLock {
+        let removed = lock.withLock { () -> Bool in
             guard let held = pods.removeValue(forKey: uid) else { return false }
             held.server.stop()
-            requestCounts.removeValue(forKey: uid)
             log("revoked \(describe(held.registration))")
             return true
         }
+        guard removed else { return false }
+        // Anything this pod had queued or running goes with it. The container is
+        // gone; finishing its matmul would only make the next pod wait.
+        let stopped = scheduler.cancel(pod: uid)
+        if stopped > 0 { log("cancelled \(stopped) in-flight request(s) for \(uid)") }
+        scheduler.forget(pod: uid)
+        persist()
+        return true
     }
 
-    func revokeAll() {
-        lock.withLock {
-            for (_, held) in pods { held.server.stop() }
+    /// Releases every socket. `forget` says whether the pods should also be
+    /// dropped from the state file.
+    ///
+    /// Shutting down does *not* forget them: a restart -- a crash, or a
+    /// supervisor bouncing the daemon -- should put the sockets back, and
+    /// rewriting an empty state file on the way out is exactly how that would
+    /// be lost. `ferry up` deletes the file instead, because that is the case
+    /// where the pods really are gone.
+    func revokeAll(forget: Bool = true) {
+        let held = lock.withLock { () -> [String] in
+            let uids = Array(pods.keys)
+            for (_, entry) in pods { entry.server.stop() }
             pods.removeAll()
-            requestCounts.removeAll()
+            return uids
         }
+        for uid in held { scheduler.cancel(pod: uid) }
+        if forget { persist() }
+    }
+
+    /// Re-binds the sockets a previous instance had granted.
+    ///
+    /// The relay dials the host socket when the guest connects, so a pod whose
+    /// socket reappears at the same path simply works again. Without this, a
+    /// restarted daemon leaves every pod holding a path that nothing answers,
+    /// and nothing in the pod or the cluster says why.
+    func restore() {
+        guard let data = FileManager.default.contents(atPath: stateFile),
+              let saved = try? JSONDecoder().decode([PodRegistration].self, from: data),
+              !saved.isEmpty
+        else { return }
+
+        var restored = 0
+        lock.withLock {
+            for registration in saved.prefix(limit) {
+                do {
+                    try bind(registration)
+                    restored += 1
+                } catch {
+                    log("could not restore \(describe(registration)): \(error)")
+                }
+            }
+        }
+        if restored > 0 { log("restored \(restored) pod socket(s) from \(stateFile)") }
+        persist()
+    }
+
+    private func persist() {
+        let saved = lock.withLock { pods.values.map(\.registration) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(saved) else { return }
+        try? data.write(to: URL(filePath: stateFile), options: .atomic)
+        chmod(stateFile, 0o600)
     }
 
     var listing: [PodEntry] {
@@ -118,13 +190,14 @@ final class Service: @unchecked Sendable {
     }
 
     var capacity: Capacity {
-        lock.withLock { Capacity(limit: limit, granted: pods.count) }
+        let granted = lock.withLock { pods.count }
+        return Capacity(limit: limit, granted: granted, pending: scheduler.pending)
     }
 
     /// Called with the lock held.
     private func entry(uid: String, registration: PodRegistration) -> PodEntry {
         PodEntry(uid: uid, namespace: registration.namespace, name: registration.name,
-                 socket: socketPath(uid: uid), requests: requestCounts[uid] ?? 0)
+                 socket: socketPath(uid: uid), usage: scheduler.usage(for: uid))
     }
 
     private func describe(_ registration: PodRegistration) -> String {
@@ -132,6 +205,11 @@ final class Service: @unchecked Sendable {
             return "\(namespace)/\(name) (\(registration.uid))"
         }
         return registration.uid
+    }
+
+    func drain(timeout: TimeInterval) {
+        scheduler.drain(timeout: timeout)
+        revokeAll(forget: false)
     }
 
     // MARK: - Routing
@@ -147,6 +225,9 @@ final class Service: @unchecked Sendable {
 
         case ("GET", ["pods"]):
             return .json(listing)
+
+        case ("GET", ["stats"]):
+            return .json(scheduler.stats)
 
         case ("POST", ["pods"]):
             do {
@@ -177,9 +258,8 @@ final class Service: @unchecked Sendable {
     /// A pod socket. `identity` is the pod uid, supplied by the listener rather
     /// than by the caller -- a pod cannot claim to be another pod.
     func handlePod(_ request: HTTPRequest, identity: String?) -> HTTPResponse {
-        if let identity {
-            lock.withLock { requestCounts[identity, default: 0] += 1 }
-        }
+        // "control" only ever reaches here from the two read-only routes above.
+        let pod = identity ?? "control"
 
         switch (request.method, request.segments) {
         case ("GET", ["healthz"]):
@@ -191,36 +271,53 @@ final class Service: @unchecked Sendable {
         case ("GET", ["v1", "model"]):
             return .json(generator.status)
 
+        case ("GET", ["v1", "usage"]):
+            // A pod may see its own accounting and nobody else's.
+            return .json(scheduler.usage(for: pod))
+
         case ("POST", ["v1", "matmul"]):
             struct Body: Decodable { var size: Int?; var iterations: Int? }
             let body = (try? request.json(Body.self)) ?? Body(size: nil, iterations: nil)
             let size = body.size ?? 1024
             let iterations = body.iterations ?? 10
-            log("matmul \(size)x\(size) x\(iterations) for \(identity ?? "control")")
-            do {
-                return .json(try gpu.matmul(size: size, iterations: iterations))
-            } catch let error as GPUError {
-                return .error("\(error)", status: 400)
-            } catch {
-                return .error("\(error)", status: 500)
+            return run(pod: pod, what: "matmul \(size)x\(size) x\(iterations)") { job in
+                try self.gpu.matmul(size: size, iterations: iterations, job: job)
             }
 
         case ("POST", ["v1", "generate"]):
             guard let body = try? request.json(GenerateRequest.self) else {
                 return .error("expected {\"prompt\": \"...\"}", status: 400)
             }
-            log("generate \(body.prompt.count) chars for \(identity ?? "control")")
-            do {
-                return .json(try awaitResult { try await self.generator.generate(body) })
-            } catch let error as GenerationError {
-                if case .unavailable = error { return .error("\(error)", status: 503) }
-                return .error("\(error)", status: 400)
-            } catch {
-                return .error("\(error)", status: 500)
+            return run(pod: pod, what: "generate \(body.prompt.count) chars") { job in
+                try awaitResult {
+                    try await self.generator.generate(body, deadline: job.remaining)
+                }
             }
 
         default:
             return .error("no route for \(request.method) \(request.path)", status: 404)
+        }
+    }
+
+    /// Puts one request through the scheduler and turns whatever comes back
+    /// into a response, with the status the caller needs to tell a "try again"
+    /// from a "you asked for too much".
+    private func run<T: Encodable>(
+        pod: String, what: String, _ work: @escaping (GPUJob) throws -> T
+    ) -> HTTPResponse {
+        log("\(what) for \(pod)")
+        do {
+            return .json(try scheduler.run(pod: pod, timeout: requestTimeout, work))
+        } catch let error as SchedulerError {
+            log("\(what) for \(pod): \(error)")
+            return .error("\(error)", status: error.status)
+        } catch let error as GPUError {
+            return .error("\(error)", status: 400)
+        } catch let error as GenerationError {
+            if case .unavailable = error { return .error("\(error)", status: 503) }
+            return .error("\(error)", status: 400)
+        } catch {
+            return .error("\(error)", status: 500)
         }
     }
 }
@@ -241,6 +338,5 @@ func awaitResult<T: Sendable>(_ work: @escaping @Sendable () async throws -> T) 
 }
 
 func log(_ message: String) {
-    let stamp = ISO8601DateFormatter().string(from: Date())
-    print("\(stamp) \(message)")
+    print("\(ISO8601DateFormatter().string(from: Date())) \(message)")
 }

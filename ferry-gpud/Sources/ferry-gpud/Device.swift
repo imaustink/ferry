@@ -45,21 +45,31 @@ enum GPUError: Error, CustomStringConvertible {
     }
 }
 
-/// Owns the Metal device and serializes work on it.
+/// Owns the Metal device. Ordering, fairness and deadlines are the scheduler's
+/// -- see Scheduler.swift; this type assumes it is already the only thing
+/// running on the device.
 final class GPU: @unchecked Sendable {
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    /// One GPU, one job at a time. See the note at the top of the file.
-    private let gate = DispatchSemaphore(value: 1)
+    /// The most one request may allocate. Unified memory is shared with the
+    /// whole Mac and the allocation is the host's, so it is not charged against
+    /// the pod's own memory limit -- a request for 80 GB is a denial of service
+    /// against the Mac rather than against the pod.
+    private let memoryCeiling: Int
 
-    init() throws {
+    init(memoryFraction: Double) throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw GPUError.unavailable }
         guard let queue = device.makeCommandQueue() else {
             throw GPUError.failed("could not create a command queue")
         }
         self.device = device
         self.queue = queue
+        self.memoryCeiling = min(
+            Int(Double(device.recommendedMaxWorkingSetSize) * memoryFraction),
+            device.maxBufferLength)
     }
+
+    var memoryCeilingMiB: Int { memoryCeiling / (1024 * 1024) }
 
     var info: DeviceInfo {
         DeviceInfo(
@@ -76,17 +86,18 @@ final class GPU: @unchecked Sendable {
     /// Real arithmetic rather than a sleep: it is what proves, from inside a
     /// pod, that the Mac's GPU did work the pod asked for. MPS rather than a
     /// hand-written kernel so the number means something.
-    func matmul(size: Int, iterations: Int) throws -> MatmulResult {
-        guard size > 0, size <= 8192 else { throw GPUError.failed("size must be 1...8192") }
-        guard iterations > 0, iterations <= 1000 else { throw GPUError.failed("iterations must be 1...1000") }
-
-        gate.wait()
-        defer { gate.signal() }
+    func matmul(size: Int, iterations: Int, job: GPUJob) throws -> MatmulResult {
+        guard size > 0, size <= 16384 else { throw GPUError.failed("size must be 1...16384") }
+        guard iterations > 0, iterations <= 10000 else { throw GPUError.failed("iterations must be 1...10000") }
 
         let count = size * size
         let bytes = count * MemoryLayout<Float>.size
-        guard bytes <= device.maxBufferLength else {
-            throw GPUError.failed("\(size)x\(size) exceeds the device's maximum buffer")
+        // Three buffers: two operands and a result.
+        guard bytes * 3 <= memoryCeiling else {
+            throw GPUError.failed("""
+                \(size)x\(size) needs \(bytes * 3 / (1024 * 1024)) MiB, over this node's \
+                per-request ceiling of \(memoryCeilingMiB) MiB
+                """)
         }
 
         // Fixed inputs, so the checksum is reproducible across calls and hosts.
@@ -123,7 +134,14 @@ final class GPU: @unchecked Sendable {
         }
 
         let start = Date()
+        var completed = 0
         for _ in 0..<iterations {
+            // Between passes, not within one: a committed command buffer runs
+            // to completion whatever anyone wants, so this is the only place
+            // the work can notice a deadline or a deleted pod. It is also why
+            // a single enormous pass is capped by size rather than by time.
+            try job.checkpoint()
+
             guard let commands = queue.makeCommandBuffer() else {
                 throw GPUError.failed("could not create a command buffer")
             }
@@ -132,14 +150,15 @@ final class GPU: @unchecked Sendable {
             commands.commit()
             commands.waitUntilCompleted()
             if let error = commands.error { throw GPUError.failed("\(error)") }
+            completed += 1
         }
         let seconds = Date().timeIntervalSince(start)
 
         // 2*n^3 flops per multiply-accumulate pass.
-        let flops = 2.0 * pow(Double(size), 3) * Double(iterations)
+        let flops = 2.0 * pow(Double(size), 3) * Double(completed)
         let checksum = bufferC.contents().bindMemory(to: Float.self, capacity: count)[0]
 
-        return MatmulResult(size: size, iterations: iterations, seconds: seconds,
+        return MatmulResult(size: size, iterations: completed, seconds: seconds,
                             gflops: seconds > 0 ? flops / seconds / 1e9 : 0,
                             checksum: checksum)
     }

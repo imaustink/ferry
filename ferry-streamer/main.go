@@ -40,6 +40,7 @@ func main() {
 	nodeName := flag.String("node-name", "", "this node, for advertising its switch endpoint")
 	relayEndpoint := flag.String("relay-endpoint", "", "host:port this node's pod switch listens on")
 	peersFile := flag.String("peers-file", "", "file to keep the other nodes' endpoints in")
+	gpudSocket := flag.String("gpud-socket", "", "ferry-gpud's control socket, to keep ferry.dev/gpu current")
 	flag.Parse()
 
 	baseURL, err := url.Parse("http://" + *listen + "/")
@@ -121,6 +122,17 @@ func main() {
 	if *kubeconfig != "" && *nodeName != "" && *relayEndpoint != "" && *peersFile != "" {
 		if publisher, err := newPeerPublisher(*kubeconfig, *nodeName, *relayEndpoint, *peersFile); err != nil {
 			fmt.Fprintf(os.Stderr, "peers: %v\n", err)
+		} else {
+			go publisher.run(context.Background())
+		}
+	}
+
+	// ferry.dev/gpu is advertised at 'ferry up', but a Node object can be
+	// recreated and ferry-gpud can die; either way the node would be lying about
+	// what it can run. This keeps the resource matching the daemon.
+	if *kubeconfig != "" && *nodeName != "" && *gpudSocket != "" {
+		if publisher, err := newGPUPublisher(*kubeconfig, *nodeName, *gpudSocket); err != nil {
+			fmt.Fprintf(os.Stderr, "gpu: %v\n", err)
 		} else {
 			go publisher.run(context.Background())
 		}
