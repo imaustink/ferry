@@ -19,9 +19,14 @@ else
   git -C "$src" checkout -- . 2>/dev/null || true
 fi
 
+# The overlay mirrors upstream's layout, but not every path it carries exists
+# upstream -- cmd/ferry-proxyd is ferry's own. install does not create the
+# directory, so a clean clone failed here and only a tree that had been worked in
+# by hand ever built.
 echo "==> applying overlay"
 (cd "$here/patches/kubelet" && find . -name '*.go' -print0) \
   | while IFS= read -r -d '' f; do
+      install -d "$(dirname "$src/$f")"
       install -m 0644 "$here/patches/kubelet/$f" "$src/$f"
       echo "    + ${f#./}"
     done
