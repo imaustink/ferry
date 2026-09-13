@@ -73,19 +73,64 @@ as a property of `vmnet_start_interface` -- and the entitlement that governs it,
 `com.apple.vm.networking`, is restricted: an ad-hoc signed binary claiming it is
 killed at launch. Docker reaches it through a privileged signed helper.
 
-## What follows
+## One vmnet network can be shared between processes
 
-**Same machine.** All pods of all nodes must sit on one vmnet network, since
-that is the only place they can reach each other. One `ferry-cri` would serve
-several kubelets, keeping one network and handing each kubelet only its own
-sandboxes. No root, and provable from what is already working.
+`vmnet_network_copy_serialization` and `vmnet_network_create_with_serialization`
+exist precisely for this, and what comes back is not a mach port or a descriptor
+-- it is a dictionary holding 120 bytes:
 
-**Across machines.** Pods must be reachable from outside their vmnet network, and
-vmnet will not do it. What the table above leaves open is that a pod *can* reach
-the Mac's LAN address, and the Mac *can* reach its own pods -- so an overlay
-terminating on each Mac and inside each pod is possible. ferry builds its own
-guest kernel, so WireGuard could be compiled in and every pod given a cluster
-interface. That is a real design and a large one.
+```
+xpc type    : dictionary
+contents    = "networkSerialization" => <data>: { length = 120 bytes }
+```
 
-Nothing here is blocked by ignorance -- the boundary is measured. It is a choice
-about how much to build.
+Bytes travel. Written to a file by one process and read by others:
+
+```
+owner:  network up, 120 bytes written, holding
+joiner: rehydrated 192.168.57.1 in a separate process
+joiner: rehydrated 192.168.57.1 in a separate process
+--- and with the owner gone?
+joiner: rehydrated 192.168.57.1 in a separate process
+```
+
+A plain create of that subnet is still refused while the reservation lives, so
+serialization is the sanctioned way in rather than a hole.
+
+**This settles multi-node on one Mac.** Every node's `ferry-cri` shares one vmnet
+network and allocates from its own slice of the subnet, so pods reach each other
+the way they already do within a node. No overlay, no routing, no root, and no
+restructuring -- each node keeps its own runtime process.
+
+## Across machines: three candidates, not one
+
+Bridged is out, and the header says so plainly rather than leaving it to
+measurement: *"Using a VZBridgedNetworkDeviceAttachment requires the app to have
+the com.apple.vm.networking entitlement"* -- which is restricted, and which an
+ad-hoc signed binary is killed for claiming. That is settled. What is left is not.
+
+**Route pod CIDRs between Macs.** The ordinary Kubernetes model: each node owns a
+CIDR, each host routes peers' CIDRs at the peer's LAN address, forwarding does the
+rest. The measurement that looked fatal -- a pod cannot reach another vmnet
+network on the *same* Mac -- may not apply across machines, because a remote CIDR
+is not a local vmnet network from the sending Mac's point of view; it is just an
+address vmnet will NAT toward whatever the host's routing table says. Pods already
+reach the LAN, and a Mac already reaches its own pods. Cheapest by far if it
+holds. Needs root for routes, and a second Mac to confirm.
+
+**Own the datapath.** `VZFileHandleNetworkDeviceAttachment` carries raw
+link-layer frames over a connected datagram socket and mentions no entitlement at
+all. ferry would attach every pod VM to a socket and be its own switch, which can
+span machines by relaying frames. It also dissolves every vmnet limit in this
+directory -- the 32-network ceiling, the minute-long reservation, the isolation.
+The cost is that every packet crosses userspace, and that DHCP, NAT and gateway
+become ferry's to provide. This is what socket_vmnet and gvisor-tap-vsock do.
+
+**WireGuard in the guest kernel.** ferry builds its own guest kernel, so pods can
+have a cluster interface natively. Local traffic stays on vmnet's kernel datapath
+and only cross-machine traffic is tunnelled, which is the best performance of the
+three, and it works across NAT and the internet rather than one LAN. It is also
+the most to build: key distribution, per-pod configuration, routes.
+
+The order to settle them is cheapest-first: try routing with a second Mac before
+building anything.
