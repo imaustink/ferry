@@ -102,35 +102,82 @@ network and allocates from its own slice of the subnet, so pods reach each other
 the way they already do within a node. No overlay, no routing, no root, and no
 restructuring -- each node keeps its own runtime process.
 
-## Across machines: three candidates, not one
+## Across machines: measured on two Macs
 
-Bridged is out, and the header says so plainly rather than leaving it to
-measurement: *"Using a VZBridgedNetworkDeviceAttachment requires the app to have
-the com.apple.vm.networking entitlement"* -- which is restricted, and which an
-ad-hoc signed binary is killed for claiming. That is settled. What is left is not.
+Bridged is out, and the header says so rather than leaving it to measurement:
+*"Using a VZBridgedNetworkDeviceAttachment requires the app to have the
+com.apple.vm.networking entitlement"* -- restricted, and an ad-hoc signed binary
+is killed for claiming it. Settled.
 
-**Route pod CIDRs between Macs.** The ordinary Kubernetes model: each node owns a
-CIDR, each host routes peers' CIDRs at the peer's LAN address, forwarding does the
-rest. The measurement that looked fatal -- a pod cannot reach another vmnet
-network on the *same* Mac -- may not apply across machines, because a remote CIDR
-is not a local vmnet network from the sending Mac's point of view; it is just an
-address vmnet will NAT toward whatever the host's routing table says. Pods already
-reach the LAN, and a Mac already reaches its own pods. Cheapest by far if it
-holds. Needs root for routes, and a second Mac to confirm.
+What was not settled was routing, so it was tried on a second Mac.
+
+### Inbound works, with real pod addresses
+
+One host route on the other Mac -- `route add -net 192.168.77.0/24 192.168.1.29`
+-- and a pod inside the first Mac's vmnet network answers:
+
+```
+ping  : reachable
+http  : reached-a-pod-on-the-other-mac
+path  : 1  192.168.1.29      <- the Mac
+        2  192.168.77.4      <- the pod inside it
+```
+
+No overlay, no entitlement, no datapath work. Two hops, real pod address.
+
+### Outbound is NATed, and cannot be turned off
+
+The other direction rewrites the source. A pod at `192.168.77.3` connecting to
+the second Mac arrives as the *host*:
+
+```
+tcp4  192.168.1.67.9099  192.168.1.29.48676  TIME_WAIT
+```
+
+Kubernetes requires pod-to-pod traffic to preserve source addresses, so this half
+has to be fixed for the routed model to be correct.
+
+`vmnet_network_configuration_disable_nat44` looked like the fix and is not. With
+NAT44 off there is no bridge interface for the network and no host route to it,
+and a pod cannot reach even its own gateway:
+
+```
+Mac A -> its own pod : NO REPLY
+pod -> its gateway   : fail
+bridge for .77       : (none)
+host route           : (none)
+```
+
+NAT44 is not merely address translation here -- it is what attaches the host to
+the network at all. Removing it leaves an isolated L2 segment with no gateway.
+
+### Where that leaves it
+
+**Routed, accepting NAT on egress.** Everything works and pods reach each other
+across Macs, but a pod sees its peer as the peer's *host* address. That breaks
+the Kubernetes network model and anything reading a source address. Cheap --
+essentially a route per node and `podCIDR` on the Node object -- and honest only
+if the limitation is documented loudly.
 
 **Own the datapath.** `VZFileHandleNetworkDeviceAttachment` carries raw
-link-layer frames over a connected datagram socket and mentions no entitlement at
-all. ferry would attach every pod VM to a socket and be its own switch, which can
-span machines by relaying frames. It also dissolves every vmnet limit in this
-directory -- the 32-network ceiling, the minute-long reservation, the isolation.
-The cost is that every packet crosses userspace, and that DHCP, NAT and gateway
-become ferry's to provide. This is what socket_vmnet and gvisor-tap-vsock do.
+link-layer frames over a datagram socket and mentions no entitlement at all. ferry
+attaches every pod VM to a socket, is its own switch, and spans machines by
+relaying frames. Correct source addresses, and it dissolves every vmnet limit in
+these experiments -- the 32-network ceiling, the minute-long reservation, the
+isolation between networks. The cost is that every packet crosses userspace and
+that DHCP, NAT and gateway become ferry's to provide. This is what socket_vmnet
+and gvisor-tap-vsock do.
 
 **WireGuard in the guest kernel.** ferry builds its own guest kernel, so pods can
-have a cluster interface natively. Local traffic stays on vmnet's kernel datapath
-and only cross-machine traffic is tunnelled, which is the best performance of the
-three, and it works across NAT and the internet rather than one LAN. It is also
-the most to build: key distribution, per-pod configuration, routes.
+carry a cluster interface natively. Local traffic stays on vmnet's kernel
+datapath and only cross-machine traffic is tunnelled, which performs best of the
+three and works beyond one LAN. Most to build: keys, per-pod configuration,
+routes.
 
-The order to settle them is cheapest-first: try routing with a second Mac before
-building anything.
+## A trap worth recording
+
+`one.swift` answers "is this subnet free?" by creating the network and releasing
+it -- and releasing starts a fresh reservation of about a minute. A retry loop
+around it therefore never terminates: every check re-reserves exactly what it is
+waiting for. It cost ten minutes of a spinning loop before anyone noticed. A
+probe with a side effect is not a probe.
