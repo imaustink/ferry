@@ -18,6 +18,14 @@ FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd.sock}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
+# The cluster pod network: one flat segment every pod shares, on every node and
+# every machine. Pods keep a vmnet NIC for the internet; this is the address
+# Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
+# and a single node.
+CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.244.0.0/16}"
+NODE_INDEX="${FERRY_NODE_INDEX:-0}"
+RELAY_PORT="${FERRY_RELAY_PORT:-8472}"
+PEERS="${FERRY_PEERS:-}"
 POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 
 # Prefer the NAT-capable kernel when it has been built. The fallback is the
@@ -171,6 +179,8 @@ cmd_up() {
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
+    --relay-port "$RELAY_PORT" --peers "$PEERS" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
