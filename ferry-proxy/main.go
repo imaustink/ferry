@@ -29,9 +29,9 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
@@ -66,6 +66,7 @@ func main() {
 	ctrl := &controller{
 		aliases:        newAliasManager(),
 		proxies:        map[string]*serviceProxy{},
+		udp:            map[string]*udpProxy{},
 		client:         client,
 		nodeName:       *nodeName,
 		pods:           newPodMap(*podMapPath),
@@ -109,6 +110,7 @@ type controller struct {
 	mu       sync.Mutex
 	aliases  *aliasManager
 	proxies  map[string]*serviceProxy
+	udp      map[string]*udpProxy
 	services corelisters.ServiceLister
 	slices   discoverylisters.EndpointSliceLister
 
@@ -131,6 +133,10 @@ func (c *controller) shutdown() {
 		p.close()
 	}
 	c.proxies = map[string]*serviceProxy{}
+	for _, p := range c.udp {
+		p.close()
+	}
+	c.udp = map[string]*udpProxy{}
 	c.aliases.removeAll()
 }
 
@@ -245,7 +251,7 @@ func (c *controller) reconcile() {
 						continue
 					}
 				}
-				proxy, err := newServiceProxy(e.key, e.address, e.port)
+				proxy, err := newServiceProxy(e.key, e.address, e.port, e.protocol)
 				if err != nil {
 					// A privileged port without privilege is the common case and
 					// deserves a sentence, not a stack of identical errors.
@@ -262,6 +268,19 @@ func (c *controller) reconcile() {
 					continue
 				}
 				c.proxies[e.key] = proxy
+				if e.protocol == corev1.ProtocolUDP {
+					u, err := newUDPProxy(e.key, e.address, e.port, proxy)
+					if err != nil {
+						if !c.complained[e.key] {
+							c.complained[e.key] = true
+							klog.ErrorS(err, "Could not listen for service",
+								"service", name, "addr", e.describe(), "kind", e.kind, "protocol", "UDP")
+						}
+						delete(c.proxies, e.key)
+						continue
+					}
+					c.udp[e.key] = u
+				}
 				delete(c.complained, e.key)
 				klog.InfoS("Serving", "kind", e.kind, "service", name, "addr", e.describe())
 			}
@@ -282,6 +301,10 @@ func (c *controller) reconcile() {
 		}
 		proxy.close()
 		delete(c.proxies, key)
+		if u, ok := c.udp[key]; ok {
+			u.close()
+			delete(c.udp, key)
+		}
 		klog.InfoS("Stopped serving", "service", key)
 	}
 }

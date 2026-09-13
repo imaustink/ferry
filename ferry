@@ -75,6 +75,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
   ferry image load <x>    run an image you built here, without a registry
+  ferry addons list       what can be turned on (metrics-server, ingress-nginx)
+  ferry addons enable <n> turn one on
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
 
@@ -83,6 +85,8 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
+                         can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
 EOF
@@ -427,9 +431,17 @@ start_proxy() {
   # ClusterIPs are handled inside each pod when the guest kernel can NAT, which
   # needs no privilege. Without such a kernel they fall back to this process,
   # which binds them on the Mac and does need root.
-  local cluster_ips=false extra=""
-  if [ "$KERNEL" = "$NAT_KERNEL" ] && [ -x "$here/bin/ferry-proxyd" ]; then
+  # Aggregated APIs -- metrics.k8s.io and anything else served by a pod rather
+  # than by the API server -- are reached by the API server itself, which is a
+  # macOS process and is not on the pod network. Binding ClusterIPs on the Mac is
+  # the way to give it a route there, and that needs root, so it is asked for
+  # rather than assumed.
+  local cluster_ips="${FERRY_HOST_CLUSTER_IPS:-false}" extra=""
+  if [ "$KERNEL" = "$NAT_KERNEL" ] && [ -x "$here/bin/ferry-proxyd" ] && [ "$cluster_ips" != true ]; then
     ok "Services route inside pods (no host proxy, no root)"
+  elif [ "$cluster_ips" = true ]; then
+    echo "  Binding ClusterIPs on the Mac as well, so the API server can reach"
+    echo "  aggregated APIs such as metrics.k8s.io. This is what needs sudo."
   else
     cluster_ips=true
     echo "  The guest kernel cannot do NAT, so ClusterIPs fall back to a host proxy."
@@ -880,6 +892,69 @@ EOF
   echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
 }
 
+# Things everybody wants and nobody should have to hunt for.
+#
+# An addon is a directory of ordinary Kubernetes manifests under addons/. Nothing
+# about them is special to ferry; they are here so a laptop cluster can have
+# metrics and an ingress controller without a scavenger hunt, and so the versions
+# are pinned to ones that have actually been run.
+cmd_addons() {
+  local action="${1:-list}" name="${2:-}"
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+
+  case "$action" in
+    list|"")
+      bold "addons"
+      local dir
+      for dir in "$here"/addons/*/; do
+        [ -d "$dir" ] || continue
+        local addon; addon="$(basename "$dir")"
+        if kubectl get namespace "$addon" >/dev/null 2>&1 \
+           || kubectl -n kube-system get deployment "$addon" >/dev/null 2>&1; then
+          ok "$addon (enabled)"
+        else
+          echo "    $addon"
+        fi
+      done
+      echo
+      echo "  ferry addons enable <name>"
+      ;;
+
+    enable)
+      [ -n "$name" ] || { bad "usage: ferry addons enable <name>"; return 2; }
+      local dir="$here/addons/$name"
+      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
+      kubectl get nodes >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+
+      bold "enabling $name"
+      local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null || echo "")"
+      local rendered; rendered="$(mktemp -d)"
+      # shellcheck disable=SC2064
+      trap "rm -rf '$rendered'" RETURN
+      local file
+      for file in "$dir"/*.yaml; do
+        [ -f "$file" ] || continue
+        sed -e "s|__CLUSTER_DNS__|$dns|g" -e "s|__NODE_NAME__|$NODE_NAME|g" \
+          "$file" > "$rendered/$(basename "$file")"
+      done
+      kubectl apply -f "$rendered" >/dev/null 2>&1 || { bad "could not apply $name"; return 1; }
+      ok "applied"
+      [ -f "$dir/NOTES" ] && { echo; sed 's/^/  /' "$dir/NOTES"; }
+      ;;
+
+    disable)
+      [ -n "$name" ] || { bad "usage: ferry addons disable <name>"; return 2; }
+      local dir="$here/addons/$name"
+      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
+      bold "disabling $name"
+      kubectl delete -f "$dir" --ignore-not-found >/dev/null 2>&1
+      ok "removed"
+      ;;
+
+    *) bad "usage: ferry addons [list|enable <name>|disable <name>]"; return 2 ;;
+  esac
+}
+
 # Run an image you just built.
 #
 # Everything else in ferry comes from a registry, which is fine for busybox and
@@ -1037,6 +1112,7 @@ case "${1:-}" in
   kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  addons)     shift; cmd_addons "$@" ;;
   image)      shift
               case "${1:-}" in
                 load) shift; cmd_image_load "$@" ;;

@@ -1,0 +1,24 @@
+metrics-server scrapes the kubelet, so `kubectl top` and HorizontalPodAutoscaler
+work. It talks to the kubelet over TLS with a certificate the kubelet signed for
+itself, which no public CA vouches for, so --kubelet-insecure-tls is set. Every
+local-cluster distribution does the same thing for the same reason.
+
+  kubectl top nodes
+  kubectl top pods -A
+
+It needs about fifteen seconds after enabling before it has anything to report.
+
+One more thing on ferry. `kubectl top` reads metrics.k8s.io, which is an
+aggregated API: the API server does not answer it, metrics-server does, and the
+API server has to reach that pod to ask. The API server is a macOS process and
+is not on the pod network, so it cannot -- the request times out and kubectl
+says "Metrics API not available".
+
+Giving it a route means binding ClusterIPs on the Mac, which needs root:
+
+  FERRY_HOST_CLUSTER_IPS=1 ferry up
+
+Everything below metrics-server works without that: the kubelet serves real
+container CPU and memory, which you can see directly with
+
+  kubectl get --raw /api/v1/nodes/<node>/proxy/metrics/resource

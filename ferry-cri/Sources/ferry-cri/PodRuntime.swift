@@ -534,6 +534,7 @@ actor PodRuntime {
                 privileged.bounding.append(netAdmin)
                 privileged.effective.append(netAdmin)
                 privileged.permitted.append(netAdmin)
+                privileged.ambient.append(netAdmin)
             }
 
             let process = try await exec(
@@ -546,7 +547,8 @@ actor PodRuntime {
                 stdin: DataReaderStream(payload),
                 stdout: DiscardWriter(),
                 stderr: ErrorWriter(prefix: "nft"),
-                capabilities: privileged
+                capabilities: privileged,
+                asRoot: true
             )
             try await process.start()
             _ = try? await process.wait(timeoutInSeconds: 15)
@@ -963,7 +965,8 @@ actor PodRuntime {
         stdin: (any ReaderStream)?,
         stdout: any Writer,
         stderr: any Writer,
-        capabilities: Containerization.LinuxCapabilities? = nil
+        capabilities: Containerization.LinuxCapabilities? = nil,
+        asRoot: Bool = false
     ) async throws -> LinuxProcess {
         guard let record = containers[containerID] else {
             throw RuntimeFailure.notFound("container \(containerID)")
@@ -986,12 +989,51 @@ actor PodRuntime {
             // on stdout; sending stderr separately would interleave badly.
             config.stderr = tty ? nil : stderr
             if let capabilities { config.capabilities = capabilities }
+            // nft has to be root inside the pod whatever the workload runs as.
+            // A hardened pod -- non-root, every capability dropped -- cannot
+            // lend NET_ADMIN to anything, so an exec that inherits its user
+            // cannot program the pod's kernel. That is not ferry's privilege to
+            // give away either: it applies to this one process, which is a
+            // binary ferry ships and runs, and leaves the workload untouched.
+            if asRoot {
+                config.user = ContainerizationOCI.User(uid: 0, gid: 0, additionalGids: [], username: "root")
+            }
         }
     }
 
     func reopenContainerLog(_ id: String) throws {
         guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
         try record.logFile?.reopen()
+    }
+
+    /// CPU and memory for containers, read from the cgroups inside their own VMs.
+    ///
+    /// The kubelet tolerates an empty answer here, which is why ferry gave one
+    /// for a long time. metrics-server does not: it scrapes the kubelet, finds
+    /// nothing, and reports "no metrics to serve" -- so `kubectl top` and every
+    /// HorizontalPodAutoscaler stay broken until something real is returned.
+    ///
+    /// Each pod is a VM with a Linux kernel, so its containers have ordinary
+    /// cgroups; the guest agent reads them and the framework hands them back.
+    func containerStatistics(ids: [String]) async -> [(id: String, stats: ContainerStatistics)] {
+        var out: [(String, ContainerStatistics)] = []
+        // Group by sandbox: one call per pod rather than one per container.
+        var bySandbox: [String: [String]] = [:]
+        for id in ids {
+            guard let record = containers[id], record.state == .running else { continue }
+            bySandbox[record.sandboxID, default: []].append(id)
+        }
+        for (sandboxID, containerIDs) in bySandbox {
+            guard let sandbox = sandboxes[sandboxID], sandbox.booted else { continue }
+            guard let statistics = try? await sandbox.pod.statistics(containerIDs: containerIDs)
+            else { continue }
+            for entry in statistics { out.append((entry.id, entry)) }
+        }
+        return out
+    }
+
+    func runningContainerIDs() -> [String] {
+        containers.values.filter { $0.state == .running }.map(\.id)
     }
 
     func container(_ id: String) throws -> ContainerRecord {
