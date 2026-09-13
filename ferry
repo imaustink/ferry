@@ -35,6 +35,14 @@ GPU_SLICE="${FERRY_GPU_SLICE:-0.5}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
+# What counts as too little disk to start pods on.
+#
+# The upstream default is a percentage, and a percentage is the wrong shape for a
+# laptop: 5% of a 1TB disk is 46GB held in reserve, so a Mac with 45GB free taints
+# itself and schedules nothing, while a Mac with a small disk gets almost no
+# margin at all. An absolute figure says what it means. Kubernetes accepts either.
+EVICT_DISK="${FERRY_EVICTION_DISK:-4Gi}"
+EVICT_MEMORY="${FERRY_EVICTION_MEMORY:-500Mi}"
 # The cluster pod network: one flat segment every pod shares, on every node and
 # every machine. Pods keep a vmnet NIC for the internet; this is the address
 # Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
@@ -94,6 +102,7 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
@@ -296,9 +305,9 @@ volumePluginDir: $FERRY_RUN/volume-plugins
 # laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
 # node taints itself NoSchedule.
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -906,9 +915,9 @@ containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
