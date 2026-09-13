@@ -29,6 +29,9 @@ FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud.sock}"
 FERRY_GPU_DIR="${FERRY_GPU_DIR:-/tmp/ferry-run/gpu}"
 # How many pods may hold the GPU at once. There is one GPU; this is policy.
 GPU_CAPACITY="${FERRY_GPU_CAPACITY:-1}"
+# How long one request holds the device before a waiting pod gets a turn, and so
+# roughly the worst wait a co-tenant sees.
+GPU_SLICE="${FERRY_GPU_SLICE:-0.5}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
@@ -381,6 +384,7 @@ start_gpud() {
   [ -n "$FERRY_GPU_DIR" ] && rm -f "$FERRY_GPU_DIR"/*.sock "$FERRY_GPU_DIR/grants.json" 2>/dev/null || true
   "$here/bin/ferry-gpud" --control "$FERRY_GPUD_SOCK" \
     --socket-dir "$FERRY_GPU_DIR" --capacity "$GPU_CAPACITY" \
+    --time-slice "$GPU_SLICE" \
     >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-gpud.pid"
   for _ in $(seq 1 30); do [ -S "$FERRY_GPUD_SOCK" ] && break; sleep 0.5; done

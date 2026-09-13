@@ -81,7 +81,9 @@ cost time.
   the GPU and a pod that requests `ferry.dev/gpu` is handed a unix socket to it,
   relayed into its VM over vsock. A scheduled pod reached 9.4 TFLOP/s of Metal
   matmul and ran the on-device model; a second pod requesting it waits on the
-  scheduler, with no device plugin anywhere. See
+  scheduler, with no device plugin anywhere. Pods share the device by preemption
+  -- a pod wanting a fraction of a second waits 0.6s while another holds 35
+  seconds of work -- and `kubectl` shows what each pod has used. See
   [docs/GPU.md](docs/GPU.md) and
   [experiments/08-vsock-socket-relay](experiments/08-vsock-socket-relay/FINDINGS.md).
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
