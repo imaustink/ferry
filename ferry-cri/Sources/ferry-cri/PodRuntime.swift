@@ -78,13 +78,6 @@ struct SandboxRecord {
     /// booted lazily on the first StartContainer rather than at RunPodSandbox.
     var booted: Bool = false
     var usesReservedAddress: Bool = false
-    /// The pod's address on the cluster network, to hand back when it stops.
-    var clusterAddress: String? = nil
-    /// The pod's vmnet address. `ip` is what Kubernetes calls the pod IP and
-    /// lives on the cluster network, which only pods are on -- so anything the
-    /// Mac itself does, port-forward and the host side of a Service, needs this
-    /// one instead.
-    var hostAddress: String = ""
     /// Kept so the VM can be rebuilt if every container in it has stopped --
     /// see createContainer.
     let interface: any Interface
@@ -190,13 +183,18 @@ actor PodRuntime {
         // for it would cost the user a minute of startup for nothing. Moving to
         // another is right; what it costs is a changed gateway, which is part of
         // the CoreDNS manifest and so rolls CoreDNS out again.
+        // When there is a cluster network, the node's slice of it *is* the vmnet
+        // subnet -- that is what puts the Mac on the pod network.
+        let preferredSubnet = config.clusterCIDR
+            .flatMap { Self.nodeSlice(of: $0, node: config.nodeIndex) } ?? config.podSubnet
+
         var chosen: VmnetNetwork?
         var lastError: Error?
-        for candidate in Self.subnetCandidates(preferred: config.podSubnet) {
+        for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
             do {
                 chosen = try VmnetNetwork(subnet: try CIDRv4(candidate))
-                if candidate != config.podSubnet {
-                    print("    \(config.podSubnet) is still reserved by a recent run; using \(candidate)")
+                if candidate != preferredSubnet {
+                    print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
                 }
                 lastError = nil
                 break
@@ -223,26 +221,34 @@ actor PodRuntime {
             to: config.stateDir.appending(component: "gateway"),
             atomically: true, encoding: .utf8)
 
-        // The cluster pod network, if this is a cluster rather than one node.
-        // eth0 stays on vmnet for the internet and the host; this is eth1, and
-        // it is the address Kubernetes knows a pod by.
-        if let cidr = config.clusterCIDR,
-           var addresses = RotatingAddresses(clusterCIDR: cidr, nodeIndex: config.nodeIndex) {
+        // The cluster pod network is carried by two interfaces that share one
+        // address, and the reason is the Mac.
+        //
+        // A pod's address used to live only on ferry's switch, which carries
+        // traffic between pods and which the host is not on -- so the Mac could
+        // not reach a pod by the address the cluster knew it by. Everything the
+        // Mac does to a pod needed a translation: probes, port forwarding, the
+        // host side of a Service. Aggregated APIs could not work at all, because
+        // the API server is a macOS process and had nowhere to send the request.
+        //
+        // The Mac is already on every vmnet network, for nothing. So this node's
+        // vmnet network is now its own slice of the cluster CIDR -- pods get
+        // 10.244.<node>.x from vmnet itself, the Mac is on that subnet natively,
+        // and a pod is reachable from the host at its real address.
+        //
+        // The switch is still needed for the other nodes, and eth1 carries the
+        // same address with a wider prefix. Longest match does the rest: the
+        // local /24 leaves by eth0 on the kernel's own datapath, the rest of the
+        // /16 leaves by eth1, and the source address is the same either way.
+        if let cidr = config.clusterCIDR, let slice = Self.nodeSlice(of: cidr, node: config.nodeIndex) {
             self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers,
                                        peersFile: config.peersFile,
                                        self: config.relayEndpoint)
-            if let reserved = addresses.takeReserved() {
-                let bare = reserved.split(separator: "/").first.map(String.init) ?? ""
-                try? "\(bare)\n".write(to: config.stateDir.appending(component: "dns"),
-                                        atomically: true, encoding: .utf8)
-                self.clusterDNSAddress = reserved
-            }
-            self.clusterAddresses = addresses
-            print("    pod network \(cidr), this node is \(addresses.prefix).0/24")
+            self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
+            print("    pod network \(cidr), this node is \(slice)")
             if config.relayPort > 0 {
                 print("    switch    udp/\(config.relayPort), peers: \(config.peers.isEmpty ? "none yet" : config.peers.joined(separator: ", "))")
             }
-            return
         }
 
         // Reserve and publish the cluster DNS address before any pod can take it.
@@ -257,6 +263,20 @@ actor PodRuntime {
 
     var gateway: String { "\(network.ipv4Gateway)" }
     var subnet: String { "\(network.subnet)" }
+
+    /// This node's slice of the cluster network, as vmnet wants it: the gateway
+    /// address and a prefix. Node 3 of 10.244.0.0/16 is 10.244.3.1/24.
+    static func nodeSlice(of clusterCIDR: String, node: Int) -> String? {
+        let parts = clusterCIDR.split(separator: "/")
+        guard parts.count == 2, let length = Int(parts[1]), length <= 24 else { return nil }
+        let octets = parts[0].split(separator: ".")
+        guard octets.count == 4, node >= 0, node <= 255 else { return nil }
+        return "\(octets[0]).\(octets[1]).\(node).1/24"
+    }
+
+    static func prefixLength(of cidr: String) -> Int? {
+        cidr.split(separator: "/").last.flatMap { Int($0) }
+    }
 
     /// The preferred subnet first, then alternatives for when a recent run
     /// still holds it.
@@ -294,26 +314,18 @@ actor PodRuntime {
             }
             interface = fresh
         }
-        var ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
+        let ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
 
-        // eth1: the cluster network. Its address is what Kubernetes calls the
-        // pod IP, because it is the one every other pod can reach -- on this
-        // machine or another. eth0 keeps the default route and the internet.
+        // eth1: the same address, with the cluster's prefix. Traffic for this
+        // node's own slice matches the narrower route and leaves by eth0 on the
+        // kernel datapath; everything else in the cluster leaves by the switch.
+        // Both carry the same source address, so a pod is one pod wherever it is
+        // talking to.
         var clusterInterface: SwitchInterface?
-        if podSwitch != nil, clusterAddresses != nil {
-            let address: String?
-            if wantsReserved, let reserved = clusterDNSAddress, !clusterDNSInUse {
-                address = reserved
-                clusterDNSInUse = true
-            } else {
-                address = clusterAddresses!.take()
-            }
-            guard let address, let cidr = try? CIDRv4(address) else {
-                throw RuntimeFailure.invalid("the pod network has no addresses left")
-            }
-            let nic = try SwitchInterface(address: cidr, mac: nil)
+        if podSwitch != nil, !ip.isEmpty,
+           let wide = try? CIDRv4("\(ip)/\(clusterPrefixLength)"),
+           let nic = try? SwitchInterface(address: wide, mac: nil) {
             clusterInterface = nic
-            ip = address.split(separator: "/").first.map(String.init) ?? ip
         }
 
         // Kubernetes sends resource limits per container, not per sandbox, so
@@ -325,7 +337,6 @@ actor PodRuntime {
         if let clusterInterface {
             podSwitch?.attach(podID: id, fd: clusterInterface.hostFD)
         }
-        defer { publishHostReachableMap() }
         // Deliberately not created yet. CRI adds containers after the sandbox
         // exists, and on this hypervisor a container can only be added before
         // the VM boots -- see startContainer.
@@ -338,9 +349,7 @@ actor PodRuntime {
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
-            usesReservedAddress: wantsReserved && (dnsInterfaceInUse || clusterDNSInUse),
-            clusterAddress: clusterInterface.map { "\($0.ipv4Address)" },
-            hostAddress: "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? "",
+            usesReservedAddress: wantsReserved && dnsInterfaceInUse,
             interface: interface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers
@@ -425,10 +434,9 @@ actor PodRuntime {
         // RemovePodSandbox lets a terminated CoreDNS keep the reservation, so
         // its replacement lands on an ordinary address and the kubelet's
         // clusterDNS then points at nothing.
-        if record.usesReservedAddress { dnsInterfaceInUse = false; clusterDNSInUse = false }
+        if record.usesReservedAddress { dnsInterfaceInUse = false }
         podSwitch?.detach(podID: id)
-        defer { publishHostReachableMap() }
-        if let address = record.clusterAddress { clusterAddresses?.give(back: address) }
+
         sandboxes[id] = record
     }
 
@@ -463,9 +471,9 @@ actor PodRuntime {
 
     /// The pod network, when ferry is running one.
     private var podSwitch: PodSwitch?
-    private var clusterAddresses: RotatingAddresses?
-    private var clusterDNSAddress: String?
-    private var clusterDNSInUse = false
+    /// The cluster network's prefix length, which eth1 carries so that anything
+    /// outside this node's own slice leaves by the switch.
+    private var clusterPrefixLength = 16
 
     private var lastRuleset: Data?
     private var lastGeneration: UInt64 = 0
@@ -648,32 +656,9 @@ actor PodRuntime {
     }
 
     /// The pod's address, for port forwarding. ferry-streamer dials it directly.
-    /// Where the *Mac* can reach this pod.
-    ///
-    /// Not the same as the pod IP once there is a cluster network: that address
-    /// is on ferry's switch, which carries traffic between pods and which the
-    /// host is not on. port-forward and the host side of a Service both run on
-    /// the Mac, so both want the vmnet address.
-    func sandboxAddress(_ id: String) -> String? {
-        guard let record = sandboxes[id] else { return nil }
-        return record.hostAddress.isEmpty ? record.ip : record.hostAddress
-    }
-
-    private func publishHostReachableMap() {
-        try? hostReachableMap().write(
-            to: config.stateDir.appending(component: "podmap"),
-            atomically: true, encoding: .utf8)
-    }
-
-    /// Every pod on this node as "<pod IP> <address the Mac can reach it at>".
-    /// ferry-proxy reads this to turn an endpoint into something it can dial.
-    func hostReachableMap() -> String {
-        sandboxes.values
-            .filter { !$0.hostAddress.isEmpty && $0.ip != $0.hostAddress }
-            .map { "\($0.ip) \($0.hostAddress)" }
-            .sorted()
-            .joined(separator: "\n") + "\n"
-    }
+    /// Where the Mac can reach this pod, which is simply its address: this
+    /// node's vmnet subnet is its slice of the pod network, and the Mac is on it.
+    func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
 
     // MARK: - Containers
 

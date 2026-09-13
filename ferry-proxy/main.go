@@ -44,7 +44,6 @@ func main() {
 	nodePorts := flag.Bool("node-ports", true, "listen on node ports")
 	loadBalancerIP := flag.String("load-balancer-ip", "", "address to answer LoadBalancer services on, usually this Mac's LAN address")
 	nodeName := flag.String("node-name", "", "this node, so endpoints elsewhere can be told apart from endpoints here")
-	podMapPath := flag.String("pod-map", "", "file ferry-cri writes mapping each pod IP to an address the Mac can reach it at")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -69,7 +68,6 @@ func main() {
 		udp:            map[string]*udpProxy{},
 		client:         client,
 		nodeName:       *nodeName,
-		pods:           newPodMap(*podMapPath),
 		clusterIPs:     *clusterIPs,
 		nodePorts:      *nodePorts,
 		loadBalancerIP: *loadBalancerIP,
@@ -116,7 +114,6 @@ type controller struct {
 
 	client         kubernetes.Interface
 	nodes          corelisters.NodeLister
-	pods           *podMap
 	nodeName       string
 	clusterIPs     bool
 	nodePorts      bool
@@ -190,10 +187,11 @@ func (c *controller) reconcile() {
 					continue
 				}
 				for _, address := range endpoint.Addresses {
-					// The cluster knows this pod by an address only other pods
-					// can reach. Dial the one the Mac can.
+					// A pod on this Mac is reachable at the address the cluster
+					// knows it by: its vmnet subnet is this node's slice of the
+					// pod network, and the Mac is on that subnet.
 					endpoints[key] = append(endpoints[key], backend{
-						address: joinHostPort(c.pods.dialable(address), *port.Port),
+						address: joinHostPort(address, *port.Port),
 					})
 				}
 			}

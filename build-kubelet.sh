@@ -117,24 +117,6 @@ if [ -f "$predicate" ]; then
   echo "    ~ pkg/kubelet/lifecycle/predicate.go"
 fi
 
-# Probes are made by the kubelet, which is a macOS process and is not on the pod
-# network -- so probing a pod at its pod IP times out, and anything with a
-# readiness probe never becomes Ready. Aim the connection at the address the Mac
-# can actually reach; the pod's identity is unchanged.
-prober="$src/pkg/kubelet/prober/prober.go"
-if [ -f "$prober" ]; then
-  sed -i '' \
-    -e 's|NewRequestForHTTPGetAction(p.HTTPGet, \&container, status.PodIP, "probe")|NewRequestForHTTPGetAction(p.HTTPGet, \&container, ferryReachableAddress(status.PodIP), "probe")|' \
-    -e 's|host = status.PodIP|host = ferryReachableAddress(status.PodIP)|' \
-    -e 's|host := status.PodIP|host := ferryReachableAddress(status.PodIP)|' \
-    "$prober"
-  # Three call sites: HTTP, TCP and gRPC. A partial patch would leave one kind
-  # of probe quietly broken, which is the hardest sort to notice.
-  [ "$(grep -c 'ferryReachableAddress(status.PodIP)' "$prober")" -ge 3 ] \
-    || { echo "    !! the probe address patch did not apply to every probe type" >&2; exit 1; }
-  echo "    ~ pkg/kubelet/prober/prober.go"
-fi
-
 # Static pod file watching is gated to linux purely by build tag; the code
 # underneath is fsnotify, which supports darwin via kqueue and uses no
 # Linux-specific API. Widen the tag rather than fork the file.

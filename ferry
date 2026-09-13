@@ -385,11 +385,20 @@ host_resolvers() {
 
 install_dns() { # gateway dns-address
   local gateway="$1" dns="$2"
+  # The same address the API server advertises and its certificate covers.
+  local advertise="$gateway"
+  [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
   local rendered="$FERRY_RUN/coredns.yaml"
   sed -e "s|__CLUSTER_DOMAIN__|$CLUSTER_DOMAIN|g" \
       -e "s|__UPSTREAM_DNS__|$(host_resolvers)|g" \
       -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
-      -e "s|__APISERVER_HOST__|$gateway|g" \
+      `# CoreDNS talks to the API server directly rather than through the` \
+      `# kubernetes Service, so it has an address of its own to be told. It has` \
+      `# to be one the API server's certificate covers, which the pod network` \
+      `# gateway is not -- that address belongs to whichever subnet this node` \
+      `# happens to have. The advertised address is in the certificate and is` \
+      `# what every other client already uses.` \
+      -e "s|__APISERVER_HOST__|$advertise|g" \
       -e "s|__APISERVER_PORT__|6443|g" \
       "$here/manifests/coredns.yaml" > "$rendered"
 
@@ -460,14 +469,14 @@ start_proxy() {
       sudo -v || { warn "no sudo; ClusterIPs will not route (pods and DNS still work)"; return 0; }
     fi
     sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
-      --cluster-ips --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --cluster-ips --node-ports --node-name "$NODE_NAME"\
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
     local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
-      --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --node-ports --node-name "$NODE_NAME"\
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     local pid=$!
@@ -873,7 +882,7 @@ EOF
   local lb="$LAN_IP"; [ "$lb" = "127.0.0.1" ] && lb=""
   if [ -x "$here/bin/ferry-proxy" ]; then
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
-      --node-ports --node-name "$name" --pod-map "$FERRY_RUN/cri/podmap" \
+      --node-ports --node-name "$name"\
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxy.pid"
