@@ -60,6 +60,15 @@ struct SandboxRecord {
     /// see createContainer.
     let interface: any Interface
     let config: Runtime_V1_PodSandboxConfig
+    /// Names of the pod's regular containers, from its spec. The kubelet
+    /// creates them one at a time and this hypervisor cannot add a container to
+    /// a running VM, so the boot waits until they have all arrived. Empty when
+    /// the pod spec could not be read, in which case the VM boots on the first
+    /// start as it always did.
+    var expectedContainers: [String] = []
+    var initContainerNames: [String] = []
+    /// Containers the kubelet has started that are waiting for the VM.
+    var pendingStart: [String] = []
 }
 
 struct ContainerRecord {
@@ -78,8 +87,13 @@ struct ContainerRecord {
     var exitCode: Int32 = 0
     var state: ContainerRunState = .created
     var reason: String = ""
+    var tty: Bool = false
     var logWriters: [ContainerLogWriter] = []
     var logFile: ContainerLogFile?
+    /// Present only when the pod spec set stdin. A container that did not ask
+    /// for stdin must see it closed, or anything reading from it hangs instead
+    /// of getting EOF.
+    var stdinFeeder: FrameReaderStream?
 }
 
 enum ContainerRunState {
@@ -118,6 +132,9 @@ actor PodRuntime {
     private var imageConfigs: [String: ContainerizationOCI.ImageConfig] = [:]
 
     private var idCounter: UInt64 = 0
+    /// Used only to read pod specs, so the VM can wait for a pod's whole
+    /// container set before booting.
+    var streamer: StreamerClient?
 
     init(config: RuntimeConfig) throws {
         self.config = config
@@ -128,6 +145,8 @@ actor PodRuntime {
 
     /// Pulls the guest agent image and creates the pod network. Kept out of
     /// init so failures surface with context before the server starts serving.
+    func setStreamer(_ client: StreamerClient) { self.streamer = client }
+
     func prepare() async throws {
         let initImage = try await store.getInitImage(reference: config.initImage)
         let initPath = config.stateDir.appending(component: "init.ext4")
@@ -222,6 +241,8 @@ actor PodRuntime {
         // Deliberately not created yet. CRI adds containers after the sandbox
         // exists, and on this hypervisor a container can only be added before
         // the VM boots -- see startContainer.
+        let expected = await podContainers(
+            namespace: cfg.metadata.namespace, name: cfg.metadata.name)
 
         sandboxes[id] = SandboxRecord(
             id: id, pod: pod,
@@ -230,7 +251,9 @@ actor PodRuntime {
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
             usesReservedAddress: wantsReserved && dnsInterfaceInUse,
-            interface: interface, config: cfg
+            interface: interface, config: cfg,
+            expectedContainers: expected.containers,
+            initContainerNames: expected.initContainers
         )
         return id
     }
@@ -263,6 +286,20 @@ actor PodRuntime {
         // own process, not inherited by anything it later executes.
         return Containerization.LinuxCapabilities(
             bounding: list, effective: list, inheritable: list, permitted: list, ambient: [])
+    }
+
+    /// Asks ferry-streamer which containers the pod spec declares. A failure is
+    /// not fatal: without it single-container pods behave exactly as before,
+    /// only sidecars are lost.
+    private func podContainers(namespace: String, name: String) async -> (initContainers: [String], containers: [String]) {
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], []) }
+        do {
+            let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
+            let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
+            return (decoded.initContainers ?? [], decoded.containers ?? [])
+        } catch {
+            return ([], [])
+        }
     }
 
     private func makePod(id: String, interface: any Interface, cfg: Runtime_V1_PodSandboxConfig) throws -> LinuxPod {
@@ -315,6 +352,22 @@ actor PodRuntime {
     }
 
     func listSandboxes() -> [SandboxRecord] { Array(sandboxes.values) }
+
+    /// Everything attach needs: the output fan-out point, the stdin feeder if
+    /// the pod asked for one, and whether the container was given a terminal.
+    func attachTargets(_ id: String) throws -> (output: ContainerLogFile, stdin: FrameReaderStream?, tty: Bool) {
+        guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
+        guard record.state == .running else {
+            throw RuntimeFailure.invalid("container \(id) is not running")
+        }
+        guard let output = record.logFile else {
+            throw RuntimeFailure.unsupported("container \(id) has no output stream to attach to")
+        }
+        return (output, record.stdinFeeder, record.tty)
+    }
+
+    /// The pod's address, for port forwarding. ferry-streamer dials it directly.
+    func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
 
     // MARK: - Containers
 
@@ -455,8 +508,12 @@ actor PodRuntime {
         let outWriter = stdoutWriter
         let errWriter = stderrWriter
 
+        let stdinFeeder = cfg.stdin ? FrameReaderStream() : nil
+
         try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
             c.process.arguments = arguments
+            c.process.terminal = cfg.tty
+            if let stdinFeeder { c.process.stdin = stdinFeeder }
             if let outWriter { c.process.stdout = outWriter }
             if let errWriter { c.process.stderr = errWriter }
             c.process.capabilities = capabilities
@@ -476,8 +533,8 @@ actor PodRuntime {
             name: cfg.metadata.name, attempt: cfg.metadata.attempt,
             image: imageRef, imageRef: imageRef,
             labels: cfg.labels, annotations: cfg.annotations,
-            logPath: absoluteLogPath, createdAt: Self.now(),
-            logWriters: writers, logFile: logFile
+            logPath: absoluteLogPath, createdAt: Self.now(), tty: cfg.tty,
+            logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder
         )
         return id
     }
@@ -488,21 +545,52 @@ actor PodRuntime {
             throw RuntimeFailure.notFound("sandbox \(record.sandboxID)")
         }
 
-        // Boot the VM on first use, with every container added so far already
-        // registered. Virtualization.framework has no hotplug, so anything
-        // added after this point cannot join the pod.
         if !sandbox.booted {
+            // The kubelet works through a pod's containers one at a time --
+            // create, start, create, start -- and this hypervisor cannot add a
+            // container to a running VM. Booting on the first start therefore
+            // locks out every later container, which is what made sidecars
+            // impossible. Instead the boot waits until the pod's whole regular
+            // container set has been created.
+            //
+            // Init containers are exempt: the kubelet runs them one at a time
+            // by design, each exiting before the next is created, so each gets
+            // its own VM.
+            let isInit = sandbox.initContainerNames.contains(record.name)
+            let expected = sandbox.expectedContainers
+            let created = Set(containers.values
+                .filter { $0.sandboxID == record.sandboxID }
+                .map(\.name))
+            let complete = expected.isEmpty || isInit || expected.allSatisfy { created.contains($0) }
+
+            if !complete {
+                // Report success and start it once the VM is up. The kubelet
+                // polls container status, so it sees the container running a
+                // moment later rather than being told it failed.
+                sandboxes[record.sandboxID]?.pendingStart.append(id)
+                return
+            }
+
             try await sandbox.pod.create()
             sandboxes[record.sandboxID]?.booted = true
+
+            for waiting in sandboxes[record.sandboxID]?.pendingStart ?? [] where waiting != id {
+                try? await sandbox.pod.startContainer(waiting)
+                markStarted(waiting, pod: sandbox.pod)
+            }
+            sandboxes[record.sandboxID]?.pendingStart = []
         }
 
         try await sandbox.pod.startContainer(id)
+        markStarted(id, pod: sandbox.pod)
+    }
+
+    private func markStarted(_ id: String, pod: LinuxPod) {
         containers[id]?.state = .running
         containers[id]?.startedAt = Self.now()
 
         // Reap asynchronously so the exit code is available to ContainerStatus
         // without the kubelet having to ask the pod directly.
-        let pod = sandbox.pod
         Task { [weak self] in
             let status = try? await pod.waitContainer(id)
             await self?.recordExit(id, code: status?.exitCode ?? -1)
@@ -533,6 +621,40 @@ actor PodRuntime {
         if record.state == .running { try? await stopContainer(id, timeout: 0) }
         try? FileManager.default.removeItem(atPath: config.stateDir.appending(component: "\(id).ext4").path())
         containers.removeValue(forKey: id)
+    }
+
+    /// Runs a command in a container's VM for `kubectl exec`. An empty command
+    /// means attach, which is not supported yet -- the framework exposes no way
+    /// to reattach to a process that is already running.
+    func exec(
+        containerID: String,
+        command: [String],
+        tty: Bool,
+        stdin: (any ReaderStream)?,
+        stdout: any Writer,
+        stderr: any Writer
+    ) async throws -> LinuxProcess {
+        guard let record = containers[containerID] else {
+            throw RuntimeFailure.notFound("container \(containerID)")
+        }
+        guard let sandbox = sandboxes[record.sandboxID], sandbox.booted else {
+            throw RuntimeFailure.invalid("container \(containerID) is not running")
+        }
+        guard !command.isEmpty else {
+            throw RuntimeFailure.unsupported("attach is not implemented; use kubectl exec")
+        }
+
+        idCounter += 1
+        let processID = String(format: "exec%012llx", idCounter)
+        return try await sandbox.pod.execInContainer(containerID, processID: processID) { config in
+            config.arguments = command
+            config.terminal = tty
+            config.stdin = stdin
+            config.stdout = stdout
+            // With a TTY there is one stream, and the client expects everything
+            // on stdout; sending stderr separately would interleave badly.
+            config.stderr = tty ? nil : stderr
+        }
     }
 
     func reopenContainerLog(_ id: String) throws {

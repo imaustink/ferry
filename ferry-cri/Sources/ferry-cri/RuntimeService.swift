@@ -7,6 +7,7 @@ import GRPCCore
 struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     let runtime: PodRuntime
     let version: String
+    let streamer: StreamerClient
 
     private func unimplemented(_ name: String) -> RPCError {
         RPCError(code: .unimplemented, message: "ferry-cri does not implement \(name) yet")
@@ -292,14 +293,61 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     func execSync(request: Runtime_V1_ExecSyncRequest, context: ServerContext) async throws -> Runtime_V1_ExecSyncResponse {
         throw unimplemented("ExecSync")
     }
+    /// CRI does not carry exec over gRPC: the runtime returns a URL and the
+    /// kubelet proxies the client's upgraded connection to it, speaking
+    /// SPDY/3.1. ferry-streamer terminates that and calls back into this
+    /// process to run the command, so the URL has to come from it -- the token
+    /// it contains is issued by the streaming server's own request cache.
     func exec(request: Runtime_V1_ExecRequest, context: ServerContext) async throws -> Runtime_V1_ExecResponse {
-        throw unimplemented("Exec")
+        do {
+            let url = try streamer.url(path: "/exec", body: [
+                "container_id": request.containerID,
+                "cmd": request.cmd,
+                "tty": request.tty,
+                "stdin": request.stdin,
+                "stdout": request.stdout,
+                "stderr": request.stderr,
+            ])
+            var response = Runtime_V1_ExecResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
+    /// Attach reconnects to a container's own process. The framework cannot
+    /// re-open a running process's stdio, but ferry-cri owns that stdio -- the
+    /// container's output already flows through its log writer -- so attaching
+    /// is a subscription to it. Input requires the pod to have asked for stdin,
+    /// since the stream has to be wired in at creation.
     func attach(request: Runtime_V1_AttachRequest, context: ServerContext) async throws -> Runtime_V1_AttachResponse {
-        throw unimplemented("Attach")
+        do {
+            let url = try streamer.url(path: "/attach", body: [
+                "container_id": request.containerID,
+                "stdin": request.stdin,
+                "stdout": request.stdout,
+                "stderr": request.stderr,
+                "tty": request.tty,
+            ])
+            var response = Runtime_V1_AttachResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
     func portForward(request: Runtime_V1_PortForwardRequest, context: ServerContext) async throws -> Runtime_V1_PortForwardResponse {
-        throw unimplemented("PortForward")
+        do {
+            let url = try streamer.url(path: "/portforward", body: [
+                "pod_sandbox_id": request.podSandboxID,
+                "port": request.port,
+            ])
+            var response = Runtime_V1_PortForwardResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
     func checkpointContainer(request: Runtime_V1_CheckpointContainerRequest, context: ServerContext) async throws -> Runtime_V1_CheckpointContainerResponse {
         throw unimplemented("CheckpointContainer")

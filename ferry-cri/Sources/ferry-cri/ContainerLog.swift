@@ -23,8 +23,41 @@ enum LogStream: String {
     case stderr
 }
 
-/// The log file for one container. Both stream writers append through this.
+/// A live subscriber to a container's output, used by `kubectl attach`.
+protocol OutputSink: AnyObject, Sendable {
+    func receive(_ data: Data, stream: LogStream)
+}
+
+/// The log file for one container, and the fan-out point for attach.
+///
+/// Attaching means reconnecting to a process that is already running, which the
+/// framework has no way to do -- its stdio was bound when the container was
+/// created and cannot be re-opened. But that stdio is bound to *this*, so
+/// attach does not need the framework's help: it subscribes here and receives
+/// the same bytes the log does, as they are written.
 final class ContainerLogFile: @unchecked Sendable {
+    private var sinks: [ObjectIdentifier: any OutputSink] = [:]
+    private let sinkLock = NSLock()
+
+    func subscribe(_ sink: any OutputSink) {
+        sinkLock.lock(); defer { sinkLock.unlock() }
+        sinks[ObjectIdentifier(sink)] = sink
+    }
+
+    func unsubscribe(_ sink: any OutputSink) {
+        sinkLock.lock(); defer { sinkLock.unlock() }
+        sinks.removeValue(forKey: ObjectIdentifier(sink))
+    }
+
+    /// Raw bytes, exactly as the process wrote them. Attach is a byte stream,
+    /// not the timestamped line format the kubelet reads from the log file.
+    func broadcast(_ data: Data, stream: LogStream) {
+        sinkLock.lock()
+        let current = Array(sinks.values)
+        sinkLock.unlock()
+        for sink in current { sink.receive(data, stream: stream) }
+    }
+
     private let path: String
     private let lock = NSLock()
     private var handle: FileHandle?
@@ -95,6 +128,10 @@ final class ContainerLogWriter: Writer, @unchecked Sendable {
     }
 
     func write(_ data: Data) throws {
+        // Anyone attached sees the bytes as written, before they are split into
+        // lines and timestamped for the log file.
+        file.broadcast(data, stream: stream)
+
         lock.lock()
         defer { lock.unlock() }
         pending.append(data)
