@@ -131,6 +131,31 @@ func main() {
 	_ = os.Remove(*socketPath)
 }
 
+// replaceTable makes a rendered ruleset replace what a pod already has rather
+// than pile onto it.
+//
+// knftables' fake backend accumulates state and Dump()s it as a script that
+// builds the table from nothing -- every line an "add". Against a real kernel
+// kube-proxy never needs more, because it sends transactions and says explicitly
+// what to remove. ferry does not: it hands the whole dump to a pod that already
+// has the table, so anything that should have gone away simply stays. A Service
+// that briefly had no endpoints keeps the reject rule ahead of the good one, and
+// that pod cannot reach it again for as long as it lives -- which is why Services
+// worked when a pod booted and rotted as the cluster changed around it.
+//
+// "add table" then "delete table" is the nftables idiom for replacing a table:
+// the add makes the delete safe when the table is not there yet, and nft applies
+// the file as one transaction, so no pod is ever left without rules in between.
+func replaceTable(rendered string) string {
+	if rendered == "" {
+		return rendered
+	}
+	const table = "kube-proxy"
+	return "add table ip " + table + "\n" +
+		"delete table ip " + table + "\n" +
+		rendered
+}
+
 // rulesetServer holds the most recently rendered ruleset and hands it out. The
 // generation only advances when the text actually changes, so a caller that
 // names the generation it already has can be left waiting until there is
@@ -179,7 +204,7 @@ func (s *rulesetServer) track(ctx context.Context) {
 			return
 		case <-nftables.FerryApplied:
 			if nftables.FerryRendered != nil {
-				s.publish(nftables.FerryRendered.Dump())
+				s.publish(replaceTable(nftables.FerryRendered.Dump()))
 			}
 		}
 	}
