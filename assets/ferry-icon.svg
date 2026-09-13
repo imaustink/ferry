@@ -1,115 +1,71 @@
-<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ferry logo">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="ferry">
+  <title>ferry</title>
   <defs>
-    <!-- macOS-inspired sky gradient -->
-    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7DB8FF"/>
-      <stop offset="0.55" stop-color="#4C86F0"/>
-      <stop offset="1" stop-color="#326CE5"/>
+    <linearGradient id="f-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7DB8FF"/><stop offset=".55" stop-color="#4C86F0"/><stop offset="1" stop-color="#326CE5"/>
     </linearGradient>
-    <!-- water -->
-    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2FB6D6"/>
-      <stop offset="1" stop-color="#1E7FB8"/>
+    <linearGradient id="f-water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2FB6D6"/><stop offset="1" stop-color="#1E7FB8"/>
     </linearGradient>
-    <!-- hull -->
-    <linearGradient id="hull" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3A4658"/>
-      <stop offset="1" stop-color="#222B39"/>
+    <linearGradient id="f-hull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A4658"/><stop offset="1" stop-color="#222B39"/>
     </linearGradient>
-    <!-- container gradients (macOS multicolor) -->
-    <linearGradient id="cOrange" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#FF9F5A"/><stop offset="1" stop-color="#FF5E7E"/>
-    </linearGradient>
-    <linearGradient id="cTeal" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#57E0C0"/><stop offset="1" stop-color="#2FBF71"/>
-    </linearGradient>
-    <linearGradient id="cBlue" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#5AA8FF"/><stop offset="1" stop-color="#4058E0"/>
-    </linearGradient>
-    <linearGradient id="cPurple" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#C07BFF"/><stop offset="1" stop-color="#8A3FE0"/>
-    </linearGradient>
-    <linearGradient id="cYellow" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#FFD75A"/><stop offset="1" stop-color="#FF9F2E"/>
-    </linearGradient>
-
-    <clipPath id="squircle">
-      <rect x="16" y="16" width="480" height="480" rx="112" ry="112"/>
-    </clipPath>
+    <linearGradient id="f-c1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9F5A"/><stop offset="1" stop-color="#FF5E7E"/></linearGradient>
+    <linearGradient id="f-c2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#57E0C0"/><stop offset="1" stop-color="#2FBF71"/></linearGradient>
+    <linearGradient id="f-c3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5AA8FF"/><stop offset="1" stop-color="#4058E0"/></linearGradient>
+    <linearGradient id="f-c4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#C07BFF"/><stop offset="1" stop-color="#8A3FE0"/></linearGradient>
+    <linearGradient id="f-c5" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFD75A"/><stop offset="1" stop-color="#FF9F2E"/></linearGradient>
+    <clipPath id="f-tile"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
   </defs>
 
-  <!-- app-icon tile -->
-  <g clip-path="url(#squircle)">
-    <rect x="16" y="16" width="480" height="480" fill="url(#sky)"/>
+  <g clip-path="url(#f-tile)">
+    <rect x="16" y="16" width="480" height="480" fill="url(#f-sky)"/>
 
-    <!-- water body with wavy top -->
-    <path d="M16 356
-             C 80 336, 140 376, 200 356
-             S 320 336, 380 356
-             S 470 340, 496 356
-             L 496 496 L 16 496 Z" fill="url(#water)"/>
-    <!-- wave highlights -->
-    <path d="M40 402 q 26 -16 52 0 t 52 0 t 52 0 t 52 0 t 52 0 t 52 0"
-          stroke="#D6F3FF" stroke-opacity="0.5" stroke-width="6" fill="none" stroke-linecap="round"/>
-    <path d="M60 446 q 24 -14 48 0 t 48 0 t 48 0 t 48 0 t 48 0 t 48 0"
-          stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="5" fill="none" stroke-linecap="round"/>
+    <path d="M16 344C80 324 140 364 200 344s120-20 180 0 90-16 116 0v152H16Z" fill="url(#f-water)"/>
+    <path d="M-12 396q26-16 52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0"
+          fill="none" stroke="#D6F3FF" stroke-opacity=".45" stroke-width="6" stroke-linecap="round"/>
 
-    <!-- ============ FERRY ============ -->
-    <g>
-      <!-- containers: bottom row (3) -->
-      <g stroke="#00000022" stroke-width="1.5">
-        <g>
-          <rect x="153" y="300" width="66" height="46" rx="5" fill="url(#cOrange)"/>
-          <path d="M175 300 V346 M197 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/>
-        </g>
-        <g>
-          <rect x="223" y="300" width="66" height="46" rx="5" fill="url(#cTeal)"/>
-          <path d="M245 300 V346 M267 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/>
-        </g>
-        <g>
-          <rect x="293" y="300" width="66" height="46" rx="5" fill="url(#cBlue)"/>
-          <path d="M315 300 V346 M337 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/>
-        </g>
-      </g>
-      <!-- containers: top row (2) -->
+    <g transform="translate(256 352) scale(1.22) translate(-256 -364)">
       <g>
-        <g>
-          <rect x="188" y="256" width="66" height="46" rx="5" fill="url(#cPurple)"/>
-          <path d="M210 256 V302 M232 256 V302" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/>
-        </g>
-        <g>
-          <rect x="258" y="256" width="66" height="46" rx="5" fill="url(#cYellow)"/>
-          <path d="M280 256 V302 M302 256 V302" stroke="#ffffff" stroke-opacity="0.28" stroke-width="3"/>
-        </g>
+        <rect x="153" y="300" width="66" height="46" rx="5" fill="url(#f-c1)"/>
+        <path d="M175 300v46M197 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/>
+      </g>
+      <g>
+        <rect x="223" y="300" width="66" height="46" rx="5" fill="url(#f-c2)"/>
+        <path d="M245 300v46M267 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/>
+      </g>
+      <g>
+        <rect x="293" y="300" width="66" height="46" rx="5" fill="url(#f-c3)"/>
+        <path d="M315 300v46M337 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/>
+      </g>
+      <g>
+        <rect x="188" y="254" width="66" height="46" rx="5" fill="url(#f-c4)"/>
+        <path d="M210 254v46M232 254v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/>
+      </g>
+      <g>
+        <rect x="258" y="254" width="66" height="46" rx="5" fill="url(#f-c5)"/>
+        <path d="M280 254v46M302 254v46" stroke="#fff" stroke-opacity=".28" stroke-width="3"/>
       </g>
 
-      <!-- hull -->
-      <path d="M132 348
-               L 380 348
-               C 372 396, 344 420, 300 420
-               L 212 420
-               C 168 420, 140 396, 132 348 Z" fill="url(#hull)"/>
-      <!-- deck stripe -->
+      <path d="M132 348h248c-8 48-36 72-80 72h-88c-44 0-72-24-80-72Z" fill="url(#f-hull)"/>
       <rect x="132" y="348" width="248" height="12" fill="#4C5A6E"/>
-      <!-- accent waterline stripe -->
-      <path d="M138 372 L 374 372" stroke="#FF5E7E" stroke-width="7" stroke-linecap="round"/>
+      <path d="M141 373h230" stroke="#FF5E7E" stroke-width="7" stroke-linecap="round"/>
 
-      <!-- Kubernetes-helm porthole accent on the hull -->
       <g transform="translate(256 394)">
         <circle r="20" fill="#0F1622"/>
         <circle r="20" fill="none" stroke="#EAF2FF" stroke-width="3"/>
         <g stroke="#EAF2FF" stroke-width="3" stroke-linecap="round">
-          <line x1="0" y1="-14" x2="0" y2="-3"/>
-          <line x1="13.3" y1="-4.3" x2="2.9" y2="-1"/>
-          <line x1="8.2" y1="11.3" x2="1.8" y2="2.4"/>
-          <line x1="-8.2" y1="11.3" x2="-1.8" y2="2.4"/>
-          <line x1="-13.3" y1="-4.3" x2="-2.9" y2="-1"/>
+          <path d="M0-14V-3M13.3-4.3 2.9-1M8.2 11.3 1.8 2.4M-8.2 11.3-1.8 2.4M-13.3-4.3-2.9-1"/>
         </g>
         <circle r="4" fill="#EAF2FF"/>
       </g>
     </g>
 
-    <!-- gloss highlight -->
-    <path d="M16 16 h480 v150 C 360 90, 150 92, 16 176 Z" fill="#ffffff" fill-opacity="0.08"/>
+    <path d="M-8 446q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+          fill="none" stroke="#8FE3F5" stroke-opacity=".55" stroke-width="7" stroke-linecap="round"/>
+    <path d="M-8 478q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+          fill="none" stroke="#FFFFFF" stroke-opacity=".3" stroke-width="6" stroke-linecap="round"/>
+
+    <path d="M16 16h480v150C360 90 150 92 16 176Z" fill="#fff" fill-opacity=".08"/>
   </g>
 </svg>

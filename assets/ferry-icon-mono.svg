@@ -1,34 +1,37 @@
-<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ferry monochrome mark">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="ferry">
+  <title>ferry</title>
   <defs>
-    <clipPath id="sq"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+    <clipPath id="fm-tile"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+    <mask id="fm-cut">
+      <rect x="16" y="16" width="480" height="480" fill="#fff"/>
+      <circle cx="256" cy="380" r="27" fill="#000"/>
+    </mask>
   </defs>
-  <g clip-path="url(#sq)">
+
+  <g clip-path="url(#fm-tile)">
     <rect x="16" y="16" width="480" height="480" fill="currentColor"/>
-  </g>
-  <g fill="none" stroke="#fff" stroke-width="14" stroke-linejoin="round" stroke-linecap="round">
-    <!-- waves -->
-    <path d="M96 392 q 26 -16 52 0 t 52 0 t 52 0 t 52 0 t 52 0" stroke-opacity="0.9"/>
-    <path d="M112 436 q 24 -14 48 0 t 48 0 t 48 0 t 48 0 t 48 0" stroke-opacity="0.6"/>
-  </g>
-  <!-- ferry silhouette in knockout white -->
-  <g fill="#fff">
-    <!-- containers -->
-    <rect x="153" y="300" width="66" height="46" rx="6"/>
-    <rect x="223" y="300" width="66" height="46" rx="6"/>
-    <rect x="293" y="300" width="66" height="46" rx="6"/>
-    <rect x="188" y="252" width="66" height="46" rx="6"/>
-    <rect x="258" y="252" width="66" height="46" rx="6"/>
-    <!-- hull -->
-    <path d="M120 350 L 392 350 C 384 402, 352 428, 302 428 L 210 428 C 160 428, 128 402, 120 350 Z"/>
-  </g>
-  <!-- helm knockout -->
-  <g transform="translate(256 392)">
-    <circle r="20" fill="currentColor"/>
-    <g stroke="#fff" stroke-width="4" stroke-linecap="round">
-      <circle r="18" fill="none"/>
-      <line x1="0" y1="-13" x2="0" y2="-3"/><line x1="12.3" y1="-4" x2="2.7" y2="-1"/>
-      <line x1="7.6" y1="10.4" x2="1.7" y2="2.2"/><line x1="-7.6" y1="10.4" x2="-1.7" y2="2.2"/><line x1="-12.3" y1="-4" x2="-2.7" y2="-1"/>
+
+    <g mask="url(#fm-cut)">
+      <g transform="translate(256 352) scale(1.22) translate(-256 -364)" fill="#fff">
+        <rect x="153" y="300" width="66" height="46" rx="6"/>
+        <rect x="223" y="300" width="66" height="46" rx="6"/>
+        <rect x="293" y="300" width="66" height="46" rx="6"/>
+        <rect x="188" y="250" width="66" height="46" rx="6"/>
+        <rect x="258" y="250" width="66" height="46" rx="6"/>
+        <path d="M128 348h256c-8 50-37 74-83 74h-90c-46 0-75-24-83-74Z"/>
+      </g>
     </g>
-    <circle r="4" fill="#fff"/>
+
+    <g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round">
+      <path d="M256 361v12M274.1 374.1l-11.4 3.7M267.2 395.4l-7.1-9.7M244.8 395.4l7.1-9.7M237.9 385.9l11.4-3.7"/>
+    </g>
+    <circle cx="256" cy="380" r="4.5" fill="#fff"/>
+
+    <g fill="none" stroke="#fff" stroke-linecap="round">
+      <path d="M-8 452q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="14" stroke-opacity=".95"/>
+      <path d="M-8 486q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="12" stroke-opacity=".6"/>
+    </g>
   </g>
 </svg>

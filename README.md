@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/ferry-logo.png" alt="ferry" width="420">
+</p>
+
 # ferry
 
 Kubernetes on a Mac where **the pod is the virtual machine** and there is no
@@ -104,6 +108,7 @@ experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
 experiments/04-pod-networking/       routable per-pod addressing, host and pod to pod
 experiments/05-real-pods/            the whole stack, with real VMs per pod
 ferry-cri/                           the CRI runtime: one VM per pod
+assets/                              logo, icon and app-icon artwork
 ferry-streamer/                      SPDY streaming for kubectl exec
 ferry-proxy/                         ClusterIP routing on the host
 kernel/                              guest kernel with NAT support

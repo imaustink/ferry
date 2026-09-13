@@ -1,34 +1,177 @@
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>ferry logo preview</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ferry — brand assets</title>
 <style>
-  body{margin:0;font-family:'SF Pro Text',Helvetica,Arial,sans-serif;background:#f5f6f8;color:#1b2430}
-  .wrap{max-width:1040px;margin:0 auto;padding:40px}
-  h1{font-weight:700;letter-spacing:-1px}
-  .row{display:flex;gap:32px;align-items:center;flex-wrap:wrap;margin:24px 0;padding:24px;background:#fff;border-radius:20px;box-shadow:0 1px 4px #0001}
-  .dark{background:#10151d;color:#fff}
-  .sizes{display:flex;gap:24px;align-items:flex-end}
-  .cap{font-size:13px;color:#8a97a8;margin-top:8px}
-  img{display:block}
-</style></head>
-<body><div class="wrap">
-  <h1>ferry — logo</h1>
+  :root { color-scheme: light dark; }
+  body { margin:0; font: 15px/1.5 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
+         background:#f5f6f8; color:#1b2430; }
+  .wrap { max-width:960px; margin:0 auto; padding:48px 32px 80px; }
+  h1 { font-size:28px; letter-spacing:-.5px; margin:0 0 4px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:1.2px; color:#8a97a8;
+       margin:40px 0 12px; font-weight:600; }
+  .sub { color:#6b7a8d; margin:0 0 8px; }
+  .card { background:#fff; border-radius:18px; padding:28px; box-shadow:0 1px 3px #0000001a; }
+  .card.dark { background:#0d1117; }
+  .row { display:flex; gap:28px; align-items:flex-end; flex-wrap:wrap; }
+  .cap { font-size:12px; color:#8a97a8; margin-top:8px; text-align:center; }
+  img, .mono svg { display:block; }
+  .mono svg { width:112px; height:112px; }
+  code { background:#eceff3; padding:2px 6px; border-radius:5px; font-size:13px; }
+  ul { padding-left:18px; color:#4b5a6d; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ferry — brand assets</h1>
+  <p class="sub">A pod is a VM. The mark is a ferry carrying containers.</p>
 
-  <div class="row">
-    <img src="ferry-logo.svg" width="640" alt="horizontal lockup">
-  </div>
+  <h2>Primary lockup</h2>
+  <div class="card"><img src="ferry-logo.svg" width="560" alt="ferry lockup"></div>
+  <div class="card dark" style="margin-top:16px"><img src="ferry-logo.svg" width="560" alt="ferry lockup on dark"></div>
 
-  <div class="row sizes">
+  <h2>App icon</h2>
+  <div class="card row">
     <div><img src="ferry-icon.svg" width="256" alt="icon 256"><div class="cap">256</div></div>
     <div><img src="ferry-icon.svg" width="128" alt="icon 128"><div class="cap">128</div></div>
     <div><img src="ferry-icon.svg" width="64" alt="icon 64"><div class="cap">64</div></div>
     <div><img src="ferry-icon.svg" width="32" alt="icon 32"><div class="cap">32</div></div>
+    <div><img src="ferry-icon.svg" width="16" alt="icon 16"><div class="cap">16</div></div>
   </div>
 
-  <div class="row dark">
-    <div style="color:#326CE5"><img src="ferry-icon-mono.svg" width="140" alt="mono blue"></div>
-    <div style="color:#1b2430"><img src="ferry-icon-mono.svg" width="140" alt="mono dark"></div>
-    <div style="color:#0b6b4f"><img src="ferry-icon-mono.svg" width="140" alt="mono green"></div>
-    <div class="cap" style="align-self:center">monochrome (currentColor)</div>
+  <h2>Exported rasters</h2>
+  <div class="card row">
+    <div><img src="ferry-icon-256.png" width="128" alt="png 256"><div class="cap">ferry-icon-256.png</div></div>
+    <div><img src="ferry-icon-64.png" width="64" alt="png 64"><div class="cap">ferry-icon-64.png</div></div>
+    <div><img src="ferry-icon-32.png" width="32" alt="png 32"><div class="cap">ferry-icon-32.png</div></div>
+    <div><img src="favicon.ico" width="32" alt="favicon"><div class="cap">favicon.ico</div></div>
   </div>
-</div></body></html>
+
+  <h2>Monochrome (inherits <code>currentColor</code>)</h2>
+  <div class="card row">
+    <div class="mono" style="color:#326CE5"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ferry">
+  <title>ferry</title>
+  <defs>
+    <clipPath id="fm-tile-1"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+    <mask id="fm-cut-1">
+      <rect x="16" y="16" width="480" height="480" fill="#fff"/>
+      <circle cx="256" cy="380" r="27" fill="#000"/>
+    </mask>
+  </defs>
+
+  <g clip-path="url(#fm-tile-1)">
+    <rect x="16" y="16" width="480" height="480" fill="currentColor"/>
+
+    <g mask="url(#fm-cut-1)">
+      <g transform="translate(256 352) scale(1.22) translate(-256 -364)" fill="#fff">
+        <rect x="153" y="300" width="66" height="46" rx="6"/>
+        <rect x="223" y="300" width="66" height="46" rx="6"/>
+        <rect x="293" y="300" width="66" height="46" rx="6"/>
+        <rect x="188" y="250" width="66" height="46" rx="6"/>
+        <rect x="258" y="250" width="66" height="46" rx="6"/>
+        <path d="M128 348h256c-8 50-37 74-83 74h-90c-46 0-75-24-83-74Z"/>
+      </g>
+    </g>
+
+    <g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round">
+      <path d="M256 361v12M274.1 374.1l-11.4 3.7M267.2 395.4l-7.1-9.7M244.8 395.4l7.1-9.7M237.9 385.9l11.4-3.7"/>
+    </g>
+    <circle cx="256" cy="380" r="4.5" fill="#fff"/>
+
+    <g fill="none" stroke="#fff" stroke-linecap="round">
+      <path d="M-8 452q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="14" stroke-opacity=".95"/>
+      <path d="M-8 486q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="12" stroke-opacity=".6"/>
+    </g>
+  </g>
+</svg><div class="cap">#326CE5</div></div>
+    <div class="mono" style="color:#1b2430"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ferry">
+  <title>ferry</title>
+  <defs>
+    <clipPath id="fm-tile-2"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+    <mask id="fm-cut-2">
+      <rect x="16" y="16" width="480" height="480" fill="#fff"/>
+      <circle cx="256" cy="380" r="27" fill="#000"/>
+    </mask>
+  </defs>
+
+  <g clip-path="url(#fm-tile-2)">
+    <rect x="16" y="16" width="480" height="480" fill="currentColor"/>
+
+    <g mask="url(#fm-cut-2)">
+      <g transform="translate(256 352) scale(1.22) translate(-256 -364)" fill="#fff">
+        <rect x="153" y="300" width="66" height="46" rx="6"/>
+        <rect x="223" y="300" width="66" height="46" rx="6"/>
+        <rect x="293" y="300" width="66" height="46" rx="6"/>
+        <rect x="188" y="250" width="66" height="46" rx="6"/>
+        <rect x="258" y="250" width="66" height="46" rx="6"/>
+        <path d="M128 348h256c-8 50-37 74-83 74h-90c-46 0-75-24-83-74Z"/>
+      </g>
+    </g>
+
+    <g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round">
+      <path d="M256 361v12M274.1 374.1l-11.4 3.7M267.2 395.4l-7.1-9.7M244.8 395.4l7.1-9.7M237.9 385.9l11.4-3.7"/>
+    </g>
+    <circle cx="256" cy="380" r="4.5" fill="#fff"/>
+
+    <g fill="none" stroke="#fff" stroke-linecap="round">
+      <path d="M-8 452q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="14" stroke-opacity=".95"/>
+      <path d="M-8 486q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="12" stroke-opacity=".6"/>
+    </g>
+  </g>
+</svg><div class="cap">#1b2430</div></div>
+    <div class="mono" style="color:#0b6b4f"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ferry">
+  <title>ferry</title>
+  <defs>
+    <clipPath id="fm-tile-3"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+    <mask id="fm-cut-3">
+      <rect x="16" y="16" width="480" height="480" fill="#fff"/>
+      <circle cx="256" cy="380" r="27" fill="#000"/>
+    </mask>
+  </defs>
+
+  <g clip-path="url(#fm-tile-3)">
+    <rect x="16" y="16" width="480" height="480" fill="currentColor"/>
+
+    <g mask="url(#fm-cut-3)">
+      <g transform="translate(256 352) scale(1.22) translate(-256 -364)" fill="#fff">
+        <rect x="153" y="300" width="66" height="46" rx="6"/>
+        <rect x="223" y="300" width="66" height="46" rx="6"/>
+        <rect x="293" y="300" width="66" height="46" rx="6"/>
+        <rect x="188" y="250" width="66" height="46" rx="6"/>
+        <rect x="258" y="250" width="66" height="46" rx="6"/>
+        <path d="M128 348h256c-8 50-37 74-83 74h-90c-46 0-75-24-83-74Z"/>
+      </g>
+    </g>
+
+    <g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round">
+      <path d="M256 361v12M274.1 374.1l-11.4 3.7M267.2 395.4l-7.1-9.7M244.8 395.4l7.1-9.7M237.9 385.9l11.4-3.7"/>
+    </g>
+    <circle cx="256" cy="380" r="4.5" fill="#fff"/>
+
+    <g fill="none" stroke="#fff" stroke-linecap="round">
+      <path d="M-8 452q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="14" stroke-opacity=".95"/>
+      <path d="M-8 486q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            stroke-width="12" stroke-opacity=".6"/>
+    </g>
+  </g>
+</svg><div class="cap">#0b6b4f</div></div>
+  </div>
+
+  <h2>Files</h2>
+  <ul>
+    <li><code>ferry-logo.svg</code> / <code>ferry-logo.png</code> — horizontal lockup (PNG is 2x, transparent)</li>
+    <li><code>ferry-icon.svg</code> — full-colour app icon, source of truth</li>
+    <li><code>ferry-icon-mono.svg</code> — single-colour mark, recolour via CSS <code>color</code></li>
+    <li><code>ferry-icon-{16..1024}.png</code>, <code>favicon.ico</code>, <code>ferry.icns</code> — exports</li>
+  </ul>
+  <p class="sub" style="font-size:13px">The lockup's wordmark is live text (SF Pro Rounded, falling back to
+  Helvetica/Arial). Use <code>ferry-logo.png</code> where the exact wordmark matters, such as GitHub READMEs.</p>
+</div>
+</body>
+</html>
