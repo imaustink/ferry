@@ -936,6 +936,39 @@ actor PodRuntime {
 
     // MARK: - Images
 
+    /// Takes images from an OCI layout on disk instead of a registry.
+    ///
+    /// This is how someone runs code they have just built. Everything else in
+    /// ferry comes from a registry, which is fine for busybox and useless for
+    /// the thing you are working on -- `minikube image load` and `kind load
+    /// docker-image` exist for exactly this reason.
+    ///
+    /// The image is registered under the name it carries, so a manifest that
+    /// says `myapp:dev` keeps saying that. Pulling is what has to be avoided:
+    /// the kubelet is told the image is present, and `imagePullPolicy: Never`
+    /// or `IfNotPresent` keeps it from going to look for a registry that has
+    /// never heard of it.
+    func loadImages(from directory: String) async throws -> [String] {
+        guard !directory.isEmpty else {
+            throw RuntimeFailure.invalid("no directory to load from")
+        }
+        let platform = ContainerizationOCI.Platform(arch: "arm64", os: "linux", variant: "v8")
+        let images = try await store.load(from: URL(filePath: directory))
+        var loaded: [String] = []
+        for image in images {
+            // Unpack now rather than at first use: a pod that has to wait for a
+            // root filesystem to be built looks like a pod that is stuck.
+            let canonical = ImageReference.normalize(image.reference)
+            _ = try? await cache(image, as: Set([image.reference, canonical]),
+                                 canonical: canonical, platform: platform)
+            loaded.append(image.reference)
+        }
+        guard !loaded.isEmpty else {
+            throw RuntimeFailure.invalid("no images found in \(directory)")
+        }
+        return loaded
+    }
+
     func pullImage(_ reference: String) async throws -> String {
         let platform = ContainerizationOCI.Platform(arch: "arm64", os: "linux", variant: "v8")
         // The registry is asked for the fully qualified name; every cache is
@@ -943,7 +976,15 @@ actor PodRuntime {
         // written as `busybox:1.36` finds the image it just pulled.
         let canonical = ImageReference.normalize(reference)
         let image = try await store.pull(reference: canonical, platform: platform)
-        let keys = Set([reference, canonical])
+        return try await cache(image, as: Set([reference, canonical]), canonical: canonical,
+                               platform: platform)
+    }
+
+    /// Unpacks an image to a root filesystem and records it where the kubelet
+    /// will look. Shared by pulling and loading, which differ only in where the
+    /// image came from.
+    private func cache(_ image: Containerization.Image, as keys: Set<String>, canonical: String,
+                       platform: ContainerizationOCI.Platform) async throws -> String {
 
         if rootfsCache[canonical] == nil {
             let safe = canonical.replacingOccurrences(of: "/", with: "_")
