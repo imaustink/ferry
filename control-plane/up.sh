@@ -97,7 +97,11 @@ start kube-apiserver "$bin/kube-apiserver" \
   --requestheader-username-headers=X-Remote-User \
   --proxy-client-cert-file="$PKI_DIR/front-proxy-client.crt" \
   --proxy-client-key-file="$PKI_DIR/front-proxy-client.key" \
-  --authorization-mode=Node,RBAC --allow-privileged=true
+  --authorization-mode=Node,RBAC --allow-privileged=true \
+  `# A node on another Mac has no credentials yet, so it authenticates with a` \
+  `# bootstrap token to ask for a certificate. Without this the token is not a` \
+  `# credential at all and the join fails as Unauthorized.` \
+  --enable-bootstrap-token-auth=true
 
 echo "    . waiting for /livez"
 for i in $(seq 1 60); do
