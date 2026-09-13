@@ -370,6 +370,7 @@ actor PodRuntime {
     // rules, not a process that works them out for itself.
 
     private var lastRuleset: Data?
+    private var lastGeneration: UInt64 = 0
 
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
@@ -411,11 +412,19 @@ actor PodRuntime {
         }
     }
 
-    /// Re-applies to every running pod when the ruleset changes.
-    func refreshServiceRules() async {
-        guard config.nftBundlePath != nil, let socket = config.proxydSocket else { return }
-        let proxyd = StreamerClient(socketPath: socket)
-        guard let ruleset = try? proxyd.get(path: "/ruleset"), !ruleset.isEmpty else { return }
+    /// The generation last applied, so the caller can ask for something newer.
+    func seenGeneration() -> UInt64 { lastGeneration }
+
+    /// Takes a freshly fetched ruleset and puts it in every running pod.
+    ///
+    /// The fetch deliberately happens outside this actor. It is a blocking read
+    /// held open by ferry-proxyd until a Service changes, which can be tens of
+    /// seconds; doing it here would park the actor for that whole time and every
+    /// CRI call behind it -- a pod would not start or stop while ferry waited
+    /// for news that may never come.
+    func applyRuleset(_ ruleset: Data, generation: UInt64) async {
+        guard config.nftBundlePath != nil, !ruleset.isEmpty else { return }
+        lastGeneration = generation
         guard ruleset != lastRuleset else { return }
         lastRuleset = ruleset
         for sandbox in sandboxes.values where sandbox.booted {
@@ -426,12 +435,15 @@ actor PodRuntime {
     /// The ruleset as it stands, for a pod that has just booted.
     func currentRuleset() -> Data? { lastRuleset }
 
-    func cacheRuleset() async {
-        guard let socket = config.proxydSocket else { return }
-        let proxyd = StreamerClient(socketPath: socket)
-        if let ruleset = try? proxyd.get(path: "/ruleset"), !ruleset.isEmpty {
-            lastRuleset = ruleset
-        }
+    func cacheRuleset(_ ruleset: Data, generation: UInt64) {
+        guard !ruleset.isEmpty else { return }
+        lastRuleset = ruleset
+        lastGeneration = generation
+    }
+
+    /// Where to fetch rulesets from, for the loop that does it off-actor.
+    nonisolated var proxydClient: StreamerClient? {
+        config.proxydSocket.map { StreamerClient(socketPath: $0) }
     }
 
     /// Everything attach needs: the output fan-out point, the stdin feeder if

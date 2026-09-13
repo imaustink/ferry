@@ -1,45 +1,93 @@
 //go:build darwin
 
-// ferry-proxyd runs kube-proxy's rule generation on macOS and renders the
-// ruleset instead of applying it.
+// ferry-proxyd renders Service rules on macOS.
 //
-// There is no kernel on the host to program, but every pod has one. So the
-// generation runs here -- unmodified kube-proxy code, with all of its semantics:
-// reject rules for Services with no endpoints, hairpin masquerade, session
-// affinity, endpoint selection -- and ferry pushes the result into each pod.
+// kube-proxy cannot run on a Mac: it programs netfilter, and macOS has none.
+// But ferry's pods each have a Linux kernel, so the rules are wanted -- just
+// not here. This runs kube-proxy's own rule generation against a rendering
+// backend and serves the ruleset it would have applied; ferry-cri loads it into
+// each pod, where a real kernel exists.
 //
-// This proves the mechanism: construct the proxier, feed it a Service and its
-// endpoints, sync, and print what it would have programmed.
+// Everything that makes Service behaviour correct therefore comes from upstream:
+// reject rules for Services with no endpoints, hairpin masquerade, rejection of
+// traffic to valid ClusterIPs on wrong ports, endpoint selection and session
+// affinity. None of it is reimplemented here.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/proxy/config"
 	"k8s.io/kubernetes/pkg/proxy/nftables"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
 
+// How long a client waiting for a new ruleset is left hanging before being sent
+// away with what there is. Only needs to be short enough that a dead client or
+// a restarted ferry-cri is noticed in reasonable time.
+const longPollTimeout = 25 * time.Second
+
 func main() {
-	ctx := context.Background()
+	kubeconfig := flag.String("kubeconfig", "", "kubeconfig with cluster-wide read access")
+	socketPath := flag.String("socket", "/tmp/ferry-proxyd.sock", "socket to serve the ruleset on")
+	nodeName := flag.String("node-name", "ferry-mac", "node name to generate rules for")
+	nodeIPText := flag.String("node-ip", "", "the pod network gateway")
+	syncPeriod := flag.Duration("sync-period", 30*time.Second, "full resync period")
+	klog.InitFlags(nil)
+	flag.Parse()
+
+	if *kubeconfig == "" || *nodeIPText == "" {
+		fmt.Fprintln(os.Stderr, "--kubeconfig and --node-ip are required")
+		os.Exit(2)
+	}
+	nodeIP := net.ParseIP(*nodeIPText)
+	if nodeIP == nil {
+		fmt.Fprintf(os.Stderr, "bad --node-ip %q\n", *nodeIPText)
+		os.Exit(2)
+	}
+
+	restConfig, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read kubeconfig: %v\n", err)
+		os.Exit(1)
+	}
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build client: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Traffic policies distinguish local from remote endpoints by node. Every
+	// pod here is its own machine, so nothing is "local" in that sense and the
+	// no-op detector is the honest answer.
 	proxier, err := nftables.NewProxier(ctx,
 		v1.IPv4Protocol,
-		30*time.Second, // syncPeriod
-		time.Second,    // minSyncPeriod
-		false,          // masqueradeAll
-		14,             // masqueradeBit
+		*syncPeriod,
+		time.Second,
+		false, // masqueradeAll: only hairpins need it, which kube-proxy marks itself
+		14,    // masqueradeBit, kube-proxy's default
 		proxyutil.NewNoOpLocalDetector(),
-		"ferry-mac",
-		net.ParseIP("192.168.122.1"),
-		nil, // recorder
-		nil, // healthzServer
-		nil, // nodePortAddresses
+		*nodeName,
+		nodeIP,
+		nil, nil, nil,
 		false,
 	)
 	if err != nil {
@@ -47,50 +95,122 @@ func main() {
 		os.Exit(1)
 	}
 
-	tcp := v1.ProtocolTCP
-	proxier.OnServiceAdd(&v1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "default"},
-		Spec: v1.ServiceSpec{
-			ClusterIP: "10.96.107.164",
-			Type:      v1.ServiceTypeClusterIP,
-			Ports:     []v1.ServicePort{{Name: "http", Port: 80, Protocol: tcp}},
-		},
-	})
-	// A second Service with no endpoints, to show the reject rule appear.
-	proxier.OnServiceAdd(&v1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "lonely", Namespace: "default"},
-		Spec: v1.ServiceSpec{
-			ClusterIP: "10.96.200.200",
-			Type:      v1.ServiceTypeClusterIP,
-			Ports:     []v1.ServicePort{{Name: "http", Port: 80, Protocol: tcp}},
-		},
-	})
+	factory := informers.NewSharedInformerFactory(client, *syncPeriod)
+	serviceConfig := config.NewServiceConfig(ctx, factory.Core().V1().Services(), *syncPeriod)
+	serviceConfig.RegisterEventHandler(proxier)
+	go serviceConfig.Run(ctx.Done())
 
-	ready := true
-	port := int32(8080)
-	name := "http"
-	proxier.OnEndpointSliceAdd(&discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "backend-abc",
-			Namespace: "default",
-			Labels:    map[string]string{discoveryv1.LabelServiceName: "backend"},
-		},
-		AddressType: discoveryv1.AddressTypeIPv4,
-		Ports:       []discoveryv1.EndpointPort{{Name: &name, Port: &port, Protocol: &tcp}},
-		Endpoints: []discoveryv1.Endpoint{
-			{Addresses: []string{"192.168.122.3"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}},
-			{Addresses: []string{"192.168.122.4"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}},
-		},
-	})
+	endpointsConfig := config.NewEndpointSliceConfig(ctx, factory.Discovery().V1().EndpointSlices(), *syncPeriod)
+	endpointsConfig.RegisterEventHandler(proxier)
+	go endpointsConfig.Run(ctx.Done())
 
-	proxier.OnServiceSynced()
-	proxier.OnEndpointSlicesSynced()
-	proxier.Sync()
-	time.Sleep(2 * time.Second)
+	factory.Start(ctx.Done())
 
-	if nftables.FerryRendered == nil {
-		fmt.Fprintln(os.Stderr, "no ruleset was rendered")
+	go proxier.SyncLoop()
+
+	server := newRulesetServer()
+	go server.track(ctx)
+
+	_ = os.Remove(*socketPath)
+	listener, err := net.Listen("unix", *socketPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listen %s: %v\n", *socketPath, err)
 		os.Exit(1)
 	}
-	fmt.Print(nftables.FerryRendered.Dump())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ruleset", server.serve)
+	go http.Serve(listener, mux)
+
+	fmt.Printf("==> ferry-proxyd\n    ruleset   unix://%s\n    node      %s (%s)\n    serving\n",
+		*socketPath, *nodeName, nodeIP)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	_ = os.Remove(*socketPath)
+}
+
+// rulesetServer holds the most recently rendered ruleset and hands it out. The
+// generation only advances when the text actually changes, so a caller that
+// names the generation it already has can be left waiting until there is
+// genuinely something new -- which is what makes a Service reach the pods as
+// soon as it is rendered rather than on the next tick of a poll.
+type rulesetServer struct {
+	mu         sync.RWMutex
+	ruleset    string
+	generation uint64
+	// changed is closed and replaced on every bump. A reader takes it under the
+	// lock and then waits on it, so it cannot miss a change that lands between
+	// reading the generation and starting to wait.
+	changed chan struct{}
+}
+
+func newRulesetServer() *rulesetServer {
+	return &rulesetServer{changed: make(chan struct{})}
+}
+
+func (s *rulesetServer) current() (string, uint64, chan struct{}) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ruleset, s.generation, s.changed
+}
+
+func (s *rulesetServer) publish(rendered string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rendered == "" || rendered == s.ruleset {
+		return
+	}
+	s.ruleset = rendered
+	s.generation++
+	close(s.changed)
+	s.changed = make(chan struct{})
+	klog.V(2).InfoS("Rendered a new ruleset", "generation", s.generation, "bytes", len(rendered))
+}
+
+// track re-renders whenever the proxier has applied a transaction. The proxier
+// says so directly, so there is no polling here and no render that turns out to
+// have been unnecessary.
+func (s *rulesetServer) track(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-nftables.FerryApplied:
+			if nftables.FerryRendered != nil {
+				s.publish(nftables.FerryRendered.Dump())
+			}
+		}
+	}
+}
+
+// serve answers GET /ruleset, optionally with ?after=<generation>. Without it,
+// whatever stands now. With it, the caller is held until there is something
+// newer than the generation it names -- or until the timeout, after which it
+// gets the current ruleset and asks again.
+func (s *rulesetServer) serve(w http.ResponseWriter, r *http.Request) {
+	ruleset, generation, changed := s.current()
+
+	if after := r.URL.Query().Get("after"); after != "" {
+		if want, err := strconv.ParseUint(after, 10, 64); err == nil && generation <= want {
+			timeout := time.NewTimer(longPollTimeout)
+			defer timeout.Stop()
+			select {
+			case <-changed:
+				ruleset, generation, _ = s.current()
+			case <-timeout.C:
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
+
+	if ruleset == "" {
+		http.Error(w, "no ruleset rendered yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("X-Ferry-Generation", strconv.FormatUint(generation, 10))
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w, ruleset)
 }
