@@ -114,6 +114,9 @@ struct StreamerClient: Sendable {
 struct PodContainers: Decodable {
     let initContainers: [String]?
     let containers: [String]?
+    /// Containers whose spec asks for ferry.dev/gpu. CRI has no field for
+    /// extended resources, so this is the only way the runtime learns of it.
+    let gpuContainers: [String]?
 }
 
 extension StreamerClient {

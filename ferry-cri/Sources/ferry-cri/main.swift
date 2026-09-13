@@ -36,6 +36,10 @@ let config = RuntimeConfig(
         let path = option("--netpol-socket", "")
         return path.isEmpty ? nil : path
     }(),
+    gpudSocket: {
+        let path = option("--gpud-socket", "")
+        return path.isEmpty ? nil : path
+    }(),
     clusterCIDR: {
         let cidr = option("--cluster-cidr", "")
         return cidr.isEmpty ? nil : cidr
