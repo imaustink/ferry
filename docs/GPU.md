@@ -326,7 +326,47 @@ boundary is the gate, not the file mode.
 
 ## Sharing it
 
-One GPU, many pods, so something has to decide the order -- and a plain lock
+### Two lanes, because the Mac has two answers
+
+"The GPU" turned out to be the wrong unit. Measured on this M4 Max
+([experiment 12](../experiments/12-gpu-contention/FINDINGS.md)):
+
+```
+two matmuls        one alone 12768 GFLOP/s
+                   two at once 6505 + 6424 = 12930 (101% of one)
+
+matmul + generation   matmul -0.9%, generation -12.0% per character
+```
+
+Two Metal matmuls split one GPU and the total does not move, so running them at
+once buys one percent and makes both of them half as fast. A matmul and a
+generation ignore each other entirely -- Apple's model does not run on the
+shaders, and the Neural Engine is separate silicon.
+
+So there is a lane per unit rather than one token for the machine: **compute**
+for Metal work, serialised, and **model** for the on-device model, independent.
+Within a lane everything below applies. Across lanes, nothing does: a pod
+generating text and a pod multiplying matrices never wait for each other,
+because the hardware does not make them.
+
+What a small matmul waits for, through the daemon:
+
+```
+nothing else running                         0.096s 0.083s 0.083s
+a generation running (other lane)            0.104s 0.086s 0.087s   <- no wait
+another matmul running (same lane)           0.098s 0.580s 0.579s   <- the slice
+```
+
+That middle row used to cost 0.26-0.77s. It is now indistinguishable from an
+idle machine, and the generation is not interrupted at all -- it reports zero
+yields, because nothing needs it to step aside.
+
+`GET /capacity` and `/metrics` report what is queued per lane, which is the
+number that says *which* resource is short rather than that something is.
+
+### Sharing a lane
+
+One lane, many pods, so something has to decide the order -- and a plain lock
 decides it badly. `ferry-gpud` hands out a device token behind a queue that is
 bounded, fair, deadlined, preemptible and cancellable.
 
@@ -436,10 +476,16 @@ at 5.00s against a 5s budget) and while queued.
 queued *and* running requests, and the caller gets a 499 rather than waiting.
 
 **The queue is bounded** -- 64 waiting by default, 8 from any one pod -- and a
-full queue is a 503 rather than an unbounded backlog. A request may allocate at
-most a quarter of the GPU's recommended working set; unified memory is shared
+full queue is a 503 rather than an unbounded backlog.
+
+Each lane also bounds how big one request may be, and they need different
+bounds because they consume different things. A compute request may allocate at
+most a quarter of the GPU's recommended working set: unified memory is shared
 with the whole Mac and the allocation is the host's, so an unbounded one is a
-denial of service against the Mac rather than against the pod.
+denial of service against the Mac rather than against the pod. A model request
+is capped at 4096 response tokens, which is the same idea for the thing the
+model actually spends -- `maximumResponseTokens` previously went to the
+framework exactly as the pod sent it, so "as long as it likes" was the policy.
 
 | flag | default | |
 |---|---|---|
@@ -530,9 +576,14 @@ daemon and it is back within a tick.
 
 ## Open questions
 
-- **One pass is the floor.** A co-tenant's worst wait is the time slice plus
-  whatever command buffer is already running, and the second half of that is not
-  ours to interrupt. At the largest allowed matmul it is about 0.9s.
+- **One pass is the floor, in the compute lane.** A co-tenant's worst wait there
+  is the time slice plus whatever command buffer is already running, and the
+  second half of that is not ours to interrupt. At the largest allowed matmul it
+  is about 0.9s.
+- **Two lanes because two were measured.** A third kind of work -- a Core ML
+  model, a video encode, a matmul too small to fill the GPU -- would need its own
+  measurement before anyone could say which lane it belongs in. The lane is a
+  claim about hardware, not a label.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 

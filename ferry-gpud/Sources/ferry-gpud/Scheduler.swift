@@ -1,8 +1,9 @@
 // Who gets the GPU next, for how long, and what happens when a pod goes away
 // mid-request.
 //
-// There is one GPU and there are many pods, so something has to decide the
-// order. A plain lock decides it badly: whoever happens to wake first wins, a
+// One of these runs each lane -- see Lanes.swift for why there is more than one.
+// Within a lane there is one resource and many pods, so something has to decide
+// the order. A plain lock decides it badly: whoever happens to wake first wins, a
 // pod that submits ten jobs starves a pod that submitted one, a job with no
 // deadline runs until it finishes however long that is, and a pod deleted
 // mid-request leaves its work running for a container that no longer exists.
@@ -171,6 +172,11 @@ final class GPUScheduler: @unchecked Sendable {
     private var current: Waiter?
     private var stopping = false
 
+    /// Which resource this scheduler is the queue for.
+    let lane: GPULane
+    /// Shared with the other lanes: a pod's GPU time is one number whatever mix
+    /// of lanes it used.
+    private let ledger: UsageLedger
     private let queueDepth: Int
     private let perPodDepth: Int
     private let slice: TimeInterval
@@ -179,17 +185,15 @@ final class GPUScheduler: @unchecked Sendable {
     /// Per pod, from its PriorityClass. Absent means 0, which is what an
     /// ordinary pod has.
     private var priorities: [String: Int32] = [:]
-    private var usage: [String: PodUsage] = [:]
-    /// Pods come and go for the life of the cluster, so their accounting cannot
-    /// be kept forever. Past this, the least recently used record is dropped.
-    private let maxUsageEntries = 256
 
-    init(queueDepth: Int, perPodDepth: Int, slice: TimeInterval,
-         starvationGuard: TimeInterval) {
+    init(lane: GPULane, queueDepth: Int, perPodDepth: Int, slice: TimeInterval,
+         starvationGuard: TimeInterval, ledger: UsageLedger) {
+        self.lane = lane
         self.queueDepth = queueDepth
         self.perPodDepth = perPodDepth
         self.slice = slice
         self.starvationGuard = starvationGuard
+        self.ledger = ledger
     }
 
     /// Records what a pod is worth, from its spec. Set when its socket is
@@ -370,14 +374,15 @@ final class GPUScheduler: @unchecked Sendable {
             waiter.held += Date().timeIntervalSince(waiter.grantedAt)
             current = nil
         }
-        var record = usage[waiter.job.pod] ?? PodUsage()
-        record.requests += 1
-        record.gpuSeconds += waiter.held
-        record.queuedSeconds += waiter.waited
-        record.lastUsed = ISO8601DateFormatter().string(from: Date())
-        if failure != nil { record.failures += 1 }
-        usage[waiter.job.pod] = record
-        evictUsageIfNeeded()
+        let held = waiter.held
+        let waited = waiter.waited
+        let failed = failure != nil
+        ledger.record(pod: waiter.job.pod) { record in
+            record.requests += 1
+            record.gpuSeconds += held
+            record.queuedSeconds += waited
+            if failed { record.failures += 1 }
+        }
         promote()
         condition.broadcast()
     }
@@ -411,7 +416,7 @@ final class GPUScheduler: @unchecked Sendable {
         waiter.granted = false
         current = nil
         enqueue(waiter)
-        usage[job.pod, default: PodUsage()].yields += 1
+        ledger.record(pod: job.pod) { $0.yields += 1 }
         job.countYield()
         promote()
         try waitForDevice(waiter)
@@ -467,22 +472,9 @@ final class GPUScheduler: @unchecked Sendable {
 
     // MARK: - Reporting
 
-    var stats: [String: PodUsage] {
-        condition.lock()
-        defer { condition.unlock() }
-        return usage
-    }
-
-    func usage(for pod: String) -> PodUsage {
-        condition.lock()
-        defer { condition.unlock() }
-        return usage[pod] ?? PodUsage()
-    }
-
     func forget(pod: String) {
         condition.lock()
         defer { condition.unlock() }
-        usage.removeValue(forKey: pod)
         priorities.removeValue(forKey: pod)
     }
 
@@ -493,11 +485,4 @@ final class GPUScheduler: @unchecked Sendable {
         return waiting + (current == nil ? 0 : 1)
     }
 
-    /// Called with the lock held. Drops the least recently used record rather
-    /// than letting a long-lived node accumulate one per pod it has served.
-    private func evictUsageIfNeeded() {
-        guard usage.count > maxUsageEntries else { return }
-        let oldest = usage.min { ($0.value.lastUsed ?? "") < ($1.value.lastUsed ?? "") }
-        if let key = oldest?.key { usage.removeValue(forKey: key) }
-    }
 }

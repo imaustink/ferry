@@ -65,9 +65,9 @@ do {
     exit(1)
 }
 
-let scheduler = GPUScheduler(queueDepth: queueDepth, perPodDepth: perPodDepth,
-                             slice: timeSlice, starvationGuard: starvationGuard)
-let service = Service(gpu: gpu, scheduler: scheduler, socketDirectory: socketDirectory,
+let lanes = GPULanes(queueDepth: queueDepth, perPodDepth: perPodDepth,
+                     slice: timeSlice, starvationGuard: starvationGuard)
+let service = Service(gpu: gpu, lanes: lanes, socketDirectory: socketDirectory,
                       limit: limit, requestTimeout: requestTimeout)
 
 print("==> ferry-gpud")
@@ -80,6 +80,8 @@ print("    capacity  \(limit) pod\(limit == 1 ? "" : "s"), "
       + "\(Int(requestTimeout))s per request, \(queueDepth) queued (\(perPodDepth) per pod)")
 print("    slice     \(timeSlice)s before a waiting pod gets a turn, "
       + "\(Int(starvationGuard))s before it gets one regardless of priority")
+print("    lanes     \(GPULane.allCases.map(\.rawValue).joined(separator: ", "))"
+      + " -- measured not to contend, so they run at once")
 print("    control   unix://\(controlSocket)")
 print("    pods      \(socketDirectory)/<uid>.sock")
 

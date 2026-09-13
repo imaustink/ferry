@@ -103,6 +103,15 @@ final class Generator: @unchecked Sendable {
     /// deadline is a blunter instrument than simply not accepting the job.
     static let maxPromptBytes = 16 * 1024
 
+    /// The most a pod may ask the model to produce.
+    ///
+    /// `maximumResponseTokens` went to the framework unchecked, which left the
+    /// model lane with no bound of its own: the request deadline would stop a
+    /// runaway eventually, but only after it had held the lane for its whole
+    /// budget. The compute lane has a memory ceiling for the same reason; this
+    /// is the model lane's version of it.
+    static let maxResponseTokens = 4096
+
     func generate(_ request: GenerateRequest, job: GPUJob) throws -> GenerateResult {
         let status = self.status
         guard status.available else {
@@ -123,8 +132,15 @@ final class Generator: @unchecked Sendable {
         // feature.
         let session = request.instructions.map { LanguageModelSession(instructions: $0) }
             ?? LanguageModelSession()
-        let options = GenerationOptions(temperature: request.temperature,
-                                        maximumResponseTokens: request.maxTokens)
+        if let asked = request.maxTokens, asked > Self.maxResponseTokens {
+            throw GenerationError.failed(
+                "maxTokens \(asked) is over this node's limit of \(Self.maxResponseTokens)")
+        }
+        // Defaulted rather than left nil: without a cap the model decides how
+        // long to run, and "as long as it likes" is not a policy.
+        let options = GenerationOptions(
+            temperature: request.temperature,
+            maximumResponseTokens: request.maxTokens ?? Self.maxResponseTokens)
 
         let start = Date()
         let puller = SnapshotPuller(session.streamResponse(to: request.prompt, options: options))
