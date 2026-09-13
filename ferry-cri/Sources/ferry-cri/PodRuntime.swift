@@ -27,6 +27,8 @@ struct RuntimeConfig: Sendable {
     var nftBundlePath: String?
     /// ferry-proxyd's socket, where the rendered ruleset comes from.
     var proxydSocket: String?
+    /// ferry-netpol's socket, where each pod's NetworkPolicy rules come from.
+    var netpolSocket: String?
     /// The cluster pod network, one flat segment across every node on every
     /// machine. Empty leaves ferry on vmnet addressing and a single node.
     var clusterCIDR: String?
@@ -467,6 +469,9 @@ actor PodRuntime {
 
     private var lastRuleset: Data?
     private var lastGeneration: UInt64 = 0
+    /// NetworkPolicy rules, one section per pod address.
+    private var policyRules: [String: String] = [:]
+    private var lastPolicyGeneration: UInt64 = 0
 
     /// One rule kube-proxy cannot know it needs.
     ///
@@ -496,7 +501,25 @@ actor PodRuntime {
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
     func applyServiceRules(sandboxID: String, ruleset: Data) async {
-        guard config.nftBundlePath != nil else { return }
+        var payload = ruleset
+        if let extra = ferryEgressRule(), let bytes = extra.data(using: .utf8) {
+            payload.append(bytes)
+        }
+        await applyNftables(sandboxID: sandboxID, payload: payload, label: "Service")
+    }
+
+    func applyNftables(sandboxID: String, text: String, label: String) async {
+        guard let payload = text.data(using: .utf8) else { return }
+        await applyNftables(sandboxID: sandboxID, payload: payload, label: label)
+    }
+
+    /// Loads an nftables script into one pod's own kernel.
+    ///
+    /// Everything ferry does to a pod's networking goes through here: the
+    /// Service rules kube-proxy rendered, and the NetworkPolicy rules meant for
+    /// this pod alone. Both are text, and the pod has a kernel to put them in.
+    private func applyNftables(sandboxID: String, payload: Data, label: String) async {
+        guard config.nftBundlePath != nil, !payload.isEmpty else { return }
         guard let target = containers.values.first(where: {
             $0.sandboxID == sandboxID && $0.state == .running
         }) else { return }
@@ -511,11 +534,6 @@ actor PodRuntime {
                 privileged.bounding.append(netAdmin)
                 privileged.effective.append(netAdmin)
                 privileged.permitted.append(netAdmin)
-            }
-
-            var payload = ruleset
-            if let extra = ferryEgressRule(), let bytes = extra.data(using: .utf8) {
-                payload.append(bytes)
             }
 
             let process = try await exec(
@@ -534,7 +552,7 @@ actor PodRuntime {
             _ = try? await process.wait(timeoutInSeconds: 15)
         } catch {
             FileHandle.standardError.write(
-                "warning: could not program Service rules in \(sandboxID): \(error)\n".data(using: .utf8)!)
+                "warning: could not program \(label) rules in \(sandboxID): \(error)\n".data(using: .utf8)!)
         }
     }
 
@@ -561,6 +579,44 @@ actor PodRuntime {
     /// The ruleset as it stands, for a pod that has just booted.
     func currentRuleset() -> Data? { lastRuleset }
 
+    /// What ferry-netpol last said about this pod, if anything.
+    func currentPolicy(forPodAt address: String) -> String? { policyRules[address] }
+
+    func seenPolicyGeneration() -> UInt64 { lastPolicyGeneration }
+
+    /// Takes a fresh set of policy rules and puts each pod's own section into it.
+    ///
+    /// A NetworkPolicy is per pod, so unlike the Service ruleset these differ
+    /// from one pod to the next and cannot be broadcast. The document is split
+    /// by address and each running pod gets its part.
+    func applyPolicies(_ document: String, generation: UInt64) async {
+        lastPolicyGeneration = generation
+        var sections: [String: String] = [:]
+        var address = ""
+        var body = ""
+        for line in document.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("## ") {
+                if !address.isEmpty { sections[address] = body }
+                address = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                body = ""
+            } else {
+                body += line + "\n"
+            }
+        }
+        if !address.isEmpty { sections[address] = body }
+
+        for (podAddress, rules) in sections where policyRules[podAddress] != rules {
+            policyRules[podAddress] = rules
+            guard let sandbox = sandboxes.values.first(where: { $0.ip == podAddress && $0.booted })
+            else { continue }
+            await applyNftables(sandboxID: sandbox.id, text: rules, label: "policy")
+        }
+        // A pod that vanished from the document has no policy to enforce.
+        for known in policyRules.keys where sections[known] == nil {
+            policyRules.removeValue(forKey: known)
+        }
+    }
+
     func cacheRuleset(_ ruleset: Data, generation: UInt64) {
         guard !ruleset.isEmpty else { return }
         lastRuleset = ruleset
@@ -570,6 +626,10 @@ actor PodRuntime {
     /// Where to fetch rulesets from, for the loop that does it off-actor.
     nonisolated var proxydClient: StreamerClient? {
         config.proxydSocket.map { StreamerClient(socketPath: $0) }
+    }
+
+    nonisolated var netpolClient: StreamerClient? {
+        config.netpolSocket.map { StreamerClient(socketPath: $0) }
     }
 
     /// Everything attach needs: the output fan-out point, the stdin feeder if
@@ -841,10 +901,17 @@ actor PodRuntime {
         try await sandbox.pod.startContainer(id)
         markStarted(id, pod: sandbox.pod)
 
-        // A pod cannot reach a Service until its own kernel has the rules.
+        // A pod cannot reach a Service until its own kernel has the rules, and
+        // it should not be reachable past its policy before it has those either.
+        let sandboxID = record.sandboxID
+        let address = sandboxes[sandboxID]?.ip ?? ""
         if let ruleset = lastRuleset {
-            let sandboxID = record.sandboxID
             Task { [weak self] in await self?.applyServiceRules(sandboxID: sandboxID, ruleset: ruleset) }
+        }
+        if let policy = policyRules[address] {
+            Task { [weak self] in
+                await self?.applyNftables(sandboxID: sandboxID, text: policy, label: "policy")
+            }
         }
     }
 
