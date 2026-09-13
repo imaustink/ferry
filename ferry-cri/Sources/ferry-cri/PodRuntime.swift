@@ -78,6 +78,11 @@ struct SandboxRecord {
     var usesReservedAddress: Bool = false
     /// The pod's address on the cluster network, to hand back when it stops.
     var clusterAddress: String? = nil
+    /// The pod's vmnet address. `ip` is what Kubernetes calls the pod IP and
+    /// lives on the cluster network, which only pods are on -- so anything the
+    /// Mac itself does, port-forward and the host side of a Service, needs this
+    /// one instead.
+    var hostAddress: String = ""
     /// Kept so the VM can be rebuilt if every container in it has stopped --
     /// see createContainer.
     let interface: any Interface
@@ -318,6 +323,7 @@ actor PodRuntime {
         if let clusterInterface {
             podSwitch?.attach(podID: id, fd: clusterInterface.hostFD)
         }
+        defer { publishHostReachableMap() }
         // Deliberately not created yet. CRI adds containers after the sandbox
         // exists, and on this hypervisor a container can only be added before
         // the VM boots -- see startContainer.
@@ -332,6 +338,7 @@ actor PodRuntime {
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
             usesReservedAddress: wantsReserved && (dnsInterfaceInUse || clusterDNSInUse),
             clusterAddress: clusterInterface.map { "\($0.ipv4Address)" },
+            hostAddress: "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? "",
             interface: interface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers
@@ -418,6 +425,7 @@ actor PodRuntime {
         // clusterDNS then points at nothing.
         if record.usesReservedAddress { dnsInterfaceInUse = false; clusterDNSInUse = false }
         podSwitch?.detach(podID: id)
+        defer { publishHostReachableMap() }
         if let address = record.clusterAddress { clusterAddresses?.give(back: address) }
         sandboxes[id] = record
     }
@@ -578,7 +586,32 @@ actor PodRuntime {
     }
 
     /// The pod's address, for port forwarding. ferry-streamer dials it directly.
-    func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
+    /// Where the *Mac* can reach this pod.
+    ///
+    /// Not the same as the pod IP once there is a cluster network: that address
+    /// is on ferry's switch, which carries traffic between pods and which the
+    /// host is not on. port-forward and the host side of a Service both run on
+    /// the Mac, so both want the vmnet address.
+    func sandboxAddress(_ id: String) -> String? {
+        guard let record = sandboxes[id] else { return nil }
+        return record.hostAddress.isEmpty ? record.ip : record.hostAddress
+    }
+
+    private func publishHostReachableMap() {
+        try? hostReachableMap().write(
+            to: config.stateDir.appending(component: "podmap"),
+            atomically: true, encoding: .utf8)
+    }
+
+    /// Every pod on this node as "<pod IP> <address the Mac can reach it at>".
+    /// ferry-proxy reads this to turn an endpoint into something it can dial.
+    func hostReachableMap() -> String {
+        sandboxes.values
+            .filter { !$0.hostAddress.isEmpty && $0.ip != $0.hostAddress }
+            .map { "\($0.ip) \($0.hostAddress)" }
+            .sorted()
+            .joined(separator: "\n") + "\n"
+    }
 
     // MARK: - Containers
 

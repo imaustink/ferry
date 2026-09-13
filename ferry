@@ -157,6 +157,10 @@ cmd_build() {
   ( cd "$here/ferry-proxy" && go build -o "$here/bin/ferry-proxy" . ) || return 1
   echo "==> $here/bin/ferry-proxy"
   echo
+  echo "==> ferry-storage"
+  ( cd "$here/ferry-storage" && go build -o "$here/bin/ferry-storage" . ) || return 1
+  echo "==> $here/bin/ferry-storage"
+  echo
   echo "==> ferry-streamer"
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
   echo "==> $here/bin/ferry-streamer"
@@ -309,11 +313,35 @@ EOF
   fi
 
   start_proxy
+  start_storage
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   echo
   bold "ferry is up"
   echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+}
+
+# Somewhere for a PersistentVolumeClaim to live.
+#
+# A volume is a directory on this Mac, handed to the pod as a virtiofs share --
+# the same mechanism every other ferry mount uses. That makes it local to one
+# machine, so the volume carries node affinity and binding waits for the
+# scheduler to choose a node.
+start_storage() {
+  [ -x "$here/bin/ferry-storage" ] || { warn "ferry-storage not built; PersistentVolumeClaims will stay Pending"; return 0; }
+  "$here/bin/ferry-storage" --kubeconfig "$FERRY_HOME/admin.conf" \
+    --node-name "$NODE_NAME" --root "$FERRY_HOME/volumes" \
+    >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-storage.pid"
+  for _ in $(seq 1 30); do
+    grep -q "serving" "$FERRY_RUN/logs/ferry-storage.log" 2>/dev/null && break
+    sleep 0.5
+  done
+  if grep -q "serving" "$FERRY_RUN/logs/ferry-storage.log" 2>/dev/null; then
+    ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
+  else
+    warn "ferry-storage did not start; see $FERRY_RUN/logs/ferry-storage.log"
+  fi
 }
 
 # CoreDNS forwards names it does not serve. It must not forward to itself, so
@@ -368,30 +396,54 @@ install_dns() { # gateway dns-address
 # bind ClusterIPs locally and listen on 443 for the kubernetes Service, both of
 # which need root, and every Service connection then passes through the Mac.
 start_proxy() {
+  [ -x "$here/bin/ferry-proxy" ] || { warn "ferry-proxy not built; NodePort and LoadBalancer will not work"; return 0; }
+
+  # ClusterIPs are handled inside each pod when the guest kernel can NAT, which
+  # needs no privilege. Without such a kernel they fall back to this process,
+  # which binds them on the Mac and does need root.
+  local cluster_ips=false extra=""
   if [ "$KERNEL" = "$NAT_KERNEL" ] && [ -x "$here/bin/ferry-proxyd" ]; then
     ok "Services route inside pods (no host proxy, no root)"
-    return 0
-  fi
-
-  [ -x "$here/bin/ferry-proxy" ] || { warn "ferry-proxy not built; Services will not route"; return 0; }
-  echo "  The guest kernel cannot do NAT, so Services fall back to a host proxy."
-  echo "  Build a NAT-capable kernel with 'ferry kernel' to avoid this."
-
-  if ! sudo -n true 2>/dev/null; then
-    echo "  ferry needs sudo once to bind ClusterIPs and listen on port 443."
-    sudo -v || { warn "no sudo; Services will not route (pods and DNS still work)"; return 0; }
-  fi
-
-  sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
-    >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
-  # The pid here is sudo's; record the child so 'ferry down' can stop it.
-  sleep 2
-  local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
-  if [ -n "$pid" ]; then
-    echo "$pid" > "$FERRY_RUN/ferry-proxy.pid"
-    ok "Service proxy running (ClusterIPs routable)"
   else
-    warn "Service proxy did not start; see $FERRY_RUN/logs/ferry-proxy.log"
+    cluster_ips=true
+    echo "  The guest kernel cannot do NAT, so ClusterIPs fall back to a host proxy."
+    echo "  Build a NAT-capable kernel with 'ferry kernel' to avoid this."
+  fi
+
+  # NodePort and LoadBalancer are the outside edge of a Service and always live
+  # on the Mac, whichever way ClusterIPs are handled. Node ports need no
+  # privilege; a LoadBalancer port below 1024 does, and ferry-proxy says so.
+  local lb="$LAN_IP"
+  [ "$lb" = "127.0.0.1" ] && lb=""
+
+  if [ "$cluster_ips" = true ]; then
+    if ! sudo -n true 2>/dev/null; then
+      echo "  ferry needs sudo once to bind ClusterIPs and listen on port 443."
+      sudo -v || { warn "no sudo; ClusterIPs will not route (pods and DNS still work)"; return 0; }
+    fi
+    sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
+      --cluster-ips --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      ${lb:+--load-balancer-ip "$lb"} \
+      >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
+    sleep 2
+    local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
+  else
+    "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
+      --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      ${lb:+--load-balancer-ip "$lb"} \
+      >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
+    local pid=$!
+  fi
+
+  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "$pid" > "$FERRY_RUN/ferry-proxy.pid"
+    if [ -n "$lb" ]; then
+      ok "NodePort on this Mac, LoadBalancer at $lb"
+    else
+      ok "NodePort on this Mac"
+    fi
+  else
+    warn "ferry-proxy did not start; see $FERRY_RUN/logs/ferry-proxy.log"
   fi
 }
 
@@ -776,6 +828,25 @@ EOF
     warn "bin/ferry-proxyd is missing; Services will not route on this node"
   fi
 
+  # Node ports and claims are per node too: a pod scheduled here needs its
+  # volume made here, and a connection arriving here needs forwarding here.
+  local lb="$LAN_IP"; [ "$lb" = "127.0.0.1" ] && lb=""
+  if [ -x "$here/bin/ferry-proxy" ]; then
+    "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
+      --node-ports --node-name "$name" --pod-map "$FERRY_RUN/cri/podmap" \
+      ${lb:+--load-balancer-ip "$lb"} \
+      >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-proxy.pid"
+    ok "NodePort on this Mac${lb:+, LoadBalancer at $lb}"
+  fi
+  if [ -x "$here/bin/ferry-storage" ]; then
+    "$here/bin/ferry-storage" --kubeconfig "$FERRY_RUN/kubelet.conf" \
+      --node-name "$name" --root "$FERRY_HOME/volumes" --default=false \
+      >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-storage.pid"
+    ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
+  fi
+
   echo
   bold "joined as $name"
   echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
@@ -806,7 +877,7 @@ cmd_down() {
     ok "node $index stopped"
   done
 
-  for component in kubelet ferry-cri ferry-streamer ferry-proxyd; do
+  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-storage; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     local pid; pid="$(cat "$pidfile")"
@@ -818,13 +889,19 @@ cmd_down() {
     kill -KILL "$pid" 2>/dev/null
     ok "$component stopped"
   done
+  # A listener that outlives its pid file holds the node port against the next
+  # run, and the symptom -- "address already in use" buried in a log -- is a poor
+  # way to find that out.
+  pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
+  sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
+
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$PEERS_FILE"
 }
 
 cmd_status() {
   bold "ferry status"
-  for component in ferry-cri ferry-streamer ferry-proxyd kubelet ferry-proxy; do
+  for component in ferry-cri ferry-streamer ferry-proxyd ferry-storage kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
@@ -842,7 +919,7 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-storage) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
     *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
