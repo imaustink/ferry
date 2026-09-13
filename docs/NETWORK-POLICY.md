@@ -26,6 +26,11 @@ ports. On an ordinary cluster a CNI plugin enforces that somewhere in the host's
 kernel. ferry has no CNI, and the Mac is not on the pod network at all -- so
 there is nowhere on the host it could be done.
 
+> That first clause is true of ferry today, but not of the Mac. The CNI
+> *runtime* and the IPAM plugins do build and run natively on darwin/arm64, and
+> the plugins that do not are the ones whose job the hypervisor already does.
+> See [experiments/11-cni-on-macos](../experiments/11-cni-on-macos/FINDINGS.md).
+
 There does not need to be. Every ferry pod is a virtual machine with its own
 Linux kernel, and ferry already loads nftables rules into those kernels: that is
 how Services work. A per-pod policy wants a per-pod firewall, and a machine per
