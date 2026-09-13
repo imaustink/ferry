@@ -123,6 +123,10 @@ func main() {
 	}
 	go servePodLookup(controlMux, pods)
 
+	stop := make(chan struct{})
+	defer close(stop)
+	serveServices(controlMux, newServiceWatch(pods, stop))
+
 	fmt.Printf("==> ferry-streamer\n    streaming  http://%s/\n    control    unix://%s\n    exec via   unix://%s\n    serving\n",
 		*listen, *control, *execSocket)
 	if err := server.Start(true); err != nil {

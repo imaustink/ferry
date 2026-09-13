@@ -22,6 +22,9 @@ struct RuntimeConfig: Sendable {
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
+    /// Host path of the static ferry-netd binary, mounted into every pod so it
+    /// can program its own Service rules.
+    var netdPath: String?
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -353,6 +356,72 @@ actor PodRuntime {
 
     func listSandboxes() -> [SandboxRecord] { Array(sandboxes.values) }
 
+    // MARK: - Service rules
+    //
+    // The ruleset is computed once on the host and applied inside each pod.
+    // That is the whole reason there is no kube-proxy here: a pod needs the
+    // rules, not a process that works them out for itself.
+
+    private var lastRuleset: Data?
+
+    /// Applies the current ruleset to one pod. Quiet on failure: a pod that
+    /// cannot reach Services is worth a log line, not a failed start.
+    func applyServiceRules(sandboxID: String, ruleset: Data) async {
+        guard config.netdPath != nil else { return }
+        guard let target = containers.values.first(where: {
+            $0.sandboxID == sandboxID && $0.state == .running
+        }) else { return }
+
+        do {
+            // ferry-netd needs NET_ADMIN to program the pod's kernel, and an
+            // ordinary pod does not ask for it. Granting it to this process
+            // rather than to the container keeps the privilege on a binary
+            // ferry ships and runs, not on the workload.
+            var privileged = Containerization.LinuxCapabilities.defaultOCICapabilities
+            if let netAdmin = try? CapabilityName(rawValue: "NET_ADMIN") {
+                privileged.bounding.append(netAdmin)
+                privileged.effective.append(netAdmin)
+                privileged.permitted.append(netAdmin)
+            }
+
+            let process = try await exec(
+                containerID: target.id,
+                command: ["/.ferry/ferry-netd"],
+                tty: false,
+                stdin: DataReaderStream(ruleset),
+                stdout: DiscardWriter(),
+                stderr: ErrorWriter(prefix: "ferry-netd"),
+                capabilities: privileged
+            )
+            try await process.start()
+            _ = try? await process.wait(timeoutInSeconds: 15)
+        } catch {
+            FileHandle.standardError.write(
+                "warning: could not program Service rules in \(sandboxID): \(error)\n".data(using: .utf8)!)
+        }
+    }
+
+    /// Re-applies to every running pod when the ruleset changes.
+    func refreshServiceRules() async {
+        guard let streamer, config.netdPath != nil else { return }
+        guard let ruleset = try? streamer.get(path: "/services"), !ruleset.isEmpty else { return }
+        guard ruleset != lastRuleset else { return }
+        lastRuleset = ruleset
+        for sandbox in sandboxes.values where sandbox.booted {
+            await applyServiceRules(sandboxID: sandbox.id, ruleset: ruleset)
+        }
+    }
+
+    /// The ruleset as it stands, for a pod that has just booted.
+    func currentRuleset() -> Data? { lastRuleset }
+
+    func cacheRuleset() async {
+        guard let streamer else { return }
+        if let ruleset = try? streamer.get(path: "/services"), !ruleset.isEmpty {
+            lastRuleset = ruleset
+        }
+    }
+
     /// Everything attach needs: the output fan-out point, the stdin feeder if
     /// the pod asked for one, and whether the container was given a terminal.
     func attachTargets(_ id: String) throws -> (output: ContainerLogFile, stdin: FrameReaderStream?, tty: Bool) {
@@ -482,6 +551,15 @@ actor PodRuntime {
                 options: mount.readonly ? ["ro"] : []
             ))
         }
+        // Every pod gets ferry-netd, so Service rules are programmed inside its
+        // own kernel rather than proxied through the host.
+        if let netdPath = config.netdPath, FileManager.default.fileExists(atPath: netdPath) {
+            collected.append(.share(
+                source: URL(filePath: netdPath).deletingLastPathComponent().path(),
+                destination: "/.ferry",
+                options: ["ro"]))
+        }
+
         // Immutable so it can cross into the configuration closure.
         let shares = collected
 
@@ -583,6 +661,12 @@ actor PodRuntime {
 
         try await sandbox.pod.startContainer(id)
         markStarted(id, pod: sandbox.pod)
+
+        // A pod cannot reach a Service until its own kernel has the rules.
+        if let ruleset = lastRuleset {
+            let sandboxID = record.sandboxID
+            Task { [weak self] in await self?.applyServiceRules(sandboxID: sandboxID, ruleset: ruleset) }
+        }
     }
 
     private func markStarted(_ id: String, pod: LinuxPod) {
@@ -632,7 +716,8 @@ actor PodRuntime {
         tty: Bool,
         stdin: (any ReaderStream)?,
         stdout: any Writer,
-        stderr: any Writer
+        stderr: any Writer,
+        capabilities: Containerization.LinuxCapabilities? = nil
     ) async throws -> LinuxProcess {
         guard let record = containers[containerID] else {
             throw RuntimeFailure.notFound("container \(containerID)")
@@ -654,6 +739,7 @@ actor PodRuntime {
             // With a TTY there is one stream, and the client expects everything
             // on stdout; sending stderr separately would interleave badly.
             config.stderr = tty ? nil : stderr
+            if let capabilities { config.capabilities = capabilities }
         }
     }
 

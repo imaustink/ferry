@@ -98,10 +98,10 @@ cmd_doctor() {
   ok "$vms virtual machines running (ceiling is 128, shared with all apps)"
 
   if [ -f "$NAT_KERNEL" ]; then
-    ok "guest kernel with NAT support (kernel/vmlinux-arm64)"
+    ok "guest kernel with NAT support — Services route inside pods, no root needed"
   else
-    warn "guest kernel without NAT (kata); Services route through the host."
-    echo "      build one with: ./kernel/build-kernel.sh"
+    warn "guest kernel without NAT (kata); Services will route through the host,"
+    echo "      which needs root. Build one with: ./kernel/build-kernel.sh"
   fi
 
   local free; free="$(df -g "$HOME" | tail -1 | awk '{print $4}')"
@@ -133,6 +133,13 @@ cmd_build() {
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
   echo "==> $here/bin/ferry-streamer"
   echo
+  # Static, and for the guest rather than the host: it runs inside pods.
+  echo "==> ferry-netd (linux/arm64, static)"
+  mkdir -p "$here/bin/guest"
+  ( cd "$here/ferry-netd" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+      go build -trimpath -ldflags='-s -w' -o "$here/bin/guest/ferry-netd" . ) || return 1
+  echo "==> $here/bin/guest/ferry-netd"
+  echo
   bold "built -- run: ferry up"
 }
 
@@ -155,6 +162,7 @@ cmd_up() {
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
+    --netd "$here/bin/guest/ferry-netd" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -289,11 +297,22 @@ install_dns() { # gateway dns-address
   fi
 }
 
-# ClusterIPs have to be bound locally for the kernel to accept traffic addressed
-# to them, and the kubernetes Service listens on 443. Both need root, and
-# nothing else in ferry does.
+# Services route inside each pod when the guest kernel can do NAT: ferry-cri
+# pushes the ruleset into pods, which program their own kernels. That needs no
+# privilege on the Mac and keeps traffic pod to pod.
+#
+# The host proxy below is the fallback for a guest kernel without NAT. It has to
+# bind ClusterIPs locally and listen on 443 for the kubernetes Service, both of
+# which need root, and every Service connection then passes through the Mac.
 start_proxy() {
+  if [ "$KERNEL" = "$NAT_KERNEL" ]; then
+    ok "Services route inside pods (no host proxy, no root)"
+    return 0
+  fi
+
   [ -x "$here/bin/ferry-proxy" ] || { warn "ferry-proxy not built; Services will not route"; return 0; }
+  echo "  The guest kernel cannot do NAT, so Services fall back to a host proxy."
+  echo "  Build a NAT-capable kernel with 'ferry kernel' to avoid this."
 
   if ! sudo -n true 2>/dev/null; then
     echo "  ferry needs sudo once to bind ClusterIPs and listen on port 443."
