@@ -448,6 +448,31 @@ actor PodRuntime {
     private var lastRuleset: Data?
     private var lastGeneration: UInt64 = 0
 
+    /// One rule kube-proxy cannot know it needs.
+    ///
+    /// A pod reaches a ClusterIP through its default route, which is eth0 on
+    /// vmnet, so the kernel picks eth0's address as the source before anything
+    /// is rewritten. kube-proxy then DNATs the destination to a pod address, and
+    /// the packet correctly leaves by eth1 -- still carrying a vmnet source.
+    ///
+    /// On one machine that survives, because the reply finds its way back over
+    /// the vmnet network the pods share. Across machines it cannot: the other
+    /// Mac's pods have never heard of this one's vmnet addresses, and the reply
+    /// goes nowhere.
+    ///
+    /// Masquerading what leaves eth1 with a source from outside the cluster
+    /// network fixes it, and does so without losing anything: masquerade takes
+    /// the outgoing interface's address, which is the pod's own cluster address.
+    /// The peer still sees the pod it is actually talking to.
+    private func ferryEgressRule() -> String? {
+        guard let cidr = config.clusterCIDR else { return nil }
+        return """
+        add chain ip kube-proxy ferry-egress { type nat hook postrouting priority 110 ; }
+        add rule ip kube-proxy ferry-egress oifname "eth1" ip saddr != \(cidr) masquerade
+
+        """
+    }
+
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
     func applyServiceRules(sandboxID: String, ruleset: Data) async {
@@ -468,6 +493,11 @@ actor PodRuntime {
                 privileged.permitted.append(netAdmin)
             }
 
+            var payload = ruleset
+            if let extra = ferryEgressRule(), let bytes = extra.data(using: .utf8) {
+                payload.append(bytes)
+            }
+
             let process = try await exec(
                 containerID: target.id,
                 // Invoked through its own loader so the pod's libc is irrelevant.
@@ -475,7 +505,7 @@ actor PodRuntime {
                           "--library-path", "/.ferry/lib",
                           "/.ferry/nft", "-f", "-"],
                 tty: false,
-                stdin: DataReaderStream(ruleset),
+                stdin: DataReaderStream(payload),
                 stdout: DiscardWriter(),
                 stderr: ErrorWriter(prefix: "nft"),
                 capabilities: privileged

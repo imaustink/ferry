@@ -531,6 +531,12 @@ EOF
   kubectl create clusterrolebinding ferry-autorenew \
     --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
     --group=system:nodes >/dev/null 2>&1
+  # Every node renders its own Service rules, so every node has to be able to
+  # read Services and EndpointSlices. system:node-proxier is the role upstream
+  # already has for this; the node's own certificate is the credential.
+  kubectl create clusterrolebinding ferry-node-proxier \
+    --clusterrole=system:node-proxier \
+    --group=system:nodes >/dev/null 2>&1
 
   # A joining Mac trusts nothing yet, so it cannot fetch the CA over a verified
   # connection -- and the CA is not on the wire either, because the API server
@@ -667,7 +673,7 @@ start_worker() {
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
-    --nft-bundle "$here/guest/nft" \
+    --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -738,6 +744,24 @@ EOF
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
   for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
+
+  # Service rules are rendered per node, so a worker runs its own ferry-proxyd.
+  # Like the streamer it authenticates as the node, so it also waits for the
+  # certificate. ferry-cri is already asking for a ruleset and simply keeps
+  # asking until this answers.
+  if [ -x "$here/bin/ferry-proxyd" ]; then
+    local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null || echo "$LAN_IP")"
+    rm -f "$FERRY_PROXYD_SOCK"
+    "$here/bin/ferry-proxyd" --kubeconfig "$FERRY_RUN/kubelet.conf" \
+      --node-name "$name" --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
+      >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-proxyd.pid"
+    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
+      || warn "ferry-proxyd did not start; Services will not route on this node"
+  else
+    warn "bin/ferry-proxyd is missing; Services will not route on this node"
+  fi
 
   echo
   bold "joined as $name"
