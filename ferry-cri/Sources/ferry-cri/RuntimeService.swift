@@ -7,6 +7,7 @@ import GRPCCore
 struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     let runtime: PodRuntime
     let version: String
+    let streamer: StreamerClient
 
     private func unimplemented(_ name: String) -> RPCError {
         RPCError(code: .unimplemented, message: "ferry-cri does not implement \(name) yet")
@@ -292,9 +293,32 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     func execSync(request: Runtime_V1_ExecSyncRequest, context: ServerContext) async throws -> Runtime_V1_ExecSyncResponse {
         throw unimplemented("ExecSync")
     }
+    /// CRI does not carry exec over gRPC: the runtime returns a URL and the
+    /// kubelet proxies the client's upgraded connection to it, speaking
+    /// SPDY/3.1. ferry-streamer terminates that and calls back into this
+    /// process to run the command, so the URL has to come from it -- the token
+    /// it contains is issued by the streaming server's own request cache.
     func exec(request: Runtime_V1_ExecRequest, context: ServerContext) async throws -> Runtime_V1_ExecResponse {
-        throw unimplemented("Exec")
+        do {
+            let url = try streamer.url(path: "/exec", body: [
+                "container_id": request.containerID,
+                "cmd": request.cmd,
+                "tty": request.tty,
+                "stdin": request.stdin,
+                "stdout": request.stdout,
+                "stderr": request.stderr,
+            ])
+            var response = Runtime_V1_ExecResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
+    /// Attach would reconnect to a container's own process. The framework
+    /// exposes no way to reattach to a process that is already running, so the
+    /// URL is minted but the stream will report the limitation rather than
+    /// silently producing nothing.
     func attach(request: Runtime_V1_AttachRequest, context: ServerContext) async throws -> Runtime_V1_AttachResponse {
         throw unimplemented("Attach")
     }

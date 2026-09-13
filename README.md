@@ -59,6 +59,9 @@ cost time.
   default capabilities; ferry's kubelet derives that code path for darwin.
   A pod with `limits.memory: 300Mi` now gets `memory.max=314572800` in its
   guest cgroup, and `NET_ADMIN` reaches the container.
+- ✅ **`kubectl exec` works** — stdin, stderr and exit codes included. CRI
+  carries exec over SPDY rather than gRPC, so `ferry-streamer` terminates that
+  using Kubernetes' own streaming server and hands the request to `ferry-cri`.
 - ✅ **Services route.** `ferry-proxy` binds each ClusterIP on the host and
   forwards to a ready endpoint, so `http://backend/` works from a pod and
   in-cluster config (`10.96.0.1:443` + ServiceAccount token) reaches the API
@@ -91,6 +94,9 @@ experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
 experiments/04-pod-networking/       routable per-pod addressing, host and pod to pod
 experiments/05-real-pods/            the whole stack, with real VMs per pod
 ferry-cri/                           the CRI runtime: one VM per pod
+ferry-streamer/                      SPDY streaming for kubectl exec
+ferry-proxy/                         ClusterIP routing on the host
+kernel/                              guest kernel with NAT support
 bin/                                 build output (gitignored)
 ```
 
@@ -130,7 +136,7 @@ it.
   Meanwhile `ferry up` asks for sudo once so `ferry-proxy` can bind ClusterIPs
   and listen on 443. Without it pods, DNS and everything else still work — only
   ClusterIP routing is skipped.
-- **No `kubectl exec` / `port-forward`** yet. `kubectl logs` works.
+- **No `kubectl port-forward`** yet. `kubectl logs` and `kubectl exec` work.
 - **128 pods, shared.** The VM ceiling belongs to the machine, so every other
   VM — Docker Desktop included — takes one of ferry's slots.
 
