@@ -26,6 +26,11 @@ CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.244.0.0/16}"
 NODE_INDEX="${FERRY_NODE_INDEX:-0}"
 RELAY_PORT="${FERRY_RELAY_PORT:-8472}"
 PEERS="${FERRY_PEERS:-}"
+PEERS_FILE="$FERRY_RUN/peers"
+# Advertised to the other nodes, so it must be the address they can reach. The
+# LAN address works for a node on this Mac and for a node on another.
+lan_address() { ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en7 2>/dev/null || echo 127.0.0.1; }
+LAN_IP="${FERRY_LAN_IP:-$(lan_address)}"
 POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 
 # Prefer the NAT-capable kernel when it has been built. The fallback is the
@@ -58,11 +63,16 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
   ferry kubeconfig  print the path to the admin kubeconfig
+  ferry node add <name>   add another node on this Mac
+  ferry node rm <name>    stop one
+  ferry node ls           list the nodes
 
 Environment:
   FERRY_HOME             cluster state, default ~/.ferry
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
+  FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
 EOF
 }
@@ -181,6 +191,7 @@ cmd_up() {
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
+    --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -214,6 +225,8 @@ cmd_up() {
     "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
       --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
       --kubeconfig "$FERRY_HOME/admin.conf" \
+      --node-name "$NODE_NAME" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+      --peers-file "$PEERS_FILE" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
     for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -360,6 +373,112 @@ start_proxy() {
   fi
 }
 
+# Another node on this Mac.
+#
+# A node here is a kubelet and a runtime, not a machine and not a container --
+# the Mac is already the machine. So a second one costs two processes and a set
+# of ports, and the pods it runs are virtual machines exactly like the first
+# node's. Their addresses come from this node's own /24 inside the cluster /16,
+# and they reach the first node's pods across ferry's switch.
+cmd_node_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || { bad "usage: ferry node add <name>"; return 2; }
+  running ferry-cri || { bad "ferry is not up; run 'ferry up' first"; return 1; }
+
+  # Find the first free index. Node 0 is the one 'ferry up' started.
+  local index=1
+  while [ -f "$FERRY_RUN/node-$index.pid" ]; do index=$((index + 1)); done
+  [ "$index" -le 200 ] || { bad "too many nodes"; return 1; }
+
+  local sock="/tmp/ferry-cri-$index.sock"
+  local exec_sock="/tmp/ferry-exec-$index.sock"
+  local streamer_sock="/tmp/ferry-str-$index.sock"
+  local relay=$((RELAY_PORT + index))
+  local kubelet_port=$((10250 + index))
+  local healthz_port=$((10248 + index * 100))
+  local stream_addr="127.0.0.1:$((10350 + index))"
+  local run="$FERRY_RUN/node-$index"
+
+  bold "adding node $name"
+  mkdir -p "$run"/{kubelet,pki,podlogs,containerlogs,volume-plugins,cri}
+  rm -f "$sock" "$exec_sock" "$streamer_sock"
+
+  "$here/bin/ferry-cri" \
+    --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
+    --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
+    --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
+    --relay-port "$relay" --peers-file "$PEERS_FILE" \
+    --relay-endpoint "$LAN_IP:$relay" \
+    >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index.pid"
+  local ready=
+  for _ in $(seq 1 90); do
+    [ -S "$sock" ] && grep -q "serving" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && { ready=1; break; }
+    sleep 1
+  done
+  [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
+  ok "runtime on 10.244.$index.0/24, switch udp/$relay"
+
+  "$here/bin/ferry-streamer" --listen "$stream_addr" \
+    --exec-socket "$exec_sock" --control "$streamer_sock" \
+    --kubeconfig "$FERRY_HOME/admin.conf" \
+    --node-name "$name" --relay-endpoint "$LAN_IP:$relay" \
+    --peers-file "$PEERS_FILE" \
+    >"$FERRY_RUN/logs/node-$index-streamer.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index-streamer.pid"
+  for _ in $(seq 1 30); do [ -S "$streamer_sock" ] && break; sleep 0.5; done
+
+  # The kubelet's config differs from node 0's only in where things live and
+  # which ports it holds; everything that makes a kubelet work on darwin is the
+  # same, so it is derived rather than written out again.
+  sed -e "s|$FERRY_RUN/podlogs|$run/podlogs|" \
+      -e "s|unix://$FERRY_SOCK|unix://$sock|g" \
+      -e "s|$FERRY_RUN/volume-plugins|$run/volume-plugins|" \
+      -e "s|^readOnlyPort: 0|readOnlyPort: 0\nport: $kubelet_port\nhealthzPort: $healthz_port|" \
+      "$FERRY_RUN/kubelet.yaml" > "$run/kubelet.yaml"
+
+  FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
+  "$here/bin/kubelet" \
+    --config="$run/kubelet.yaml" --kubeconfig="$FERRY_HOME/kubelet.conf" \
+    --hostname-override="$name" --root-dir="$run/kubelet" \
+    --cert-dir="$run/pki" --v=2 >"$FERRY_RUN/logs/node-$index-kubelet.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index-kubelet.pid"
+
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  for _ in $(seq 1 90); do
+    [ "$(kubectl get node "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] && break
+    sleep 1
+  done
+  if [ "$(kubectl get node "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
+    ok "node $name Ready"
+    echo
+    kubectl get nodes
+  else
+    bad "node $name did not become Ready"; tail -5 "$FERRY_RUN/logs/node-$index-kubelet.log"; return 1
+  fi
+}
+
+cmd_node_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || { bad "usage: ferry node rm <name>"; return 2; }
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  local index
+  for index in $(seq 1 200); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    grep -q "hostname-override=$name" "$FERRY_RUN/logs/node-$index-kubelet.log" 2>/dev/null && break
+    pgrep -f "hostname-override=$name" >/dev/null && break
+  done
+  pkill -f "hostname-override=$name" 2>/dev/null
+  for suffix in "" -streamer -kubelet; do
+    local pidfile="$FERRY_RUN/node-$index$suffix.pid"
+    [ -f "$pidfile" ] && { kill -TERM "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"; }
+  done
+  kubectl delete node "$name" >/dev/null 2>&1
+  ok "node $name removed"
+}
+
 cmd_down() {
   bold "stopping ferry"
   # ferry-proxy runs as root, so stopping it does too.
@@ -369,6 +488,22 @@ cmd_down() {
     rm -f "$FERRY_RUN/ferry-proxy.pid"
     sleep 1
   fi
+  # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
+  local index
+  for index in $(seq 1 200); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    for suffix in -kubelet -streamer ""; do
+      local pidfile="$FERRY_RUN/node-$index$suffix.pid"
+      [ -f "$pidfile" ] || continue
+      local pid; pid="$(cat "$pidfile")"; rm -f "$pidfile"
+      kill -TERM "$pid" 2>/dev/null || continue
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      kill -KILL "$pid" 2>/dev/null
+    done
+    rm -f "/tmp/ferry-cri-$index.sock" "/tmp/ferry-exec-$index.sock" "/tmp/ferry-str-$index.sock"
+    ok "node $index stopped"
+  done
+
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -382,7 +517,7 @@ cmd_down() {
     ok "$component stopped"
   done
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$PEERS_FILE"
 }
 
 cmd_status() {
@@ -417,6 +552,13 @@ case "${1:-}" in
   kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  node)       shift
+              case "${1:-}" in
+                add) shift; cmd_node_add "$@" ;;
+                rm)  shift; cmd_node_rm "$@" ;;
+                ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes ;;
+                *)   bad "usage: ferry node [add <name>|rm <name>|ls]"; exit 2 ;;
+              esac ;;
   down)       shift; cmd_down "$@" ;;
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;

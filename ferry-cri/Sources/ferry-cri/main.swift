@@ -41,6 +41,14 @@ let config = RuntimeConfig(
     peers: {
         let list = option("--peers", "")
         return list.isEmpty ? [] : list.split(separator: ",").map(String.init)
+    }(),
+    peersFile: {
+        let path = option("--peers-file", "")
+        return path.isEmpty ? nil : path
+    }(),
+    relayEndpoint: {
+        let endpoint = option("--relay-endpoint", "")
+        return endpoint.isEmpty ? nil : endpoint
     }()
 )
 

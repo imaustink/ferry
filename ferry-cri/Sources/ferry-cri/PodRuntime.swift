@@ -35,8 +35,13 @@ struct RuntimeConfig: Sendable {
     var nodeIndex: Int
     /// UDP port carrying frames to other machines. 0 keeps the switch local.
     var relayPort: UInt16
-    /// host:port of the other machines' switches.
+    /// host:port of the other nodes' switches, at startup.
     var peers: [String]
+    /// A file listing every relay endpoint in the cluster, kept current by
+    /// ferry-streamer as nodes join and leave.
+    var peersFile: String?
+    /// This node's own endpoint, so it can be skipped in that list.
+    var relayEndpoint: String?
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -204,7 +209,9 @@ actor PodRuntime {
         // it is the address Kubernetes knows a pod by.
         if let cidr = config.clusterCIDR,
            var addresses = RotatingAddresses(clusterCIDR: cidr, nodeIndex: config.nodeIndex) {
-            self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers)
+            self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers,
+                                       peersFile: config.peersFile,
+                                       self: config.relayEndpoint)
             if let reserved = addresses.takeReserved() {
                 let bare = reserved.split(separator: "/").first.map(String.init) ?? ""
                 try? "\(bare)\n".write(to: config.stateDir.appending(component: "dns"),

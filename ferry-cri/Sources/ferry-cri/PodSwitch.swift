@@ -43,10 +43,44 @@ final class PodSwitch: @unchecked Sendable {
     private(set) var framesLocal = 0
     private(set) var framesRelayed = 0
 
-    init(relayPort: UInt16, peers: [String]) {
+    init(relayPort: UInt16, peers: [String], peersFile: String? = nil, self endpoint: String? = nil) {
         self.relayPort = relayPort
         self.peers = Set(peers)
+        self.ownEndpoint = endpoint
         if relayPort > 0 { startRelay() }
+        if let peersFile { watchPeers(file: peersFile) }
+    }
+
+    private let ownEndpoint: String?
+
+    /// Nodes come and go while ferry is running -- a second node on this Mac, or
+    /// a whole other machine joining -- so the peer list is read from a file
+    /// somebody else keeps current rather than fixed at startup.
+    /// Nodes come and go while ferry is running -- a second node on this Mac, or
+    /// a whole other machine joining -- so the peer list is read from a file
+    /// somebody else keeps current rather than fixed at startup.
+    ///
+    /// The switch lives as long as the process, so this holds it strongly. A
+    /// weak capture here would let one nil reading end the thread for good, and
+    /// the node would silently never learn about its peers again.
+    private func watchPeers(file: String) {
+        Thread.detachNewThread {
+            var lastSeen = ""
+            while true {
+                if let text = try? String(contentsOfFile: file, encoding: .utf8), text != lastSeen {
+                    lastSeen = text
+                    let listed = text.split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty && $0 != self.ownEndpoint }
+                    self.lock.lock()
+                    self.peers = Set(listed)
+                    self.macToPeer = self.macToPeer.filter { Set(listed).contains($0.value) }
+                    self.lock.unlock()
+                    print("    switch: peers \(listed.isEmpty ? "none" : listed.joined(separator: ", "))")
+                }
+                Thread.sleep(forTimeInterval: 2)
+            }
+        }
     }
 
     // MARK: - Ports
