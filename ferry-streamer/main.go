@@ -33,6 +33,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:10350", "address to serve streaming requests on")
+	kubeconfig := flag.String("kubeconfig", "", "kubeconfig used to read pod specs (optional)")
 	execSocket := flag.String("exec-socket", "/tmp/ferry-exec.sock", "ferry-cri's exec socket")
 	control := flag.String("control", "/tmp/ferry-streamer.sock", "socket ferry-cri asks for URLs on")
 	flag.Parse()
@@ -64,8 +65,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to listen on %s: %v\n", *control, err)
 		os.Exit(1)
 	}
+	controlMux := http.NewServeMux()
 	go func() {
-		mux := http.NewServeMux()
+		mux := controlMux
 		mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 			var req runtimeapi.ExecRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -94,6 +96,18 @@ func main() {
 		})
 		runtime.HandleError(http.Serve(controlListener, mux))
 	}()
+
+	// ferry-cri needs to know how many containers a pod has before it boots the
+	// VM, because this hypervisor cannot add one afterwards. CRI never says, so
+	// the answer comes from the pod spec.
+	var pods *podLookup
+	if *kubeconfig != "" {
+		pods, err = newPodLookup(*kubeconfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: pod lookup unavailable, sidecars will not work: %v\n", err)
+		}
+	}
+	go servePodLookup(controlMux, pods)
 
 	fmt.Printf("==> ferry-streamer\n    streaming  http://%s/\n    control    unix://%s\n    exec via   unix://%s\n    serving\n",
 		*listen, *control, *execSocket)

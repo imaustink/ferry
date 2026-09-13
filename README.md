@@ -59,6 +59,10 @@ cost time.
   default capabilities; ferry's kubelet derives that code path for darwin.
   A pod with `limits.memory: 300Mi` now gets `memory.max=314572800` in its
   guest cgroup, and `NET_ADMIN` reaches the container.
+- ✅ **Sidecars work.** Containers in a pod share one VM, and therefore one
+  network stack: a process in one reaches a listener in another over
+  `127.0.0.1`. The hypervisor cannot add a container to a running VM, so the
+  boot waits until the kubelet has created them all.
 - ✅ **`kubectl exec` works** — stdin, stderr and exit codes included. CRI
   carries exec over SPDY rather than gRPC, so `ferry-streamer` terminates that
   using Kubernetes' own streaming server and hands the request to `ferry-cri`.

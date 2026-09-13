@@ -34,7 +34,11 @@ struct StreamerClient: Sendable {
         return url
     }
 
-    private func exchange(path: String, payload: Data) throws -> Data {
+    func exchangeGet(path: String) throws -> Data {
+        try exchange(path: path, payload: nil, method: "GET")
+    }
+
+    private func exchange(path: String, payload: Data?, method: String = "POST") throws -> Data {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw Failure.unreachable("socket() failed") }
         defer { close(descriptor) }
@@ -57,10 +61,10 @@ struct StreamerClient: Sendable {
         }
         guard ok == 0 else { throw Failure.unreachable("connect(\(socketPath)) failed") }
 
-        var request = "POST \(path) HTTP/1.0\r\nHost: ferry\r\nContent-Type: application/json\r\n"
-        request += "Content-Length: \(payload.count)\r\nConnection: close\r\n\r\n"
+        var request = "\(method) \(path) HTTP/1.0\r\nHost: ferry\r\nContent-Type: application/json\r\n"
+        request += "Content-Length: \(payload?.count ?? 0)\r\nConnection: close\r\n\r\n"
         var outgoing = Data(request.utf8)
-        outgoing.append(payload)
+        if let payload { outgoing.append(payload) }
         try writeAll(descriptor, outgoing)
 
         var incoming = Data()
@@ -91,5 +95,17 @@ struct StreamerClient: Sendable {
                 offset += written
             }
         }
+    }
+}
+
+struct PodContainers: Decodable {
+    let initContainers: [String]?
+    let containers: [String]?
+}
+
+extension StreamerClient {
+    /// A plain GET against ferry-streamer's control socket.
+    func get(path: String) throws -> Data {
+        try exchangeGet(path: path)
     }
 }
