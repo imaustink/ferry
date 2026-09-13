@@ -27,6 +27,21 @@ struct RuntimeConfig: Sendable {
     var nftBundlePath: String?
     /// ferry-proxyd's socket, where the rendered ruleset comes from.
     var proxydSocket: String?
+    /// The cluster pod network, one flat segment across every node on every
+    /// machine. Empty leaves ferry on vmnet addressing and a single node.
+    var clusterCIDR: String?
+    /// This node's slice of it. Pods here are 10.244.<index>.x when the cluster
+    /// network is 10.244.0.0/16.
+    var nodeIndex: Int
+    /// UDP port carrying frames to other machines. 0 keeps the switch local.
+    var relayPort: UInt16
+    /// host:port of the other nodes' switches, at startup.
+    var peers: [String]
+    /// A file listing every relay endpoint in the cluster, kept current by
+    /// ferry-streamer as nodes join and leave.
+    var peersFile: String?
+    /// This node's own endpoint, so it can be skipped in that list.
+    var relayEndpoint: String?
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -61,6 +76,8 @@ struct SandboxRecord {
     /// booted lazily on the first StartContainer rather than at RunPodSandbox.
     var booted: Bool = false
     var usesReservedAddress: Bool = false
+    /// The pod's address on the cluster network, to hand back when it stops.
+    var clusterAddress: String? = nil
     /// Kept so the VM can be rebuilt if every container in it has stopped --
     /// see createContainer.
     let interface: any Interface
@@ -199,6 +216,28 @@ actor PodRuntime {
             to: config.stateDir.appending(component: "gateway"),
             atomically: true, encoding: .utf8)
 
+        // The cluster pod network, if this is a cluster rather than one node.
+        // eth0 stays on vmnet for the internet and the host; this is eth1, and
+        // it is the address Kubernetes knows a pod by.
+        if let cidr = config.clusterCIDR,
+           var addresses = RotatingAddresses(clusterCIDR: cidr, nodeIndex: config.nodeIndex) {
+            self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers,
+                                       peersFile: config.peersFile,
+                                       self: config.relayEndpoint)
+            if let reserved = addresses.takeReserved() {
+                let bare = reserved.split(separator: "/").first.map(String.init) ?? ""
+                try? "\(bare)\n".write(to: config.stateDir.appending(component: "dns"),
+                                        atomically: true, encoding: .utf8)
+                self.clusterDNSAddress = reserved
+            }
+            self.clusterAddresses = addresses
+            print("    pod network \(cidr), this node is \(addresses.prefix).0/24")
+            if config.relayPort > 0 {
+                print("    switch    udp/\(config.relayPort), peers: \(config.peers.isEmpty ? "none yet" : config.peers.joined(separator: ", "))")
+            }
+            return
+        }
+
         // Reserve and publish the cluster DNS address before any pod can take it.
         if let reserved = try? self.network.createInterface("ferry-dns") {
             self.dnsInterface = reserved
@@ -248,13 +287,37 @@ actor PodRuntime {
             }
             interface = fresh
         }
-        let ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
+        var ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
+
+        // eth1: the cluster network. Its address is what Kubernetes calls the
+        // pod IP, because it is the one every other pod can reach -- on this
+        // machine or another. eth0 keeps the default route and the internet.
+        var clusterInterface: SwitchInterface?
+        if podSwitch != nil, clusterAddresses != nil {
+            let address: String?
+            if wantsReserved, let reserved = clusterDNSAddress, !clusterDNSInUse {
+                address = reserved
+                clusterDNSInUse = true
+            } else {
+                address = clusterAddresses!.take()
+            }
+            guard let address, let cidr = try? CIDRv4(address) else {
+                throw RuntimeFailure.invalid("the pod network has no addresses left")
+            }
+            let nic = try SwitchInterface(address: cidr, mac: nil)
+            clusterInterface = nic
+            ip = address.split(separator: "/").first.map(String.init) ?? ip
+        }
 
         // Kubernetes sends resource limits per container, not per sandbox, so
         // the VM is sized from defaults here and containers are bounded inside
         // it by cgroups. Right-sizing the VM from the pod's aggregate requests
         // is a worthwhile refinement, not a correctness issue.
-        let pod = try makePod(id: id, interface: interface, cfg: cfg)
+        let pod = try makePod(id: id, interface: interface, cfg: cfg,
+                              clusterInterface: clusterInterface)
+        if let clusterInterface {
+            podSwitch?.attach(podID: id, fd: clusterInterface.hostFD)
+        }
         // Deliberately not created yet. CRI adds containers after the sandbox
         // exists, and on this hypervisor a container can only be added before
         // the VM boots -- see startContainer.
@@ -267,7 +330,8 @@ actor PodRuntime {
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
-            usesReservedAddress: wantsReserved && dnsInterfaceInUse,
+            usesReservedAddress: wantsReserved && (dnsInterfaceInUse || clusterDNSInUse),
+            clusterAddress: clusterInterface.map { "\($0.ipv4Address)" },
             interface: interface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers
@@ -319,11 +383,15 @@ actor PodRuntime {
         }
     }
 
-    private func makePod(id: String, interface: any Interface, cfg: Runtime_V1_PodSandboxConfig) throws -> LinuxPod {
+    private func makePod(id: String, interface: any Interface,
+                         cfg: Runtime_V1_PodSandboxConfig,
+                         clusterInterface: SwitchInterface? = nil) throws -> LinuxPod {
         try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs)) { c in
             c.cpus = config.defaultCPUs
             c.memoryInBytes = config.defaultMemoryBytes
-            c.interfaces = [interface]
+            // eth0 is vmnet and keeps the default route; eth1, when there is a
+            // cluster, is ferry's own segment.
+            c.interfaces = clusterInterface.map { [interface, $0] } ?? [interface]
             c.hostname = cfg.hostname.isEmpty ? cfg.metadata.name : cfg.hostname
             if !cfg.dnsConfig.servers.isEmpty {
                 c.dns = DNS(nameservers: cfg.dnsConfig.servers,
@@ -348,7 +416,9 @@ actor PodRuntime {
         // RemovePodSandbox lets a terminated CoreDNS keep the reservation, so
         // its replacement lands on an ordinary address and the kubelet's
         // clusterDNS then points at nothing.
-        if record.usesReservedAddress { dnsInterfaceInUse = false }
+        if record.usesReservedAddress { dnsInterfaceInUse = false; clusterDNSInUse = false }
+        podSwitch?.detach(podID: id)
+        if let address = record.clusterAddress { clusterAddresses?.give(back: address) }
         sandboxes[id] = record
     }
 
@@ -381,8 +451,39 @@ actor PodRuntime {
     // That is the whole reason there is no kube-proxy here: a pod needs the
     // rules, not a process that works them out for itself.
 
+    /// The pod network, when ferry is running one.
+    private var podSwitch: PodSwitch?
+    private var clusterAddresses: RotatingAddresses?
+    private var clusterDNSAddress: String?
+    private var clusterDNSInUse = false
+
     private var lastRuleset: Data?
     private var lastGeneration: UInt64 = 0
+
+    /// One rule kube-proxy cannot know it needs.
+    ///
+    /// A pod reaches a ClusterIP through its default route, which is eth0 on
+    /// vmnet, so the kernel picks eth0's address as the source before anything
+    /// is rewritten. kube-proxy then DNATs the destination to a pod address, and
+    /// the packet correctly leaves by eth1 -- still carrying a vmnet source.
+    ///
+    /// On one machine that survives, because the reply finds its way back over
+    /// the vmnet network the pods share. Across machines it cannot: the other
+    /// Mac's pods have never heard of this one's vmnet addresses, and the reply
+    /// goes nowhere.
+    ///
+    /// Masquerading what leaves eth1 with a source from outside the cluster
+    /// network fixes it, and does so without losing anything: masquerade takes
+    /// the outgoing interface's address, which is the pod's own cluster address.
+    /// The peer still sees the pod it is actually talking to.
+    private func ferryEgressRule() -> String? {
+        guard let cidr = config.clusterCIDR else { return nil }
+        return """
+        add chain ip kube-proxy ferry-egress { type nat hook postrouting priority 110 ; }
+        add rule ip kube-proxy ferry-egress oifname "eth1" ip saddr != \(cidr) masquerade
+
+        """
+    }
 
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
@@ -404,6 +505,11 @@ actor PodRuntime {
                 privileged.permitted.append(netAdmin)
             }
 
+            var payload = ruleset
+            if let extra = ferryEgressRule(), let bytes = extra.data(using: .utf8) {
+                payload.append(bytes)
+            }
+
             let process = try await exec(
                 containerID: target.id,
                 // Invoked through its own loader so the pod's libc is irrelevant.
@@ -411,7 +517,7 @@ actor PodRuntime {
                           "--library-path", "/.ferry/lib",
                           "/.ferry/nft", "-f", "-"],
                 tty: false,
-                stdin: DataReaderStream(ruleset),
+                stdin: DataReaderStream(payload),
                 stdout: DiscardWriter(),
                 stderr: ErrorWriter(prefix: "nft"),
                 capabilities: privileged

@@ -1,3 +1,5 @@
+<img src="assets/ferry.svg" alt="" width="72">
+
 # ferry
 
 Kubernetes on a Mac where **the pod is the virtual machine** and there is no
@@ -112,6 +114,7 @@ ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for dar
 guest/                               nft, bundled with its loader for pods
 ferry-proxy/                         host-side ClusterIP routing (fallback)
 kernel/                              guest kernel with NAT support
+assets/                              the logo
 bin/                                 build output (gitignored)
 ```
 

@@ -4,6 +4,13 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# A kubelet holds thousands of descriptors -- watches, TLS connections, one log
+# file per container. A login shell on macOS allows about a million, but an SSH
+# session allows 256, and 'ferry join' is usually run over SSH. Inheriting that
+# gives a node that works for a few minutes and then fails to reach the API, with
+# an error that says nothing about descriptors.
+ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
+
 # Cluster state that should survive a restart: certificates and etcd.
 FERRY_HOME="${FERRY_HOME:-$HOME/.ferry}"
 # Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
@@ -18,6 +25,19 @@ FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd.sock}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
+# The cluster pod network: one flat segment every pod shares, on every node and
+# every machine. Pods keep a vmnet NIC for the internet; this is the address
+# Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
+# and a single node.
+CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.244.0.0/16}"
+NODE_INDEX="${FERRY_NODE_INDEX:-0}"
+RELAY_PORT="${FERRY_RELAY_PORT:-8472}"
+PEERS="${FERRY_PEERS:-}"
+PEERS_FILE="$FERRY_RUN/peers"
+# Advertised to the other nodes, so it must be the address they can reach. The
+# LAN address works for a node on this Mac and for a node on another.
+lan_address() { ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en7 2>/dev/null || echo 127.0.0.1; }
+LAN_IP="${FERRY_LAN_IP:-$(lan_address)}"
 POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 
 # Prefer the NAT-capable kernel when it has been built. The fallback is the
@@ -50,11 +70,18 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
   ferry kubeconfig  print the path to the admin kubeconfig
+  ferry node add <name>   add another node on this Mac
+  ferry node rm <name>    stop one
+  ferry node ls           list the nodes
+  ferry token create      print a command another Mac can join with
+  ferry join ...          join this Mac to a cluster on another
 
 Environment:
   FERRY_HOME             cluster state, default ~/.ferry
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
+  FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
 EOF
 }
@@ -171,6 +198,9 @@ cmd_up() {
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
+    --relay-port "$RELAY_PORT" --peers "$PEERS" \
+    --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -192,7 +222,11 @@ cmd_up() {
   # so the kubelet can be told where DNS will be before CoreDNS exists.
   local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null)"
 
-  STATE="$FERRY_HOME" POD_GATEWAY="$gateway" NODE_NAME="$NODE_NAME" \
+  # Advertise the LAN address when there is one: it is the only address a pod on
+  # another Mac can reach. Without a network, the pod gateway is still right.
+  local advertise="$gateway"
+  [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
+  STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -5 "$FERRY_RUN/logs/control-plane.log"; return 1; }
   ok "control plane advertising $gateway"
@@ -204,6 +238,8 @@ cmd_up() {
     "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
       --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
       --kubeconfig "$FERRY_HOME/admin.conf" \
+      --node-name "$NODE_NAME" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+      --peers-file "$PEERS_FILE" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
     for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -359,6 +395,392 @@ start_proxy() {
   fi
 }
 
+# Another node on this Mac.
+#
+# A node here is a kubelet and a runtime, not a machine and not a container --
+# the Mac is already the machine. So a second one costs two processes and a set
+# of ports, and the pods it runs are virtual machines exactly like the first
+# node's. Their addresses come from this node's own /24 inside the cluster /16,
+# and they reach the first node's pods across ferry's switch.
+cmd_node_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || { bad "usage: ferry node add <name>"; return 2; }
+  running ferry-cri || { bad "ferry is not up; run 'ferry up' first"; return 1; }
+
+  # Find the first free index. Node 0 is the one 'ferry up' started.
+  local index=1
+  while [ -f "$FERRY_RUN/node-$index.pid" ]; do index=$((index + 1)); done
+  [ "$index" -le 200 ] || { bad "too many nodes"; return 1; }
+
+  local sock="/tmp/ferry-cri-$index.sock"
+  local exec_sock="/tmp/ferry-exec-$index.sock"
+  local streamer_sock="/tmp/ferry-str-$index.sock"
+  local relay=$((RELAY_PORT + index))
+  local kubelet_port=$((10250 + index))
+  local healthz_port=$((10248 + index * 100))
+  local stream_addr="127.0.0.1:$((10350 + index))"
+  local run="$FERRY_RUN/node-$index"
+
+  bold "adding node $name"
+  mkdir -p "$run"/{kubelet,pki,podlogs,containerlogs,volume-plugins,cri}
+  rm -f "$sock" "$exec_sock" "$streamer_sock"
+
+  "$here/bin/ferry-cri" \
+    --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
+    --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
+    --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
+    --relay-port "$relay" --peers-file "$PEERS_FILE" \
+    --relay-endpoint "$LAN_IP:$relay" \
+    >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index.pid"
+  local ready=
+  for _ in $(seq 1 90); do
+    [ -S "$sock" ] && grep -q "serving" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && { ready=1; break; }
+    sleep 1
+  done
+  [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
+  ok "runtime on 10.244.$index.0/24, switch udp/$relay"
+
+  "$here/bin/ferry-streamer" --listen "$stream_addr" \
+    --exec-socket "$exec_sock" --control "$streamer_sock" \
+    --kubeconfig "$FERRY_HOME/admin.conf" \
+    --node-name "$name" --relay-endpoint "$LAN_IP:$relay" \
+    --peers-file "$PEERS_FILE" \
+    >"$FERRY_RUN/logs/node-$index-streamer.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index-streamer.pid"
+  for _ in $(seq 1 30); do [ -S "$streamer_sock" ] && break; sleep 0.5; done
+
+  # The kubelet's config differs from node 0's only in where things live and
+  # which ports it holds; everything that makes a kubelet work on darwin is the
+  # same, so it is derived rather than written out again.
+  sed -e "s|$FERRY_RUN/podlogs|$run/podlogs|" \
+      -e "s|unix://$FERRY_SOCK|unix://$sock|g" \
+      -e "s|$FERRY_RUN/volume-plugins|$run/volume-plugins|" \
+      -e "s|^readOnlyPort: 0|readOnlyPort: 0\nport: $kubelet_port\nhealthzPort: $healthz_port|" \
+      "$FERRY_RUN/kubelet.yaml" > "$run/kubelet.yaml"
+
+  FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
+  "$here/bin/kubelet" \
+    --config="$run/kubelet.yaml" --kubeconfig="$FERRY_HOME/kubelet.conf" \
+    --hostname-override="$name" --root-dir="$run/kubelet" \
+    --cert-dir="$run/pki" --v=2 >"$FERRY_RUN/logs/node-$index-kubelet.log" 2>&1 &
+  echo $! > "$FERRY_RUN/node-$index-kubelet.pid"
+
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  for _ in $(seq 1 90); do
+    [ "$(kubectl get node "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] && break
+    sleep 1
+  done
+  if [ "$(kubectl get node "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
+    ok "node $name Ready"
+    echo
+    kubectl get nodes
+  else
+    bad "node $name did not become Ready"; tail -5 "$FERRY_RUN/logs/node-$index-kubelet.log"; return 1
+  fi
+}
+
+cmd_node_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || { bad "usage: ferry node rm <name>"; return 2; }
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  local index
+  for index in $(seq 1 200); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    grep -q "hostname-override=$name" "$FERRY_RUN/logs/node-$index-kubelet.log" 2>/dev/null && break
+    pgrep -f "hostname-override=$name" >/dev/null && break
+  done
+  pkill -f "hostname-override=$name" 2>/dev/null
+  for suffix in "" -streamer -kubelet; do
+    local pidfile="$FERRY_RUN/node-$index$suffix.pid"
+    [ -f "$pidfile" ] && { kill -TERM "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"; }
+  done
+  kubectl delete node "$name" >/dev/null 2>&1
+  ok "node $name removed"
+}
+
+# A token another Mac can join with.
+#
+# Kubernetes already has a way to admit a node it has never met: a bootstrap
+# token lets the kubelet ask for a certificate, and the control plane signs it.
+# ferry uses that rather than inventing anything -- the token is a Secret, the
+# approval is upstream RBAC, and the certificate the node ends up with is a real
+# one, not a copied credential.
+cmd_token_create() {
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  kubectl get nodes >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+
+  local id secret
+  id="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+  secret="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 16)"
+
+  kubectl create -f - >/dev/null 2>&1 <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bootstrap-token-$id
+  namespace: kube-system
+type: bootstrap.kubernetes.io/token
+stringData:
+  token-id: "$id"
+  token-secret: "$secret"
+  expiration: "$(date -u -v+24H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+24 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+  auth-extra-groups: system:bootstrappers:ferry
+EOF
+
+  # Let a bootstrapping node ask for a certificate, and let the control plane
+  # approve the ask automatically. Without the second binding a joining node
+  # waits forever on a CSR nobody looks at.
+  kubectl create clusterrolebinding ferry-bootstrap \
+    --clusterrole=system:node-bootstrapper \
+    --group=system:bootstrappers:ferry >/dev/null 2>&1
+  kubectl create clusterrolebinding ferry-autoapprove \
+    --clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient \
+    --group=system:bootstrappers:ferry >/dev/null 2>&1
+  kubectl create clusterrolebinding ferry-autorenew \
+    --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
+    --group=system:nodes >/dev/null 2>&1
+  # Every node renders its own Service rules, so every node has to be able to
+  # read Services and EndpointSlices. system:node-proxier is the role upstream
+  # already has for this; the node's own certificate is the credential.
+  kubectl create clusterrolebinding ferry-node-proxier \
+    --clusterrole=system:node-proxier \
+    --group=system:nodes >/dev/null 2>&1
+
+  # A joining Mac trusts nothing yet, so it cannot fetch the CA over a verified
+  # connection -- and the CA is not on the wire either, because the API server
+  # serves only its own certificate. So the CA is published where anyone can read
+  # it and the token carries a hash of it: the fetch is unverified, the contents
+  # are not. This is how kubeadm does discovery, and for the same reason.
+  kubectl create configmap cluster-info -n kube-public \
+    --from-file=ca.crt="$FERRY_HOME/pki/ca.crt" >/dev/null 2>&1
+  kubectl create role ferry-cluster-info -n kube-public \
+    --verb=get --resource=configmaps --resource-name=cluster-info >/dev/null 2>&1
+  kubectl create rolebinding ferry-cluster-info -n kube-public \
+    --role=ferry-cluster-info --user=system:anonymous >/dev/null 2>&1
+
+  local hash count index
+  hash="$(openssl x509 -pubkey -in "$FERRY_HOME/pki/ca.crt" \
+          | openssl pkey -pubin -outform der 2>/dev/null \
+          | openssl dgst -sha256 -hex | awk '{print $NF}')"
+  count="$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  index="$count"
+
+  bold "join token"
+  echo
+  echo "  On the other Mac, in a ferry checkout with the binaries copied over:"
+  echo
+  echo "    ./ferry join --server $LAN_IP:6443 \\"
+  echo "      --token $id.$secret \\"
+  echo "      --ca-hash sha256:$hash \\"
+  echo "      --node-index $index"
+  echo
+  echo "  The token is good for 24 hours. Each node needs its own --node-index;"
+  echo "  it decides which /24 of $CLUSTER_CIDR that node's pods come from."
+}
+
+# Join this Mac to a cluster running on another.
+cmd_join() {
+  local server= token= ca_hash= node_name= index=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --server) server="$2"; shift 2 ;;
+      --token) token="$2"; shift 2 ;;
+      --ca-hash) ca_hash="$2"; shift 2 ;;
+      --node-name) node_name="$2"; shift 2 ;;
+      --node-index) index="$2"; shift 2 ;;
+      *) bad "unknown option $1"; return 2 ;;
+    esac
+  done
+  [ -n "$server" ] && [ -n "$token" ] && [ -n "$index" ] || {
+    bad "usage: ferry join --server <host:6443> --token <id.secret> --ca-hash sha256:<hash> --node-index <n>"
+    return 2; }
+  node_name="${node_name:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+
+  for binary in ferry-cri kubelet ferry-streamer; do
+    [ -x "$here/bin/$binary" ] || { bad "bin/$binary is missing; copy it from the first Mac"; return 1; }
+  done
+  [ -f "$KERNEL" ] || { bad "no guest kernel at $KERNEL; copy it from the first Mac"; return 1; }
+
+  # macOS grants access to the local network per launching session, and an SSH
+  # session ends when the command returns. A node started over SSH therefore runs
+  # perfectly until that moment and then cannot reach the cluster at all, with
+  # "no route to host" against an address that answers ping and answers curl.
+  # Measured: zero failures for three minutes with the session held open, and
+  # failures within twenty seconds of it closing.
+  if [ -n "${SSH_CONNECTION:-}" ] && [ -z "${FERRY_ALLOW_SSH_JOIN:-}" ]; then
+    bad "this looks like an SSH session, and a node started from one stops being"
+    echo "    able to reach the cluster as soon as the session ends."
+    echo
+    echo "    Run 'ferry join' from a Terminal window on this Mac instead. If the"
+    echo "    first pod cannot reach the network, approve the local network prompt"
+    echo "    macOS shows the first time."
+    echo
+    echo "    To override anyway: FERRY_ALLOW_SSH_JOIN=1 ferry join ..."
+    return 1
+  fi
+
+  bold "joining $server as $node_name"
+  mkdir -p "$FERRY_HOME/pki" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs,cri}
+
+  # Fetch the cluster's CA without trusting the connection, then refuse it unless
+  # it hashes to what the token said. The connection being unverified does not
+  # matter: a server that hands over the wrong CA fails the check.
+  # sed and printf rather than a JSON parser: a machine joining a cluster should
+  # need nothing but what macOS ships, and the one field wanted here sits on a
+  # single line with escaped newlines.
+  local encoded
+  encoded="$(curl -sk --max-time 20 \
+    "https://$server/api/v1/namespaces/kube-public/configmaps/cluster-info" \
+    | sed -n 's/^ *"ca\.crt": "\(.*\)"$/\1/p' | head -1)"
+  [ -n "$encoded" ] && printf '%b' "$encoded" > "$FERRY_RUN/fetched-ca.crt"
+  if [ ! -s "$FERRY_RUN/fetched-ca.crt" ]; then
+    bad "could not read cluster-info from $server (was the token made by 'ferry token create'?)"
+    return 1
+  fi
+  local h
+  h="$(openssl x509 -pubkey -in "$FERRY_RUN/fetched-ca.crt" 2>/dev/null \
+       | openssl pkey -pubin -outform der 2>/dev/null \
+       | openssl dgst -sha256 -hex | awk '{print $NF}')"
+  if [ "sha256:$h" != "$ca_hash" ]; then
+    bad "the CA at $server hashes to sha256:$h, not $ca_hash -- refusing to join"
+    rm -f "$FERRY_RUN/fetched-ca.crt"
+    return 1
+  fi
+  mv "$FERRY_RUN/fetched-ca.crt" "$FERRY_HOME/pki/ca.crt"
+  ok "verified the cluster CA against the token's hash"
+
+  cat > "$FERRY_RUN/bootstrap.conf" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster: {certificate-authority: $FERRY_HOME/pki/ca.crt, server: "https://$server"}
+  name: ferry
+contexts:
+- context: {cluster: ferry, user: bootstrap}
+  name: ferry
+current-context: ferry
+users:
+- name: bootstrap
+  user: {token: "$token"}
+EOF
+
+  NODE_NAME="$node_name"
+  NODE_INDEX="$index"
+  RELAY_PORT=$((RELAY_PORT))
+  start_worker "$node_name" "$index" || return 1
+}
+
+# The parts of a node that are not the control plane: a runtime, a streamer and
+# a kubelet. Used by 'ferry join'; 'ferry up' starts these itself because it has
+# a control plane to start first.
+start_worker() {
+  local name="$1" index="$2"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
+
+  "$here/bin/ferry-cri" \
+    --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
+    --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
+    --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
+    --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
+    --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-cri.pid"
+  local ready=
+  for _ in $(seq 1 90); do
+    [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null && { ready=1; break; }
+    sleep 1
+  done
+  [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
+  ok "runtime on 10.244.$index.0/24, switch udp/$RELAY_PORT"
+
+  cat > "$FERRY_RUN/kubelet.yaml" <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+podLogsDir: $FERRY_RUN/podlogs
+containerRuntimeEndpoint: unix://$FERRY_SOCK
+imageServiceEndpoint: unix://$FERRY_SOCK
+volumePluginDir: $FERRY_RUN/volume-plugins
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "5%"
+  imagefs.available: "5%"
+  nodefs.inodesFree: "5%"
+cgroupsPerQOS: false
+enforceNodeAllocatable: []
+failSwapOn: false
+readOnlyPort: 0
+clusterDomain: $CLUSTER_DOMAIN
+clusterDNS: [10.244.0.2]
+runtimeRequestTimeout: 10m
+authentication:
+  x509: {clientCAFile: $FERRY_HOME/pki/ca.crt}
+  anonymous: {enabled: false}
+  webhook: {enabled: true}
+authorization: {mode: Webhook}
+EOF
+
+  FERRY_CONTAINER_LOGS_DIR="$FERRY_RUN/containerlogs" \
+  "$here/bin/kubelet" \
+    --config="$FERRY_RUN/kubelet.yaml" \
+    --bootstrap-kubeconfig="$FERRY_RUN/bootstrap.conf" \
+    --kubeconfig="$FERRY_RUN/kubelet.conf" \
+    --hostname-override="$name" --root-dir="$FERRY_RUN/kubelet" \
+    --cert-dir="$FERRY_RUN/pki" --v=2 >"$FERRY_RUN/logs/kubelet.log" 2>&1 &
+  echo $! > "$FERRY_RUN/kubelet.pid"
+
+  for _ in $(seq 1 120); do
+    [ -f "$FERRY_RUN/kubelet.conf" ] && break
+    sleep 1
+  done
+  if [ -f "$FERRY_RUN/kubelet.conf" ]; then
+    ok "got a certificate from the cluster"
+  else
+    bad "the kubelet never got a certificate"; tail -8 "$FERRY_RUN/logs/kubelet.log"; return 1
+  fi
+
+  # Only now: the streamer authenticates as this node, and the credential it
+  # needs is the one the kubelet has just been issued. Started any earlier it
+  # has nothing to present, and the node never advertises where its switch is.
+  "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
+    --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
+    --kubeconfig "$FERRY_RUN/kubelet.conf" \
+    --node-name "$name" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    --peers-file "$PEERS_FILE" \
+    >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-streamer.pid"
+  for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+  ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
+
+  # Service rules are rendered per node, so a worker runs its own ferry-proxyd.
+  # Like the streamer it authenticates as the node, so it also waits for the
+  # certificate. ferry-cri is already asking for a ruleset and simply keeps
+  # asking until this answers.
+  if [ -x "$here/bin/ferry-proxyd" ]; then
+    local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null || echo "$LAN_IP")"
+    rm -f "$FERRY_PROXYD_SOCK"
+    "$here/bin/ferry-proxyd" --kubeconfig "$FERRY_RUN/kubelet.conf" \
+      --node-name "$name" --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
+      >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-proxyd.pid"
+    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
+      || warn "ferry-proxyd did not start; Services will not route on this node"
+  else
+    warn "bin/ferry-proxyd is missing; Services will not route on this node"
+  fi
+
+  echo
+  bold "joined as $name"
+  echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
+}
+
 cmd_down() {
   bold "stopping ferry"
   # ferry-proxy runs as root, so stopping it does too.
@@ -368,6 +790,22 @@ cmd_down() {
     rm -f "$FERRY_RUN/ferry-proxy.pid"
     sleep 1
   fi
+  # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
+  local index
+  for index in $(seq 1 200); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    for suffix in -kubelet -streamer ""; do
+      local pidfile="$FERRY_RUN/node-$index$suffix.pid"
+      [ -f "$pidfile" ] || continue
+      local pid; pid="$(cat "$pidfile")"; rm -f "$pidfile"
+      kill -TERM "$pid" 2>/dev/null || continue
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      kill -KILL "$pid" 2>/dev/null
+    done
+    rm -f "/tmp/ferry-cri-$index.sock" "/tmp/ferry-exec-$index.sock" "/tmp/ferry-str-$index.sock"
+    ok "node $index stopped"
+  done
+
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -381,7 +819,7 @@ cmd_down() {
     ok "$component stopped"
   done
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$PEERS_FILE"
 }
 
 cmd_status() {
@@ -416,6 +854,15 @@ case "${1:-}" in
   kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  token)      shift; case "${1:-}" in create|"") cmd_token_create ;; *) bad "usage: ferry token create"; exit 2 ;; esac ;;
+  join)       shift; cmd_join "$@" ;;
+  node)       shift
+              case "${1:-}" in
+                add) shift; cmd_node_add "$@" ;;
+                rm)  shift; cmd_node_rm "$@" ;;
+                ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes ;;
+                *)   bad "usage: ferry node [add <name>|rm <name>|ls]"; exit 2 ;;
+              esac ;;
   down)       shift; cmd_down "$@" ;;
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
