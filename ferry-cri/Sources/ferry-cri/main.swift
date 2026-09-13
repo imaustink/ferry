@@ -24,8 +24,12 @@ let config = RuntimeConfig(
     initImage: option("--init-image", "ghcr.io/apple/containerization/vminit:0.45.0"),
     defaultCPUs: Int(option("--pod-cpus", "2")) ?? 2,
     defaultMemoryBytes: (UInt64(option("--pod-memory-mib", "512")) ?? 512) * 1024 * 1024,
-    netdPath: {
-        let path = option("--netd", "")
+    nftBundlePath: {
+        let path = option("--nft-bundle", "")
+        return path.isEmpty ? nil : path
+    }(),
+    proxydSocket: {
+        let path = option("--proxyd-socket", "")
         return path.isEmpty ? nil : path
     }()
 )
@@ -96,8 +100,8 @@ let shutdownSignals = [SIGTERM, SIGINT].map { sig -> DispatchSourceSignal in
 }
 _ = shutdownSignals
 
-if let netdPath = config.netdPath {
-    print("    services  in-guest rules via \(netdPath)")
+if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
+    print("    services  kube-proxy rules applied in-guest (from \(proxyd))")
     // Poll rather than subscribe: the ruleset is small, changes are rare, and
     // this keeps ferry-cri free of an API client of its own.
     Task {

@@ -22,9 +22,11 @@ struct RuntimeConfig: Sendable {
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
-    /// Host path of the static ferry-netd binary, mounted into every pod so it
-    /// can program its own Service rules.
-    var netdPath: String?
+    /// Host directory holding nft and its loader, mounted into every pod so it
+    /// can apply the Service rules kube-proxy rendered.
+    var nftBundlePath: String?
+    /// ferry-proxyd's socket, where the rendered ruleset comes from.
+    var proxydSocket: String?
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -330,6 +332,11 @@ actor PodRuntime {
         }
         if wasBooted { try? await record.pod.stop() }
         record.ready = false
+        // Free the reserved DNS address as soon as the pod stops. Waiting for
+        // RemovePodSandbox lets a terminated CoreDNS keep the reservation, so
+        // its replacement lands on an ordinary address and the kubelet's
+        // clusterDNS then points at nothing.
+        if record.usesReservedAddress { dnsInterfaceInUse = false }
         sandboxes[id] = record
     }
 
@@ -367,16 +374,16 @@ actor PodRuntime {
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
     func applyServiceRules(sandboxID: String, ruleset: Data) async {
-        guard config.netdPath != nil else { return }
+        guard config.nftBundlePath != nil else { return }
         guard let target = containers.values.first(where: {
             $0.sandboxID == sandboxID && $0.state == .running
         }) else { return }
 
         do {
-            // ferry-netd needs NET_ADMIN to program the pod's kernel, and an
-            // ordinary pod does not ask for it. Granting it to this process
-            // rather than to the container keeps the privilege on a binary
-            // ferry ships and runs, not on the workload.
+            // nft needs NET_ADMIN to program the pod's kernel, and an ordinary
+            // pod does not ask for it. Granting it to this process rather than
+            // to the container keeps the privilege on a binary ferry ships and
+            // runs, not on the workload.
             var privileged = Containerization.LinuxCapabilities.defaultOCICapabilities
             if let netAdmin = try? CapabilityName(rawValue: "NET_ADMIN") {
                 privileged.bounding.append(netAdmin)
@@ -386,11 +393,14 @@ actor PodRuntime {
 
             let process = try await exec(
                 containerID: target.id,
-                command: ["/.ferry/ferry-netd"],
+                // Invoked through its own loader so the pod's libc is irrelevant.
+                command: ["/.ferry/lib/ld-musl-aarch64.so.1",
+                          "--library-path", "/.ferry/lib",
+                          "/.ferry/nft", "-f", "-"],
                 tty: false,
                 stdin: DataReaderStream(ruleset),
                 stdout: DiscardWriter(),
-                stderr: ErrorWriter(prefix: "ferry-netd"),
+                stderr: ErrorWriter(prefix: "nft"),
                 capabilities: privileged
             )
             try await process.start()
@@ -403,8 +413,9 @@ actor PodRuntime {
 
     /// Re-applies to every running pod when the ruleset changes.
     func refreshServiceRules() async {
-        guard let streamer, config.netdPath != nil else { return }
-        guard let ruleset = try? streamer.get(path: "/services"), !ruleset.isEmpty else { return }
+        guard config.nftBundlePath != nil, let socket = config.proxydSocket else { return }
+        let proxyd = StreamerClient(socketPath: socket)
+        guard let ruleset = try? proxyd.get(path: "/ruleset"), !ruleset.isEmpty else { return }
         guard ruleset != lastRuleset else { return }
         lastRuleset = ruleset
         for sandbox in sandboxes.values where sandbox.booted {
@@ -416,8 +427,9 @@ actor PodRuntime {
     func currentRuleset() -> Data? { lastRuleset }
 
     func cacheRuleset() async {
-        guard let streamer else { return }
-        if let ruleset = try? streamer.get(path: "/services"), !ruleset.isEmpty {
+        guard let socket = config.proxydSocket else { return }
+        let proxyd = StreamerClient(socketPath: socket)
+        if let ruleset = try? proxyd.get(path: "/ruleset"), !ruleset.isEmpty {
             lastRuleset = ruleset
         }
     }
@@ -551,13 +563,11 @@ actor PodRuntime {
                 options: mount.readonly ? ["ro"] : []
             ))
         }
-        // Every pod gets ferry-netd, so Service rules are programmed inside its
-        // own kernel rather than proxied through the host.
-        if let netdPath = config.netdPath, FileManager.default.fileExists(atPath: netdPath) {
-            collected.append(.share(
-                source: URL(filePath: netdPath).deletingLastPathComponent().path(),
-                destination: "/.ferry",
-                options: ["ro"]))
+        // Every pod gets nft, so Service rules are applied inside its own kernel
+        // rather than proxied through the host. The bundle carries its own musl
+        // loader, so it does not matter what the pod's image is built on.
+        if let bundle = config.nftBundlePath, FileManager.default.fileExists(atPath: bundle) {
+            collected.append(.share(source: bundle, destination: "/.ferry", options: ["ro"]))
         }
 
         // Immutable so it can cross into the configuration closure.
