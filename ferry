@@ -73,6 +73,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node add <name>   add another node on this Mac
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
+  ferry image load <x>    run an image you built here, without a registry
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
 
@@ -852,6 +853,84 @@ EOF
   echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
 }
 
+# Run an image you just built.
+#
+# Everything else in ferry comes from a registry, which is fine for busybox and
+# useless for the thing you are working on. 'minikube image load' and 'kind load
+# docker-image' exist for this, and until now ferry had no answer at all.
+#
+# What arrives can be an OCI layout directory, an archive of one, or the name of
+# an image Docker or Podman is holding -- in the last case ferry asks that tool
+# to export it first. The image keeps the name it already has, so a manifest
+# saying `myapp:dev` still says that.
+cmd_image_load() {
+  local what="${1:-}"
+  [ -n "$what" ] || { bad "usage: ferry image load <name|archive.tar|oci-directory>"; return 2; }
+  [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up"; return 1; }
+
+  local staging; staging="$(mktemp -d "${TMPDIR:-/tmp}/ferry-load.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$staging'" RETURN
+
+  local layout=
+  if [ -d "$what" ]; then
+    layout="$what"
+  elif [ -f "$what" ]; then
+    tar -xf "$what" -C "$staging" 2>/dev/null || { bad "could not unpack $what"; return 1; }
+    layout="$staging"
+  else
+    # A name: ask whichever tool has it to hand over an OCI archive. Docker's
+    # plain 'save' format is not one, so the flag is not optional.
+    local exported="$staging/image.tar"
+    if command -v docker >/dev/null 2>&1 && docker image inspect "$what" >/dev/null 2>&1; then
+      echo "  exporting $what from docker"
+      docker save --output "$exported" "$what" >/dev/null 2>&1 || { bad "docker save failed"; return 1; }
+    elif command -v podman >/dev/null 2>&1 && podman image exists "$what" 2>/dev/null; then
+      echo "  exporting $what from podman"
+      podman save --format oci-archive --output "$exported" "$what" >/dev/null 2>&1 \
+        || { bad "podman save failed"; return 1; }
+    else
+      bad "no such file, directory, or local image: $what"
+      return 1
+    fi
+    mkdir -p "$staging/layout"
+    tar -xf "$exported" -C "$staging/layout" 2>/dev/null || { bad "could not unpack the export"; return 1; }
+    layout="$staging/layout"
+  fi
+
+  # An OCI layout says so. Anything else will fail inside ferry-cri with a less
+  # helpful message, so it is worth saying here.
+  if [ ! -f "$layout/oci-layout" ] || [ ! -f "$layout/index.json" ]; then
+    bad "$what is not an OCI layout (no oci-layout/index.json)"
+    echo "    Docker's default 'save' format is not one. Export with:"
+    echo "      docker save <name> | ...   # docker 25+ with the containerd store"
+    echo "      podman save --format oci-archive <name> -o image.tar"
+    return 1
+  fi
+
+  # ferry-cri owns the image store, so the load happens there. One JSON line in,
+  # one back, over the socket it already listens on.
+  echo "  loading into the image store"
+  local reply
+  reply="$(printf '{"op":"loadimage","path":"%s"}\n' "$layout" | nc -U "$FERRY_EXEC_SOCK" 2>/dev/null)"
+
+  case "$reply" in
+    *'"images"'*)
+      # {"images":["a","b"]} -> one name per line, without reaching for a parser.
+      echo "$reply" \
+        | sed -e 's/.*"images":\[//' -e 's/\].*//' -e 's/","/\n/g' -e 's/"//g' -e 's|\\/|/|g' \
+        | while read -r name; do [ -n "$name" ] && ok "loaded $name"; done
+      echo
+      echo "  Pods must not try to fetch it again: set"
+      echo "    imagePullPolicy: IfNotPresent   (or Never)"
+      ;;
+    *'"error"'*)
+      bad "$(echo "$reply" | sed -n 's/.*"error":"\(.*\)".*/\1/p')" ;;
+    *)
+      bad "ferry-cri did not answer; see 'ferry logs ferry-cri'" ;;
+  esac
+}
+
 cmd_down() {
   bold "stopping ferry"
   # ferry-proxy runs as root, so stopping it does too.
@@ -931,6 +1010,12 @@ case "${1:-}" in
   kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  image)      shift
+              case "${1:-}" in
+                load) shift; cmd_image_load "$@" ;;
+                ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' 2>/dev/null | sort -u ;;
+                *) bad "usage: ferry image [load <name|archive|dir>|ls]"; exit 2 ;;
+              esac ;;
   token)      shift; case "${1:-}" in create|"") cmd_token_create ;; *) bad "usage: ferry token create"; exit 2 ;; esac ;;
   join)       shift; cmd_join "$@" ;;
   node)       shift
