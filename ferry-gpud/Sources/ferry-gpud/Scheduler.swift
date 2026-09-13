@@ -26,6 +26,18 @@
 // What cannot be preempted is a single Metal command buffer, which runs to
 // completion whatever anyone wants. That, not the slice, sets the floor on how
 // long another pod can be made to wait.
+//
+// Turns are not all worth the same. Kubernetes already has the word for this --
+// PriorityClass, resolved by admission into spec.priority on every pod -- and
+// ferry already reads the pod spec to find the GPU request, so priority comes
+// along with it. A higher-priority pod goes first, and does not even wait out
+// the current slice: the holder yields at its next checkpoint. Nothing else here
+// would give "this pod matters more" any meaning on a device only one pod can
+// use at a time.
+//
+// Strict priority starves, so it is bounded: anything that has waited longer
+// than the starvation guard goes next whatever its priority. Priority decides
+// who is served first, not who is served at all.
 
 import Foundation
 
@@ -131,6 +143,10 @@ final class GPUScheduler: @unchecked Sendable {
         /// Time spent waiting for it, before the first grant and at every yield.
         var waited: TimeInterval = 0
         var waitingSince = Date()
+        /// Set when the starvation guard let this waiter in past a pod that
+        /// outranks it, which buys it one slice that priority cannot take away.
+        /// See yieldIfNeeded.
+        var protected = false
         var failed: Error?
         init(job: GPUJob) { self.job = job }
     }
@@ -148,15 +164,40 @@ final class GPUScheduler: @unchecked Sendable {
     private let queueDepth: Int
     private let perPodDepth: Int
     private let slice: TimeInterval
+    /// Nothing waits longer than this, whatever anyone's priority.
+    private let starvationGuard: TimeInterval
+    /// Per pod, from its PriorityClass. Absent means 0, which is what an
+    /// ordinary pod has.
+    private var priorities: [String: Int32] = [:]
     private var usage: [String: PodUsage] = [:]
     /// Pods come and go for the life of the cluster, so their accounting cannot
     /// be kept forever. Past this, the least recently used record is dropped.
     private let maxUsageEntries = 256
 
-    init(queueDepth: Int, perPodDepth: Int, slice: TimeInterval) {
+    init(queueDepth: Int, perPodDepth: Int, slice: TimeInterval,
+         starvationGuard: TimeInterval) {
         self.queueDepth = queueDepth
         self.perPodDepth = perPodDepth
         self.slice = slice
+        self.starvationGuard = starvationGuard
+    }
+
+    /// Records what a pod is worth, from its spec. Set when its socket is
+    /// granted, so it is known before the pod can ask for anything.
+    func setPriority(_ priority: Int32, for pod: String) {
+        condition.lock()
+        defer { condition.unlock() }
+        priorities[pod] = priority
+    }
+
+    /// Called with the lock held.
+    private func priority(of pod: String) -> Int32 { priorities[pod] ?? 0 }
+
+    /// Called with the lock held. How long the pod at the head of this queue has
+    /// been waiting.
+    private func headWait(_ pod: String, now: Date) -> TimeInterval {
+        guard let head = queues[pod]?.first else { return 0 }
+        return now.timeIntervalSince(head.waitingSince)
     }
 
     // MARK: - Running
@@ -255,7 +296,8 @@ final class GPUScheduler: @unchecked Sendable {
     /// rotation, if it is free and anyone wants it.
     private func promote() {
         guard current == nil, !rotation.isEmpty else { return }
-        let pod = rotation.removeFirst()
+        guard let (pod, rescued) = chooseNext() else { return }
+        rotation.removeAll { $0 == pod }
         guard var queued = queues[pod], !queued.isEmpty else { return }
         let next = queued.removeFirst()
         waiting -= 1
@@ -269,7 +311,44 @@ final class GPUScheduler: @unchecked Sendable {
         current = next
         next.granted = true
         next.grantedAt = Date()
+        next.protected = rescued
         condition.broadcast()
+    }
+
+    /// Called with the lock held. Which pod gets the device next, and whether it
+    /// needed rescuing from a pod that outranks it.
+    ///
+    /// The rotation is kept in arrival order, so picking its head is plain
+    /// round-robin and is what happens when every pod has the same priority --
+    /// which, since priority defaults to 0, is the ordinary case.
+    private func chooseNext() -> (pod: String, rescued: Bool)? {
+        guard !rotation.isEmpty else { return nil }
+        let now = Date()
+
+        // Starvation guard first, so priority decides who goes first rather than
+        // who goes at all.
+        let starved = rotation.filter { headWait($0, now: now) >= starvationGuard }
+        if let longest = starved.max(by: { headWait($0, now: now) < headWait($1, now: now) }) {
+            // Only a pod that was actually being held under by something more
+            // important needs protecting from it. A pod that waited a long time
+            // because the device was simply busy owes nothing to anyone, and
+            // giving it protection would delay a high-priority arrival by a
+            // slice for no reason.
+            let rescued = rotation.contains { priority(of: $0) > priority(of: longest) }
+            return (longest, rescued)
+        }
+
+        var best = rotation[0]
+        for pod in rotation.dropFirst() where priority(of: pod) > priority(of: best) {
+            best = pod
+        }
+        return (best, false)
+    }
+
+    /// Called with the lock held. The highest priority among pods waiting, other
+    /// than this one.
+    private func highestWaitingPriority(besides pod: String) -> Int32? {
+        rotation.filter { $0 != pod }.map { priority(of: $0) }.max()
     }
 
     /// Hands the device back and records what the request cost.
@@ -303,8 +382,20 @@ final class GPUScheduler: @unchecked Sendable {
         defer { condition.unlock() }
 
         guard let waiter = current, waiter.job === job else { return }
-        guard Date().timeIntervalSince(waiter.grantedAt) >= slice else { return }
         guard rotation.contains(where: { $0 != job.pod }) else { return }
+
+        // A pod that matters more does not wait out someone else's slice. It
+        // still waits for the command buffer in flight, which is not ours to
+        // interrupt.
+        //
+        // Unless this waiter is only here because the starvation guard let it
+        // in. Preempting it immediately would hand the device straight back to
+        // the pod it was rescued from, and it would never do any work at all --
+        // the guard would admit it and priority would evict it, forever. So a
+        // rescued waiter keeps the device for its slice like anyone else.
+        let outranked = (highestWaitingPriority(besides: job.pod) ?? Int32.min) > priority(of: job.pod)
+        let spent = Date().timeIntervalSince(waiter.grantedAt) >= slice
+        guard (outranked && !waiter.protected) || spent else { return }
 
         waiter.held += Date().timeIntervalSince(waiter.grantedAt)
         waiter.granted = false
@@ -381,6 +472,7 @@ final class GPUScheduler: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         usage.removeValue(forKey: pod)
+        priorities.removeValue(forKey: pod)
     }
 
     /// Requests queued or running right now, for /capacity.

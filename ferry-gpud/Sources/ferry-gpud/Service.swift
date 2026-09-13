@@ -17,6 +17,9 @@ struct PodRegistration: Codable, Sendable {
     /// pods actually exist can tell a grant that has outlived its pod from one
     /// made a moment ago for a pod it has not seen yet.
     var grantedAt: String?
+    /// From the pod's PriorityClass. Persisted with the grant so a restarted
+    /// daemon does not quietly demote every pod to ordinary.
+    var priority: Int32?
 }
 
 struct PodEntry: Encodable {
@@ -25,6 +28,7 @@ struct PodEntry: Encodable {
     var name: String?
     var socket: String
     var grantedAt: String?
+    var priority: Int32
     var usage: PodUsage
 }
 
@@ -107,8 +111,10 @@ final class Service: @unchecked Sendable {
         return entry
     }
 
-    /// Called with the lock held.
+    /// Called with the lock held. Binds the socket and tells the scheduler what
+    /// this pod is worth, before it can ask for anything.
     private func bind(_ registration: PodRegistration) throws {
+        scheduler.setPriority(registration.priority ?? 0, for: registration.uid)
         let path = socketPath(uid: registration.uid)
         let server = UnixHTTPServer(path: path, identity: registration.uid) { [weak self] request, identity in
             self?.handlePod(request, identity: identity) ?? .error("shutting down", status: 503)
@@ -205,7 +211,7 @@ final class Service: @unchecked Sendable {
     private func entry(uid: String, registration: PodRegistration) -> PodEntry {
         PodEntry(uid: uid, namespace: registration.namespace, name: registration.name,
                  socket: socketPath(uid: uid), grantedAt: registration.grantedAt,
-                 usage: scheduler.usage(for: uid))
+                 priority: registration.priority ?? 0, usage: scheduler.usage(for: uid))
     }
 
     private func describe(_ registration: PodRegistration) -> String {

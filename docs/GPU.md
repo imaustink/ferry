@@ -372,6 +372,37 @@ wait a co-tenant sees. It was picked by measuring rather than taste: at 2s a
 waiting pod waited 2.1s, at 0.5s it waited 0.6s, and the hog's own time on the
 device did not measurably change.
 
+### Not every turn is worth the same
+
+Kubernetes already has the word for this. `PriorityClass` is a first-class API,
+and the admission plugin resolves `priorityClassName` into `spec.priority` on
+every pod -- 0 when nobody said otherwise. ferry already reads the pod spec to
+find the GPU request, so priority comes along beside it and needs nothing new
+invented.
+
+A pod that outranks the holder does not wait out its slice: the holder yields at
+its next checkpoint, which is one command buffer away. Measured, with the same
+hog and the same waiter, changing only the priorities:
+
+| waiter against the hog | four consecutive waits |
+|---|---|
+| outranks it (100000 vs 0) | 0.11s 0.10s 0.10s 0.10s |
+| same priority (0 vs 0) | 0.10s 0.64s 0.59s 0.60s |
+| outranked by it (0 vs 100000) | 5.20s 5.16s 5.18s 5.16s |
+
+Strict priority starves, so it is bounded. Anything that has waited longer than
+the starvation guard -- 5s by default -- goes next whatever anyone's priority,
+which is the third row: served last, but served. **Priority decides who goes
+first, not who goes at all.**
+
+The rescue has to be protected to mean anything. A pod let in by the guard would
+otherwise hit its first checkpoint, see the pod that outranks it still waiting,
+and hand the device straight back without doing any work -- admitted by the
+guard and evicted by priority, forever. So a pod rescued *from a pod that
+outranks it* keeps the device for its slice. A pod that merely waited a long
+time on a busy device is not rescued from anyone and gets no protection, or a
+high-priority arrival would be delayed a slice for nothing.
+
 **Every request has a deadline**, queue time included -- a client that asked for
 120s means 120s, not 120s once it is its turn. Verified both while running (504
 at 5.00s against a 5s budget) and while queued.
@@ -389,6 +420,7 @@ denial of service against the Mac rather than against the pod.
 |---|---|---|
 | `--capacity` | 1 | pods that may hold a socket at once |
 | `--time-slice` | 0.5 | seconds before a waiting pod gets a turn |
+| `--starvation-guard` | 5 | seconds before it gets one regardless of priority |
 | `--request-timeout` | 120 | seconds per request, queue time included |
 | `--queue-depth` | 64 | requests waiting for the device |
 | `--pod-queue-depth` | 8 | of those, from any one pod |
@@ -479,9 +511,6 @@ daemon and it is back within a tick.
 - **Generation cannot yield.** `/v1/generate` is opaque to us once the model has
   the prompt, so it holds the device for its whole run and is bounded only by the
   request deadline. A matmul submitted alongside waits for it.
-- **Nothing is priority-aware.** Every pod's turn is worth the same. There is no
-  way to say that one workload matters more, and Kubernetes has no standard way
-  to express it for an extended resource either.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 

@@ -26,9 +26,14 @@ struct GPUClient: Sendable {
     /// pod has exactly one and nothing else may be at it.
     static let guestPath = "/run/ferry/gpu.sock"
 
-    func grant(uid: String, namespace: String, name: String) throws -> GPUGrant {
+    func grant(uid: String, namespace: String, name: String,
+               priority: Int32) throws -> GPUGrant {
+        struct Registration: Encodable {
+            let uid: String, namespace: String, name: String
+            let priority: Int32
+        }
         let body = try JSONEncoder().encode(
-            ["uid": uid, "namespace": namespace, "name": name])
+            Registration(uid: uid, namespace: namespace, name: name, priority: priority))
         let response = try exchange(method: "POST", path: "/pods", body: body)
         return try JSONDecoder().decode(GPUGrant.self, from: response)
     }

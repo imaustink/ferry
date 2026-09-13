@@ -83,7 +83,8 @@ cost time.
   matmul and ran the on-device model; a second pod requesting it waits on the
   scheduler, with no device plugin anywhere. Pods share the device by preemption
   -- a pod wanting a fraction of a second waits 0.6s while another holds 35
-  seconds of work -- and `kubectl` shows what each pod has used. See
+  seconds of work, or 0.1s if its PriorityClass outranks the pod holding the
+  device -- and `kubectl` shows what each pod has used. See
   [docs/GPU.md](docs/GPU.md) and
   [experiments/08-vsock-socket-relay](experiments/08-vsock-socket-relay/FINDINGS.md).
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
