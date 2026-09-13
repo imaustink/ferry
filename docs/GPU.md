@@ -205,7 +205,7 @@ no package graph to fetch and no weights to ship before a pod can use it.
 | `GET /v1/device` | what the GPU is -- name, architecture, unified memory, limits |
 | `GET /v1/model` | whether the on-device model is usable, and why not if it is not |
 | `POST /v1/matmul` | a square matrix multiply on the GPU, `{size, iterations}` |
-| `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}` |
+| `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}`; reports how often it yielded |
 | `GET /v1/usage` | this pod's own accounting, and no one else's |
 
 The control socket adds `/capacity`, `/pods`, `/stats` and `/metrics`.
@@ -362,6 +362,31 @@ The work runs on the caller's own thread, so a job's progress is just that
 thread's stack: handing the device over and taking it back costs nothing but the
 handoff. Nothing is re-run and no progress is serialised anywhere.
 
+**Generation yields too**, which is not obvious, because a generation looks
+opaque: hand over a prompt, wait, get a paragraph. It is not, if it is streamed.
+The model emits snapshots as it goes -- measured on this one, a 5s generation
+arrives as 27 snapshots a median of 0.153s apart -- and the gap between them is
+a checkpoint as good as the gap between matmul passes.
+
+So `/v1/generate` streams internally even though nothing shows partial output to
+anyone. It is streamed for the checkpoint. A matmul asking while a 4.6s
+generation runs:
+
+```
+with the generation yielding      0.26s  0.65s  0.61s  0.77s
+with it holding the device        3.37s  0.08s  0.08s  0.08s   <- waited it out
+```
+
+The second row is the same test with the slice raised past the generation's run
+time, which is what the old behaviour was: the first matmul waits for the whole
+generation, and the rest are fast only because there is nothing left to wait
+for. Streaming costs the generation nothing beyond the time it hands over.
+
+It buys two other things that were previously impossible. A generation can now
+be **cancelled** when its pod goes away -- 499 within a snapshot of the pod being
+deleted, rather than after the whole paragraph -- and its **deadline** is checked
+per snapshot rather than only at the end.
+
 What **cannot** be preempted is a single Metal command buffer, which runs to
 completion whatever anyone wants. That is the real floor on how long a co-tenant
 waits -- one pass of whatever is running, which at the largest allowed matmul is
@@ -508,9 +533,6 @@ daemon and it is back within a tick.
 - **One pass is the floor.** A co-tenant's worst wait is the time slice plus
   whatever command buffer is already running, and the second half of that is not
   ours to interrupt. At the largest allowed matmul it is about 0.9s.
-- **Generation cannot yield.** `/v1/generate` is opaque to us once the model has
-  the prompt, so it holds the device for its whole run and is bounded only by the
-  request deadline. A matmul submitted alongside waits for it.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 
@@ -518,6 +540,5 @@ daemon and it is back within a tick.
 
 Another backend behind `/v1/generate` -- MLX or llama.cpp with real weights, for
 a model larger than the one the OS ships. The endpoint was shaped so that lands
-without the pod noticing, and it is also where the yielding question gets
-interesting: a token loop has an obvious checkpoint between tokens, which the
-system model's API does not give us.
+without the pod noticing, and the yielding is already solved for it: a token
+loop has the same checkpoint between tokens that the stream gives us here.
