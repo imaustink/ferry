@@ -132,8 +132,8 @@ extension StreamerClient {
     /// hold the request open until it has something newer, so a change reaches
     /// the pods when it is rendered rather than on the next turn of a poll. The
     /// server lets go by itself well before the timeout here.
-    func ruleset(after generation: UInt64? = nil) throws -> Ruleset {
-        var path = "/ruleset"
+    func ruleset(after generation: UInt64? = nil, path base: String = "/ruleset") throws -> Ruleset {
+        var path = base
         if let generation { path += "?after=\(generation)" }
         let response = try exchange(path: path, payload: nil, method: "GET", timeout: 45)
         return Ruleset(body: response.body,
