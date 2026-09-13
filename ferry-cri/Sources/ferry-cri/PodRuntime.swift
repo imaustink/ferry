@@ -449,7 +449,7 @@ actor PodRuntime {
         // The kubelet resolves an image to its ID before calling
         // CreateContainer, so the lookup has to work by digest as well as by
         // the reference the pull used.
-        guard let base = rootfsCache[imageRef] else {
+        guard let base = rootfsCache[imageRef] ?? rootfsCache[ImageReference.normalize(imageRef)] else {
             throw RuntimeFailure.notFound("image \(imageRef) has not been pulled")
         }
 
@@ -494,7 +494,7 @@ actor PodRuntime {
         // Merge the pod's overrides with the image's own configuration, the way
         // Kubernetes defines it: `command` replaces ENTRYPOINT, `args` replaces
         // CMD, and anything not overridden comes from the image.
-        let imageConfig = imageConfigs[imageRef]
+        let imageConfig = imageConfigs[imageRef] ?? imageConfigs[ImageReference.normalize(imageRef)]
         let entrypoint = cfg.command.isEmpty ? (imageConfig?.entrypoint ?? []) : cfg.command
         let commandArgs: [String]
         if !cfg.args.isEmpty {
@@ -609,7 +609,13 @@ actor PodRuntime {
         containers[id] = ContainerRecord(
             id: id, sandboxID: sandboxID,
             name: cfg.metadata.name, attempt: cfg.metadata.attempt,
-            image: imageRef, imageRef: imageRef,
+            // CRI asks for two different things here: `image` is the name the
+            // pod was written with, `imageRef` identifies the bytes. The kubelet
+            // has already resolved the first into the second by this point, so
+            // the name is recovered from what the pull recorded -- otherwise
+            // kubectl reports every container as running a bare digest.
+            image: pulledImages[imageRef]?.repoTags.last ?? imageRef,
+            imageRef: pulledImages[imageRef]?.id ?? imageRef,
             labels: cfg.labels, annotations: cfg.annotations,
             logPath: absoluteLogPath, createdAt: Self.now(), tty: cfg.tty,
             logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder
@@ -759,10 +765,15 @@ actor PodRuntime {
 
     func pullImage(_ reference: String) async throws -> String {
         let platform = ContainerizationOCI.Platform(arch: "arm64", os: "linux", variant: "v8")
-        let image = try await store.pull(reference: reference, platform: platform)
+        // The registry is asked for the fully qualified name; every cache is
+        // keyed by both that and whatever the manifest actually said, so a pod
+        // written as `busybox:1.36` finds the image it just pulled.
+        let canonical = ImageReference.normalize(reference)
+        let image = try await store.pull(reference: canonical, platform: platform)
+        let keys = Set([reference, canonical])
 
-        if rootfsCache[reference] == nil {
-            let safe = reference.replacingOccurrences(of: "/", with: "_")
+        if rootfsCache[canonical] == nil {
+            let safe = canonical.replacingOccurrences(of: "/", with: "_")
                 .replacingOccurrences(of: ":", with: "_")
             let path = config.stateDir.appending(component: "image-\(safe).ext4")
             let mount: Containerization.Mount
@@ -772,12 +783,14 @@ actor PodRuntime {
             } catch let error as ContainerizationError where error.code == .exists {
                 mount = .block(format: "ext4", source: path.path(), destination: "/", options: [])
             }
-            rootfsCache[reference] = mount
+            for key in keys { rootfsCache[key] = mount }
             if !image.digest.isEmpty { rootfsCache[image.digest] = mount }
+        } else {
+            for key in keys { rootfsCache[key] = rootfsCache[canonical] }
         }
 
         if let imageConfig = try? await image.config(for: platform).config {
-            imageConfigs[reference] = imageConfig
+            for key in keys { imageConfigs[key] = imageConfig }
             if !image.digest.isEmpty { imageConfigs[image.digest] = imageConfig }
         }
 
@@ -785,9 +798,9 @@ actor PodRuntime {
         // ImageInspectError and the pod never starts. Size is taken from the
         // unpacked root filesystem, which is the thing that actually occupies
         // disk in this runtime.
-        let digest = image.digest.isEmpty ? reference : image.digest
+        let digest = image.digest.isEmpty ? canonical : image.digest
         var size: UInt64 = 0
-        if let mount = rootfsCache[reference],
+        if let mount = rootfsCache[canonical],
            let attrs = try? FileManager.default.attributesOfItem(atPath: mount.source),
            let bytes = attrs[.size] as? UInt64 {
             size = bytes
@@ -795,20 +808,25 @@ actor PodRuntime {
 
         var entry = Runtime_V1_Image()
         entry.id = digest
-        entry.repoTags = [reference]
-        entry.repoDigests = image.digest.isEmpty ? [] : ["\(reference)@\(image.digest)"]
+        entry.repoTags = Array(keys).sorted()
+        entry.repoDigests = image.digest.isEmpty ? [] : ["\(canonical)@\(image.digest)"]
         entry.size = max(size, 1)
-        pulledImages[reference] = entry
+        for key in keys { pulledImages[key] = entry }
         if !image.digest.isEmpty { pulledImages[image.digest] = entry }
         return digest
     }
 
-    func imageStatus(_ reference: String) -> Runtime_V1_Image? { pulledImages[reference] }
+    func imageStatus(_ reference: String) -> Runtime_V1_Image? {
+        pulledImages[reference] ?? pulledImages[ImageReference.normalize(reference)]
+    }
     func listImages() -> [Runtime_V1_Image] { Array(pulledImages.values) }
 
     func removeImage(_ reference: String) {
-        pulledImages.removeValue(forKey: reference)
-        rootfsCache.removeValue(forKey: reference)
+        for key in Set([reference, ImageReference.normalize(reference)]) {
+            pulledImages.removeValue(forKey: key)
+            rootfsCache.removeValue(forKey: key)
+            imageConfigs.removeValue(forKey: key)
+        }
     }
 
     /// Stops every pod and releases every address. Without this the vmnet
