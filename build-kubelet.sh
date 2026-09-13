@@ -36,7 +36,8 @@ for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
          staging/src/k8s.io/mount-utils/mount_unsupported.go \
          pkg/kubelet/config/file_unsupported.go \
          pkg/kubelet/kuberuntime/kuberuntime_container_unsupported.go \
-         pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go; do
+         pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go \
+         pkg/volume/util/subpath/subpath_unsupported.go; do
   if [ -f "$src/$f" ]; then
     sed -i '' \
       -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
