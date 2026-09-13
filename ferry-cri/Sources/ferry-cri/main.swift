@@ -104,13 +104,37 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
     print("    services  kube-proxy rules applied in-guest (from \(proxyd))")
     // Poll rather than subscribe: the ruleset is small, changes are rare, and
     // this keeps ferry-cri free of an API client of its own.
-    Task {
-        await runtime.cacheRuleset()
-        while true {
-            try? await Task.sleep(for: .seconds(3))
-            await runtime.refreshServiceRules()
+    // Service rules follow the cluster rather than a clock: each pass asks
+    // ferry-proxyd for something newer than it last saw, and ferry-proxyd holds
+    // the request until a Service actually changes. The only sleeping is a
+    // backoff for when ferry-proxyd is not up yet.
+    //
+    // The fetch runs on a thread of its own rather than on the runtime actor.
+    // It blocks for as long as the cluster is quiet, and the actor has pods to
+    // start and stop in the meantime.
+    if let proxyd = runtime.proxydClient {
+        Task {
+            if let first = try? await fetchRuleset(proxyd, after: nil) {
+                await runtime.cacheRuleset(first.body, generation: first.generation)
+            }
+            while true {
+                let seen = await runtime.seenGeneration()
+                guard let next = try? await fetchRuleset(proxyd, after: seen) else {
+                    try? await Task.sleep(for: .seconds(3))
+                    continue
+                }
+                await runtime.applyRuleset(next.body, generation: next.generation)
+            }
         }
     }
+}
+
+/// Fetches a ruleset off the calling actor, because the read blocks until
+/// ferry-proxyd has something to say.
+func fetchRuleset(_ proxyd: StreamerClient, after generation: UInt64?) async throws -> StreamerClient.Ruleset {
+    try await Task.detached(priority: .utility) {
+        try proxyd.ruleset(after: generation)
+    }.value
 }
 
 print("    serving")

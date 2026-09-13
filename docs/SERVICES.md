@@ -73,6 +73,19 @@ before the NAT kernel, and still runs when the guest kernel cannot do NAT. Its
 costs are the ones the in-guest path removes: it needs root, and every Service
 connection hairpins through the host.
 
+## How a change reaches a pod
+
+Nothing polls. The proxier says when it has applied a transaction, which is the
+only moment the rendered ruleset can differ, and `ferry-proxyd` re-renders then.
+A pod asks for something newer than the generation it holds -- `GET
+/ruleset?after=N` -- and the request is held open until there is one.
+
+The fetch runs off the runtime actor. It blocks for as long as the cluster is
+quiet, and the actor has pods to start and stop in the meantime.
+
+A newly created Service is reachable from inside a pod in about a second, most
+of which is `kubectl exec` starting a process in a VM.
+
 ## Known limits
 
 - **UDP and SCTP are rendered but not verified.** kube-proxy emits rules for
@@ -82,4 +95,4 @@ connection hairpins through the host.
   pod's kernel. Traffic can keep flowing to a removed endpoint until entries age
   out.
 - **NodePort is rendered but has nowhere to land** -- there are no nodes.
-- **Rules reach pods on a 3 second poll** rather than a watch.
+- **Session affinity is rendered but not verified.**
