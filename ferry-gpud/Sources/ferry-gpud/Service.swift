@@ -306,9 +306,7 @@ final class Service: @unchecked Sendable {
                 return .error("expected {\"prompt\": \"...\"}", status: 400)
             }
             return run(pod: pod, what: "generate \(body.prompt.count) chars") { job in
-                try awaitResult {
-                    try await self.generator.generate(body, deadline: job.remaining)
-                }
+                try self.generator.generate(body, job: job)
             }
 
         default:

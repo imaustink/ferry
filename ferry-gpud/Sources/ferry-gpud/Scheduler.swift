@@ -106,6 +106,16 @@ final class GPUJob: @unchecked Sendable {
 
     var isCancelled: Bool { lock.withLock { cancelledFlag } }
 
+    /// How many times this job has handed the device over and taken it back.
+    /// Reported so a caller can tell a slow model from a busy node.
+    private(set) var timesYielded: Int {
+        get { lock.withLock { yieldCount } }
+        set { lock.withLock { yieldCount = newValue } }
+    }
+    private var yieldCount = 0
+
+    fileprivate func countYield() { lock.withLock { yieldCount += 1 } }
+
     func cancel() { lock.withLock { cancelledFlag = true } }
 
     /// Throws if the job should stop: its pod went away, or it is out of time.
@@ -402,6 +412,7 @@ final class GPUScheduler: @unchecked Sendable {
         current = nil
         enqueue(waiter)
         usage[job.pod, default: PodUsage()].yields += 1
+        job.countYield()
         promote()
         try waitForDevice(waiter)
     }

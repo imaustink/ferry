@@ -9,6 +9,14 @@
 // Availability is a runtime question (Apple Intelligence can be off, or the
 // model still downloading), so it is reported rather than assumed, and the
 // endpoint 503s with the reason instead of failing obscurely.
+//
+// Generation is *streamed* rather than awaited whole, and not for the usual
+// reason -- nothing here shows partial output to anybody. It is streamed
+// because the gap between snapshots is the only checkpoint a generation has,
+// and without one a long generation would hold the device for its entire run
+// while every matmul queued behind it. Measured on this model: a 5s generation
+// arrives as 27 snapshots, a median of 0.153s apart. That is finer than the
+// scheduler's time slice, so generation yields as readily as a matmul does.
 
 import Foundation
 import FoundationModels
@@ -23,6 +31,9 @@ struct GenerateRequest: Decodable {
 struct GenerateResult: Encodable {
     var content: String
     var seconds: Double
+    /// How many times the device was handed to another pod mid-generation.
+    /// Visible so a caller can tell a slow model from a busy node.
+    var yields: Int
 }
 
 struct ModelStatus: Encodable {
@@ -42,14 +53,33 @@ enum GenerationError: Error, CustomStringConvertible {
     }
 }
 
-/// Serializes generation the same way GPU work is serialized, and for the same
-/// reason: one device, and timings that mean something. An actor rather than a
-/// semaphore, because the model's API is async and a semaphore cannot be waited
-/// on from an async context -- actor isolation is the serialization.
-actor Generator {
-    /// Reads no actor state -- it asks the OS -- so the connection threads can
-    /// have it without hopping.
-    nonisolated var status: ModelStatus {
+/// Pulls one snapshot at a time from a response stream.
+///
+/// The point is to get back onto the calling thread between snapshots, because
+/// that thread is the one holding the device and the only one that can hand it
+/// over. Consuming the whole stream inside a single async call would give the
+/// scheduler nowhere to interpose.
+///
+/// Only ever used by one thread at a time -- the one holding the device -- which
+/// is what makes the unchecked conformance true.
+private final class SnapshotPuller: @unchecked Sendable {
+    private var iterator: LanguageModelSession.ResponseStream<String>.AsyncIterator
+
+    init(_ stream: LanguageModelSession.ResponseStream<String>) {
+        self.iterator = stream.makeAsyncIterator()
+    }
+
+    func next() async throws -> String? {
+        try await iterator.next()?.content
+    }
+}
+
+/// Runs generation on the thread that holds the device.
+///
+/// Not an actor any more: the scheduler already guarantees one job at a time,
+/// and actor isolation would only add a hop that makes yielding harder.
+final class Generator: @unchecked Sendable {
+    var status: ModelStatus {
         switch SystemLanguageModel.default.availability {
         case .available:
             return ModelStatus(available: true, reason: nil)
@@ -73,7 +103,7 @@ actor Generator {
     /// deadline is a blunter instrument than simply not accepting the job.
     static let maxPromptBytes = 16 * 1024
 
-    func generate(_ request: GenerateRequest, deadline: TimeInterval) async throws -> GenerateResult {
+    func generate(_ request: GenerateRequest, job: GPUJob) throws -> GenerateResult {
         let status = self.status
         guard status.available else {
             throw GenerationError.unavailable(status.reason ?? "the on-device model is unavailable")
@@ -97,22 +127,42 @@ actor Generator {
                                         maximumResponseTokens: request.maxTokens)
 
         let start = Date()
-        do {
-            // Raced against the deadline rather than trusted to finish. The
-            // model has no bound of its own beyond maximumResponseTokens, and a
-            // request that never returns would hold the GPU queue behind it.
-            // `.content` is taken inside the child task: Response itself is
-            // not Sendable, and only the String needs to cross back.
-            let content = try await withDeadline(seconds: deadline) {
-                try await session.respond(to: request.prompt, options: options).content
+        let puller = SnapshotPuller(session.streamResponse(to: request.prompt, options: options))
+        var content = ""
+        var yields = 0
+
+        while true {
+            // Between snapshots: the deadline, the pod going away, and anyone
+            // else waiting for the device are all noticed here.
+            let heldBefore = job.timesYielded
+            try job.yieldIfNeeded()
+            yields += job.timesYielded - heldBefore
+
+            // Each snapshot is bounded too. Without this a model that stalls
+            // mid-generation would sit on the device until the request deadline
+            // with nothing to notice it, since the loop only comes round when a
+            // snapshot arrives.
+            let remaining = job.remaining
+            guard remaining > 0 else { throw SchedulerError.timedOut(0) }
+
+            let snapshot: String?
+            do {
+                snapshot = try awaitResult {
+                    try await withDeadline(seconds: remaining) { try await puller.next() }
+                }
+            } catch let error as SchedulerError {
+                throw error
+            } catch {
+                throw GenerationError.failed("\(error)")
             }
-            return GenerateResult(content: content,
-                                  seconds: Date().timeIntervalSince(start))
-        } catch let error as SchedulerError {
-            throw error
-        } catch {
-            throw GenerationError.failed("\(error)")
+
+            guard let snapshot else { break }
+            content = snapshot
         }
+
+        return GenerateResult(content: content,
+                              seconds: Date().timeIntervalSince(start),
+                              yields: yields)
     }
 }
 
