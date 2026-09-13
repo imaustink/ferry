@@ -1,12 +1,17 @@
-// ferry-proxy makes ClusterIPs reachable.
+// ferry-proxy is the outside edge of a Service.
 //
-// It watches Services and EndpointSlices, binds each ClusterIP as a loopback
-// alias so the kernel accepts traffic addressed to it, and forwards connections
-// to a ready endpoint. Pods already default-route to the Mac, so nothing has to
-// be configured inside them.
+// NodePort and LoadBalancer both mean "reach this Service from outside the
+// cluster", which on a normal node is netfilter in the host's kernel. ferry has
+// none on the host and needs none: every pod is a virtual machine with a
+// routable address, so the edge is a listener on the Mac that forwards to a
+// ready pod.
 //
-// Root is required for exactly two things: adding loopback aliases, and
-// listening on privileged ports (the kubernetes Service is 443).
+// It also still serves ClusterIPs, but only when asked. That was how Services
+// worked before the guest kernel could NAT, and it is now the fallback for a
+// kernel that cannot -- ordinarily the rules live in each pod instead.
+//
+// NodePort needs no privilege: the range is 30000-32767. Loopback aliases for
+// ClusterIPs do, and so does a LoadBalancer port below 1024.
 package main
 
 import (
@@ -35,6 +40,11 @@ import (
 func main() {
 	kubeconfig := flag.String("kubeconfig", "", "path to a kubeconfig with cluster-wide read access")
 	resync := flag.Duration("resync", 5*time.Minute, "informer resync period")
+	clusterIPs := flag.Bool("cluster-ips", false, "also bind ClusterIPs on the host (needs root; only for a guest kernel that cannot NAT)")
+	nodePorts := flag.Bool("node-ports", true, "listen on node ports")
+	loadBalancerIP := flag.String("load-balancer-ip", "", "address to answer LoadBalancer services on, usually this Mac's LAN address")
+	nodeName := flag.String("node-name", "", "this node, so endpoints elsewhere can be told apart from endpoints here")
+	podMapPath := flag.String("pod-map", "", "file ferry-cri writes mapping each pod IP to an address the Mac can reach it at")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -54,13 +64,20 @@ func main() {
 	}
 
 	ctrl := &controller{
-		aliases: newAliasManager(),
-		proxies: map[string]*serviceProxy{},
+		aliases:        newAliasManager(),
+		proxies:        map[string]*serviceProxy{},
+		client:         client,
+		nodeName:       *nodeName,
+		pods:           newPodMap(*podMapPath),
+		clusterIPs:     *clusterIPs,
+		nodePorts:      *nodePorts,
+		loadBalancerIP: *loadBalancerIP,
 	}
 
 	factory := informers.NewSharedInformerFactory(client, *resync)
 	ctrl.services = factory.Core().V1().Services().Lister()
 	ctrl.slices = factory.Discovery().V1().EndpointSlices().Lister()
+	ctrl.nodes = factory.Core().V1().Nodes().Lister()
 
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { ctrl.reconcile() },
@@ -69,6 +86,7 @@ func main() {
 	}
 	factory.Core().V1().Services().Informer().AddEventHandler(handler)
 	factory.Discovery().V1().EndpointSlices().Informer().AddEventHandler(handler)
+	factory.Core().V1().Nodes().Informer().AddEventHandler(handler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -83,7 +101,7 @@ func main() {
 
 	// Loopback aliases and listeners outlive this process if not cleaned up,
 	// and the next run would then fail to bind.
-	klog.InfoS("Shutting down; releasing ClusterIP aliases")
+	klog.InfoS("Shutting down; releasing listeners and any ClusterIP aliases")
 	ctrl.shutdown()
 }
 
@@ -93,6 +111,17 @@ type controller struct {
 	proxies  map[string]*serviceProxy
 	services corelisters.ServiceLister
 	slices   discoverylisters.EndpointSliceLister
+
+	client         kubernetes.Interface
+	nodes          corelisters.NodeLister
+	pods           *podMap
+	nodeName       string
+	clusterIPs     bool
+	nodePorts      bool
+	loadBalancerIP string
+	// Ports that could not be bound, so the reason is logged once rather than
+	// on every reconcile.
+	complained map[string]bool
 }
 
 func (c *controller) shutdown() {
@@ -122,9 +151,11 @@ func (c *controller) reconcile() {
 		return
 	}
 
-	// Endpoints grouped by service and port name.
+	// Endpoints grouped by service and port name, split by whether the pod is on
+	// this Mac. A pod elsewhere cannot be reached from here directly.
 	type portKey struct{ service, portName string }
 	endpoints := map[portKey][]backend{}
+	remoteNodes := map[portKey][]string{}
 	for _, slice := range slices {
 		serviceName := slice.Labels[discoveryv1.LabelServiceName]
 		if serviceName == "" {
@@ -146,47 +177,102 @@ func (c *controller) reconcile() {
 				if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
 					continue
 				}
+				key := portKey{service, name}
+				onThisMac := endpoint.NodeName == nil || *endpoint.NodeName == c.nodeName
+				if !onThisMac {
+					remoteNodes[key] = append(remoteNodes[key], *endpoint.NodeName)
+					continue
+				}
 				for _, address := range endpoint.Addresses {
-					key := portKey{service, name}
+					// The cluster knows this pod by an address only other pods
+					// can reach. Dial the one the Mac can.
 					endpoints[key] = append(endpoints[key], backend{
-						address: joinHostPort(address, *port.Port),
+						address: joinHostPort(c.pods.dialable(address), *port.Port),
 					})
 				}
 			}
 		}
 	}
 
+	if c.complained == nil {
+		c.complained = map[string]bool{}
+	}
+
 	desired := map[string]bool{}
 	for _, service := range services {
-		clusterIP := service.Spec.ClusterIP
-		// Headless services have no address to bind; DNS resolves them to pod
-		// IPs directly, which already route.
-		if clusterIP == "" || clusterIP == corev1.ClusterIPNone {
-			continue
-		}
 		name := service.Namespace + "/" + service.Name
-		for _, port := range service.Spec.Ports {
-			if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
-				// UDP and SCTP are not proxied yet; see docs/SERVICES.md.
-				continue
-			}
-			key := name + ":" + strconv.Itoa(int(port.Port))
-			desired[key] = true
 
-			if _, exists := c.proxies[key]; !exists {
-				if err := c.aliases.ensure(clusterIP); err != nil {
-					klog.ErrorS(err, "Could not bind ClusterIP", "service", name, "ip", clusterIP)
+		// The outside edge: node ports, and a load balancer address when this
+		// Mac is standing in for one.
+		var wanted []exposure
+		if c.nodePorts || c.loadBalancerIP != "" {
+			for _, e := range exposuresFor(service, c.loadBalancerIP) {
+				if e.kind == "NodePort" && !c.nodePorts {
 					continue
 				}
-				proxy, err := newServiceProxy(key, clusterIP, port.Port)
-				if err != nil {
-					klog.ErrorS(err, "Could not listen for service", "service", name, "addr", clusterIP)
-					continue
-				}
-				c.proxies[key] = proxy
-				klog.InfoS("Serving ClusterIP", "service", name, "addr", proxy.listen)
+				wanted = append(wanted, e)
 			}
-			c.proxies[key].setBackends(endpoints[portKey{name, port.Name}])
+		}
+
+		// ClusterIPs, only when the guest kernel cannot do it itself.
+		if c.clusterIPs {
+			clusterIP := service.Spec.ClusterIP
+			// Headless services have no address to bind; DNS resolves them to
+			// pod IPs directly, which already route.
+			if clusterIP != "" && clusterIP != corev1.ClusterIPNone {
+				for _, port := range service.Spec.Ports {
+					if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
+						continue
+					}
+					wanted = append(wanted, exposure{
+						key:      "clusterip/" + name + ":" + strconv.Itoa(int(port.Port)),
+						address:  clusterIP,
+						port:     port.Port,
+						portName: port.Name,
+						kind:     "ClusterIP",
+					})
+				}
+			}
+		}
+
+		published := false
+		for _, e := range wanted {
+			desired[e.key] = true
+			if _, exists := c.proxies[e.key]; !exists {
+				if e.kind == "ClusterIP" {
+					if err := c.aliases.ensure(e.address); err != nil {
+						klog.ErrorS(err, "Could not bind ClusterIP", "service", name, "ip", e.address)
+						continue
+					}
+				}
+				proxy, err := newServiceProxy(e.key, e.address, e.port)
+				if err != nil {
+					// A privileged port without privilege is the common case and
+					// deserves a sentence, not a stack of identical errors.
+					if !c.complained[e.key] {
+						c.complained[e.key] = true
+						if e.port < 1024 {
+							klog.ErrorS(err, "Could not listen on a privileged port; run ferry-proxy as root to serve it",
+								"service", name, "addr", e.describe(), "kind", e.kind)
+						} else {
+							klog.ErrorS(err, "Could not listen for service",
+								"service", name, "addr", e.describe(), "kind", e.kind)
+						}
+					}
+					continue
+				}
+				c.proxies[e.key] = proxy
+				delete(c.complained, e.key)
+				klog.InfoS("Serving", "kind", e.kind, "service", name, "addr", e.describe())
+			}
+			pk := portKey{name, e.portName}
+			c.proxies[e.key].setBackends(
+				chooseBackends(endpoints[pk], remoteNodes[pk], c.nodeAddresses(), e.nodePort))
+
+			if e.kind == "LoadBalancer" && !published {
+				published = true
+				publishLoadBalancer(context.Background(), c.client, service, c.loadBalancerIP)
+			}
 		}
 	}
 
@@ -196,8 +282,26 @@ func (c *controller) reconcile() {
 		}
 		proxy.close()
 		delete(c.proxies, key)
-		klog.InfoS("Stopped serving ClusterIP", "service", key)
+		klog.InfoS("Stopped serving", "service", key)
 	}
+}
+
+// nodeAddresses returns where each node can be reached from another Mac.
+func (c *controller) nodeAddresses() nodeAddresses {
+	out := nodeAddresses{}
+	nodes, err := c.nodes.List(labels.Everything())
+	if err != nil {
+		return out
+	}
+	for _, node := range nodes {
+		for _, address := range node.Status.Addresses {
+			if address.Type == corev1.NodeInternalIP && address.Address != "" {
+				out[node.Name] = address.Address
+				break
+			}
+		}
+	}
+	return out
 }
 
 func joinHostPort(host string, port int32) string {
