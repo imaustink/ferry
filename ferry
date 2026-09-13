@@ -11,6 +11,9 @@ FERRY_HOME="${FERRY_HOME:-$HOME/.ferry}"
 # so a long home directory would break it.
 FERRY_RUN="${FERRY_RUN:-/tmp/ferry-run}"
 FERRY_SOCK="${FERRY_SOCK:-/tmp/ferry-cri.sock}"
+FERRY_EXEC_SOCK="${FERRY_EXEC_SOCK:-/tmp/ferry-exec.sock}"
+FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer.sock}"
+FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:10350}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
@@ -126,6 +129,10 @@ cmd_build() {
   ( cd "$here/ferry-proxy" && go build -o "$here/bin/ferry-proxy" . ) || return 1
   echo "==> $here/bin/ferry-proxy"
   echo
+  echo "==> ferry-streamer"
+  ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
+  echo "==> $here/bin/ferry-streamer"
+  echo
   bold "built -- run: ferry up"
 }
 
@@ -140,13 +147,29 @@ cmd_up() {
   fi
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
-  rm -f "$FERRY_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 
   bold "starting ferry"
+
+  # kubectl exec arrives as SPDY, which ferry-streamer terminates before
+  # handing the request to ferry-cri. It has to be up first, because ferry-cri
+  # asks it for streaming URLs.
+  if [ -x "$here/bin/ferry-streamer" ]; then
+    "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
+      --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
+      >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-streamer.pid"
+    for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+    [ -S "$FERRY_STREAMER_SOCK" ] && ok "streaming server on $FERRY_STREAM_ADDR" \
+      || warn "streaming server did not start; kubectl exec will not work"
+  else
+    warn "ferry-streamer not built; kubectl exec will not work"
+  fi
 
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -298,7 +321,7 @@ cmd_down() {
     rm -f "$FERRY_RUN/ferry-proxy.pid"
     sleep 1
   fi
-  for component in kubelet ferry-cri; do
+  for component in kubelet ferry-cri ferry-streamer; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     local pid; pid="$(cat "$pidfile")"
@@ -311,12 +334,12 @@ cmd_down() {
     ok "$component stopped"
   done
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
-  rm -f "$FERRY_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 }
 
 cmd_status() {
   bold "ferry status"
-  for component in ferry-cri kubelet ferry-proxy; do
+  for component in ferry-cri ferry-streamer kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
@@ -334,7 +357,7 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-streamer) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
     *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;

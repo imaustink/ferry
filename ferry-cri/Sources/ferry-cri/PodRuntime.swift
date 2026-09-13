@@ -535,6 +535,40 @@ actor PodRuntime {
         containers.removeValue(forKey: id)
     }
 
+    /// Runs a command in a container's VM for `kubectl exec`. An empty command
+    /// means attach, which is not supported yet -- the framework exposes no way
+    /// to reattach to a process that is already running.
+    func exec(
+        containerID: String,
+        command: [String],
+        tty: Bool,
+        stdin: (any ReaderStream)?,
+        stdout: any Writer,
+        stderr: any Writer
+    ) async throws -> LinuxProcess {
+        guard let record = containers[containerID] else {
+            throw RuntimeFailure.notFound("container \(containerID)")
+        }
+        guard let sandbox = sandboxes[record.sandboxID], sandbox.booted else {
+            throw RuntimeFailure.invalid("container \(containerID) is not running")
+        }
+        guard !command.isEmpty else {
+            throw RuntimeFailure.unsupported("attach is not implemented; use kubectl exec")
+        }
+
+        idCounter += 1
+        let processID = String(format: "exec%012llx", idCounter)
+        return try await sandbox.pod.execInContainer(containerID, processID: processID) { config in
+            config.arguments = command
+            config.terminal = tty
+            config.stdin = stdin
+            config.stdout = stdout
+            // With a TTY there is one stream, and the client expects everything
+            // on stdout; sending stderr separately would interleave badly.
+            config.stderr = tty ? nil : stderr
+        }
+    }
+
     func reopenContainerLog(_ id: String) throws {
         guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
         try record.logFile?.reopen()

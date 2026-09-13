@@ -15,6 +15,8 @@ func option(_ name: String, _ fallback: String) -> String {
 }
 
 let socketPath = option("--endpoint", "/tmp/ferry-cri.sock")
+let execSocketPath = option("--exec-socket", "/tmp/ferry-exec.sock")
+let streamerControl = option("--streamer-control", "/tmp/ferry-streamer.sock")
 let config = RuntimeConfig(
     stateDir: URL(filePath: option("--state", "/tmp/ferry-cri")),
     kernelPath: option("--kernel", "experiments/03-vm-ceiling/assets/vmlinux-arm64"),
@@ -45,6 +47,16 @@ do {
 }
 print("    network   \(await runtime.subnet), gateway \(await runtime.gateway)")
 
+// kubectl exec arrives over SPDY, which ferry-streamer terminates; it reaches
+// pods through this socket.
+let execServer = ExecServer(path: execSocketPath, runtime: runtime)
+do {
+    try execServer.start()
+    print("    exec      unix://\(execSocketPath)")
+} catch {
+    print("    exec      unavailable: \(error)")
+}
+
 try? FileManager.default.removeItem(atPath: socketPath)
 let server = GRPCServer(
     transport: .http2NIOPosix(
@@ -52,7 +64,8 @@ let server = GRPCServer(
         transportSecurity: .plaintext
     ),
     services: [
-        FerryRuntimeService(runtime: runtime, version: "0.1.0"),
+        FerryRuntimeService(runtime: runtime, version: "0.1.0",
+                            streamer: StreamerClient(socketPath: streamerControl)),
         FerryImageService(runtime: runtime),
     ]
 )
