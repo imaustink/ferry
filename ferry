@@ -16,7 +16,13 @@ POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
 POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 
-KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
+# Prefer the NAT-capable kernel when it has been built. The fallback is the
+# kata-containers kernel, which boots pods perfectly well but ships netfilter
+# without the NAT extensions -- so a pod cannot program Service rules in its own
+# kernel, and ClusterIP routing has to happen on the host instead.
+NAT_KERNEL="$here/kernel/vmlinux-arm64"
+FALLBACK_KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
+if [ -f "$NAT_KERNEL" ]; then KERNEL="$NAT_KERNEL"; else KERNEL="$FALLBACK_KERNEL"; fi
 CLUSTER_DOMAIN="${FERRY_CLUSTER_DOMAIN:-cluster.local}"
 COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 
@@ -33,6 +39,7 @@ usage() {
 ferry -- Kubernetes on a Mac, one virtual machine per pod
 
   ferry doctor      check that this machine can run ferry
+  ferry kernel      build a guest kernel with NAT support (slow, needs docker)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
   ferry up          start the cluster
   ferry down        stop the cluster
@@ -86,6 +93,13 @@ cmd_doctor() {
     warn "Docker Desktop is running and holds one of the 128 VM slots"
   fi
   ok "$vms virtual machines running (ceiling is 128, shared with all apps)"
+
+  if [ -f "$NAT_KERNEL" ]; then
+    ok "guest kernel with NAT support (kernel/vmlinux-arm64)"
+  else
+    warn "guest kernel without NAT (kata); Services route through the host."
+    echo "      build one with: ./kernel/build-kernel.sh"
+  fi
 
   local free; free="$(df -g "$HOME" | tail -1 | awk '{print $4}')"
   if [ "$free" -ge 20 ]; then ok "${free}G free disk"
@@ -329,6 +343,7 @@ cmd_logs() {
 
 case "${1:-}" in
   doctor)     shift; cmd_doctor "$@" ;;
+  kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
   down)       shift; cmd_down "$@" ;;

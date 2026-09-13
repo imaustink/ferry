@@ -1,0 +1,58 @@
+<svg width="1280" height="420" viewBox="0 0 1280 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ferry">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7DB8FF"/><stop offset="0.55" stop-color="#4C86F0"/><stop offset="1" stop-color="#326CE5"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2FB6D6"/><stop offset="1" stop-color="#1E7FB8"/>
+    </linearGradient>
+    <linearGradient id="hull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A4658"/><stop offset="1" stop-color="#222B39"/>
+    </linearGradient>
+    <linearGradient id="cOrange" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9F5A"/><stop offset="1" stop-color="#FF5E7E"/></linearGradient>
+    <linearGradient id="cTeal" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#57E0C0"/><stop offset="1" stop-color="#2FBF71"/></linearGradient>
+    <linearGradient id="cBlue" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5AA8FF"/><stop offset="1" stop-color="#4058E0"/></linearGradient>
+    <linearGradient id="cPurple" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#C07BFF"/><stop offset="1" stop-color="#8A3FE0"/></linearGradient>
+    <linearGradient id="cYellow" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFD75A"/><stop offset="1" stop-color="#FF9F2E"/></linearGradient>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4C86F0"/><stop offset="1" stop-color="#326CE5"/>
+    </linearGradient>
+    <clipPath id="squircleL"><rect x="16" y="16" width="388" height="388" rx="90" ry="90"/></clipPath>
+  </defs>
+
+  <!-- icon -->
+  <g clip-path="url(#squircleL)" transform="translate(0 0) scale(0.8047)">
+    <rect x="16" y="16" width="480" height="480" fill="url(#sky)"/>
+    <path d="M16 356 C 80 336, 140 376, 200 356 S 320 336, 380 356 S 470 340, 496 356 L 496 496 L 16 496 Z" fill="url(#water)"/>
+    <path d="M40 402 q 26 -16 52 0 t 52 0 t 52 0 t 52 0 t 52 0 t 52 0" stroke="#D6F3FF" stroke-opacity="0.5" stroke-width="6" fill="none" stroke-linecap="round"/>
+    <path d="M60 446 q 24 -14 48 0 t 48 0 t 48 0 t 48 0 t 48 0 t 48 0" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="5" fill="none" stroke-linecap="round"/>
+    <g stroke="#00000022" stroke-width="1.5">
+      <g><rect x="153" y="300" width="66" height="46" rx="5" fill="url(#cOrange)"/><path d="M175 300 V346 M197 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/></g>
+      <g><rect x="223" y="300" width="66" height="46" rx="5" fill="url(#cTeal)"/><path d="M245 300 V346 M267 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/></g>
+      <g><rect x="293" y="300" width="66" height="46" rx="5" fill="url(#cBlue)"/><path d="M315 300 V346 M337 300 V346" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/></g>
+    </g>
+    <g>
+      <g><rect x="188" y="256" width="66" height="46" rx="5" fill="url(#cPurple)"/><path d="M210 256 V302 M232 256 V302" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3"/></g>
+      <g><rect x="258" y="256" width="66" height="46" rx="5" fill="url(#cYellow)"/><path d="M280 256 V302 M302 256 V302" stroke="#ffffff" stroke-opacity="0.28" stroke-width="3"/></g>
+    </g>
+    <path d="M132 348 L 380 348 C 372 396, 344 420, 300 420 L 212 420 C 168 420, 140 396, 132 348 Z" fill="url(#hull)"/>
+    <rect x="132" y="348" width="248" height="12" fill="#4C5A6E"/>
+    <path d="M138 372 L 374 372" stroke="#FF5E7E" stroke-width="7" stroke-linecap="round"/>
+    <g transform="translate(256 394)">
+      <circle r="20" fill="#0F1622"/>
+      <circle r="20" fill="none" stroke="#EAF2FF" stroke-width="3"/>
+      <g stroke="#EAF2FF" stroke-width="3" stroke-linecap="round">
+        <line x1="0" y1="-14" x2="0" y2="-3"/><line x1="13.3" y1="-4.3" x2="2.9" y2="-1"/>
+        <line x1="8.2" y1="11.3" x2="1.8" y2="2.4"/><line x1="-8.2" y1="11.3" x2="-1.8" y2="2.4"/><line x1="-13.3" y1="-4.3" x2="-2.9" y2="-1"/>
+      </g>
+      <circle r="4" fill="#EAF2FF"/>
+    </g>
+    <path d="M16 16 h480 v150 C 360 90, 150 92, 16 176 Z" fill="#ffffff" fill-opacity="0.08"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="452" y="210" font-family="'SF Pro Rounded','SF Pro Display','Helvetica Neue',Arial,system-ui,sans-serif"
+        font-size="240" font-weight="700" letter-spacing="-6" fill="url(#wordmark)" dominant-baseline="middle">ferry</text>
+  <text x="458" y="322" font-family="'SF Pro Text','Helvetica Neue',Arial,system-ui,sans-serif"
+        font-size="52" font-weight="500" letter-spacing="6" fill="#5B6B82">A POD IS A VM</text>
+</svg>

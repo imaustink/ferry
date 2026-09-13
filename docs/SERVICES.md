@@ -1,7 +1,27 @@
 # Services on ferry — design
 
-**Status: designed, not implemented.** Pods run and are routable
-(experiment 05); ClusterIPs are not yet.
+**Status: implemented and verified.** `ferry-proxy` binds each ClusterIP on the
+host and forwards to a ready endpoint.
+
+```
+from the Mac      curl http://<clusterIP>/            -> hello from pod VM
+from a pod        wget -O- http://backend/            -> hello from pod VM
+                  wget -O- http://backend.default.svc.cluster.local/
+in-cluster        KUBERNETES_SERVICE_HOST=10.96.0.1:443 + SA token -> API server
+```
+
+The last one matters most: that is what client-go does by default, so
+Kubernetes-native workloads now run unmodified.
+
+### One quirk worth knowing
+
+The vmnet gateway interface only exists on the host while at least one pod VM is
+attached. With no pods running, the API server's advertised address is not
+locally reachable and the `kubernetes` Service cannot be served -- the proxy
+accepts the connection and then times out dialling the backend. It recovers as
+soon as any pod starts. CoreDNS keeps its `KUBERNETES_SERVICE_HOST` override for
+the same reason: it must be able to start before Services work, including when
+ferry is running without root.
 
 ## The problem
 
@@ -89,9 +109,23 @@ The kata-containers kernel has base netfilter compiled in but not the NAT
 extensions, and it is monolithic -- no modules can be loaded. kube-proxy cannot
 program DNAT in a pod that cannot do DNAT.
 
-This is solvable by building a kernel with `CONFIG_NF_NAT` and the NAT targets,
-which is the same road kiac walks for eBPF with its `--kernel full` option. Until
-then option 1 is unavailable and option 2 stands.
+**This has since been fixed.** `kernel/build-kernel.sh` builds Apple's own kernel
+configuration, which enables `CONFIG_NF_NAT`, `CONFIG_NF_CONNTRACK`,
+`CONFIG_NF_TABLES` and `CONFIG_NF_NAT_MASQUERADE`. On that kernel a pod can
+program its own NAT rules:
+
+```
+kernel: 6.18.5-ferry
+DNAT RULE ACCEPTED
+-A OUTPUT -d 10.96.0.99/32 -p tcp -m tcp --dport 80 -j DNAT --to-destination 127.0.0.1:8080
+conntrack present
+```
+
+So options 1 and 3 are both available now. Option 3 remains the one worth
+building: rules computed once on the host and pushed into each pod, rather than
+a kube-proxy and an API watch in every pod. `LinuxPod.execInContainer` exists and
+host paths are already shared into pods over virtiofs, so a static rule
+programmer can be injected and run without adding a container.
 
 ## Recommendation
 
