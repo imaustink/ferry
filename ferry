@@ -302,16 +302,25 @@ install_dns() { # gateway dns-address
   KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f "$rendered" >/dev/null 2>&1 \
     || { warn "could not apply CoreDNS"; return 0; }
 
-  for _ in $(seq 1 90); do
-    [ "$(KUBECONFIG=$FERRY_HOME/admin.conf kubectl get deploy coredns -n kube-system \
-        -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "1" ] && break
-    sleep 2
-  done
-  if [ "$(KUBECONFIG=$FERRY_HOME/admin.conf kubectl get deploy coredns -n kube-system \
-      -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" = "1" ]; then
+  # Wait on this rollout rather than on readyReplicas.
+  #
+  # The cluster's objects outlive a restart -- they are in etcd, and 'ferry down'
+  # stops processes rather than deleting anything. So at this point the previous
+  # CoreDNS is still recorded as ready, and the apply above has just started
+  # replacing it, because the pod network gateway is part of the manifest and
+  # can differ from the last run. Polling readyReplicas sees that stale 1 and
+  # stops immediately, and by the time it is checked again the old pod has gone
+  # and the new one has not arrived -- so ferry announced a broken cluster DNS
+  # that was in fact seconds from ready.
+  #
+  # 'rollout status' waits for the generation that was just applied, which is
+  # the question actually being asked.
+  if KUBECONFIG="$FERRY_HOME/admin.conf" kubectl rollout status deployment/coredns \
+       -n kube-system --timeout=180s >/dev/null 2>&1; then
     ok "cluster DNS at $dns"
   else
     warn "CoreDNS did not become ready; pods will start without cluster DNS"
+    echo "  Check with: ferry kubeconfig && kubectl -n kube-system logs deploy/coredns"
   fi
 }
 
