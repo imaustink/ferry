@@ -4,6 +4,13 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# A kubelet holds thousands of descriptors -- watches, TLS connections, one log
+# file per container. A login shell on macOS allows about a million, but an SSH
+# session allows 256, and 'ferry join' is usually run over SSH. Inheriting that
+# gives a node that works for a few minutes and then fails to reach the API, with
+# an error that says nothing about descriptors.
+ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
+
 # Cluster state that should survive a restart: certificates and etcd.
 FERRY_HOME="${FERRY_HOME:-$HOME/.ferry}"
 # Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
@@ -579,6 +586,24 @@ cmd_join() {
     [ -x "$here/bin/$binary" ] || { bad "bin/$binary is missing; copy it from the first Mac"; return 1; }
   done
   [ -f "$KERNEL" ] || { bad "no guest kernel at $KERNEL; copy it from the first Mac"; return 1; }
+
+  # macOS grants access to the local network per launching session, and an SSH
+  # session ends when the command returns. A node started over SSH therefore runs
+  # perfectly until that moment and then cannot reach the cluster at all, with
+  # "no route to host" against an address that answers ping and answers curl.
+  # Measured: zero failures for three minutes with the session held open, and
+  # failures within twenty seconds of it closing.
+  if [ -n "${SSH_CONNECTION:-}" ] && [ -z "${FERRY_ALLOW_SSH_JOIN:-}" ]; then
+    bad "this looks like an SSH session, and a node started from one stops being"
+    echo "    able to reach the cluster as soon as the session ends."
+    echo
+    echo "    Run 'ferry join' from a Terminal window on this Mac instead. If the"
+    echo "    first pod cannot reach the network, approve the local network prompt"
+    echo "    macOS shows the first time."
+    echo
+    echo "    To override anyway: FERRY_ALLOW_SSH_JOIN=1 ferry join ..."
+    return 1
+  fi
 
   bold "joining $server as $node_name"
   mkdir -p "$FERRY_HOME/pki" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs,cri}
