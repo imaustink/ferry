@@ -53,7 +53,24 @@ let config = RuntimeConfig(
     relayEndpoint: {
         let endpoint = option("--relay-endpoint", "")
         return endpoint.isEmpty ? nil : endpoint
-    }()
+    }(),
+    cniBinary: {
+        let path = option("--cni", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniConflist: {
+        let path = option("--cni-conflist", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniHostPlugins: {
+        let path = option("--cni-host-plugins", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniGuestPlugins: {
+        let path = option("--cni-guest-plugins", "")
+        return path.isEmpty ? nil : path
+    }(),
+    execSocket: execSocketPath
 )
 
 guard FileManager.default.fileExists(atPath: config.kernelPath) else {

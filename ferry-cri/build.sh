@@ -8,7 +8,12 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
-swift build -c release
-cp "$(swift build -c release --show-bin-path)/ferry-cri" ../bin/ferry-cri
+# SWIFT lets a working toolchain be named when the default one is not. macOS
+# ships SwiftPM and the compiler as separate pieces of the developer tools and
+# a half-applied update leaves them disagreeing, which fails in the manifest
+# before any of this code is even read.
+SWIFT="${SWIFT:-swift}"
+"$SWIFT" build -c release
+cp "$("$SWIFT" build -c release --show-bin-path)/ferry-cri" ../bin/ferry-cri
 codesign --force --sign - --entitlements entitlements.plist ../bin/ferry-cri
 echo "==> $(cd .. && pwd)/bin/ferry-cri"

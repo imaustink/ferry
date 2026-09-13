@@ -163,6 +163,9 @@ cmd_build() {
   ( cd "$here/ferry-netpol" && go build -o "$here/bin/ferry-netpol" . ) || return 1
   echo "==> $here/bin/ferry-netpol"
   echo
+  # ferry-cni and the upstream plugins it runs, in both architectures.
+  "$here/ferry-cni/build.sh" || return 1
+  echo
   echo "==> ferry-storage"
   ( cd "$here/ferry-storage" && go build -o "$here/bin/ferry-storage" . ) || return 1
   echo "==> $here/bin/ferry-storage"
@@ -191,7 +194,7 @@ cmd_build() {
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
 
 cmd_up() {
-  for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$KERNEL"; do
+  for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
   done
   if running ferry-cri || running kubelet; then
@@ -209,6 +212,10 @@ cmd_up() {
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -449,6 +456,7 @@ start_proxy() {
     fi
     sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --cluster-ips --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
@@ -456,6 +464,7 @@ start_proxy() {
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     local pid=$!
@@ -509,6 +518,10 @@ cmd_node_add() {
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
@@ -767,6 +780,10 @@ start_worker() {
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -862,6 +879,7 @@ EOF
   if [ -x "$here/bin/ferry-proxy" ]; then
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
       --node-ports --node-name "$name" --pod-map "$FERRY_RUN/cri/podmap" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxy.pid"

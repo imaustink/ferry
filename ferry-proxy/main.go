@@ -45,6 +45,7 @@ func main() {
 	loadBalancerIP := flag.String("load-balancer-ip", "", "address to answer LoadBalancer services on, usually this Mac's LAN address")
 	nodeName := flag.String("node-name", "", "this node, so endpoints elsewhere can be told apart from endpoints here")
 	podMapPath := flag.String("pod-map", "", "file ferry-cri writes mapping each pod IP to an address the Mac can reach it at")
+	hostPortPath := flag.String("host-ports", "", "file ferry-cri writes listing each pod's hostPorts")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -73,6 +74,10 @@ func main() {
 		nodePorts:      *nodePorts,
 		loadBalancerIP: *loadBalancerIP,
 	}
+
+	// hostPort has nothing to do with Services, so it watches a file rather
+	// than the API and runs beside the Service controller instead of inside it.
+	newHostPorts(*hostPortPath)
 
 	factory := informers.NewSharedInformerFactory(client, *resync)
 	ctrl.services = factory.Core().V1().Services().Lister()

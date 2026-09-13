@@ -32,6 +32,13 @@ struct ExecHeader: Decodable {
     var stdin: Bool?
     /// "loadimage": an OCI layout directory to take images from.
     var path: String?
+    /// The environment to run the command with. A CNI plugin needs one -- the
+    /// verb and the container id travel in it -- and `kubectl exec` does not.
+    var env: [String]?
+    /// Extra capabilities, by name. Programming a pod's netfilter tables takes
+    /// NET_ADMIN, which an ordinary pod does not ask for; granting it to a
+    /// binary ferry ships and runs keeps the privilege off the workload.
+    var caps: [String]?
 }
 
 /// Forwards a container's live output to an attached client.
@@ -278,7 +285,9 @@ final class ExecServer: @unchecked Sendable {
                 tty: header.tty ?? false,
                 stdin: stdinStream,
                 stdout: FrameWriter(socket: socket, channel: .stdout),
-                stderr: FrameWriter(socket: socket, channel: .stderr)
+                stderr: FrameWriter(socket: socket, channel: .stderr),
+                capabilities: header.caps.map { PodRuntime.capabilities(adding: $0) },
+                environment: header.env
             )
             try await process.start()
 
