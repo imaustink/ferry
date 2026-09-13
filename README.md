@@ -76,6 +76,14 @@ cost time.
   `ferry-proxyd` runs kube-proxy's rule generation natively on macOS and renders
   the ruleset; each pod applies it to its own kernel. Traffic goes pod to pod
   and nothing needs root. See [docs/SERVICES.md](docs/SERVICES.md).
+- ✅ **Pods can use the Mac's GPU.** Not pass-through -- there is none on Apple
+  silicon, and Metal is reachable only from a macOS process. `ferry-gpud` holds
+  the GPU and a pod that requests `ferry.dev/gpu` is handed a unix socket to it,
+  relayed into its VM over vsock. A scheduled pod reached 9.4 TFLOP/s of Metal
+  matmul and ran the on-device model; a second pod requesting it waits on the
+  scheduler, with no device plugin anywhere. See
+  [docs/GPU.md](docs/GPU.md) and
+  [experiments/08-vsock-socket-relay](experiments/08-vsock-socket-relay/FINDINGS.md).
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
@@ -108,11 +116,13 @@ experiments/04-pod-networking/       routable per-pod addressing, host and pod t
 experiments/05-real-pods/            the whole stack, with real VMs per pod
 experiments/06-kube-proxy-on-macos/  kube-proxy's rule generation, rendered on darwin
 experiments/07-vmnet-leak/           what a refused vmnet subnet actually means
+experiments/08-vsock-socket-relay/   a host socket, inside a pod, over vsock
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-streamer/                      SPDY streaming for exec, attach and port-forward
 ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
 guest/                               nft, bundled with its loader for pods
 ferry-proxy/                         host-side ClusterIP routing (fallback)
+ferry-gpud/                          the Mac's GPU, offered to pods over a socket
 kernel/                              guest kernel with NAT support
 assets/                              the logo
 bin/                                 build output (gitignored)

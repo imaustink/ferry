@@ -29,6 +29,9 @@ struct RuntimeConfig: Sendable {
     var proxydSocket: String?
     /// ferry-netpol's socket, where each pod's NetworkPolicy rules come from.
     var netpolSocket: String?
+    /// ferry-gpud's control socket, where a pod that asked for ferry.dev/gpu
+    /// gets a socket to the Mac's GPU. Absent leaves the node without one.
+    var gpudSocket: String?
     /// The cluster pod network, one flat segment across every node on every
     /// machine. Empty leaves ferry on vmnet addressing and a single node.
     var clusterCIDR: String?
@@ -89,6 +92,11 @@ struct SandboxRecord {
     /// start as it always did.
     var expectedContainers: [String] = []
     var initContainerNames: [String] = []
+    /// Containers in this pod that asked for ferry.dev/gpu, from its spec.
+    var gpuContainerNames: [String] = []
+    /// Whether ferry-gpud has bound a socket for this pod, so it can be handed
+    /// back when the pod goes away.
+    var gpuGranted: Bool = false
     /// Containers the kubelet has started that are waiting for the VM.
     var pendingStart: [String] = []
 }
@@ -352,7 +360,8 @@ actor PodRuntime {
             usesReservedAddress: wantsReserved && dnsInterfaceInUse,
             interface: interface, config: cfg,
             expectedContainers: expected.containers,
-            initContainerNames: expected.initContainers
+            initContainerNames: expected.initContainers,
+            gpuContainerNames: expected.gpuContainers
         )
         return id
     }
@@ -390,14 +399,16 @@ actor PodRuntime {
     /// Asks ferry-streamer which containers the pod spec declares. A failure is
     /// not fatal: without it single-container pods behave exactly as before,
     /// only sidecars are lost.
-    private func podContainers(namespace: String, name: String) async -> (initContainers: [String], containers: [String]) {
-        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], []) }
+    private func podContainers(namespace: String, name: String) async
+        -> (initContainers: [String], containers: [String], gpuContainers: [String])
+    {
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], []) }
         do {
             let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
             let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
-            return (decoded.initContainers ?? [], decoded.containers ?? [])
+            return (decoded.initContainers ?? [], decoded.containers ?? [], decoded.gpuContainers ?? [])
         } catch {
-            return ([], [])
+            return ([], [], [])
         }
     }
 
@@ -429,6 +440,8 @@ actor PodRuntime {
             containers[containerID]?.finishedAt = Self.now()
         }
         if wasBooted { try? await record.pod.stop() }
+        releaseGPU(record)
+        record.gpuGranted = false
         record.ready = false
         // Free the reserved DNS address as soon as the pod stops. Waiting for
         // RemovePodSandbox lets a terminated CoreDNS keep the reservation, so
@@ -660,6 +673,47 @@ actor PodRuntime {
     /// node's vmnet subnet is its slice of the pod network, and the Mac is on it.
     func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
 
+    // MARK: - GPU
+
+    /// The socket ferry-gpud bound for this pod, if this container asked for
+    /// one. Nil means the container did not ask, which is the common case.
+    ///
+    /// Throwing here fails CreateContainer, and that is the intent: a pod that
+    /// requested a GPU and silently did not get one is worse than a pod that
+    /// does not start, because the failure would surface as a missing file
+    /// inside the container long after the scheduler charged the node for it.
+    private func gpuGrant(for sandboxID: String, containerName: String) throws -> String? {
+        guard let sandbox = sandboxes[sandboxID],
+              sandbox.gpuContainerNames.contains(containerName)
+        else { return nil }
+
+        guard let socket = config.gpudSocket else {
+            throw RuntimeFailure.unsupported("""
+                \(containerName) requests \(Self.gpuResource) but ferry-gpud is not \
+                configured on this node
+                """)
+        }
+
+        // Idempotent in the daemon: the kubelet retries CreateContainer, and
+        // two containers in one pod may both have asked.
+        let grant = try GPUClient(controlSocket: socket).grant(
+            uid: sandbox.uid.isEmpty ? sandboxID : sandbox.uid,
+            namespace: sandbox.namespace, name: sandbox.name)
+        sandboxes[sandboxID]?.gpuGranted = true
+        print("    gpu       \(sandbox.namespace)/\(sandbox.name) -> \(grant.socket)")
+        return grant.socket
+    }
+
+    /// Hands a pod's GPU socket back. Called when the pod stops, not when it is
+    /// removed: a stopped pod is not using the GPU, and holding the node's only
+    /// slot until garbage collection would strand it.
+    private func releaseGPU(_ record: SandboxRecord) {
+        guard record.gpuGranted, let socket = config.gpudSocket else { return }
+        GPUClient(controlSocket: socket).revoke(uid: record.uid.isEmpty ? record.id : record.uid)
+    }
+
+    static let gpuResource = "ferry.dev/gpu"
+
     // MARK: - Containers
 
     func createContainer(
@@ -808,6 +862,12 @@ actor PodRuntime {
 
         let stdinFeeder = cfg.stdin ? FrameReaderStream() : nil
 
+        // A container that asked for ferry.dev/gpu gets a socket to ferry-gpud,
+        // relayed into the VM over vsock. Per container, not per pod: a sidecar
+        // that did not ask does not inherit it, which is measured rather than
+        // assumed -- experiments/08-vsock-socket-relay.
+        let gpuSocket = try gpuGrant(for: sandboxID, containerName: cfg.metadata.name)
+
         try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
             c.process.arguments = arguments
             c.process.terminal = cfg.tty
@@ -824,6 +884,12 @@ actor PodRuntime {
             // Append rather than replace: the defaults carry /proc, /sys and
             // the rest of the standard container filesystem.
             c.mounts.append(contentsOf: shares)
+            if let gpuSocket {
+                c.sockets.append(UnixSocketConfiguration(
+                    source: URL(filePath: gpuSocket),
+                    destination: URL(filePath: GPUClient.guestPath),
+                    direction: .into))
+            }
         }
 
         containers[id] = ContainerRecord(

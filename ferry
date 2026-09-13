@@ -23,6 +23,12 @@ FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer.sock}"
 FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:10350}"
 FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd.sock}"
 FERRY_NETPOL_SOCK="${FERRY_NETPOL_SOCK:-/tmp/ferry-netpol.sock}"
+FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud.sock}"
+# Pod sockets are named by pod uid, and macOS caps a unix socket path near 104
+# bytes, so this directory is deliberately short.
+FERRY_GPU_DIR="${FERRY_GPU_DIR:-/tmp/ferry-run/gpu}"
+# How many pods may hold the GPU at once. There is one GPU; this is policy.
+GPU_CAPACITY="${FERRY_GPU_CAPACITY:-1}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
@@ -171,6 +177,9 @@ cmd_build() {
   ( cd "$here/ferry-storage" && go build -o "$here/bin/ferry-storage" . ) || return 1
   echo "==> $here/bin/ferry-storage"
   echo
+  echo "==> ferry-gpud"
+  ( cd "$here/ferry-gpud" && ./build.sh ) || return 1
+  echo
   echo "==> ferry-streamer"
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
   echo "==> $here/bin/ferry-streamer"
@@ -203,16 +212,18 @@ cmd_up() {
   fi
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_GPUD_SOCK"
 
   bold "starting ferry"
+
+  start_gpud
 
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
-    --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -254,7 +265,7 @@ cmd_up() {
       --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
       --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-name "$NODE_NAME" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-      --peers-file "$PEERS_FILE" \
+      --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
     for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -326,6 +337,7 @@ EOF
   start_netpol
   start_proxy
   start_storage
+  advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   echo
@@ -349,6 +361,65 @@ start_netpol() {
   for _ in $(seq 1 30); do [ -S "$FERRY_NETPOL_SOCK" ] && break; sleep 0.5; done
   [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
     || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+}
+
+# The Mac's GPU, offered to pods over a socket.
+#
+# There is no GPU pass-through on Apple silicon: Virtualization.framework has no
+# PCI passthrough and no compute device, and Metal is reachable only from a
+# macOS process. So the work does not move into the pod -- ferry-gpud holds the
+# GPU here, and a pod that asks for ferry.dev/gpu is handed a unix socket to it,
+# relayed into its VM over vsock. See docs/GPU.md.
+start_gpud() {
+  [ -x "$here/bin/ferry-gpud" ] || { warn "ferry-gpud not built; ferry.dev/gpu will not be offered"; return 0; }
+  rm -f "$FERRY_GPUD_SOCK"
+  # The directory is the daemon's to create -- it makes it 0700, and doing it
+  # here first would leave it 0755 until the daemon caught up.
+  # Pod sockets from a previous run are stale the moment that process is gone.
+  # ...and the record of who held them: this is a fresh cluster, so the daemon
+  # must not restore grants for pods from the last one.
+  [ -n "$FERRY_GPU_DIR" ] && rm -f "$FERRY_GPU_DIR"/*.sock "$FERRY_GPU_DIR/grants.json" 2>/dev/null || true
+  "$here/bin/ferry-gpud" --control "$FERRY_GPUD_SOCK" \
+    --socket-dir "$FERRY_GPU_DIR" --capacity "$GPU_CAPACITY" \
+    >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-gpud.pid"
+  for _ in $(seq 1 30); do [ -S "$FERRY_GPUD_SOCK" ] && break; sleep 0.5; done
+  if [ -S "$FERRY_GPUD_SOCK" ]; then
+    ok "GPU offered to pods: $(sed -n 's/.*device  *//p' "$FERRY_RUN/logs/ferry-gpud.log" | head -1)"
+  else
+    warn "ferry-gpud did not start; ferry.dev/gpu will not be offered"
+  fi
+}
+
+# Advertise the GPU as a schedulable resource.
+#
+# No device plugin is involved. The kubelet merges into node.status.capacity
+# rather than replacing it -- "avoid blindly overwriting the capacity in case
+# opaque resources are being advertised" -- so this sticks, and the scheduler
+# gates on it. The number is how many pods may hold the GPU at once, not how
+# many GPUs there are; there is one.
+advertise_gpu() {
+  [ -S "$FERRY_GPUD_SOCK" ] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+  # The resource name contains a slash, which JSON Patch escapes as ~1.
+  local op='[{"op":"add","path":"/status/capacity/ferry.dev~1gpu","value":"'"$GPU_CAPACITY"'"}]'
+  if KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$NODE_NAME" \
+       --subresource=status --type=json -p "$op" >/dev/null 2>&1; then
+    ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
+  else
+    warn "could not advertise ferry.dev/gpu on $NODE_NAME"
+  fi
+}
+
+# Take ferry.dev/gpu off the node. Best effort and deliberately quiet: the
+# control plane may already be gone, which is not worth a warning during
+# shutdown.
+withdraw_gpu() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  [ -f "$FERRY_HOME/admin.conf" ] || return 0
+  local op='[{"op":"remove","path":"/status/capacity/ferry.dev~1gpu"}]'
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$NODE_NAME" \
+    --subresource=status --type=json -p "$op" >/dev/null 2>&1 || true
 }
 
 # Somewhere for a PersistentVolumeClaim to live.
@@ -529,7 +600,7 @@ cmd_node_add() {
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
-    --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
@@ -782,12 +853,17 @@ start_worker() {
   local name="$1" index="$2"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 
+  # A joining Mac has its own GPU, so it runs its own daemon and advertises its
+  # own capacity -- unlike 'node add', which is another node on this Mac and
+  # shares the one that is already running.
+  start_gpud
+
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
-    --netpol-socket "$FERRY_NETPOL_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -853,11 +929,14 @@ EOF
     --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
     --kubeconfig "$FERRY_RUN/kubelet.conf" \
     --node-name "$name" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-    --peers-file "$PEERS_FILE" \
+    --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
     >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
   for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
+
+  # The node object exists now, so its GPU capacity can go on it.
+  advertise_gpu
 
   # Service rules are rendered per node, so a worker runs its own ferry-proxyd.
   # Like the streamer it authenticates as the node, so it also waits for the
@@ -1067,7 +1146,7 @@ cmd_down() {
     ok "node $index stopped"
   done
 
-  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage; do
+  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     local pid; pid="$(cat "$pidfile")"
@@ -1085,13 +1164,17 @@ cmd_down() {
   pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
   sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
 
+  # After the streamer, which would otherwise put it straight back, and before
+  # the control plane, which has to be up to accept the patch.
+  withdraw_gpu
+
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK" "$PEERS_FILE"
 }
 
 cmd_status() {
   bold "ferry status"
-  for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage kubelet ferry-proxy; do
+  for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
@@ -1109,7 +1192,7 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
     *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
