@@ -72,10 +72,10 @@ cost time.
 - ✅ **`kubectl exec` works** — stdin, stderr and exit codes included. CRI
   carries exec over SPDY rather than gRPC, so `ferry-streamer` terminates that
   using Kubernetes' own streaming server and hands the request to `ferry-cri`.
-- ✅ **Services route inside the pods.** Each pod programs its own kernel, so
-  Service traffic goes pod to pod and nothing needs root on the Mac. No
-  kube-proxy: the ruleset is computed once on the host and applied by a 2.6 MB
-  static binary. See [docs/SERVICES.md](docs/SERVICES.md).
+- ✅ **Services route inside the pods, with kube-proxy's own rules.**
+  `ferry-proxyd` runs kube-proxy's rule generation natively on macOS and renders
+  the ruleset; each pod applies it to its own kernel. Traffic goes pod to pod
+  and nothing needs root. See [docs/SERVICES.md](docs/SERVICES.md).
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
@@ -105,7 +105,8 @@ experiments/04-pod-networking/       routable per-pod addressing, host and pod t
 experiments/05-real-pods/            the whole stack, with real VMs per pod
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-streamer/                      SPDY streaming for kubectl exec
-ferry-netd/                          in-guest Service rules (static, runs in pods)
+ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
+guest/                               nft, bundled with its loader for pods
 ferry-proxy/                         host-side ClusterIP routing (fallback)
 kernel/                              guest kernel with NAT support
 bin/                                 build output (gitignored)
@@ -141,10 +142,10 @@ it.
   each exits before the next is created, so the VM is rebuilt between them and
   shared volumes carry state across. Two containers running *at once* in one pod
   does not work.
-- **Services are TCP only**, with no session affinity, NodePort or
-  LoadBalancer. They route inside each pod and need no privilege on the Mac —
-  build the guest kernel with `ferry kernel` first, or ferry falls back to a
-  host proxy that does need root.
+- **Services** route inside each pod using kube-proxy's own rules and need no
+  privilege on the Mac — build the guest kernel with `ferry kernel` first, or
+  ferry falls back to a host proxy that does need root. Conntrack is not
+  reconciled, and only TCP has been verified.
 - `logs`, `exec`, `port-forward` and `attach` all work. Attach needs the pod to
   set `stdin: true` to accept input, since the stream has to be wired in when
   the container is created.
