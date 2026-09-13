@@ -15,12 +15,19 @@ CLUSTER_CIDR="${CLUSTER_CIDR:-10.244.0.0/16}"
 
 # The endpoint reconciler writes this address into the kubernetes Endpoints
 # object, which every in-cluster client resolves 10.96.0.1 to. It may not be
-# loopback, and it must be reachable from inside a pod -- so it is the vmnet
-# gateway, not the LAN address, which changes with the network the Mac is on.
+# loopback, and it must be reachable from inside a pod -- every pod, on every
+# machine in the cluster.
 #
-# The gateway interface only materialises once a pod VM attaches to the network,
-# which is after the API server starts. That is fine: the server binds 0.0.0.0
-# and only needs the advertised address to be non-loopback, not yet present.
+# That last part rules out the vmnet gateway, which was the obvious choice while
+# ferry was one Mac: a gateway belongs to one Mac's vmnet network, and pods on
+# another Mac cannot reach it, so the kubernetes Service works for local pods and
+# fails everywhere else. The LAN address is reachable from both -- pods get to it
+# through their own vmnet NAT -- so ferry advertises that and falls back to the
+# gateway only when there is no network to speak of.
+#
+# The cost is that the advertised address changes when the Mac changes networks,
+# and the kubernetes Service keeps the old one until the control plane restarts.
+# kubeadm has the same property for the same reason.
 POD_GATEWAY="${POD_GATEWAY:-192.168.66.1}"
 ADVERTISE="${ADVERTISE:-$POD_GATEWAY}"
 if [ -z "$ADVERTISE" ]; then

@@ -222,7 +222,11 @@ cmd_up() {
   # so the kubelet can be told where DNS will be before CoreDNS exists.
   local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null)"
 
-  STATE="$FERRY_HOME" POD_GATEWAY="$gateway" NODE_NAME="$NODE_NAME" \
+  # Advertise the LAN address when there is one: it is the only address a pod on
+  # another Mac can reach. Without a network, the pod gateway is still right.
+  local advertise="$gateway"
+  [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
+  STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -5 "$FERRY_RUN/logs/control-plane.log"; return 1; }
   ok "control plane advertising $gateway"
