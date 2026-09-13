@@ -138,6 +138,7 @@ type podRuntime struct {
 }
 
 type execHeader struct {
+	Op          string   `json:"op,omitempty"`
 	ContainerID string   `json:"containerID"`
 	Cmd         []string `json:"cmd"`
 	TTY         bool     `json:"tty"`
@@ -145,13 +146,14 @@ type execHeader struct {
 }
 
 func (p *podRuntime) Exec(ctx context.Context, containerID string, cmd []string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
-	return p.stream(ctx, execHeader{ContainerID: containerID, Cmd: cmd, TTY: tty, Stdin: in != nil}, in, out, errOut, resize)
+	return p.stream(ctx, execHeader{Op: "exec", ContainerID: containerID, Cmd: cmd, TTY: tty, Stdin: in != nil}, in, out, errOut, resize)
 }
 
-// Attach reuses the exec path with no command: ferry-cri interprets an empty
-// command as attaching to the container's own process.
+// Attach reconnects to the container's own process rather than starting a new
+// one. ferry-cri subscribes the connection to the output already flowing
+// through that container's log writer.
 func (p *podRuntime) Attach(ctx context.Context, containerID string, in io.Reader, out, errOut io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
-	return p.stream(ctx, execHeader{ContainerID: containerID, TTY: tty, Stdin: in != nil}, in, out, errOut, resize)
+	return p.stream(ctx, execHeader{Op: "attach", ContainerID: containerID, TTY: tty, Stdin: in != nil}, in, out, errOut, resize)
 }
 
 // PortForward is unusually simple here because pod IPs are routable from the

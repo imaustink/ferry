@@ -87,8 +87,13 @@ struct ContainerRecord {
     var exitCode: Int32 = 0
     var state: ContainerRunState = .created
     var reason: String = ""
+    var tty: Bool = false
     var logWriters: [ContainerLogWriter] = []
     var logFile: ContainerLogFile?
+    /// Present only when the pod spec set stdin. A container that did not ask
+    /// for stdin must see it closed, or anything reading from it hangs instead
+    /// of getting EOF.
+    var stdinFeeder: FrameReaderStream?
 }
 
 enum ContainerRunState {
@@ -348,6 +353,19 @@ actor PodRuntime {
 
     func listSandboxes() -> [SandboxRecord] { Array(sandboxes.values) }
 
+    /// Everything attach needs: the output fan-out point, the stdin feeder if
+    /// the pod asked for one, and whether the container was given a terminal.
+    func attachTargets(_ id: String) throws -> (output: ContainerLogFile, stdin: FrameReaderStream?, tty: Bool) {
+        guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
+        guard record.state == .running else {
+            throw RuntimeFailure.invalid("container \(id) is not running")
+        }
+        guard let output = record.logFile else {
+            throw RuntimeFailure.unsupported("container \(id) has no output stream to attach to")
+        }
+        return (output, record.stdinFeeder, record.tty)
+    }
+
     /// The pod's address, for port forwarding. ferry-streamer dials it directly.
     func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
 
@@ -490,8 +508,12 @@ actor PodRuntime {
         let outWriter = stdoutWriter
         let errWriter = stderrWriter
 
+        let stdinFeeder = cfg.stdin ? FrameReaderStream() : nil
+
         try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
             c.process.arguments = arguments
+            c.process.terminal = cfg.tty
+            if let stdinFeeder { c.process.stdin = stdinFeeder }
             if let outWriter { c.process.stdout = outWriter }
             if let errWriter { c.process.stderr = errWriter }
             c.process.capabilities = capabilities
@@ -511,8 +533,8 @@ actor PodRuntime {
             name: cfg.metadata.name, attempt: cfg.metadata.attempt,
             image: imageRef, imageRef: imageRef,
             labels: cfg.labels, annotations: cfg.annotations,
-            logPath: absoluteLogPath, createdAt: Self.now(),
-            logWriters: writers, logFile: logFile
+            logPath: absoluteLogPath, createdAt: Self.now(), tty: cfg.tty,
+            logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder
         )
         return id
     }

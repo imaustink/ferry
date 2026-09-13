@@ -32,6 +32,16 @@ struct ExecHeader: Decodable {
     var stdin: Bool?
 }
 
+/// Forwards a container's live output to an attached client.
+final class AttachSink: OutputSink, @unchecked Sendable {
+    private let socket: FrameSocket
+    init(socket: FrameSocket) { self.socket = socket }
+
+    func receive(_ data: Data, stream: LogStream) {
+        socket.writeFrame(stream == .stderr ? .stderr : .stdout, data)
+    }
+}
+
 /// Writes framed data to a socket. One instance per stream, sharing the
 /// descriptor, so writes are serialised through a shared lock.
 final class FrameWriter: Writer, @unchecked Sendable {
@@ -183,6 +193,39 @@ final class ExecServer: @unchecked Sendable {
         }
     }
 
+    /// Reconnects a client to a container that is already running.
+    ///
+    /// The framework cannot re-open a running process's stdio, but it does not
+    /// have to: output is already flowing through our own writer, so attaching
+    /// is a subscription. Input works only if the pod asked for stdin, since a
+    /// stream has to have been wired in when the container was created.
+    private static func attach(containerID: String, socket: FrameSocket, runtime: PodRuntime) async {
+        let targets: (output: ContainerLogFile, stdin: FrameReaderStream?, tty: Bool)
+        do {
+            targets = try await runtime.attachTargets(containerID)
+        } catch {
+            socket.writeFrame(.stderr, Data("ferry-cri: \(error)\n".utf8))
+            socket.writeFrame(.exit, Data([1]))
+            return
+        }
+
+        let sink = AttachSink(socket: socket)
+        targets.output.subscribe(sink)
+        defer { targets.output.unsubscribe(sink) }
+
+        // Hold the connection open, forwarding anything the client types, until
+        // it disconnects. Output arrives through the sink meanwhile.
+        while let (channel, payload) = socket.readFrame() {
+            switch channel {
+            case .stdin:
+                guard let feeder = targets.stdin else { continue }
+                if payload.isEmpty { feeder.finish() } else { feeder.deliver(payload) }
+            default:
+                continue
+            }
+        }
+    }
+
     private static func handle(socket: FrameSocket, runtime: PodRuntime) async {
         defer { socket.close() }
         guard let line = socket.readHeaderLine(),
@@ -201,6 +244,12 @@ final class ExecServer: @unchecked Sendable {
         }
 
         guard let containerID = header.containerID else { return }
+
+        if header.op == "attach" {
+            await attach(containerID: containerID, socket: socket, runtime: runtime)
+            return
+        }
+
         let stdinStream = (header.stdin ?? false) ? FrameReaderStream() : nil
         do {
             let process = try await runtime.exec(

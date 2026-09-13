@@ -315,12 +315,26 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             throw RPCError(code: .unavailable, message: "\(error)")
         }
     }
-    /// Attach would reconnect to a container's own process. The framework
-    /// exposes no way to reattach to a process that is already running, so the
-    /// URL is minted but the stream will report the limitation rather than
-    /// silently producing nothing.
+    /// Attach reconnects to a container's own process. The framework cannot
+    /// re-open a running process's stdio, but ferry-cri owns that stdio -- the
+    /// container's output already flows through its log writer -- so attaching
+    /// is a subscription to it. Input requires the pod to have asked for stdin,
+    /// since the stream has to be wired in at creation.
     func attach(request: Runtime_V1_AttachRequest, context: ServerContext) async throws -> Runtime_V1_AttachResponse {
-        throw unimplemented("Attach")
+        do {
+            let url = try streamer.url(path: "/attach", body: [
+                "container_id": request.containerID,
+                "stdin": request.stdin,
+                "stdout": request.stdout,
+                "stderr": request.stderr,
+                "tty": request.tty,
+            ])
+            var response = Runtime_V1_AttachResponse()
+            response.url = url
+            return response
+        } catch {
+            throw RPCError(code: .unavailable, message: "\(error)")
+        }
     }
     func portForward(request: Runtime_V1_PortForwardRequest, context: ServerContext) async throws -> Runtime_V1_PortForwardResponse {
         do {

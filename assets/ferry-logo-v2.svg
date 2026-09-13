@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" viewBox="0 0 800 360" role="img" aria-label="ferry — a pod is a VM">
+  <title>ferry — a pod is a VM</title>
+  <defs>
+    <linearGradient id="f-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7DB8FF"/><stop offset=".55" stop-color="#4C86F0"/><stop offset="1" stop-color="#326CE5"/>
+    </linearGradient>
+    <linearGradient id="f-water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2FB6D6"/><stop offset="1" stop-color="#1E7FB8"/>
+    </linearGradient>
+    <linearGradient id="f-hull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A4658"/><stop offset="1" stop-color="#222B39"/>
+    </linearGradient>
+    <linearGradient id="f-c1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9F5A"/><stop offset="1" stop-color="#FF5E7E"/></linearGradient>
+    <linearGradient id="f-c2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#57E0C0"/><stop offset="1" stop-color="#2FBF71"/></linearGradient>
+    <linearGradient id="f-c3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5AA8FF"/><stop offset="1" stop-color="#4058E0"/></linearGradient>
+    <linearGradient id="f-c4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#C07BFF"/><stop offset="1" stop-color="#8A3FE0"/></linearGradient>
+    <linearGradient id="f-c5" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFD75A"/><stop offset="1" stop-color="#FF9F2E"/></linearGradient>
+    <linearGradient id="f-word" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4C86F0"/><stop offset="1" stop-color="#326CE5"/>
+    </linearGradient>
+    <clipPath id="f-tile"><rect x="16" y="16" width="480" height="480" rx="112" ry="112"/></clipPath>
+  </defs>
+
+  <svg x="40" y="40" width="280" height="280" viewBox="16 16 480 480" overflow="visible">
+    <g clip-path="url(#f-tile)">
+      <rect x="16" y="16" width="480" height="480" fill="url(#f-sky)"/>
+      <path d="M16 356C80 336 140 376 200 356s120-20 180 0 90-16 116 0v140H16Z" fill="url(#f-water)"/>
+      <path d="M-12 404q26-16 52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0t52 0"
+            fill="none" stroke="#D6F3FF" stroke-opacity=".45" stroke-width="6" stroke-linecap="round"/>
+      <path d="M-8 450q24-14 48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0t48 0"
+            fill="none" stroke="#FFFFFF" stroke-opacity=".32" stroke-width="5" stroke-linecap="round"/>
+      <g>
+        <g><rect x="153" y="300" width="66" height="46" rx="5" fill="url(#f-c1)"/><path d="M175 300v46M197 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/></g>
+        <g><rect x="223" y="300" width="66" height="46" rx="5" fill="url(#f-c2)"/><path d="M245 300v46M267 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/></g>
+        <g><rect x="293" y="300" width="66" height="46" rx="5" fill="url(#f-c3)"/><path d="M315 300v46M337 300v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/></g>
+        <g><rect x="188" y="254" width="66" height="46" rx="5" fill="url(#f-c4)"/><path d="M210 254v46M232 254v46" stroke="#fff" stroke-opacity=".25" stroke-width="3"/></g>
+        <g><rect x="258" y="254" width="66" height="46" rx="5" fill="url(#f-c5)"/><path d="M280 254v46M302 254v46" stroke="#fff" stroke-opacity=".28" stroke-width="3"/></g>
+        <path d="M132 348h248c-8 48-36 72-80 72h-88c-44 0-72-24-80-72Z" fill="url(#f-hull)"/>
+        <rect x="132" y="348" width="248" height="12" fill="#4C5A6E"/>
+        <path d="M141 373h230" stroke="#FF5E7E" stroke-width="7" stroke-linecap="round"/>
+        <g transform="translate(256 394)">
+          <circle r="20" fill="#0F1622"/>
+          <circle r="20" fill="none" stroke="#EAF2FF" stroke-width="3"/>
+          <g stroke="#EAF2FF" stroke-width="3" stroke-linecap="round">
+            <path d="M0-14V-3M13.3-4.3 2.9-1M8.2 11.3 1.8 2.4M-8.2 11.3-1.8 2.4M-13.3-4.3-2.9-1"/>
+          </g>
+          <circle r="4" fill="#EAF2FF"/>
+        </g>
+      </g>
+      <path d="M16 16h480v150C360 90 150 92 16 176Z" fill="#fff" fill-opacity=".08"/>
+    </g>
+  </svg>
+
+  <text x="376" y="200" font-family="SF Pro Rounded, SF Pro Display, Helvetica Neue, Arial, system-ui, sans-serif"
+        font-size="176" font-weight="700" letter-spacing="-4" fill="url(#f-word)">ferry</text>
+  <text x="380" y="285" font-family="SF Pro Text, Helvetica Neue, Arial, system-ui, sans-serif"
+        font-size="38" font-weight="600" letter-spacing="5" fill="#5B6B82">A POD IS A VM</text>
+</svg>
