@@ -35,6 +35,14 @@ GPU_SLICE="${FERRY_GPU_SLICE:-0.5}"
 NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
+# What counts as too little disk to start pods on.
+#
+# The upstream default is a percentage, and a percentage is the wrong shape for a
+# laptop: 5% of a 1TB disk is 46GB held in reserve, so a Mac with 45GB free taints
+# itself and schedules nothing, while a Mac with a small disk gets almost no
+# margin at all. An absolute figure says what it means. Kubernetes accepts either.
+EVICT_DISK="${FERRY_EVICTION_DISK:-4Gi}"
+EVICT_MEMORY="${FERRY_EVICTION_MEMORY:-500Mi}"
 # The cluster pod network: one flat segment every pod shares, on every node and
 # every machine. Pods keep a vmnet NIC for the internet; this is the address
 # Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
@@ -94,6 +102,7 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
@@ -296,9 +305,9 @@ volumePluginDir: $FERRY_RUN/volume-plugins
 # laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
 # node taints itself NoSchedule.
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -409,16 +418,58 @@ start_gpud() {
 # opaque resources are being advertised" -- so this sticks, and the scheduler
 # gates on it. The number is how many pods may hold the GPU at once, not how
 # many GPUs there are; there is one.
-advertise_gpu() {
+advertise_gpu() { # node-name [kubeconfig]
+  local node="${1:-$NODE_NAME}"
   [ -S "$FERRY_GPUD_SOCK" ] || return 0
-  command -v kubectl >/dev/null 2>&1 || return 0
-  # The resource name contains a slash, which JSON Patch escapes as ~1.
-  local op='[{"op":"add","path":"/status/capacity/ferry.dev~1gpu","value":"'"$GPU_CAPACITY"'"}]'
-  if KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$NODE_NAME" \
-       --subresource=status --type=json -p "$op" >/dev/null 2>&1; then
+
+  # Whichever credential this machine has. A joined node has no admin.conf --
+  # only the certificate the cluster issued its kubelet.
+  local cfg="${2:-}"
+  if [ -z "$cfg" ]; then
+    if [ -r "$FERRY_HOME/admin.conf" ]; then cfg="$FERRY_HOME/admin.conf"
+    elif [ -r "$FERRY_RUN/kubelet.conf" ]; then cfg="$FERRY_RUN/kubelet.conf"
+    else warn "no kubeconfig to advertise ferry.dev/gpu with"; return 0; fi
+  fi
+
+  # Written with curl rather than kubectl, and that is the whole fix.
+  #
+  # A node may update its own status -- its kubelet does nothing else all day --
+  # but it may not *get* nodes/status, which the Node authorizer scopes to the
+  # object rather than the subresource. kubectl fetches before it patches, even
+  # for a merge patch, so it was refused at the first step on every joined node
+  # and the GPU was only ever offered by the Mac that had the admin kubeconfig.
+  #
+  # Sending the patch directly asks for exactly the permission the node has.
+  local server cert key
+  server="$(sed -n 's|.*server: *||p' "$cfg" | head -1)"
+  cert="$(sed -n 's|.*client-certificate: *||p' "$cfg" | head -1)"
+  key="$(sed -n 's|.*client-key: *||p' "$cfg" | head -1)"
+  [ -n "$server" ] || { warn "could not read the API server address from $cfg"; return 0; }
+
+  local auth=()
+  if [ -n "$cert" ] && [ -n "$key" ]; then
+    auth=(--cert "$cert" --key "$key")
+  else
+    # admin.conf embeds its credentials, and kubectl is present wherever that is.
+    command -v kubectl >/dev/null 2>&1 || { warn "no usable credential for ferry.dev/gpu"; return 0; }
+    if KUBECONFIG="$cfg" kubectl patch node "$node" --subresource=status --type=merge \
+         -p "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" >/dev/null 2>&1; then
+      ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
+    else
+      warn "could not advertise ferry.dev/gpu on $node"
+    fi
+    return 0
+  fi
+
+  local code
+  code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
+    -X PATCH -H "Content-Type: application/merge-patch+json" \
+    -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
+    "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+  if [ "$code" = "200" ]; then
     ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
   else
-    warn "could not advertise ferry.dev/gpu on $NODE_NAME"
+    warn "could not advertise ferry.dev/gpu on $node (HTTP ${code:-no response})"
   fi
 }
 
@@ -906,9 +957,9 @@ containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -957,7 +1008,7 @@ EOF
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
 
   # The node object exists now, so its GPU capacity can go on it.
-  advertise_gpu
+  advertise_gpu "$name" "$FERRY_RUN/kubelet.conf"
 
   # Service rules are rendered per node, so a worker runs its own ferry-proxyd.
   # Like the streamer it authenticates as the node, so it also waits for the
