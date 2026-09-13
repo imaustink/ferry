@@ -160,17 +160,19 @@ actor PodRuntime {
         } catch let error as ContainerizationError where error.code == .exists {
             self.initfs = .block(format: "ext4", source: initPath.path(), destination: "/", options: ["ro"])
         }
-        // vmnet networks are not always reclaimed when the process that made
-        // them exits -- a subnet can stay claimed with nothing holding it, and
-        // stays that way. So try the configured subnet first and fall back
-        // through candidates rather than refusing to start.
+        // A vmnet subnet stays reserved for about a minute after the process
+        // using it exits -- measured, not guessed: see experiments/07-vmnet-leak.
+        // So a restart normally cannot have its previous subnet back, and waiting
+        // for it would cost the user a minute of startup for nothing. Moving to
+        // another is right; what it costs is a changed gateway, which is part of
+        // the CoreDNS manifest and so rolls CoreDNS out again.
         var chosen: VmnetNetwork?
         var lastError: Error?
         for candidate in Self.subnetCandidates(preferred: config.podSubnet) {
             do {
                 chosen = try VmnetNetwork(subnet: try CIDRv4(candidate))
                 if candidate != config.podSubnet {
-                    print("    \(config.podSubnet) is claimed by a leaked network; using \(candidate)")
+                    print("    \(config.podSubnet) is still reserved by a recent run; using \(candidate)")
                 }
                 lastError = nil
                 break
@@ -178,7 +180,17 @@ actor PodRuntime {
                 lastError = error
             }
         }
-        guard let chosen else { throw lastError ?? RuntimeFailure.unsupported("no pod subnet available") }
+        guard let chosen else {
+            // vmnet allows 32 networks across the whole Mac, shared with anything
+            // else using it, and each of ferry's is held for about a minute after
+            // it stops. Enough restarts in quick succession exhausts the list, and
+            // the raw VMNET_FAILURE says none of that.
+            throw lastError ?? RuntimeFailure.unsupported(
+                "no pod subnet is available. vmnet allows 32 networks across the "
+                + "whole Mac and holds each for about a minute after the process "
+                + "using it stops, so this usually clears on its own -- wait a "
+                + "minute and try again. Otherwise check for other VMs still running.")
+        }
         self.network = chosen
 
         // The API server has to advertise the gateway of whichever subnet was
@@ -200,8 +212,8 @@ actor PodRuntime {
     var gateway: String { "\(network.ipv4Gateway)" }
     var subnet: String { "\(network.subnet)" }
 
-    /// The preferred subnet first, then a spread of alternatives for when it
-    /// has been leaked by an earlier run.
+    /// The preferred subnet first, then alternatives for when a recent run
+    /// still holds it.
     private static func subnetCandidates(preferred: String) -> [String] {
         var candidates = [preferred]
         for third in [66, 77, 88, 99, 111, 122, 133, 144, 155, 166, 177, 188, 199, 211, 222] {
