@@ -151,21 +151,6 @@ cmd_up() {
 
   bold "starting ferry"
 
-  # kubectl exec arrives as SPDY, which ferry-streamer terminates before
-  # handing the request to ferry-cri. It has to be up first, because ferry-cri
-  # asks it for streaming URLs.
-  if [ -x "$here/bin/ferry-streamer" ]; then
-    "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
-      --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
-      >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
-    echo $! > "$FERRY_RUN/ferry-streamer.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
-    [ -S "$FERRY_STREAMER_SOCK" ] && ok "streaming server on $FERRY_STREAM_ADDR" \
-      || warn "streaming server did not start; kubectl exec will not work"
-  else
-    warn "ferry-streamer not built; kubectl exec will not work"
-  fi
-
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
@@ -195,6 +180,22 @@ cmd_up() {
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -5 "$FERRY_RUN/logs/control-plane.log"; return 1; }
   ok "control plane advertising $gateway"
+
+  # kubectl exec arrives as SPDY, which ferry-streamer terminates before
+  # handing the request to ferry-cri. It has to be up first, because ferry-cri
+  # asks it for streaming URLs.
+  if [ -x "$here/bin/ferry-streamer" ]; then
+    "$here/bin/ferry-streamer" --listen "$FERRY_STREAM_ADDR" \
+      --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
+      --kubeconfig "$FERRY_HOME/admin.conf" \
+      >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
+    echo $! > "$FERRY_RUN/ferry-streamer.pid"
+    for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+    [ -S "$FERRY_STREAMER_SOCK" ] && ok "streaming server on $FERRY_STREAM_ADDR" \
+      || warn "streaming server did not start; kubectl exec will not work"
+  else
+    warn "ferry-streamer not built; kubectl exec will not work"
+  fi
 
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1

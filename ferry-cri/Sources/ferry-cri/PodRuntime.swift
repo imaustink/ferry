@@ -60,6 +60,15 @@ struct SandboxRecord {
     /// see createContainer.
     let interface: any Interface
     let config: Runtime_V1_PodSandboxConfig
+    /// Names of the pod's regular containers, from its spec. The kubelet
+    /// creates them one at a time and this hypervisor cannot add a container to
+    /// a running VM, so the boot waits until they have all arrived. Empty when
+    /// the pod spec could not be read, in which case the VM boots on the first
+    /// start as it always did.
+    var expectedContainers: [String] = []
+    var initContainerNames: [String] = []
+    /// Containers the kubelet has started that are waiting for the VM.
+    var pendingStart: [String] = []
 }
 
 struct ContainerRecord {
@@ -118,6 +127,9 @@ actor PodRuntime {
     private var imageConfigs: [String: ContainerizationOCI.ImageConfig] = [:]
 
     private var idCounter: UInt64 = 0
+    /// Used only to read pod specs, so the VM can wait for a pod's whole
+    /// container set before booting.
+    var streamer: StreamerClient?
 
     init(config: RuntimeConfig) throws {
         self.config = config
@@ -128,6 +140,8 @@ actor PodRuntime {
 
     /// Pulls the guest agent image and creates the pod network. Kept out of
     /// init so failures surface with context before the server starts serving.
+    func setStreamer(_ client: StreamerClient) { self.streamer = client }
+
     func prepare() async throws {
         let initImage = try await store.getInitImage(reference: config.initImage)
         let initPath = config.stateDir.appending(component: "init.ext4")
@@ -222,6 +236,8 @@ actor PodRuntime {
         // Deliberately not created yet. CRI adds containers after the sandbox
         // exists, and on this hypervisor a container can only be added before
         // the VM boots -- see startContainer.
+        let expected = await podContainers(
+            namespace: cfg.metadata.namespace, name: cfg.metadata.name)
 
         sandboxes[id] = SandboxRecord(
             id: id, pod: pod,
@@ -230,7 +246,9 @@ actor PodRuntime {
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
             usesReservedAddress: wantsReserved && dnsInterfaceInUse,
-            interface: interface, config: cfg
+            interface: interface, config: cfg,
+            expectedContainers: expected.containers,
+            initContainerNames: expected.initContainers
         )
         return id
     }
@@ -263,6 +281,20 @@ actor PodRuntime {
         // own process, not inherited by anything it later executes.
         return Containerization.LinuxCapabilities(
             bounding: list, effective: list, inheritable: list, permitted: list, ambient: [])
+    }
+
+    /// Asks ferry-streamer which containers the pod spec declares. A failure is
+    /// not fatal: without it single-container pods behave exactly as before,
+    /// only sidecars are lost.
+    private func podContainers(namespace: String, name: String) async -> (initContainers: [String], containers: [String]) {
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], []) }
+        do {
+            let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
+            let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
+            return (decoded.initContainers ?? [], decoded.containers ?? [])
+        } catch {
+            return ([], [])
+        }
     }
 
     private func makePod(id: String, interface: any Interface, cfg: Runtime_V1_PodSandboxConfig) throws -> LinuxPod {
@@ -488,21 +520,52 @@ actor PodRuntime {
             throw RuntimeFailure.notFound("sandbox \(record.sandboxID)")
         }
 
-        // Boot the VM on first use, with every container added so far already
-        // registered. Virtualization.framework has no hotplug, so anything
-        // added after this point cannot join the pod.
         if !sandbox.booted {
+            // The kubelet works through a pod's containers one at a time --
+            // create, start, create, start -- and this hypervisor cannot add a
+            // container to a running VM. Booting on the first start therefore
+            // locks out every later container, which is what made sidecars
+            // impossible. Instead the boot waits until the pod's whole regular
+            // container set has been created.
+            //
+            // Init containers are exempt: the kubelet runs them one at a time
+            // by design, each exiting before the next is created, so each gets
+            // its own VM.
+            let isInit = sandbox.initContainerNames.contains(record.name)
+            let expected = sandbox.expectedContainers
+            let created = Set(containers.values
+                .filter { $0.sandboxID == record.sandboxID }
+                .map(\.name))
+            let complete = expected.isEmpty || isInit || expected.allSatisfy { created.contains($0) }
+
+            if !complete {
+                // Report success and start it once the VM is up. The kubelet
+                // polls container status, so it sees the container running a
+                // moment later rather than being told it failed.
+                sandboxes[record.sandboxID]?.pendingStart.append(id)
+                return
+            }
+
             try await sandbox.pod.create()
             sandboxes[record.sandboxID]?.booted = true
+
+            for waiting in sandboxes[record.sandboxID]?.pendingStart ?? [] where waiting != id {
+                try? await sandbox.pod.startContainer(waiting)
+                markStarted(waiting, pod: sandbox.pod)
+            }
+            sandboxes[record.sandboxID]?.pendingStart = []
         }
 
         try await sandbox.pod.startContainer(id)
+        markStarted(id, pod: sandbox.pod)
+    }
+
+    private func markStarted(_ id: String, pod: LinuxPod) {
         containers[id]?.state = .running
         containers[id]?.startedAt = Self.now()
 
         // Reap asynchronously so the exit code is available to ContainerStatus
         // without the kubelet having to ask the pod directly.
-        let pod = sandbox.pod
         Task { [weak self] in
             let status = try? await pod.waitContainer(id)
             await self?.recordExit(id, code: status?.exitCode ?? -1)

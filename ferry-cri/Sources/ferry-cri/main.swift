@@ -39,6 +39,7 @@ print("    kernel    \(config.kernelPath)")
 print("    pod size  \(config.defaultCPUs) cpu, \(config.defaultMemoryBytes / 1024 / 1024) MiB")
 
 let runtime = try PodRuntime(config: config)
+await runtime.setStreamer(StreamerClient(socketPath: streamerControl))
 do {
     try await runtime.prepare()
 } catch {
