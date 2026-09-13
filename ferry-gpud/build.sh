@@ -10,9 +10,14 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
-swift build -c release
+# SWIFT lets a working toolchain be named when the default one is not, the same
+# way ferry-cri/build.sh does. macOS ships SwiftPM and the compiler as separate
+# pieces of the developer tools, and a half-applied update leaves them
+# disagreeing -- which fails in the manifest, before any of this code is read.
+SWIFT="${SWIFT:-swift}"
+"$SWIFT" build -c release
 mkdir -p ../bin
 rm -f ../bin/ferry-gpud
-cp "$(swift build -c release --show-bin-path)/ferry-gpud" ../bin/ferry-gpud
+cp "$("$SWIFT" build -c release --show-bin-path)/ferry-gpud" ../bin/ferry-gpud
 codesign --force --sign - ../bin/ferry-gpud
 echo "==> $(cd .. && pwd)/bin/ferry-gpud"

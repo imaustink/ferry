@@ -47,6 +47,19 @@ struct RuntimeConfig: Sendable {
     var peersFile: String?
     /// This node's own endpoint, so it can be skipped in that list.
     var relayEndpoint: String?
+    /// ferry-cni, the CNI runtime. Absent leaves ferry allocating addresses
+    /// itself, which is what it did before it had one.
+    var cniBinary: String?
+    /// The network configuration to run. Generated from clusterCIDR and
+    /// nodeIndex when not supplied, so the default needs no file.
+    var cniConflist: String?
+    /// darwin/arm64 plugins, forked here.
+    var cniHostPlugins: String?
+    /// linux/arm64 plugins, shared into every pod and run in its own kernel.
+    var cniGuestPlugins: String?
+    /// This process's own exec socket. ferry-cni dials back to it to run a
+    /// plugin inside a pod, because only this process owns the VMs.
+    var execSocket: String?
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -99,6 +112,9 @@ struct SandboxRecord {
     var gpuGranted: Bool = false
     /// Containers the kubelet has started that are waiting for the VM.
     var pendingStart: [String] = []
+    /// Whether the guest half of the CNI chain has run. The kubelet starts each
+    /// container in turn and the chain is per pod, not per container.
+    var cniChainDone: Bool = false
 }
 
 struct ContainerRecord {
@@ -229,6 +245,7 @@ actor PodRuntime {
             to: config.stateDir.appending(component: "gateway"),
             atomically: true, encoding: .utf8)
 
+
         // The cluster pod network is carried by two interfaces that share one
         // address, and the reason is the Mac.
         //
@@ -253,7 +270,11 @@ actor PodRuntime {
                                        peersFile: config.peersFile,
                                        self: config.relayEndpoint)
             self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
+            self.cni = try makeCNI()
             print("    pod network \(cidr), this node is \(slice)")
+            if cni != nil {
+                print("    cni       \(config.cniConflist ?? defaultConflistPath.path())")
+            }
             if config.relayPort > 0 {
                 print("    switch    udp/\(config.relayPort), peers: \(config.peers.isEmpty ? "none yet" : config.peers.joined(separator: ", "))")
             }
@@ -267,6 +288,34 @@ actor PodRuntime {
                 to: config.stateDir.appending(component: "dns"),
                 atomically: true, encoding: .utf8)
         }
+    }
+
+    /// Where a generated configuration is written, so it can be read and edited.
+    private var defaultConflistPath: URL {
+        config.stateDir.appending(component: "ferry.conflist")
+    }
+
+    /// Assembles the CNI runtime, and writes a configuration for it when the
+    /// operator did not supply one. Returns nil when ferry-cni is not present,
+    /// which leaves the pod network unaddressed and is reported as such.
+    private func makeCNI() throws -> CNIRuntime? {
+        guard let binary = config.cniBinary, FileManager.default.fileExists(atPath: binary),
+              let hostPlugins = config.cniHostPlugins else { return nil }
+
+        let conflist: String
+        if let supplied = config.cniConflist, !supplied.isEmpty {
+            conflist = supplied
+        } else {
+            try CNIRuntime.writeDefaultConflist(at: defaultConflistPath.path())
+            conflist = defaultConflistPath.path()
+        }
+        let cache = config.stateDir.appending(component: "cni-cache")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        return CNIRuntime(binary: binary, conflist: conflist,
+                          hostPlugins: hostPlugins,
+                          guestPlugins: config.cniGuestPlugins ?? "",
+                          cacheDir: cache.path(),
+                          execSocket: config.execSocket)
     }
 
     var gateway: String { "\(network.ipv4Gateway)" }
@@ -324,6 +373,7 @@ actor PodRuntime {
         }
         let ip = "\(interface.ipv4Address)".split(separator: "/").first.map(String.init) ?? ""
 
+
         // eth1: the same address, with the cluster's prefix. Traffic for this
         // node's own slice matches the narrower route and leaves by eth0 on the
         // kernel datapath; everything else in the cluster leaves by the switch.
@@ -334,6 +384,24 @@ actor PodRuntime {
            let wide = try? CIDRv4("\(ip)/\(clusterPrefixLength)"),
            let nic = try? SwitchInterface(address: wide, mac: nil) {
             clusterInterface = nic
+        }
+
+        // The CNI chain's host half. vmnet chose the address, so this hands it
+        // to CNI rather than asking for one -- upstream's `static` IPAM takes it
+        // through the `ips` capability, the same mechanism portMappings uses.
+        //
+        // What it produces is the prevResult the guest half chains from. A CNI
+        // chain has to start with something that made an interface, and on this
+        // system that is the hypervisor, so ferry-vm says so and the rest of the
+        // chain proceeds exactly as it would anywhere else.
+        if let cni, !ip.isEmpty {
+            do {
+                _ = try await cni.add(sandboxID: id, stage: .host,
+                                      addresses: ["\(ip)/\(clusterPrefixLength)"])
+            } catch {
+                FileHandle.standardError.write(
+                    "warning: the host half of the CNI chain failed for \(id): \(error)\n".data(using: .utf8)!)
+            }
         }
 
         // Kubernetes sends resource limits per container, not per sandbox, so
@@ -351,6 +419,7 @@ actor PodRuntime {
         let expected = await podContainers(
             namespace: cfg.metadata.namespace, name: cfg.metadata.name)
 
+        defer { publishHostPorts() }
         sandboxes[id] = SandboxRecord(
             id: id, pod: pod,
             name: cfg.metadata.name, uid: cfg.metadata.uid,
@@ -396,6 +465,21 @@ actor PodRuntime {
             bounding: list, effective: list, inheritable: list, permitted: list, ambient: [])
     }
 
+    /// The default set plus a few named capabilities, for the helper binaries
+    /// ferry runs inside a pod on its own behalf -- nft and the CNI plugins.
+    /// The workload's own capabilities are untouched.
+    static func capabilities(adding names: [String]) -> Containerization.LinuxCapabilities {
+        var privileged = Containerization.LinuxCapabilities.defaultOCICapabilities
+        for name in names {
+            guard let capability = try? CapabilityName(rawValue: name) else { continue }
+            privileged.bounding.append(capability)
+            privileged.effective.append(capability)
+            privileged.permitted.append(capability)
+            privileged.ambient.append(capability)
+        }
+        return privileged
+    }
+
     /// Asks ferry-streamer which containers the pod spec declares. A failure is
     /// not fatal: without it single-container pods behave exactly as before,
     /// only sidecars are lost.
@@ -435,6 +519,11 @@ actor PodRuntime {
         guard var record = sandboxes[id] else { throw RuntimeFailure.notFound("sandbox \(id)") }
         guard record.ready else { return }
         let wasBooted = record.booted
+        // Unwind the guest half of the chain first: it runs inside the pod, so
+        // it needs a kernel that is still alive and a container to exec beside.
+        if wasBooted, cni != nil, !record.ip.isEmpty {
+            try? await runGuestChain(.del, sandboxID: id)
+        }
         for containerID in containers.values.filter({ $0.sandboxID == id }).map(\.id) {
             containers[containerID]?.state = .exited
             containers[containerID]?.finishedAt = Self.now()
@@ -449,6 +538,12 @@ actor PodRuntime {
         // clusterDNS then points at nothing.
         if record.usesReservedAddress { dnsInterfaceInUse = false }
         podSwitch?.detach(podID: id)
+        defer { publishHostPorts() }
+        // The guest half of DEL already ran, above, while there was still a
+        // kernel to run it in. This is the rest of the chain unwinding.
+        if cni != nil, !record.ip.isEmpty {
+            try? await cni?.del(sandboxID: id, stage: .host)
+        }
 
         sandboxes[id] = record
     }
@@ -484,6 +579,8 @@ actor PodRuntime {
 
     /// The pod network, when ferry is running one.
     private var podSwitch: PodSwitch?
+    /// The CNI runtime that runs each pod's plugin chain.
+    private var cni: CNIRuntime?
     /// The cluster network's prefix length, which eth1 carries so that anything
     /// outside this node's own slice leaves by the switch.
     private var clusterPrefixLength = 16
@@ -550,13 +647,7 @@ actor PodRuntime {
             // pod does not ask for it. Granting it to this process rather than
             // to the container keeps the privilege on a binary ferry ships and
             // runs, not on the workload.
-            var privileged = Containerization.LinuxCapabilities.defaultOCICapabilities
-            if let netAdmin = try? CapabilityName(rawValue: "NET_ADMIN") {
-                privileged.bounding.append(netAdmin)
-                privileged.effective.append(netAdmin)
-                privileged.permitted.append(netAdmin)
-                privileged.ambient.append(netAdmin)
-            }
+            let privileged = Self.capabilities(adding: ["NET_ADMIN"])
 
             let process = try await exec(
                 containerID: target.id,
@@ -576,6 +667,47 @@ actor PodRuntime {
         } catch {
             FileHandle.standardError.write(
                 "warning: could not program \(label) rules in \(sandboxID): \(error)\n".data(using: .utf8)!)
+        }
+    }
+
+    enum CNIVerb { case add, del }
+
+    /// Runs the guest half of the CNI chain for one pod.
+    ///
+    /// This is the half that could not run before the VM existed. It happens
+    /// inside the pod, against the pod's own root netns, which is what a main
+    /// plugin would have created on Linux and what the hypervisor created here.
+    ///
+    /// portmap is the plugin that makes the difference visible: hostPort is
+    /// carried in the sandbox config, ferry never implemented it, and upstream
+    /// already has.
+    private func runGuestChain(_ verb: CNIVerb, sandboxID: String) async throws {
+        guard let cni, config.cniGuestPlugins != nil else { return }
+        guard let sandbox = sandboxes[sandboxID] else { return }
+        // Any running container in the pod will do: one VM is one network
+        // stack, so they all share the netns the plugin is about to program.
+        guard let target = containers.values.first(where: {
+            $0.sandboxID == sandboxID && $0.state == .running
+        }) else { return }
+
+        // A host port of 0 is explicitly "do not expose this", not "pick one",
+        // and portmap has no SCTP backend -- so both are dropped here rather
+        // than turned into a rule that means something else.
+        let mappings = sandbox.config.portMappings
+            .filter { $0.hostPort > 0 && $0.protocol != .sctp }
+            .map {
+                CNIPortMapping(hostPort: $0.hostPort,
+                               containerPort: $0.containerPort,
+                               protocol: $0.protocol == .udp ? "udp" : "tcp",
+                               hostIP: $0.hostIp.isEmpty ? nil : $0.hostIp)
+            }
+        switch verb {
+        case .add:
+            _ = try await cni.add(sandboxID: sandboxID, stage: .guest,
+                                  execContainer: target.id, portMappings: mappings)
+        case .del:
+            try await cni.del(sandboxID: sandboxID, stage: .guest,
+                              execContainer: target.id, portMappings: mappings)
         }
     }
 
@@ -672,6 +804,33 @@ actor PodRuntime {
     /// Where the Mac can reach this pod, which is simply its address: this
     /// node's vmnet subnet is its slice of the pod network, and the Mac is on it.
     func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
+
+    private func publishHostPorts() {
+        try? hostPortMap().write(
+            to: config.stateDir.appending(component: "hostports"),
+            atomically: true, encoding: .utf8)
+    }
+
+    /// Every hostPort a pod on this node asked for, as
+    /// "<host address> <port> <protocol> <the pod's address>".
+    ///
+    /// This is the other half of hostPort. portmap puts the mapping inside the
+    /// pod, which makes it real on the pod's own addresses; Kubernetes means
+    /// the *node's* address, and the node here is the Mac. So ferry-proxy
+    /// listens and forwards to the pod at the same port, where portmap's rule
+    /// is waiting to rewrite it to the container port.
+    func hostPortMap() -> String {
+        var lines: [String] = []
+        for sandbox in sandboxes.values where sandbox.ready && !sandbox.ip.isEmpty {
+            for mapping in sandbox.config.portMappings
+            where mapping.hostPort > 0 && mapping.protocol != .sctp {
+                let host = mapping.hostIp.isEmpty ? "*" : mapping.hostIp
+                let proto = mapping.protocol == .udp ? "udp" : "tcp"
+                lines.append("\(host) \(mapping.hostPort) \(proto) \(sandbox.ip)")
+            }
+        }
+        return lines.sorted().joined(separator: "\n") + "\n"
+    }
 
     // MARK: - GPU
 
@@ -833,6 +992,12 @@ actor PodRuntime {
         if let bundle = config.nftBundlePath, FileManager.default.fileExists(atPath: bundle) {
             collected.append(.share(source: bundle, destination: "/.ferry", options: ["ro"]))
         }
+        // And the CNI plugins that need a kernel, at the path CNI has always
+        // used for them. Nothing about them is ferry-specific: they are
+        // upstream binaries, in the upstream location, run by a real runtime.
+        if let plugins = config.cniGuestPlugins, FileManager.default.fileExists(atPath: plugins) {
+            collected.append(.share(source: plugins, destination: CNIRuntime.guestPluginPath, options: ["ro"]))
+        }
 
         // Immutable so it can cross into the configuration closure.
         let shares = collected
@@ -966,6 +1131,23 @@ actor PodRuntime {
                 await self?.applyNftables(sandboxID: sandboxID, text: policy, label: "policy")
             }
         }
+        // And the rest of the pod's CNI chain, which needed a booted kernel.
+        // Detached for the same reason the rules are: it dials back into this
+        // process's own exec socket, and holding the actor across that would
+        // wait on a reply only this actor can send.
+        if sandboxes[sandboxID]?.cniChainDone != true {
+            sandboxes[sandboxID]?.cniChainDone = true
+            // The pod can serve its hostPorts now, so tell the host edge.
+            publishHostPorts()
+            Task { [weak self] in
+                do {
+                    try await self?.runGuestChain(.add, sandboxID: sandboxID)
+                } catch {
+                    FileHandle.standardError.write(
+                        "warning: the pod half of the CNI chain failed in \(sandboxID): \(error)\n".data(using: .utf8)!)
+                }
+            }
+        }
     }
 
     private func markStarted(_ id: String, pod: LinuxPod) {
@@ -1017,6 +1199,7 @@ actor PodRuntime {
         stdout: any Writer,
         stderr: any Writer,
         capabilities: Containerization.LinuxCapabilities? = nil,
+        environment: [String]? = nil,
         asRoot: Bool = false
     ) async throws -> LinuxProcess {
         guard let record = containers[containerID] else {
@@ -1040,6 +1223,7 @@ actor PodRuntime {
             // on stdout; sending stderr separately would interleave badly.
             config.stderr = tty ? nil : stderr
             if let capabilities { config.capabilities = capabilities }
+            if let environment { config.environmentVariables = environment }
             // nft has to be root inside the pod whatever the workload runs as.
             // A hardened pod -- non-root, every capability dropped -- cannot
             // lend NET_ADMIN to anything, so an exec that inherits its user

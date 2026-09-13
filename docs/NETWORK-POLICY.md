@@ -23,8 +23,16 @@ AFTER REMOVING THE POLICY
 
 A NetworkPolicy is per pod: *this* pod accepts from *those* pods, on these
 ports. On an ordinary cluster a CNI plugin enforces that somewhere in the host's
-kernel. ferry has no CNI, and the Mac is not on the pod network at all -- so
-there is nowhere on the host it could be done.
+kernel. The Mac is not on the pod network at all, so there is nowhere on the
+host it could be done.
+
+> An earlier version of this page said "ferry has no CNI". That is no longer
+> true: ferry runs real CNI plugins, on the Mac and inside pods, through
+> `ferry-cni`. It does not change the argument below -- the plugin that would
+> enforce policy is a Linux one, and where it runs is the pod's own kernel,
+> which is exactly where ferry already puts these rules. `firewall` is a second
+> path worth comparing against what ferry-netpol compiles today. See
+> [experiments/11-cni-on-macos](../experiments/11-cni-on-macos/FINDINGS.md).
 
 There does not need to be. Every ferry pod is a virtual machine with its own
 Linux kernel, and ferry already loads nftables rules into those kernels: that is
