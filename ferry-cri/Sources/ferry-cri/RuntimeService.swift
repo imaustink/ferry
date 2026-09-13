@@ -265,16 +265,79 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     // MARK: Statistics
     //
-    // Empty rather than invented. The kubelet tolerates absent container stats
-    // and sources node-level numbers from cadvisor; fabricated figures would
-    // feed the eviction manager lies.
-
+    // Real numbers now, from the cgroups inside each pod's VM. The kubelet
+    // tolerates an empty answer here and metrics-server does not, so an empty
+    // one meant `kubectl top` and every autoscaler stayed broken.
     func containerStats(request: Runtime_V1_ContainerStatsRequest, context: ServerContext) async throws -> Runtime_V1_ContainerStatsResponse {
-        Runtime_V1_ContainerStatsResponse()
+        var response = Runtime_V1_ContainerStatsResponse()
+        let measured = await runtime.containerStatistics(ids: [request.containerID])
+        if let first = measured.first, let stats = await containerStats(for: first.id, from: first.stats) {
+            response.stats = stats
+        }
+        return response
     }
+
     func listContainerStats(request: Runtime_V1_ListContainerStatsRequest, context: ServerContext) async throws -> Runtime_V1_ListContainerStatsResponse {
-        Runtime_V1_ListContainerStatsResponse()
+        var response = Runtime_V1_ListContainerStatsResponse()
+        var wanted = await runtime.runningContainerIDs()
+        if !request.filter.id.isEmpty { wanted = wanted.filter { $0 == request.filter.id } }
+        for entry in await runtime.containerStatistics(ids: wanted) {
+            if let stats = await containerStats(for: entry.id, from: entry.stats) {
+                response.stats.append(stats)
+            }
+        }
+        return response
     }
+
+    /// Translates the framework's numbers into CRI's shape.
+    private func containerStats(for id: String,
+                                from statistics: ContainerStatistics) async -> Runtime_V1_ContainerStats? {
+        guard let record = try? await runtime.container(id) else { return nil }
+
+        var attributes = Runtime_V1_ContainerAttributes()
+        attributes.id = id
+        var metadata = Runtime_V1_ContainerMetadata()
+        metadata.name = record.name
+        metadata.attempt = record.attempt
+        attributes.metadata = metadata
+        attributes.labels = record.labels
+        attributes.annotations = record.annotations
+
+        var stats = Runtime_V1_ContainerStats()
+        stats.attributes = attributes
+
+        let now = Self.now()
+        if let cpu = statistics.cpu {
+            var usage = Runtime_V1_CpuUsage()
+            usage.timestamp = now
+            var nanos = Runtime_V1_UInt64Value()
+            // cgroup v2 counts microseconds; CRI wants nanoseconds.
+            nanos.value = cpu.usageUsec * 1000
+            usage.usageCoreNanoSeconds = nanos
+            stats.cpu = usage
+        }
+        if let memory = statistics.memory {
+            var usage = Runtime_V1_MemoryUsage()
+            usage.timestamp = now
+            var working = Runtime_V1_UInt64Value()
+            // Working set is usage minus what the kernel can reclaim, which is
+            // the number the kubelet evicts on and `kubectl top` shows.
+            working.value = memory.usageBytes > memory.cacheBytes
+                ? memory.usageBytes - memory.cacheBytes : memory.usageBytes
+            usage.workingSetBytes = working
+            var used = Runtime_V1_UInt64Value(); used.value = memory.usageBytes
+            usage.usageBytes = used
+            var rss = Runtime_V1_UInt64Value(); rss.value = working.value
+            usage.rssBytes = rss
+            stats.memory = usage
+        }
+        return stats
+    }
+
+    private static func now() -> Int64 { Int64(Date().timeIntervalSince1970 * 1_000_000_000) }
+
+    // Per-sandbox rollups are still empty: the kubelet does not require them and
+    // metrics-server reads the per-container numbers above.
     func podSandboxStats(request: Runtime_V1_PodSandboxStatsRequest, context: ServerContext) async throws -> Runtime_V1_PodSandboxStatsResponse {
         Runtime_V1_PodSandboxStatsResponse()
     }

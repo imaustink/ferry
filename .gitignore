@@ -5,3 +5,4 @@ experiments/03-vm-ceiling/assets/vmlinux-arm64
 kernel/.build/
 kernel/vmlinux-arm64
 guest/nft/
+ferry-proxy/ferry-proxy

@@ -108,7 +108,12 @@ start kube-apiserver "$bin/kube-apiserver" \
   `# A node on another Mac has no credentials yet, so it authenticates with a` \
   `# bootstrap token to ask for a certificate. Without this the token is not a` \
   `# credential at all and the join fails as Unauthorized.` \
-  --enable-bootstrap-token-auth=true
+  --enable-bootstrap-token-auth=true \
+  `# An aggregated API -- metrics.k8s.io and anything else served by a pod -- is` \
+  `# answered by that pod, and the API server has to reach it to ask. Routing to` \
+  `# the endpoint rather than the Service means it dials a pod address, which is` \
+  `# on this node's vmnet subnet and so reachable from the Mac.` \
+  --enable-aggregator-routing=true
 
 echo "    . waiting for /livez"
 for i in $(seq 1 60); do

@@ -14,7 +14,10 @@ package main
 // is the better end state; see docs/SERVICES.md.
 
 import (
+	"errors"
+
 	"io"
+	corev1 "k8s.io/api/core/v1"
 	"net"
 	"strconv"
 	"sync"
@@ -26,6 +29,10 @@ import (
 type backend struct {
 	address string
 }
+
+var errNoBackends = errors.New("no ready endpoints")
+
+func itoa(port int32) string { return strconv.Itoa(int(port)) }
 
 // serviceProxy listens on one address and port and forwards to a Service's
 // ready endpoints. The address is a ClusterIP, a node port on every interface,
@@ -41,15 +48,23 @@ type serviceProxy struct {
 	closeOnce sync.Once
 }
 
-func newServiceProxy(key, address string, port int32) (*serviceProxy, error) {
+// newServiceProxy listens for a Service. TCP gets a listener and a goroutine per
+// connection; UDP gets neither, because there are no connections -- the caller
+// builds a udpProxy around this one for its backend list and picks.
+func newServiceProxy(key, address string, port int32, protocol corev1.Protocol) (*serviceProxy, error) {
 	listen := net.JoinHostPort(address, strconv.Itoa(int(port)))
+	p := &serviceProxy{key: key, listen: listen}
+	empty := []backend{}
+	p.backends.Store(&empty)
+
+	if protocol == corev1.ProtocolUDP {
+		return p, nil
+	}
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	p := &serviceProxy{key: key, listen: listen, listener: listener}
-	empty := []backend{}
-	p.backends.Store(&empty)
+	p.listener = listener
 	go p.serve()
 	return p, nil
 }
@@ -102,5 +117,8 @@ func (p *serviceProxy) handle(client net.Conn) {
 }
 
 func (p *serviceProxy) close() {
+	if p.listener == nil {
+		return
+	}
 	p.closeOnce.Do(func() { p.listener.Close() })
 }
