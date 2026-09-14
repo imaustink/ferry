@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -18,6 +19,38 @@ type compiler struct {
 	policies    networkinglisters.NetworkPolicyLister
 	pods        corelisters.PodLister
 	namespaces  corelisters.NamespaceLister
+	nodes       corelisters.NodeLister
+}
+
+// nodeAddresses is every Mac's own address on the pod network.
+//
+// A node sits on the pod network at the first address of the slice it hands to
+// its pods: a node whose podCIDR is 10.244.1.0/24 is 10.244.1.1. That address is
+// what a health probe and a forwarded node port arrive from, and it is inside
+// the cluster CIDR, so it cannot be told apart from pod traffic by prefix alone.
+// It is listed here instead.
+func (c *compiler) nodeAddresses() []string {
+	nodes, err := c.nodes.List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, node := range nodes {
+		cidr := node.Spec.PodCIDR
+		if cidr == "" {
+			continue
+		}
+		ip, network, err := net.ParseCIDR(cidr)
+		if err != nil || ip.To4() == nil {
+			continue
+		}
+		gateway := make(net.IP, len(network.IP.To4()))
+		copy(gateway, network.IP.To4())
+		gateway[3]++
+		out = append(out, gateway.String())
+	}
+	sort.Strings(out)
+	return out
 }
 
 // render produces one section per pod, which ferry-cri splits up and applies to
@@ -105,17 +138,34 @@ func (c *compiler) rulesFor(pod *corev1.Pod, all []*networkingv1.NetworkPolicy) 
 // writeIngressGuards exempts two things from an ingress policy.
 //
 // Return traffic, because a policy describes who may start a conversation, not
-// who may answer. And anything arriving on eth0 rather than the cluster network:
-// that is the Mac itself -- the kubelet's health probes, and connections
-// forwarded in from a node port. Dropping those does not isolate the pod, it
-// takes it down, because a failed probe restarts the container.
+// who may answer. And the node itself -- the kubelet's health probes, and
+// connections forwarded in from a node port. Dropping those does not isolate the
+// pod, it takes it down, because a failed probe restarts the container.
 //
-// This is a deliberate difference from the API, which does not exempt the node.
-// It is the same bargain most CNI plugins strike, and it is written down in
-// docs/NETWORK-POLICY.md rather than left to be discovered.
+// Exempting the node is a deliberate difference from the API, the same bargain
+// most CNI plugins strike, and it is written down in docs/NETWORK-POLICY.md
+// rather than left to be discovered.
+//
+// It used to be written as "anything that did not arrive on eth1", on the
+// reasoning that eth1 is the cluster switch and eth0 is the Mac. That is true of
+// where the Mac's traffic comes from and false of where pod traffic does: two
+// pods on the *same* node reach each other over eth0, on the kernel datapath,
+// because each node's slice is a route the guest resolves directly. So the guard
+// exempted every same-node conversation, and a deny-all policy isolated a pod
+// from the rest of the cluster while leaving it open to its neighbours -- the
+// half that is easiest to reach and least likely to be tested.
+//
+// Matching on the source address instead says what was meant. Anything from
+// outside the pod network is not a pod, and anything from a node's own address
+// on that network is the Mac. Everything else is a pod and is policed, whichever
+// interface carried it.
 func (c *compiler) writeIngressGuards(b *strings.Builder) {
 	b.WriteString("add rule ip ferry-netpol input ct state established,related accept\n")
-	b.WriteString("add rule ip ferry-netpol input iifname != \"eth1\" accept\n")
+	fmt.Fprintf(b, "add rule ip ferry-netpol input ip saddr != %s accept\n", c.clusterCIDR)
+	if nodes := c.nodeAddresses(); len(nodes) > 0 {
+		fmt.Fprintf(b, "add rule ip ferry-netpol input ip saddr { %s } accept\n",
+			strings.Join(nodes, ", "))
+	}
 }
 
 // writeEgressGuards exempts only return traffic.

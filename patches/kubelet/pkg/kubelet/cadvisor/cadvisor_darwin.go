@@ -23,6 +23,32 @@ limitations under the License.
 // source container stats from the CRI instead.
 package cadvisor
 
+/*
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+
+// ferry_cpu_ticks reads the machine's cumulative CPU time.
+//
+// macOS publishes no sysctl for this -- there is no kern.cp_time here as there
+// is on the BSDs, and no /proc/stat as there is on Linux -- so the host port is
+// the only way to ask. The counters are in ticks of 1/CLK_TCK of a second,
+// summed across every core, and they only ever go up, which is what a cumulative
+// usage metric needs.
+static int ferry_cpu_ticks(unsigned long long *out) {
+	host_cpu_load_info_data_t info;
+	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+	if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
+	                    (host_info_t)&info, &count) != KERN_SUCCESS) {
+		return -1;
+	}
+	out[0] = info.cpu_ticks[CPU_STATE_USER];
+	out[1] = info.cpu_ticks[CPU_STATE_SYSTEM];
+	out[2] = info.cpu_ticks[CPU_STATE_NICE];
+	return 0;
+}
+*/
+import "C"
+
 import (
 	"context"
 	"fmt"
@@ -78,7 +104,9 @@ func (c *cadvisorDarwin) ContainerInfoV2(name string, options cadvisorapiv2.Requ
 			},
 			Stats: []*cadvisorapiv2.ContainerStats{{
 				Timestamp: now,
-				Cpu:       &cadvisorapi.CpuStats{},
+				Cpu: &cadvisorapi.CpuStats{
+					Usage: cadvisorapi.CpuUsage{Total: machineCPUNanoseconds()},
+				},
 				Memory: &cadvisorapi.MemoryStats{
 					Usage:      used,
 					WorkingSet: used,
@@ -87,6 +115,29 @@ func (c *cadvisorDarwin) ContainerInfoV2(name string, options cadvisorapiv2.Requ
 			}},
 		},
 	}, nil
+}
+
+// machineCPUNanoseconds reports how much CPU time this Mac has spent since boot.
+//
+// The kubelet turns the root "cgroup"'s cumulative CPU into the node's
+// node_cpu_usage_seconds_total, which is what metrics-server rates to answer
+// `kubectl top nodes`. Leaving it at zero did not simply lose a number:
+// metrics-server discards a node sample whose cumulative CPU is zero, so the
+// node vanished from the metrics API entirely and `kubectl top nodes` failed
+// with "metrics not available yet" while `kubectl top pods` worked.
+//
+// Idle time is deliberately not counted -- this is time spent, not time
+// available. A failed read yields zero, which puts the node back in the state
+// this function exists to fix, and is still better than a wrong number.
+func machineCPUNanoseconds() uint64 {
+	var ticks [3]C.ulonglong
+	if C.ferry_cpu_ticks(&ticks[0]) != 0 {
+		return 0
+	}
+	// CLK_TCK is 100 on Darwin and is not exposed as a sysctl; the constant is
+	// part of the platform's ABI rather than a property of this machine.
+	const nanosecondsPerTick = uint64(time.Second) / 100
+	return (uint64(ticks[0]) + uint64(ticks[1]) + uint64(ticks[2])) * nanosecondsPerTick
 }
 
 // freeMemoryBytes reports memory macOS considers immediately available. A

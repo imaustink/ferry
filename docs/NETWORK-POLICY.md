@@ -69,14 +69,26 @@ conversation, not who may answer.
 
 **Ingress policies do not filter traffic from the Mac itself.**
 
-Traffic arriving on a pod's `eth0` -- the vmnet interface -- is the node: the
-kubelet's health probes, and connections forwarded in from a node port. The API
-does not exempt those. ferry does, because dropping a probe does not isolate a
-pod, it takes it down: a failed probe restarts the container, and the result
-looks like a crash loop rather than a policy.
+A node reaches its pods from its own address on the pod network -- the first
+address of the slice it hands out, so `10.244.1.1` for a node whose podCIDR is
+`10.244.1.0/24`. That is where the kubelet's health probes come from, and where
+connections forwarded in from a node port come from. The API does not exempt
+those. ferry does, because dropping a probe does not isolate a pod, it takes it
+down: a failed probe restarts the container, and the result looks like a crash
+loop rather than a policy.
 
 Most CNI plugins strike the same bargain. It is written here so it is a decision
 rather than a surprise.
+
+This exemption used to be written as "anything that did not arrive on `eth1`",
+`eth1` being the cluster switch and `eth0` the vmnet interface the Mac is on.
+That described where the node's traffic comes from correctly and where pod
+traffic comes from wrongly: two pods on the **same node** reach each other over
+`eth0` as well, because each node's slice is a route their kernels resolve
+directly. The exemption therefore covered every same-node conversation, and a
+`deny-all` policy isolated a pod from the rest of the cluster while leaving it
+open to the neighbours most likely to be talking to it. Matching on the source
+address instead says what was meant.
 
 **Egress policies have no such exemption**, and restrict everything the pod
 starts, including traffic to the internet -- which is what the API asks for. It
@@ -88,7 +100,9 @@ is correct.
 
 - **TCP, UDP and SCTP ports are rendered**, but only TCP has been tested.
 - **`endPort` ranges are not implemented.**
-- **Cross-machine enforcement is untested.** It should hold -- rules are applied
-  at the destination pod, and peer addresses are cluster-wide -- but it has only
-  been exercised on one Mac.
+- **Cross-machine enforcement works**, and so does same-machine. Both were
+  measured on a two-node cluster: with a `deny-all` in place a pod refuses its
+  neighbour on the same Mac and a pod on the other Mac, and with an
+  `ingress.from.podSelector` it accepts the peer that policy names -- same node
+  or not -- and refuses the rest.
 - Policy changes reach a pod in a couple of seconds, not instantly.

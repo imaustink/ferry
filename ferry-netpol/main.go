@@ -69,6 +69,7 @@ func main() {
 	compiler.policies = factory.Networking().V1().NetworkPolicies().Lister()
 	compiler.pods = factory.Core().V1().Pods().Lister()
 	compiler.namespaces = factory.Core().V1().Namespaces().Lister()
+	compiler.nodes = factory.Core().V1().Nodes().Lister()
 
 	rebuild := func() { server.publish(compiler.render()) }
 	handler := cache.ResourceEventHandlerFuncs{
@@ -79,6 +80,9 @@ func main() {
 	factory.Networking().V1().NetworkPolicies().Informer().AddEventHandler(handler)
 	factory.Core().V1().Pods().Informer().AddEventHandler(handler)
 	factory.Core().V1().Namespaces().Informer().AddEventHandler(handler)
+	// Nodes matter because a node's own address on the pod network is exempt
+	// from ingress policy, and that address comes from its podCIDR.
+	factory.Core().V1().Nodes().Informer().AddEventHandler(handler)
 
 	factory.Start(ctx.Done())
 	factory.WaitForCacheSync(ctx.Done())
