@@ -193,6 +193,63 @@ Environment:
 EOF
 }
 
+# Binaries the kernel will refuse to run.
+#
+# Copying a file over one that is currently executing leaves the copy
+# permanently unrunnable. macOS kills it at launch with SIGKILL, and it stays
+# that way after whatever was running has exited -- the inode was rewritten
+# while it was mapped, and nothing un-rewrites it. Removing the file and copying
+# again fixes it, which is why every build script here does exactly that.
+#
+# It is worth a check because of how it presents: a bare "Killed: 9" against a
+# binary that worked ten minutes ago, with nothing anywhere saying "signature".
+# `codesign --verify` does not help -- it passes, because the signature is
+# structurally valid; what is wrong is not the signature but the pages behind it.
+#
+# So the only thing that finds it is running them. Each gets the cheapest
+# argument that makes it exit on its own: a version, a usage message, or a
+# refusal to start. All of them return in well under a tenth of a second, and
+# none of them touch the cluster's state.
+ferry_probe_args() {
+  case "$1" in
+    etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kubelet) echo "--version" ;;
+    etcdctl) echo "version" ;;
+    # A CNI plugin and two daemons that have no --version: give each something
+    # it will decline, rather than something it will act on.
+    ferry-cri) echo "--kernel /nonexistent" ;;
+    ferry-gpud) echo "--control /dev/null/no --socket-dir /dev/null/no" ;;
+    *) echo "--help" ;;
+  esac
+}
+
+check_binaries_run() {
+  local broken=() checked=0 name args
+  for name in "$@"; do
+    [ -x "$here/bin/$name" ] || continue
+    checked=$(( checked + 1 ))
+    args="$(ferry_probe_args "$name")"
+    # Grouped with stderr redirected because the shell announces a killed child
+    # itself -- "Killed: 9" straight to the terminal, which is the very message
+    # this check exists to replace with something that explains it.
+    # shellcheck disable=SC2086
+    { timeout 5 "$here/bin/$name" $args >/dev/null 2>&1; } 2>/dev/null
+    # 137 is 128 + SIGKILL. Every other outcome, including a non-zero exit or
+    # the timeout, means the binary got far enough to be running its own code.
+    [ "$?" -eq 137 ] && broken+=("$name")
+  done
+
+  # Nothing built yet is not a finding; 'ferry build' is already the next step.
+  [ "$checked" -eq 0 ] && return 0
+  if [ "${#broken[@]}" -eq 0 ]; then
+    ok "$checked binaries run (none killed on launch)"
+    return 0
+  fi
+  bad "killed on launch: ${broken[*]}"
+  warn "a binary copied over one that was running stays unrunnable, and"
+  echo "      codesign says it is fine. Rebuild to replace it: ferry build"
+  return 1
+}
+
 cmd_doctor() {
   bold "ferry doctor"
   local fatal=0
@@ -223,6 +280,13 @@ cmd_doctor() {
 
   if command -v kubectl >/dev/null; then ok "kubectl present"
   else warn "kubectl not found; you will want it to talk to the cluster"; fi
+
+  # Only worth saying anything about once something has been built.
+  if [ -d "$here/bin" ]; then
+    check_binaries_run etcd etcdctl kube-apiserver kube-controller-manager \
+      kube-scheduler kubelet ferry-cri ferry-gpud ferry-cni ferry-streamer \
+      ferry-proxyd ferry-netpol ferry-storage ferry-proxy || fatal=1
+  fi
 
   # A pod is a VM, and every other VM on the Mac takes one of ferry's 128 slots.
   local vms; vms="$(count_vms)"
