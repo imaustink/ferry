@@ -88,11 +88,19 @@ of which is `kubectl exec` starting a process in a VM.
 
 ## Known limits
 
-- **SCTP works between pods and cannot reach the node edge.** A ClusterIP SCTP
+- **SCTP works between pods and does not reach the node edge.** A ClusterIP SCTP
   Service carries traffic, same node or across machines. A NodePort or
-  LoadBalancer one cannot: a node port is a listener on macOS, and macOS has no
-  SCTP sockets to listen with. `ferry-proxy` records that on the Service as an
-  `SCTPNotExposed` event rather than leaving the port quietly unserved.
+  LoadBalancer one does not: a node port is a listener on macOS, and macOS ships
+  no SCTP stack to listen with -- `socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)`
+  returns `EPROTONOSUPPORT`, because nothing is registered to handle the
+  protocol. `ferry-proxy` records that on the Service as an `SCTPNotExposed`
+  event rather than leaving the port quietly unserved.
+
+  Not the same as impossible. The protocol number is defined and a *raw* socket
+  for it fails on privilege rather than protocol, so a userspace stack such as
+  usrsctp, running as root, might serve the node edge. What stands in the way is
+  probably that a kernel with no handler for SCTP answers it with ICMP protocol
+  unreachable. Measured and written up in issue #38 rather than guessed at here.
 
   Pod-to-pod SCTP needs one thing that TCP and UDP do not, and it is worth
   knowing why. Two pods on the same Mac normally reach each other over `eth0`,

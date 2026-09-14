@@ -260,9 +260,9 @@ func (c *controller) reconcile() {
 				klog.InfoS("SCTP is not served on the node edge; the ClusterIP still works",
 					"service", name, "port", port.Port, "type", service.Spec.Type)
 				warnOnService(context.Background(), c.client, service, "SCTPNotExposed",
-					fmt.Sprintf("ferry cannot expose SCTP port %d as %s: macOS has no SCTP "+
-						"sockets, so the Mac cannot listen for it. Pod-to-pod SCTP works, "+
-						"including through this Service's ClusterIP.",
+					fmt.Sprintf("ferry cannot expose SCTP port %d as %s: macOS ships no "+
+						"SCTP stack, so the Mac cannot listen for it. Pod-to-pod SCTP "+
+						"works, including through this Service's ClusterIP.",
 						port.Port, service.Spec.Type))
 			}
 		}
