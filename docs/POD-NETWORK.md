@@ -44,6 +44,33 @@ pod is reachable from the host at its real address.
 Three workarounds went away with it: the probe-address patch, ferry-proxy's
 address translation, and the map `ferry-cri` published for them to read.
 
+### What happens when vmnet will not give up the slice
+
+The design depends on getting one particular subnet, and vmnet does not always
+grant it. A network stays reserved for a while after the process using it stops,
+and only 32 exist across the whole Mac, so a few restarts in a row can leave the
+slice unavailable for longer than it takes to get annoyed about.
+
+Falling back to another subnet is harmless while this Mac is the whole cluster:
+the gateway changes, CoreDNS rolls out again, nothing else notices. With another
+node in the cluster it is not a fallback, it is a partition. The other Macs route
+`10.244.<node>.0/24` over the switch, this node keeps advertising that slice as
+its `podCIDR`, and its pods are on some other network entirely -- so nothing
+reaches them, TCP included, while every node still reports `Ready`.
+
+So the two cases are treated differently:
+
+- **No other nodes:** fall back at once, and say the pods are off the pod network
+  and another Mac cannot join until this one starts on its slice.
+- **Other nodes:** wait 90 seconds for the slice, then refuse to start. A node
+  that cannot hold its slice has nothing to offer a cluster it cannot talk to.
+  `FERRY_ALLOW_OFF_SLICE=1` overrides this and starts anyway, with a warning,
+  because vmnet can stay exhausted longer than its documentation suggests.
+
+Whether this node has peers is read from `$FERRY_HOME/peers`, which is why that
+file lives with the cluster's state rather than in the run directory -- the
+question is asked before there is an API server to ask instead.
+
 ## What each interface is for
 
 | | eth0 (vmnet) | eth1 (switch) |

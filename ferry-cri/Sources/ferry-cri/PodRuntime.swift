@@ -214,18 +214,96 @@ actor PodRuntime {
         let preferredSubnet = config.clusterCIDR
             .flatMap { Self.nodeSlice(of: $0, node: config.nodeIndex) } ?? config.podSubnet
 
+        // Moving to another subnet is only harmless while this Mac is the whole
+        // cluster. With another node in it, the fallback is not a changed gateway
+        // -- it is the wrong network. The other Macs route this node's slice over
+        // the switch, the node goes on advertising that slice as its podCIDR, and
+        // the pods are somewhere else entirely, so nothing reaches them and every
+        // node still reads Ready. TCP breaks along with everything else, which is
+        // not a thing anyone would look for in a subnet allocator.
+        //
+        // So the cost of waiting is paid where it buys something. Alone, fall back
+        // at once and say what it means. With peers, wait for the reservation to
+        // lapse, and if it never does, refuse -- a node that cannot hold its own
+        // slice has nothing useful to offer a cluster it cannot talk to.
+        // The override exists because "refuse" is the right default and a bad
+        // absolute: vmnet can stay exhausted well past the minute it documents,
+        // and someone who understands this node will be cut off is better served
+        // by a cluster that starts than by one that cannot.
+        let allowOffSlice = ProcessInfo.processInfo.environment["FERRY_ALLOW_OFF_SLICE"] == "1"
+        let peers = allowOffSlice ? [] : Self.otherPeers(config: config)
         var chosen: VmnetNetwork?
         var lastError: Error?
-        for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
-            do {
-                chosen = try VmnetNetwork(subnet: try CIDRv4(candidate))
-                if candidate != preferredSubnet {
-                    print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
+
+        if !peers.isEmpty {
+            let deadline = Date().addingTimeInterval(Self.sliceWaitSeconds)
+            var announced = false
+            while true {
+                do {
+                    chosen = try VmnetNetwork(subnet: try CIDRv4(preferredSubnet))
+                    lastError = nil
+                    break
+                } catch {
+                    lastError = error
                 }
-                lastError = nil
-                break
-            } catch {
-                lastError = error
+                if Date() >= deadline { break }
+                if !announced {
+                    announced = true
+                    let others = peers.count == 1
+                        ? "1 other node routes to it"
+                        : "\(peers.count) other nodes route to it"
+                    print("    waiting for \(preferredSubnet); it is this node's slice and \(others)")
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
+            guard let held = chosen else {
+                // Built by concatenation rather than as one multiline literal:
+                // this goes straight to a terminal, and the indentation of a
+                // literal nested this deep ends up in the output.
+                let message = [
+                    "this node's slice of the pod network, \(preferredSubnet), is not available",
+                    "from vmnet after \(Int(Self.sliceWaitSeconds)) seconds, and this cluster has",
+                    "other nodes that route to it: \(peers.joined(separator: ", ")).",
+                    "",
+                    "Starting on another subnet would put this node's pods off the pod network",
+                    "while the node kept advertising \(preferredSubnet). Nothing would reach",
+                    "them, and every node would still report Ready. Refusing instead.",
+                    "",
+                    "vmnet holds a subnet for a while after the process using it stops, and",
+                    "allows 32 across the whole Mac, so this often clears on its own -- wait",
+                    "and try again. If it does not, something else is holding it: look for",
+                    "other VMs, and for another ferry running from a different checkout.",
+                    "",
+                    "To start anyway, knowing this node will not reach the others:",
+                    "  FERRY_ALLOW_OFF_SLICE=1 ferry up",
+                ].joined(separator: "\n")
+                throw RuntimeFailure.unsupported(message)
+            }
+            chosen = held
+        } else {
+            for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
+                do {
+                    chosen = try VmnetNetwork(subnet: try CIDRv4(candidate))
+                    if candidate != preferredSubnet {
+                        print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
+                        if config.clusterCIDR != nil {
+                            let others = Self.otherPeers(config: config)
+                            if others.isEmpty {
+                                print("    note: these pods are outside the pod network, so another "
+                                    + "Mac cannot join this cluster until it starts on \(preferredSubnet)")
+                            } else {
+                                print("    WARNING: starting off-slice with other nodes in this "
+                                    + "cluster (\(others.joined(separator: ", ")))")
+                                print("    Nothing on another Mac will reach these pods, and every "
+                                    + "node will still report Ready.")
+                            }
+                        }
+                    }
+                    lastError = nil
+                    break
+                } catch {
+                    lastError = error
+                }
             }
         }
         guard let chosen else {
@@ -322,6 +400,32 @@ actor PodRuntime {
 
     var gateway: String { "\(network.ipv4Gateway)" }
     var subnet: String { "\(network.subnet)" }
+
+    /// How long to wait for this node's slice before giving up on it, when there
+    /// are peers that would be cut off by starting anywhere else. vmnet holds a
+    /// subnet for about a minute after the process using it stops, so this is
+    /// that plus enough margin to cover a slow release.
+    static let sliceWaitSeconds: TimeInterval = 90
+
+    /// The other Macs in this cluster, as relay endpoints.
+    ///
+    /// Read from the peers file as well as the flag, because the file is what
+    /// ferry-streamer maintains from the node list and survives a restart -- at
+    /// the moment this runs nothing has talked to the API server yet, so a file
+    /// written by the previous run is the only evidence a second node exists.
+    /// This node's own endpoint is not a peer.
+    static func otherPeers(config: RuntimeConfig) -> [String] {
+        var found = Set(config.peers)
+        if let path = config.peersFile,
+           let text = try? String(contentsOfFile: path, encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                found.insert(line.trimmingCharacters(in: CharacterSet.whitespaces))
+            }
+        }
+        found.remove("")
+        if let mine = config.relayEndpoint { found.remove(mine) }
+        return found.sorted()
+    }
 
     /// This node's slice of the cluster network, as vmnet wants it: the gateway
     /// address and a prefix. Node 3 of 10.244.0.0/16 is 10.244.3.1/24.

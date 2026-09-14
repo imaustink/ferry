@@ -130,7 +130,12 @@ fi
 NODE_INDEX="${FERRY_NODE_INDEX:-0}"
 RELAY_PORT="${FERRY_RELAY_PORT:-$(( 8472 + PORT_SHIFT ))}"
 PEERS="${FERRY_PEERS:-}"
-PEERS_FILE="$FERRY_RUN/peers"
+# Kept in FERRY_HOME rather than FERRY_RUN because it has to outlive a restart.
+# ferry-cri reads it before the API server exists, to find out whether this
+# cluster has other Macs in it -- which decides whether starting on a subnet
+# other than this node's slice is a harmless fallback or a silent partition.
+# A run directory under /tmp cannot answer that question after 'ferry down'.
+PEERS_FILE="$FERRY_HOME/peers"
 # Advertised to the other nodes, so it must be the address they can reach. The
 # LAN address works for a node on this Mac and for a node on another.
 lan_address() { ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en7 2>/dev/null || echo 127.0.0.1; }
@@ -187,6 +192,10 @@ Environment:
   FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
+  FERRY_ALLOW_OFF_SLICE  1 to start even when vmnet will not give this node its
+                         slice of the pod network. Other nodes will not reach
+                         these pods; without it ferry refuses rather than
+                         partition a multi-node cluster silently
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
   K8S_VERSION            kubernetes to build, default v1.34.0 (same as
                          'ferry build --kubernetes-version')
@@ -433,7 +442,19 @@ cmd_up() {
     running ferry-cri || break
     sleep 1
   done
-  [ -n "$ready" ] || { bad "runtime failed to start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
+  # Show the whole failure, not the last five lines of it. ferry-cri explains
+  # some of these at length -- a refused pod subnet takes a paragraph to say
+  # properly -- and a truncated explanation is worse than none.
+  if [ -z "$ready" ]; then
+    bad "runtime failed to start"
+    local log="$FERRY_RUN/logs/ferry-cri.log"
+    if grep -q '^failed to prepare runtime' "$log" 2>/dev/null; then
+      sed -n '/^failed to prepare runtime/,$p' "$log" | sed 's/^/    /'
+    else
+      tail -5 "$log" | sed 's/^/    /'
+    fi
+    return 1
+  fi
   ok "runtime on $(grep -oE 'network .*' "$FERRY_RUN/logs/ferry-cri.log" | tail -1)"
 
   # The API server must advertise the gateway of the subnet the runtime actually
@@ -1453,7 +1474,10 @@ cmd_down() {
   withdraw_gpu
 
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK" "$PEERS_FILE"
+  # The peers file is deliberately not removed: it is what tells the next
+  # 'ferry up' that this cluster has other nodes, before there is an API server
+  # to ask. 'ferry node rm' and a fresh join rewrite it.
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK"
 }
 
 cmd_status() {
