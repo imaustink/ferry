@@ -92,6 +92,17 @@ func (c *cadvisorDarwin) ContainerInfoV2(name string, options cadvisorapiv2.Requ
 // freeMemoryBytes reports memory macOS considers immediately available. A
 // failed read yields zero, which makes the node look fully used -- the
 // conservative direction for an eviction decision.
+//
+// Free pages alone are not that number. macOS deliberately keeps very few of
+// them and holds everything else as cache, so a machine with gigabytes to spare
+// reports a few hundred megabytes free and the kubelet taints the node
+// MemoryPressure with nothing actually wrong. That is what Linux's MemAvailable
+// exists to avoid.
+//
+// Purgeable, reusable and speculative pages are the ones the kernel can take
+// back without writing anything out, so they are counted too. Inactive pages
+// are also usually reclaimable and are deliberately left out: macOS exposes no
+// sysctl for them, and a lower bound is the right kind of wrong here.
 func freeMemoryBytes() uint64 {
 	pageSize, err := unix.SysctlUint32("hw.pagesize")
 	if err != nil || pageSize == 0 {
@@ -101,7 +112,18 @@ func freeMemoryBytes() uint64 {
 	if err != nil {
 		return 0
 	}
-	return uint64(freePages) * uint64(pageSize)
+	pages := uint64(freePages)
+	// Best effort: a counter this kernel does not publish just does not count.
+	for _, name := range []string{
+		"vm.page_purgeable_count",
+		"vm.page_reusable_count",
+		"vm.page_speculative_count",
+	} {
+		if reclaimable, err := unix.SysctlUint32(name); err == nil {
+			pages += uint64(reclaimable)
+		}
+	}
+	return pages * uint64(pageSize)
 }
 
 // bootTime reports when the machine came up, used as the root's creation time.

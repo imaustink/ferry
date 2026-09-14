@@ -34,6 +34,17 @@ if [ -z "$ADVERTISE" ]; then
   echo "no non-loopback address found; set ADVERTISE=" >&2; exit 1
 fi
 
+# Ports are the caller's to choose. ferry shifts them per profile so a second
+# checkout can run its own cluster without fighting this one for a socket.
+API_PORT="${API_PORT:-6443}"
+# The controller manager and scheduler serve their own health and metrics ports.
+# They are easy to forget, because nothing talks to them and a clash shows up
+# only as a component that will not start.
+CONTROLLER_PORT="${CONTROLLER_PORT:-10257}"
+SCHEDULER_PORT="${SCHEDULER_PORT:-10259}"
+ETCD_CLIENT_PORT="${ETCD_CLIENT_PORT:-2379}"
+ETCD_PEER_PORT="${ETCD_PEER_PORT:-2380}"
+
 mkdir -p "$STATE/logs" "$STATE/etcd"
 PKI_DIR="$PKI_DIR" NODE_NAME="$NODE_NAME" VMNET_GW="$POD_GATEWAY" "$here/pki.sh"
 "$here/fetch-binaries.sh" >/dev/null
@@ -45,7 +56,7 @@ kind: Config
 clusters:
 - name: ferry
   cluster:
-    server: https://127.0.0.1:6443
+    server: https://127.0.0.1:$API_PORT
     certificate-authority: $PKI_DIR/ca.crt
 contexts:
 - name: ferry
@@ -74,20 +85,20 @@ echo "==> starting control plane (advertise=$ADVERTISE)"
 
 start etcd "$bin/etcd" \
   --data-dir="$STATE/etcd" \
-  --listen-client-urls=http://127.0.0.1:2379 \
-  --advertise-client-urls=http://127.0.0.1:2379 \
-  --listen-peer-urls=http://127.0.0.1:2380 \
-  --initial-advertise-peer-urls=http://127.0.0.1:2380 \
-  --initial-cluster=default=http://127.0.0.1:2380
+  --listen-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
+  --advertise-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
+  --listen-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
+  --initial-advertise-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
+  --initial-cluster=default=http://127.0.0.1:$ETCD_PEER_PORT
 
 for i in $(seq 1 30); do
-  "$bin/etcdctl" --endpoints=127.0.0.1:2379 endpoint health >/dev/null 2>&1 && break
+  "$bin/etcdctl" --endpoints=127.0.0.1:$ETCD_CLIENT_PORT endpoint health >/dev/null 2>&1 && break
   sleep 1
 done
 
 start kube-apiserver "$bin/kube-apiserver" \
-  --etcd-servers=http://127.0.0.1:2379 \
-  --secure-port=6443 --bind-address=0.0.0.0 --advertise-address="$ADVERTISE" \
+  --etcd-servers=http://127.0.0.1:$ETCD_CLIENT_PORT \
+  --secure-port=$API_PORT --bind-address=0.0.0.0 --advertise-address="$ADVERTISE" \
   --service-cluster-ip-range="$SERVICE_CIDR" \
   --tls-cert-file="$PKI_DIR/apiserver.crt" --tls-private-key-file="$PKI_DIR/apiserver.key" \
   --client-ca-file="$PKI_DIR/ca.crt" \
@@ -108,7 +119,14 @@ start kube-apiserver "$bin/kube-apiserver" \
   `# A node on another Mac has no credentials yet, so it authenticates with a` \
   `# bootstrap token to ask for a certificate. Without this the token is not a` \
   `# credential at all and the join fails as Unauthorized.` \
-  --enable-bootstrap-token-auth=true
+  --enable-bootstrap-token-auth=true \
+  `# An aggregated API -- metrics.k8s.io and anything else served by a pod -- is` \
+  `# answered by that pod, and the API server has to reach it to ask. Routing to` \
+  `# the endpoint rather than the Service means it dials a pod address, which is` \
+  `# on this node's vmnet subnet and so reachable from the Mac.` \
+  --enable-aggregator-routing=true \
+  `# Node ports are bound on the Mac, so two profiles need separate ranges.` \
+  --service-node-port-range="${SERVICE_NODE_PORT_RANGE:-30000-32767}"
 
 echo "    . waiting for /livez"
 for i in $(seq 1 60); do
@@ -127,7 +145,7 @@ start kube-controller-manager "$bin/kube-controller-manager" \
   --cluster-signing-key-file="$PKI_DIR/ca.key" \
   --requestheader-client-ca-file="$PKI_DIR/front-proxy-ca.crt" \
   --use-service-account-credentials=true --leader-elect=false \
-  --bind-address=127.0.0.1 \
+  --bind-address=127.0.0.1 --secure-port=$CONTROLLER_PORT \
   --allocate-node-cidrs=true --cluster-cidr="$CLUSTER_CIDR" \
   --service-cluster-ip-range="$SERVICE_CIDR" \
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller'
@@ -137,7 +155,7 @@ start kube-scheduler "$bin/kube-scheduler" \
   --authentication-kubeconfig="$STATE/scheduler.conf" \
   --authorization-kubeconfig="$STATE/scheduler.conf" \
   --requestheader-client-ca-file="$PKI_DIR/front-proxy-ca.crt" \
-  --leader-elect=false --bind-address=127.0.0.1
+  --leader-elect=false --bind-address=127.0.0.1 --secure-port=$SCHEDULER_PORT
 
 export KUBECONFIG="$STATE/admin.conf"
 # /livez only reports that the process is serving. The RBAC and priority-class

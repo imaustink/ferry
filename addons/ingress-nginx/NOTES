@@ -1,0 +1,8 @@
+ingress-nginx is exposed as a LoadBalancer, which on ferry means the Mac's own
+address answers for it. Find it with:
+
+  kubectl -n ingress-nginx get svc ingress-nginx-controller
+
+Then point an Ingress at a Service and reach it at that address. Host-based rules
+need the name to resolve, so either use the address directly with a Host header
+or add a line to /etc/hosts.

@@ -114,6 +114,12 @@ struct StreamerClient: Sendable {
 struct PodContainers: Decodable {
     let initContainers: [String]?
     let containers: [String]?
+    /// Containers whose spec asks for ferry.dev/gpu. CRI has no field for
+    /// extended resources, so this is the only way the runtime learns of it.
+    let gpuContainers: [String]?
+    /// The pod's priority, from PriorityClass. Travels with the GPU request:
+    /// one device shared between pods is exactly where it has to mean something.
+    let priority: Int32?
 }
 
 extension StreamerClient {
@@ -132,8 +138,8 @@ extension StreamerClient {
     /// hold the request open until it has something newer, so a change reaches
     /// the pods when it is rendered rather than on the next turn of a poll. The
     /// server lets go by itself well before the timeout here.
-    func ruleset(after generation: UInt64? = nil) throws -> Ruleset {
-        var path = "/ruleset"
+    func ruleset(after generation: UInt64? = nil, path base: String = "/ruleset") throws -> Ruleset {
+        var path = base
         if let generation { path += "?after=\(generation)" }
         let response = try exchange(path: path, payload: nil, method: "GET", timeout: 45)
         return Ruleset(body: response.body,

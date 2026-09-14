@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -33,11 +34,35 @@ func newPodLookup(kubeconfig string) (*podLookup, error) {
 	return &podLookup{client: client}, nil
 }
 
+// The extended resource a pod asks for to be given a socket to the Mac's GPU.
+// There is no GPU to pass through on Apple silicon, so this is not nvidia.com/gpu
+// with a different vendor -- see docs/GPU.md.
+const gpuResource = "ferry.dev/gpu"
+
 type podContainers struct {
 	// Names only. The container configuration still comes from CRI; this is
 	// purely about knowing when the set is complete.
 	InitContainers []string `json:"initContainers"`
 	Containers     []string `json:"containers"`
+	// Which of them asked for a GPU. CRI has no field for extended resources --
+	// ContainerConfig carries CPU, memory and cgroup settings and nothing else --
+	// so the runtime cannot see this from the request it is handed. It is
+	// reported here because this handler already has the pod spec open.
+	GPUContainers []string `json:"gpuContainers"`
+	// What the pod is worth relative to other pods, from PriorityClass. The
+	// admission plugin resolves priorityClassName into spec.priority, so this is
+	// set on every pod -- 0 when nobody said otherwise. It travels with the GPU
+	// request because sharing one device is exactly the situation where "this
+	// pod matters more" has to mean something.
+	Priority int32 `json:"priority"`
+}
+
+// wantsGPU reports whether a container asked for the GPU resource. Limits only:
+// an extended resource must be requested and limited equally, and the API
+// server defaults requests from limits, so limits is the one that is always set.
+func wantsGPU(c *v1.Container) bool {
+	quantity, ok := c.Resources.Limits[gpuResource]
+	return ok && !quantity.IsZero()
 }
 
 func servePodLookup(mux *http.ServeMux, pods *podLookup) {
@@ -58,11 +83,18 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 			return
 		}
 		out := podContainers{}
+		if pod.Spec.Priority != nil {
+			out.Priority = *pod.Spec.Priority
+		}
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}
-		for _, c := range pod.Spec.Containers {
+		for i := range pod.Spec.Containers {
+			c := &pod.Spec.Containers[i]
 			out.Containers = append(out.Containers, c.Name)
+			if wantsGPU(c) {
+				out.GPUContainers = append(out.GPUContainers, c.Name)
+			}
 		}
 		json.NewEncoder(w).Encode(out)
 	})

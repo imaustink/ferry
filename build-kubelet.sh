@@ -22,6 +22,10 @@ fi
 echo "==> applying overlay"
 (cd "$here/patches/kubelet" && find . -name '*.go' -print0) \
   | while IFS= read -r -d '' f; do
+      # Make the parent first: a patch may add a directory upstream does not
+      # have -- cmd/ferry-proxyd is ferry's own -- and BSD install will not
+      # create it, so a fresh clone failed here.
+      mkdir -p "$(dirname "$src/$f")"
       install -m 0644 "$here/patches/kubelet/$f" "$src/$f"
       echo "    + ${f#./}"
     done
@@ -73,6 +77,48 @@ if [ -f "$proxier" ]; then
   echo "    ~ pkg/proxy/nftables/proxier.go"
   grep -q 'ferryNFTablesInterface(ipFamily)' "$proxier" \
     || { echo "    !! the nftables seam did not apply; ferry-proxyd will not work" >&2; exit 1; }
+fi
+
+# Tell the cluster that this node runs Linux containers.
+#
+# The kubelet labels its node with its own GOOS, which here is darwin -- and
+# nothing schedules onto a darwin node. Practically every manifest in the
+# ecosystem carries nodeSelector kubernetes.io/os: linux, including
+# metrics-server, ingress-nginx and most Helm charts, so a truthful label makes
+# ferry unable to run the software people actually want to run.
+#
+# The label describes where containers run, and containers here run on Linux --
+# each in its own virtual machine with a Linux kernel. `kubectl get nodes -o wide`
+# still reports macOS as the OS image, which is where the Mac is honestly
+# visible. This makes the label say the useful thing rather than the literal one.
+echo "==> labelling the node as running linux containers"
+node_status="$src/pkg/kubelet/kubelet_node_status.go"
+if [ -f "$node_status" ]; then
+  # Both the value and the comparison: leaving the comparison against GOOS makes
+  # the kubelet decide the label is wrong on every pass and rewrite it forever.
+  sed -i '' \
+    -e 's|v1.LabelOSStable:      goruntime.GOOS,|v1.LabelOSStable:      ferryContainerOS(),|' \
+    -e 's|node.Labels\[v1.LabelOSStable\] = goruntime.GOOS|node.Labels[v1.LabelOSStable] = ferryContainerOS()|' \
+    -e 's|osName != goruntime.GOOS|osName != ferryContainerOS()|' \
+    "$node_status"
+  grep -q 'ferryContainerOS()' "$node_status" \
+    || { echo "    !! the node OS label patch did not apply" >&2; exit 1; }
+  echo "    ~ pkg/kubelet/kubelet_node_status.go"
+fi
+
+# The same question is asked again when a pod is admitted, and answered there
+# from GOOS as well -- so a pod that asks for linux was rejected by the node it
+# had just been scheduled to, with the API and the scheduler both saying linux
+# and the kubelet overruling them.
+predicate="$src/pkg/kubelet/lifecycle/predicate.go"
+if [ -f "$predicate" ]; then
+  sed -i '' \
+    -e 's|if !osLabelExists \|\| osName != runtime.GOOS {|if !osLabelExists \|\| osName != ferryContainerOS() {|' \
+    -e 's|labels\[v1.LabelOSStable\] = runtime.GOOS|labels[v1.LabelOSStable] = ferryContainerOS()|' \
+    "$predicate"
+  grep -q 'ferryContainerOS()' "$predicate" \
+    || { echo "    !! the admission OS patch did not apply" >&2; exit 1; }
+  echo "    ~ pkg/kubelet/lifecycle/predicate.go"
 fi
 
 # Static pod file watching is gated to linux purely by build tag; the code

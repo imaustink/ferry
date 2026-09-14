@@ -32,6 +32,14 @@ let config = RuntimeConfig(
         let path = option("--proxyd-socket", "")
         return path.isEmpty ? nil : path
     }(),
+    netpolSocket: {
+        let path = option("--netpol-socket", "")
+        return path.isEmpty ? nil : path
+    }(),
+    gpudSocket: {
+        let path = option("--gpud-socket", "")
+        return path.isEmpty ? nil : path
+    }(),
     clusterCIDR: {
         let cidr = option("--cluster-cidr", "")
         return cidr.isEmpty ? nil : cidr
@@ -49,7 +57,24 @@ let config = RuntimeConfig(
     relayEndpoint: {
         let endpoint = option("--relay-endpoint", "")
         return endpoint.isEmpty ? nil : endpoint
-    }()
+    }(),
+    cniBinary: {
+        let path = option("--cni", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniConflist: {
+        let path = option("--cni-conflist", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniHostPlugins: {
+        let path = option("--cni-host-plugins", "")
+        return path.isEmpty ? nil : path
+    }(),
+    cniGuestPlugins: {
+        let path = option("--cni-guest-plugins", "")
+        return path.isEmpty ? nil : path
+    }(),
+    execSocket: execSocketPath
 )
 
 guard FileManager.default.fileExists(atPath: config.kernelPath) else {
@@ -130,6 +155,22 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
     // The fetch runs on a thread of its own rather than on the runtime actor.
     // It blocks for as long as the cluster is quiet, and the actor has pods to
     // start and stop in the meantime.
+    // NetworkPolicy, one pod at a time. Same bargain as the Service ruleset: ask
+    // for something newer than what we have and be held until there is some.
+    if let netpol = runtime.netpolClient {
+        Task {
+            while true {
+                let seen = await runtime.seenPolicyGeneration()
+                guard let next = try? await fetchRuleset(netpol, after: seen, path: "/rules") else {
+                    try? await Task.sleep(for: .seconds(3))
+                    continue
+                }
+                await runtime.applyPolicies(
+                    String(data: next.body, encoding: .utf8) ?? "", generation: next.generation)
+            }
+        }
+    }
+
     if let proxyd = runtime.proxydClient {
         Task {
             if let first = try? await fetchRuleset(proxyd, after: nil) {
@@ -149,9 +190,10 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
 
 /// Fetches a ruleset off the calling actor, because the read blocks until
 /// ferry-proxyd has something to say.
-func fetchRuleset(_ proxyd: StreamerClient, after generation: UInt64?) async throws -> StreamerClient.Ruleset {
+func fetchRuleset(_ proxyd: StreamerClient, after generation: UInt64?,
+                  path: String = "/ruleset") async throws -> StreamerClient.Ruleset {
     try await Task.detached(priority: .utility) {
-        try proxyd.ruleset(after: generation)
+        try proxyd.ruleset(after: generation, path: path)
     }.value
 }
 

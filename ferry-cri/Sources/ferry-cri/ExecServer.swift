@@ -30,6 +30,18 @@ struct ExecHeader: Decodable {
     var cmd: [String]?
     var tty: Bool?
     var stdin: Bool?
+    /// "loadimage": an OCI layout directory to take images from.
+    var path: String?
+    /// The environment to run the command with. A CNI plugin needs one -- the
+    /// verb and the container id travel in it -- and `kubectl exec` does not.
+    var env: [String]?
+    /// Extra capabilities, by name. Programming a pod's netfilter tables takes
+    /// NET_ADMIN, which an ordinary pod does not ask for; granting it to a
+    /// binary ferry ships and runs keeps the privilege off the workload.
+    var caps: [String]?
+    /// Run as root inside the pod. A hardened pod cannot lend a capability it
+    /// does not hold, so a plugin inheriting its user cannot program a kernel.
+    var asRoot: Bool?
 }
 
 /// Forwards a container's live output to an attached client.
@@ -232,6 +244,24 @@ final class ExecServer: @unchecked Sendable {
               let header = try? JSONDecoder().decode(ExecHeader.self, from: line)
         else { return }
 
+        // Loading an image has to happen in this process, because this process
+        // owns the image store. The CLI unpacks an archive and points here.
+        if header.op == "loadimage" {
+            var reply: [String: Any] = [:]
+            do {
+                let loaded = try await runtime.loadImages(from: header.path ?? "")
+                reply["images"] = loaded
+            } catch {
+                reply["error"] = "\(error)"
+            }
+            if let encoded = try? JSONSerialization.data(withJSONObject: reply) {
+                var line = encoded
+                line.append(0x0A)
+                _ = line.withUnsafeBytes { Darwin.write(socket.descriptor, $0.baseAddress, $0.count) }
+            }
+            return
+        }
+
         if header.op == "podip" {
             let ip = await runtime.sandboxAddress(header.sandboxID ?? "")
             let reply = ["ip": ip ?? ""]
@@ -258,7 +288,10 @@ final class ExecServer: @unchecked Sendable {
                 tty: header.tty ?? false,
                 stdin: stdinStream,
                 stdout: FrameWriter(socket: socket, channel: .stdout),
-                stderr: FrameWriter(socket: socket, channel: .stderr)
+                stderr: FrameWriter(socket: socket, channel: .stderr),
+                capabilities: header.caps.map { PodRuntime.capabilities(adding: $0) },
+                environment: header.env,
+                asRoot: header.asRoot ?? false
             )
             try await process.start()
 

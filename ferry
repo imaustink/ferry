@@ -11,27 +11,124 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # an error that says nothing about descriptors.
 ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
 
+# Which cluster this is.
+#
+# ferry keeps its state at fixed paths and binds fixed ports, which is right
+# until a second copy of ferry runs on the same Mac -- and with git worktrees
+# that happens without anyone deciding to. Two clusters then share one etcd, one
+# set of certificates, one set of sockets, and both try to reserve the same vmnet
+# subnet. What it looks like from outside is a cluster that was working and
+# quietly stopped.
+#
+# So everything that cannot be shared is named after the checkout it belongs to.
+# The main checkout is "default" and keeps exactly the paths and ports it always
+# had; a linked worktree gets its own. The key is the directory rather than the
+# branch: a branch changes under a running cluster the moment someone checks
+# something else out, two worktrees can sit on the same branch, and a detached
+# HEAD has no branch at all.
+ferry_profile() {
+  [ -n "${FERRY_PROFILE:-}" ] && { echo "$FERRY_PROFILE"; return; }
+  local common top
+  common="$(git -C "$here" rev-parse --git-common-dir 2>/dev/null)"
+  top="$(git -C "$here" rev-parse --git-dir 2>/dev/null)"
+  # In the main checkout these are the same directory; in a worktree they differ.
+  if [ -n "$common" ] && [ "$common" = "$top" ]; then echo default; return; fi
+  basename "$here" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/-*$//' | cut -c1-24
+}
+PROFILE="$(ferry_profile)"
+
+# A number for the profile, so ports and subnets can be moved out of each other's
+# way. It is allocated and written down rather than hashed: a hash cannot promise
+# two profiles differ, and with a handful of worktrees a collision is likely
+# rather than exotic -- the first attempt here put two of three worktrees on the
+# same number, which is the bug this whole change exists to prevent.
+#
+# The register is a file of "<index> <profile>" lines. Claiming is done under a
+# directory lock, because concurrent checkouts is the case being designed for and
+# two of them starting at once must not claim the same number.
+FERRY_PROFILES="${FERRY_PROFILES:-$HOME/.ferry-profiles}"
+
+ferry_profile_index() {
+  [ "$PROFILE" = default ] && { echo 0; return; }
+
+  local existing
+  existing="$(awk -v p="$PROFILE" '$2 == p {print $1; exit}' "$FERRY_PROFILES" 2>/dev/null)"
+  [ -n "$existing" ] && { echo "$existing"; return; }
+
+  local lock="$FERRY_PROFILES.lock" waited=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    waited=$((waited + 1))
+    [ "$waited" -gt 50 ] && { rmdir "$lock" 2>/dev/null; break; }
+    sleep 0.1
+  done
+
+  # Re-read inside the lock: another checkout may have claimed it while waiting.
+  existing="$(awk -v p="$PROFILE" '$2 == p {print $1; exit}' "$FERRY_PROFILES" 2>/dev/null)"
+  if [ -z "$existing" ]; then
+    local n=1
+    while awk -v i="$n" '$1 == i {found=1} END {exit !found}' "$FERRY_PROFILES" 2>/dev/null; do
+      n=$((n + 1))
+      [ "$n" -gt 50 ] && break
+    done
+    existing="$n"
+    printf '%s %s\n' "$existing" "$PROFILE" >> "$FERRY_PROFILES"
+  fi
+  rmdir "$lock" 2>/dev/null
+  echo "$existing"
+}
+PROFILE_INDEX="$(ferry_profile_index)"
+PORT_SHIFT=$(( PROFILE_INDEX * 1000 ))
+# Suffix for anything named rather than numbered.
+[ "$PROFILE" = default ] && SUFFIX="" || SUFFIX="-$PROFILE"
+
 # Cluster state that should survive a restart: certificates and etcd.
-FERRY_HOME="${FERRY_HOME:-$HOME/.ferry}"
+FERRY_HOME="${FERRY_HOME:-$HOME/.ferry$SUFFIX}"
 # Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
 # ~104 bytes and the kubelet builds its podresources socket beneath --root-dir,
 # so a long home directory would break it.
-FERRY_RUN="${FERRY_RUN:-/tmp/ferry-run}"
-FERRY_SOCK="${FERRY_SOCK:-/tmp/ferry-cri.sock}"
-FERRY_EXEC_SOCK="${FERRY_EXEC_SOCK:-/tmp/ferry-exec.sock}"
-FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer.sock}"
-FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:10350}"
-FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd.sock}"
-NODE_NAME="${FERRY_NODE_NAME:-ferry-mac}"
+FERRY_RUN="${FERRY_RUN:-/tmp/ferry-run$SUFFIX}"
+FERRY_SOCK="${FERRY_SOCK:-/tmp/ferry-cri$SUFFIX.sock}"
+FERRY_EXEC_SOCK="${FERRY_EXEC_SOCK:-/tmp/ferry-exec$SUFFIX.sock}"
+FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer$SUFFIX.sock}"
+FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:$(( 10350 + PORT_SHIFT ))}"
+FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd$SUFFIX.sock}"
+FERRY_NETPOL_SOCK="${FERRY_NETPOL_SOCK:-/tmp/ferry-netpol$SUFFIX.sock}"
+FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud$SUFFIX.sock}"
+# Pod sockets are named by pod uid, and macOS caps a unix socket path near 104
+# bytes, so this directory is deliberately short.
+FERRY_GPU_DIR="${FERRY_GPU_DIR:-$FERRY_RUN/gpu}"
+# How many pods may hold the GPU at once. There is one GPU; this is policy.
+GPU_CAPACITY="${FERRY_GPU_CAPACITY:-1}"
+# How long one request holds the device before a waiting pod gets a turn, and so
+# roughly the worst wait a co-tenant sees.
+GPU_SLICE="${FERRY_GPU_SLICE:-0.5}"
+NODE_NAME="${FERRY_NODE_NAME:-ferry-mac$SUFFIX}"
 POD_SUBNET="${FERRY_POD_SUBNET:-192.168.66.1/24}"
 POD_CPUS="${FERRY_POD_CPUS:-2}"
+# What counts as too little disk to start pods on.
+#
+# The upstream default is a percentage, and a percentage is the wrong shape for a
+# laptop: 5% of a 1TB disk is 46GB held in reserve, so a Mac with 45GB free taints
+# itself and schedules nothing, while a Mac with a small disk gets almost no
+# margin at all. An absolute figure says what it means. Kubernetes accepts either.
+EVICT_DISK="${FERRY_EVICTION_DISK:-4Gi}"
+EVICT_MEMORY="${FERRY_EVICTION_MEMORY:-500Mi}"
 # The cluster pod network: one flat segment every pod shares, on every node and
 # every machine. Pods keep a vmnet NIC for the internet; this is the address
 # Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
 # and a single node.
-CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.244.0.0/16}"
+# Each profile needs its own pod network: a vmnet subnet is reserved for the
+# whole Mac, so two clusters asking for the same one means the second has none.
+# The default keeps 10.244 so an existing cluster is undisturbed; the rest are
+# numbered from 10.151 upward, which leaves room for fifty and stays clear of the
+# ranges Docker and colima like.
+if [ "$PROFILE_INDEX" = 0 ]; then
+  CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.244.0.0/16}"
+else
+  CLUSTER_CIDR="${FERRY_CLUSTER_CIDR:-10.$(( 150 + PROFILE_INDEX )).0.0/16}"
+fi
 NODE_INDEX="${FERRY_NODE_INDEX:-0}"
-RELAY_PORT="${FERRY_RELAY_PORT:-8472}"
+RELAY_PORT="${FERRY_RELAY_PORT:-$(( 8472 + PORT_SHIFT ))}"
 PEERS="${FERRY_PEERS:-}"
 PEERS_FILE="$FERRY_RUN/peers"
 # Advertised to the other nodes, so it must be the address they can reach. The
@@ -73,6 +170,10 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node add <name>   add another node on this Mac
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
+  ferry image load <x>    run an image you built here, without a registry
+  ferry profile           which cluster this checkout runs, and on what ports
+  ferry addons list       what can be turned on (metrics-server, ingress-nginx)
+  ferry addons enable <n> turn one on
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
 
@@ -81,6 +182,9 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
+  FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
+                         can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
 EOF
@@ -157,9 +261,19 @@ cmd_build() {
   ( cd "$here/ferry-proxy" && go build -o "$here/bin/ferry-proxy" . ) || return 1
   echo "==> $here/bin/ferry-proxy"
   echo
+  echo "==> ferry-netpol"
+  ( cd "$here/ferry-netpol" && go build -o "$here/bin/ferry-netpol" . ) || return 1
+  echo "==> $here/bin/ferry-netpol"
+  echo
+  # ferry-cni and the upstream plugins it runs, in both architectures.
+  "$here/ferry-cni/build.sh" || return 1
+  echo
   echo "==> ferry-storage"
   ( cd "$here/ferry-storage" && go build -o "$here/bin/ferry-storage" . ) || return 1
   echo "==> $here/bin/ferry-storage"
+  echo
+  echo "==> ferry-gpud"
+  ( cd "$here/ferry-gpud" && ./build.sh ) || return 1
   echo
   echo "==> ferry-streamer"
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
@@ -185,7 +299,7 @@ cmd_build() {
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
 
 cmd_up() {
-  for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$KERNEL"; do
+  for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
   done
   if running ferry-cri || running kubelet; then
@@ -193,15 +307,22 @@ cmd_up() {
   fi
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_GPUD_SOCK"
 
   bold "starting ferry"
+
+  start_gpud
 
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -231,6 +352,10 @@ cmd_up() {
   local advertise="$gateway"
   [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
+    API_PORT="$(( 6443 + PORT_SHIFT ))" \
+    ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
+    CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
+    SERVICE_NODE_PORT_RANGE="$(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -5 "$FERRY_RUN/logs/control-plane.log"; return 1; }
   ok "control plane advertising $gateway"
@@ -243,7 +368,7 @@ cmd_up() {
       --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
       --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-name "$NODE_NAME" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-      --peers-file "$PEERS_FILE" \
+      --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
     for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
@@ -256,6 +381,8 @@ cmd_up() {
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+port: $(( 10250 + PORT_SHIFT ))
+healthzPort: $(( 10248 + PORT_SHIFT ))
 podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
@@ -264,9 +391,9 @@ volumePluginDir: $FERRY_RUN/volume-plugins
 # laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
 # node taints itself NoSchedule.
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -312,13 +439,135 @@ EOF
       || warn "ferry-proxyd did not start; Services will not route"
   fi
 
+  start_netpol
   start_proxy
   start_storage
+  advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   echo
   bold "ferry is up"
   echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+}
+
+# NetworkPolicy, enforced where the packets are.
+#
+# A policy is per pod, and every ferry pod is a virtual machine with its own
+# kernel, so the rules are worked out here and applied there -- the same way
+# Service rules already reach a pod. Without this, policies were accepted and
+# silently ignored, which is worse than not supporting them.
+start_netpol() {
+  [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
+  rm -f "$FERRY_NETPOL_SOCK"
+  "$here/bin/ferry-netpol" --kubeconfig "$FERRY_HOME/admin.conf" \
+    --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
+    >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-netpol.pid"
+  for _ in $(seq 1 30); do [ -S "$FERRY_NETPOL_SOCK" ] && break; sleep 0.5; done
+  [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
+    || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+}
+
+# The Mac's GPU, offered to pods over a socket.
+#
+# There is no GPU pass-through on Apple silicon: Virtualization.framework has no
+# PCI passthrough and no compute device, and Metal is reachable only from a
+# macOS process. So the work does not move into the pod -- ferry-gpud holds the
+# GPU here, and a pod that asks for ferry.dev/gpu is handed a unix socket to it,
+# relayed into its VM over vsock. See docs/GPU.md.
+start_gpud() {
+  [ -x "$here/bin/ferry-gpud" ] || { warn "ferry-gpud not built; ferry.dev/gpu will not be offered"; return 0; }
+  rm -f "$FERRY_GPUD_SOCK"
+  # The directory is the daemon's to create -- it makes it 0700, and doing it
+  # here first would leave it 0755 until the daemon caught up.
+  # Pod sockets from a previous run are stale the moment that process is gone.
+  # ...and the record of who held them: this is a fresh cluster, so the daemon
+  # must not restore grants for pods from the last one.
+  [ -n "$FERRY_GPU_DIR" ] && rm -f "$FERRY_GPU_DIR"/*.sock "$FERRY_GPU_DIR/grants.json" 2>/dev/null || true
+  "$here/bin/ferry-gpud" --control "$FERRY_GPUD_SOCK" \
+    --socket-dir "$FERRY_GPU_DIR" --capacity "$GPU_CAPACITY" \
+    --time-slice "$GPU_SLICE" \
+    >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-gpud.pid"
+  for _ in $(seq 1 30); do [ -S "$FERRY_GPUD_SOCK" ] && break; sleep 0.5; done
+  if [ -S "$FERRY_GPUD_SOCK" ]; then
+    ok "GPU offered to pods: $(sed -n 's/.*device  *//p' "$FERRY_RUN/logs/ferry-gpud.log" | head -1)"
+  else
+    warn "ferry-gpud did not start; ferry.dev/gpu will not be offered"
+  fi
+}
+
+# Advertise the GPU as a schedulable resource.
+#
+# No device plugin is involved. The kubelet merges into node.status.capacity
+# rather than replacing it -- "avoid blindly overwriting the capacity in case
+# opaque resources are being advertised" -- so this sticks, and the scheduler
+# gates on it. The number is how many pods may hold the GPU at once, not how
+# many GPUs there are; there is one.
+advertise_gpu() { # node-name [kubeconfig]
+  local node="${1:-$NODE_NAME}"
+  [ -S "$FERRY_GPUD_SOCK" ] || return 0
+
+  # Whichever credential this machine has. A joined node has no admin.conf --
+  # only the certificate the cluster issued its kubelet.
+  local cfg="${2:-}"
+  if [ -z "$cfg" ]; then
+    if [ -r "$FERRY_HOME/admin.conf" ]; then cfg="$FERRY_HOME/admin.conf"
+    elif [ -r "$FERRY_RUN/kubelet.conf" ]; then cfg="$FERRY_RUN/kubelet.conf"
+    else warn "no kubeconfig to advertise ferry.dev/gpu with"; return 0; fi
+  fi
+
+  # Written with curl rather than kubectl, and that is the whole fix.
+  #
+  # A node may update its own status -- its kubelet does nothing else all day --
+  # but it may not *get* nodes/status, which the Node authorizer scopes to the
+  # object rather than the subresource. kubectl fetches before it patches, even
+  # for a merge patch, so it was refused at the first step on every joined node
+  # and the GPU was only ever offered by the Mac that had the admin kubeconfig.
+  #
+  # Sending the patch directly asks for exactly the permission the node has.
+  local server cert key
+  server="$(sed -n 's|.*server: *||p' "$cfg" | head -1)"
+  cert="$(sed -n 's|.*client-certificate: *||p' "$cfg" | head -1)"
+  key="$(sed -n 's|.*client-key: *||p' "$cfg" | head -1)"
+  [ -n "$server" ] || { warn "could not read the API server address from $cfg"; return 0; }
+
+  local auth=()
+  if [ -n "$cert" ] && [ -n "$key" ]; then
+    auth=(--cert "$cert" --key "$key")
+  else
+    # admin.conf embeds its credentials, and kubectl is present wherever that is.
+    command -v kubectl >/dev/null 2>&1 || { warn "no usable credential for ferry.dev/gpu"; return 0; }
+    if KUBECONFIG="$cfg" kubectl patch node "$node" --subresource=status --type=merge \
+         -p "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" >/dev/null 2>&1; then
+      ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
+    else
+      warn "could not advertise ferry.dev/gpu on $node"
+    fi
+    return 0
+  fi
+
+  local code
+  code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
+    -X PATCH -H "Content-Type: application/merge-patch+json" \
+    -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
+    "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+  if [ "$code" = "200" ]; then
+    ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
+  else
+    warn "could not advertise ferry.dev/gpu on $node (HTTP ${code:-no response})"
+  fi
+}
+
+# Take ferry.dev/gpu off the node. Best effort and deliberately quiet: the
+# control plane may already be gone, which is not worth a warning during
+# shutdown.
+withdraw_gpu() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  [ -f "$FERRY_HOME/admin.conf" ] || return 0
+  local op='[{"op":"remove","path":"/status/capacity/ferry.dev~1gpu"}]'
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$NODE_NAME" \
+    --subresource=status --type=json -p "$op" >/dev/null 2>&1 || true
 }
 
 # Somewhere for a PersistentVolumeClaim to live.
@@ -355,12 +604,21 @@ host_resolvers() {
 
 install_dns() { # gateway dns-address
   local gateway="$1" dns="$2"
+  # The same address the API server advertises and its certificate covers.
+  local advertise="$gateway"
+  [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
   local rendered="$FERRY_RUN/coredns.yaml"
   sed -e "s|__CLUSTER_DOMAIN__|$CLUSTER_DOMAIN|g" \
       -e "s|__UPSTREAM_DNS__|$(host_resolvers)|g" \
       -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
-      -e "s|__APISERVER_HOST__|$gateway|g" \
-      -e "s|__APISERVER_PORT__|6443|g" \
+      `# CoreDNS talks to the API server directly rather than through the` \
+      `# kubernetes Service, so it has an address of its own to be told. It has` \
+      `# to be one the API server's certificate covers, which the pod network` \
+      `# gateway is not -- that address belongs to whichever subnet this node` \
+      `# happens to have. The advertised address is in the certificate and is` \
+      `# what every other client already uses.` \
+      -e "s|__APISERVER_HOST__|$advertise|g" \
+      -e "s|__APISERVER_PORT__|$(( 6443 + PORT_SHIFT ))|g" \
       "$here/manifests/coredns.yaml" > "$rendered"
 
   KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f "$rendered" >/dev/null 2>&1 \
@@ -401,9 +659,17 @@ start_proxy() {
   # ClusterIPs are handled inside each pod when the guest kernel can NAT, which
   # needs no privilege. Without such a kernel they fall back to this process,
   # which binds them on the Mac and does need root.
-  local cluster_ips=false extra=""
-  if [ "$KERNEL" = "$NAT_KERNEL" ] && [ -x "$here/bin/ferry-proxyd" ]; then
+  # Aggregated APIs -- metrics.k8s.io and anything else served by a pod rather
+  # than by the API server -- are reached by the API server itself, which is a
+  # macOS process and is not on the pod network. Binding ClusterIPs on the Mac is
+  # the way to give it a route there, and that needs root, so it is asked for
+  # rather than assumed.
+  local cluster_ips="${FERRY_HOST_CLUSTER_IPS:-false}" extra=""
+  if [ "$KERNEL" = "$NAT_KERNEL" ] && [ -x "$here/bin/ferry-proxyd" ] && [ "$cluster_ips" != true ]; then
     ok "Services route inside pods (no host proxy, no root)"
+  elif [ "$cluster_ips" = true ]; then
+    echo "  Binding ClusterIPs on the Mac as well, so the API server can reach"
+    echo "  aggregated APIs such as metrics.k8s.io. This is what needs sudo."
   else
     cluster_ips=true
     echo "  The guest kernel cannot do NAT, so ClusterIPs fall back to a host proxy."
@@ -422,14 +688,16 @@ start_proxy() {
       sudo -v || { warn "no sudo; ClusterIPs will not route (pods and DNS still work)"; return 0; }
     fi
     sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
-      --cluster-ips --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --cluster-ips --node-ports --node-name "$NODE_NAME" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
     local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
-      --node-ports --node-name "$NODE_NAME" --pod-map "$FERRY_RUN/cri/podmap" \
+      --node-ports --node-name "$NODE_NAME" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     local pid=$!
@@ -468,8 +736,8 @@ cmd_node_add() {
   local exec_sock="/tmp/ferry-exec-$index.sock"
   local streamer_sock="/tmp/ferry-str-$index.sock"
   local relay=$((RELAY_PORT + index))
-  local kubelet_port=$((10250 + index))
-  local healthz_port=$((10248 + index * 100))
+  local kubelet_port=$(( 10250 + PORT_SHIFT + index ))
+  local healthz_port=$(( 10248 + PORT_SHIFT + index * 100 ))
   local stream_addr="127.0.0.1:$((10350 + index))"
   local run="$FERRY_RUN/node-$index"
 
@@ -482,6 +750,11 @@ cmd_node_add() {
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
@@ -626,7 +899,7 @@ EOF
   echo
   echo "  On the other Mac, in a ferry checkout with the binaries copied over:"
   echo
-  echo "    ./ferry join --server $LAN_IP:6443 \\"
+  echo "    ./ferry join --server $LAN_IP:$(( 6443 + PORT_SHIFT )) \\"
   echo "      --token $id.$secret \\"
   echo "      --ca-hash sha256:$hash \\"
   echo "      --node-index $index"
@@ -734,11 +1007,21 @@ start_worker() {
   local name="$1" index="$2"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 
+  # A joining Mac has its own GPU, so it runs its own daemon and advertises its
+  # own capacity -- unlike 'node add', which is another node on this Mac and
+  # shares the one that is already running.
+  start_gpud
+
   "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
+    --cni "$here/bin/ferry-cni" \
+    --cni-host-plugins "$here/ferry-cni/plugins/host" \
+    --cni-guest-plugins "$here/ferry-cni/plugins/guest" \
+    ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
@@ -755,14 +1038,16 @@ start_worker() {
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+port: $(( 10250 + PORT_SHIFT ))
+healthzPort: $(( 10248 + PORT_SHIFT ))
 podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
 evictionHard:
-  memory.available: "500Mi"
-  nodefs.available: "5%"
-  imagefs.available: "5%"
+  memory.available: "$EVICT_MEMORY"
+  nodefs.available: "$EVICT_DISK"
+  imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -804,11 +1089,14 @@ EOF
     --exec-socket "$FERRY_EXEC_SOCK" --control "$FERRY_STREAMER_SOCK" \
     --kubeconfig "$FERRY_RUN/kubelet.conf" \
     --node-name "$name" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
-    --peers-file "$PEERS_FILE" \
+    --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
     >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
   for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
+
+  # The node object exists now, so its GPU capacity can go on it.
+  advertise_gpu "$name" "$FERRY_RUN/kubelet.conf"
 
   # Service rules are rendered per node, so a worker runs its own ferry-proxyd.
   # Like the streamer it authenticates as the node, so it also waits for the
@@ -833,7 +1121,8 @@ EOF
   local lb="$LAN_IP"; [ "$lb" = "127.0.0.1" ] && lb=""
   if [ -x "$here/bin/ferry-proxy" ]; then
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
-      --node-ports --node-name "$name" --pod-map "$FERRY_RUN/cri/podmap" \
+      --node-ports --node-name "$name" \
+      --host-ports "$FERRY_RUN/cri/hostports" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxy.pid"
@@ -850,6 +1139,172 @@ EOF
   echo
   bold "joined as $name"
   echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
+}
+
+# Things everybody wants and nobody should have to hunt for.
+#
+# An addon is a directory of ordinary Kubernetes manifests under addons/. Nothing
+# about them is special to ferry; they are here so a laptop cluster can have
+# metrics and an ingress controller without a scavenger hunt, and so the versions
+# are pinned to ones that have actually been run.
+cmd_addons() {
+  local action="${1:-list}" name="${2:-}"
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+
+  case "$action" in
+    list|"")
+      bold "addons"
+      local dir
+      for dir in "$here"/addons/*/; do
+        [ -d "$dir" ] || continue
+        local addon; addon="$(basename "$dir")"
+        if kubectl get namespace "$addon" >/dev/null 2>&1 \
+           || kubectl -n kube-system get deployment "$addon" >/dev/null 2>&1; then
+          ok "$addon (enabled)"
+        else
+          echo "    $addon"
+        fi
+      done
+      echo
+      echo "  ferry addons enable <name>"
+      ;;
+
+    enable)
+      [ -n "$name" ] || { bad "usage: ferry addons enable <name>"; return 2; }
+      local dir="$here/addons/$name"
+      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
+      kubectl get nodes >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+
+      bold "enabling $name"
+      local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null || echo "")"
+      local rendered; rendered="$(mktemp -d)"
+      # shellcheck disable=SC2064
+      trap "rm -rf '$rendered'" RETURN
+      local file
+      for file in "$dir"/*.yaml; do
+        [ -f "$file" ] || continue
+        sed -e "s|__CLUSTER_DNS__|$dns|g" -e "s|__NODE_NAME__|$NODE_NAME|g" \
+          "$file" > "$rendered/$(basename "$file")"
+      done
+      kubectl apply -f "$rendered" >/dev/null 2>&1 || { bad "could not apply $name"; return 1; }
+      ok "applied"
+      [ -f "$dir/NOTES" ] && { echo; sed 's/^/  /' "$dir/NOTES"; }
+      ;;
+
+    disable)
+      [ -n "$name" ] || { bad "usage: ferry addons disable <name>"; return 2; }
+      local dir="$here/addons/$name"
+      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
+      bold "disabling $name"
+      kubectl delete -f "$dir" --ignore-not-found >/dev/null 2>&1
+      ok "removed"
+      ;;
+
+    *) bad "usage: ferry addons [list|enable <name>|disable <name>]"; return 2 ;;
+  esac
+}
+
+# Run an image you just built.
+#
+# Everything else in ferry comes from a registry, which is fine for busybox and
+# useless for the thing you are working on. 'minikube image load' and 'kind load
+# docker-image' exist for this, and until now ferry had no answer at all.
+#
+# What arrives can be an OCI layout directory, an archive of one, or the name of
+# an image Docker or Podman is holding -- in the last case ferry asks that tool
+# to export it first. The image keeps the name it already has, so a manifest
+# saying `myapp:dev` still says that.
+cmd_image_load() {
+  local what="${1:-}"
+  [ -n "$what" ] || { bad "usage: ferry image load <name|archive.tar|oci-directory>"; return 2; }
+  [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up"; return 1; }
+
+  local staging; staging="$(mktemp -d "${TMPDIR:-/tmp}/ferry-load.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$staging'" RETURN
+
+  local layout=
+  if [ -d "$what" ]; then
+    layout="$what"
+  elif [ -f "$what" ]; then
+    tar -xf "$what" -C "$staging" 2>/dev/null || { bad "could not unpack $what"; return 1; }
+    layout="$staging"
+  else
+    # A name: ask whichever tool has it to hand over an OCI archive. Docker's
+    # plain 'save' format is not one, so the flag is not optional.
+    local exported="$staging/image.tar"
+    if command -v docker >/dev/null 2>&1 && docker image inspect "$what" >/dev/null 2>&1; then
+      echo "  exporting $what from docker"
+      docker save --output "$exported" "$what" >/dev/null 2>&1 || { bad "docker save failed"; return 1; }
+    elif command -v podman >/dev/null 2>&1 && podman image exists "$what" 2>/dev/null; then
+      echo "  exporting $what from podman"
+      podman save --format oci-archive --output "$exported" "$what" >/dev/null 2>&1 \
+        || { bad "podman save failed"; return 1; }
+    else
+      bad "no such file, directory, or local image: $what"
+      return 1
+    fi
+    mkdir -p "$staging/layout"
+    tar -xf "$exported" -C "$staging/layout" 2>/dev/null || { bad "could not unpack the export"; return 1; }
+    layout="$staging/layout"
+  fi
+
+  # An OCI layout says so. Anything else will fail inside ferry-cri with a less
+  # helpful message, so it is worth saying here.
+  if [ ! -f "$layout/oci-layout" ] || [ ! -f "$layout/index.json" ]; then
+    bad "$what is not an OCI layout (no oci-layout/index.json)"
+    echo "    Docker's default 'save' format is not one. Export with:"
+    echo "      docker save <name> | ...   # docker 25+ with the containerd store"
+    echo "      podman save --format oci-archive <name> -o image.tar"
+    return 1
+  fi
+
+  # ferry-cri owns the image store, so the load happens there. One JSON line in,
+  # one back, over the socket it already listens on.
+  echo "  loading into the image store"
+  local reply
+  reply="$(printf '{"op":"loadimage","path":"%s"}\n' "$layout" | nc -U "$FERRY_EXEC_SOCK" 2>/dev/null)"
+
+  case "$reply" in
+    *'"images"'*)
+      # {"images":["a","b"]} -> one name per line, without reaching for a parser.
+      echo "$reply" \
+        | sed -e 's/.*"images":\[//' -e 's/\].*//' -e 's/","/\n/g' -e 's/"//g' -e 's|\\/|/|g' \
+        | while read -r name; do [ -n "$name" ] && ok "loaded $name"; done
+      echo
+      echo "  Pods must not try to fetch it again: set"
+      echo "    imagePullPolicy: IfNotPresent   (or Never)"
+      ;;
+    *'"error"'*)
+      bad "$(echo "$reply" | sed -n 's/.*"error":"\(.*\)".*/\1/p')" ;;
+    *)
+      bad "ferry-cri did not answer; see 'ferry logs ferry-cri'" ;;
+  esac
+}
+
+# What this checkout is using, and why.
+#
+# Worth being able to ask: when two clusters are running on one Mac the first
+# question is always which one you are talking to.
+cmd_profile() {
+  bold "profile $PROFILE"
+  echo "  state       $FERRY_HOME"
+  echo "  runtime     $FERRY_RUN"
+  echo "  node name   $NODE_NAME"
+  echo "  pod network $CLUSTER_CIDR"
+  echo "  api server  https://$(lan_address):$(( 6443 + PORT_SHIFT ))"
+  echo "  kubelet     $(( 10250 + PORT_SHIFT ))"
+  echo "  streaming   $FERRY_STREAM_ADDR"
+  echo "  pod switch  udp/$RELAY_PORT"
+  echo "  node ports  $(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))"
+  echo
+  if [ "$PROFILE" = default ]; then
+    echo "  This is the main checkout, so nothing is renamed or moved."
+  else
+    echo "  This is a worktree, so it has its own state, ports and pod network"
+    echo "  and will not disturb a cluster running from another checkout."
+  fi
+  echo "  Set FERRY_PROFILE to override."
 }
 
 cmd_down() {
@@ -877,7 +1332,7 @@ cmd_down() {
     ok "node $index stopped"
   done
 
-  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-storage; do
+  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     local pid; pid="$(cat "$pidfile")"
@@ -895,13 +1350,17 @@ cmd_down() {
   pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
   sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
 
+  # After the streamer, which would otherwise put it straight back, and before
+  # the control plane, which has to be up to accept the patch.
+  withdraw_gpu
+
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 && ok "control plane stopped"
-  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$PEERS_FILE"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK" "$PEERS_FILE"
 }
 
 cmd_status() {
   bold "ferry status"
-  for component in ferry-cri ferry-streamer ferry-proxyd ferry-storage kubelet ferry-proxy; do
+  for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
@@ -919,7 +1378,7 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-storage) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
     *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
@@ -931,6 +1390,14 @@ case "${1:-}" in
   kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  profile)    shift; cmd_profile ;;
+  addons)     shift; cmd_addons "$@" ;;
+  image)      shift
+              case "${1:-}" in
+                load) shift; cmd_image_load "$@" ;;
+                ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' 2>/dev/null | sort -u ;;
+                *) bad "usage: ferry image [load <name|archive|dir>|ls]"; exit 2 ;;
+              esac ;;
   token)      shift; case "${1:-}" in create|"") cmd_token_create ;; *) bad "usage: ferry token create"; exit 2 ;; esac ;;
   join)       shift; cmd_join "$@" ;;
   node)       shift

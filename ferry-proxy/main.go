@@ -29,9 +29,9 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
@@ -44,7 +44,7 @@ func main() {
 	nodePorts := flag.Bool("node-ports", true, "listen on node ports")
 	loadBalancerIP := flag.String("load-balancer-ip", "", "address to answer LoadBalancer services on, usually this Mac's LAN address")
 	nodeName := flag.String("node-name", "", "this node, so endpoints elsewhere can be told apart from endpoints here")
-	podMapPath := flag.String("pod-map", "", "file ferry-cri writes mapping each pod IP to an address the Mac can reach it at")
+	hostPortPath := flag.String("host-ports", "", "file ferry-cri writes listing each pod's hostPorts")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -66,13 +66,17 @@ func main() {
 	ctrl := &controller{
 		aliases:        newAliasManager(),
 		proxies:        map[string]*serviceProxy{},
+		udp:            map[string]*udpProxy{},
 		client:         client,
 		nodeName:       *nodeName,
-		pods:           newPodMap(*podMapPath),
 		clusterIPs:     *clusterIPs,
 		nodePorts:      *nodePorts,
 		loadBalancerIP: *loadBalancerIP,
 	}
+
+	// hostPort has nothing to do with Services, so it watches a file rather
+	// than the API and runs beside the Service controller instead of inside it.
+	newHostPorts(*hostPortPath)
 
 	factory := informers.NewSharedInformerFactory(client, *resync)
 	ctrl.services = factory.Core().V1().Services().Lister()
@@ -109,12 +113,12 @@ type controller struct {
 	mu       sync.Mutex
 	aliases  *aliasManager
 	proxies  map[string]*serviceProxy
+	udp      map[string]*udpProxy
 	services corelisters.ServiceLister
 	slices   discoverylisters.EndpointSliceLister
 
 	client         kubernetes.Interface
 	nodes          corelisters.NodeLister
-	pods           *podMap
 	nodeName       string
 	clusterIPs     bool
 	nodePorts      bool
@@ -131,6 +135,10 @@ func (c *controller) shutdown() {
 		p.close()
 	}
 	c.proxies = map[string]*serviceProxy{}
+	for _, p := range c.udp {
+		p.close()
+	}
+	c.udp = map[string]*udpProxy{}
 	c.aliases.removeAll()
 }
 
@@ -184,10 +192,11 @@ func (c *controller) reconcile() {
 					continue
 				}
 				for _, address := range endpoint.Addresses {
-					// The cluster knows this pod by an address only other pods
-					// can reach. Dial the one the Mac can.
+					// A pod on this Mac is reachable at the address the cluster
+					// knows it by: its vmnet subnet is this node's slice of the
+					// pod network, and the Mac is on that subnet.
 					endpoints[key] = append(endpoints[key], backend{
-						address: joinHostPort(c.pods.dialable(address), *port.Port),
+						address: joinHostPort(address, *port.Port),
 					})
 				}
 			}
@@ -245,7 +254,7 @@ func (c *controller) reconcile() {
 						continue
 					}
 				}
-				proxy, err := newServiceProxy(e.key, e.address, e.port)
+				proxy, err := newServiceProxy(e.key, e.address, e.port, e.protocol)
 				if err != nil {
 					// A privileged port without privilege is the common case and
 					// deserves a sentence, not a stack of identical errors.
@@ -262,6 +271,19 @@ func (c *controller) reconcile() {
 					continue
 				}
 				c.proxies[e.key] = proxy
+				if e.protocol == corev1.ProtocolUDP {
+					u, err := newUDPProxy(e.key, e.address, e.port, proxy)
+					if err != nil {
+						if !c.complained[e.key] {
+							c.complained[e.key] = true
+							klog.ErrorS(err, "Could not listen for service",
+								"service", name, "addr", e.describe(), "kind", e.kind, "protocol", "UDP")
+						}
+						delete(c.proxies, e.key)
+						continue
+					}
+					c.udp[e.key] = u
+				}
 				delete(c.complained, e.key)
 				klog.InfoS("Serving", "kind", e.kind, "service", name, "addr", e.describe())
 			}
@@ -282,6 +304,10 @@ func (c *controller) reconcile() {
 		}
 		proxy.close()
 		delete(c.proxies, key)
+		if u, ok := c.udp[key]; ok {
+			u.close()
+			delete(c.udp, key)
+		}
 		klog.InfoS("Stopped serving", "service", key)
 	}
 }
