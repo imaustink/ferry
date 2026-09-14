@@ -162,6 +162,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry doctor      check that this machine can run ferry
   ferry kernel      build a guest kernel with NAT support (slow, needs docker)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
+                    --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry up          start the cluster
   ferry down        stop the cluster
   ferry status      show what is running
@@ -187,6 +188,8 @@ Environment:
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
+  K8S_VERSION            kubernetes to build, default v1.34.0 (same as
+                         'ferry build --kubernetes-version')
 EOF
 }
 
@@ -245,14 +248,45 @@ cmd_doctor() {
   else bold "not ready"; return 1; fi
 }
 
+# Which Kubernetes ferry builds.
+#
+# Every distribution lets you pick: minikube takes --kubernetes-version, kind
+# takes a node image. ferry compiles the kubelet itself, so a version is a build
+# input rather than a download, and the patches in patches/ are written against
+# a particular tree. That makes another version a thing you can ask for and not
+# a thing that is promised to work -- build-kubelet.sh verifies every seam it
+# edits and fails loudly if one has moved, which is the honest failure for a
+# version whose source has drifted.
+K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+BUILT_VERSION_FILE="$here/bin/.kubelet-version"
+
 cmd_build() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kubernetes-version)
+        [ $# -ge 2 ] && [ -n "${2:-}" ] || { bad "--kubernetes-version needs a value, such as v1.34.0"; return 2; }
+        K8S_VERSION="$2"; shift 2 ;;
+      --kubernetes-version=*) K8S_VERSION="${1#*=}"; shift ;;
+      --rebuild) FERRY_REBUILD=1; shift ;;
+      *) bad "usage: ferry build [--kubernetes-version <vX.Y.Z>] [--rebuild]"; return 2 ;;
+    esac
+  done
+  export K8S_VERSION
+
   bold "building ferry"
+  echo "  kubernetes $K8S_VERSION"
   "$here/experiments/03-vm-ceiling/fetch-kernel.sh" || return 1
   echo
-  if [ ! -x "$here/bin/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
+  # A kubelet built from a different version is not the one that was asked for,
+  # so the version it was built from is recorded and a change forces a rebuild.
+  local built=""
+  [ -f "$BUILT_VERSION_FILE" ] && built="$(cat "$BUILT_VERSION_FILE")"
+  if [ ! -x "$here/bin/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ] || [ "$built" != "$K8S_VERSION" ]; then
+    [ -n "$built" ] && [ "$built" != "$K8S_VERSION" ] &&       echo "==> kubelet was built from $built; rebuilding for $K8S_VERSION"
     "$here/build-kubelet.sh" || return 1
+    echo "$K8S_VERSION" > "$BUILT_VERSION_FILE"
   else
-    echo "==> kubelet present (FERRY_REBUILD=1 to force)"
+    echo "==> kubelet present, $built (--rebuild to force)"
   fi
   echo
   ( cd "$here/ferry-cri" && ./build.sh ) || return 1
@@ -281,7 +315,7 @@ cmd_build() {
   echo
   # kube-proxy's own rule generation, built for darwin from the patched tree.
   echo "==> ferry-proxyd"
-  src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${K8S_VERSION:-v1.34.0}}"
+  src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${K8S_VERSION}}"
   if [ -d "$src" ]; then
     ( cd "$src" && GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
         go build -o "$here/bin/ferry-proxyd" ./cmd/ferry-proxyd ) || return 1

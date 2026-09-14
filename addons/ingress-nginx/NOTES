@@ -3,6 +3,22 @@ address answers for it. Find it with:
 
   kubectl -n ingress-nginx get svc ingress-nginx-controller
 
-Then point an Ingress at a Service and reach it at that address. Host-based rules
-need the name to resolve, so either use the address directly with a Host header
-or add a line to /etc/hosts.
+An ingress controller asks for ports 80 and 443, and those are below 1024, so
+the Mac will not let an ordinary process listen on them. Unless ferry-proxy is
+running as root -- which is what
+
+  FERRY_HOST_CLUSTER_IPS=1 ferry up
+
+arranges -- the EXTERNAL-IP stays <pending> and the reason is recorded on the
+Service itself, visible with `kubectl describe svc -n ingress-nginx
+ingress-nginx-controller`.
+
+The node ports work either way, and are enough to test an Ingress:
+
+  kubectl -n ingress-nginx get svc ingress-nginx-controller \
+    -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}'
+  curl -H 'Host: your.host' http://<mac>:<that port>/
+
+Then point an Ingress at a Service. Host-based rules need the name to resolve,
+so either use the address directly with a Host header or add a line to
+/etc/hosts.

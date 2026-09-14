@@ -263,9 +263,16 @@ func (c *controller) reconcile() {
 						if e.port < 1024 {
 							klog.ErrorS(err, "Could not listen on a privileged port; run ferry-proxy as root to serve it",
 								"service", name, "addr", e.describe(), "kind", e.kind)
+							warnOnService(context.Background(), c.client, service, "PortNotPermitted",
+								fmt.Sprintf("ferry cannot listen on %s: ports below 1024 need root. "+
+									"Restart the cluster with 'FERRY_HOST_CLUSTER_IPS=1 ferry up', which runs "+
+									"ferry-proxy under sudo, or reach this Service on its node port instead.",
+									e.describe()))
 						} else {
 							klog.ErrorS(err, "Could not listen for service",
 								"service", name, "addr", e.describe(), "kind", e.kind)
+							warnOnService(context.Background(), c.client, service, "ListenFailed",
+								fmt.Sprintf("ferry could not listen on %s: %v", e.describe(), err))
 						}
 					}
 					continue

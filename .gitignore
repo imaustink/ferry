@@ -6,3 +6,4 @@ kernel/.build/
 kernel/vmlinux-arm64
 guest/nft/
 ferry-proxy/ferry-proxy
+ferry-netpol/ferry-netpol

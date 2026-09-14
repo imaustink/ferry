@@ -147,3 +147,45 @@ func (e exposure) describe() string {
 	}
 	return e.address + ":" + strconv.Itoa(int(e.port))
 }
+
+// warnOnService puts a reason where a person will look for it.
+//
+// A LoadBalancer that cannot open its port stays at <pending> forever, and until
+// now the only explanation was a line in ferry-proxy's log -- which is on the
+// Mac, not in the cluster, and which nobody reads unless they already suspect
+// the answer is there. `kubectl describe svc` is where that question gets asked,
+// so the answer is written there as an Event.
+//
+// Events are deduplicated by the API server on count, so repeating one is
+// cheap; the caller still rate-limits itself so a tight loop does not write one
+// per pass.
+func warnOnService(ctx context.Context, client kubernetes.Interface,
+	service *corev1.Service, reason, message string) {
+
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: service.Name + ".",
+			Namespace:    service.Namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:            "Service",
+			Namespace:       service.Namespace,
+			Name:            service.Name,
+			UID:             service.UID,
+			APIVersion:      "v1",
+			ResourceVersion: service.ResourceVersion,
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           corev1.EventTypeWarning,
+		Source:         corev1.EventSource{Component: "ferry-proxy"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	if _, err := client.CoreV1().Events(service.Namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		klog.V(2).ErrorS(err, "Could not record an event on the service",
+			"service", service.Namespace+"/"+service.Name, "reason", reason)
+	}
+}

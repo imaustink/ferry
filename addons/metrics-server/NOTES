@@ -3,22 +3,13 @@ work. It talks to the kubelet over TLS with a certificate the kubelet signed for
 itself, which no public CA vouches for, so --kubelet-insecure-tls is set. Every
 local-cluster distribution does the same thing for the same reason.
 
-  kubectl top nodes
   kubectl top pods -A
+  kubectl top nodes
 
 It needs about fifteen seconds after enabling before it has anything to report.
 
-One more thing on ferry. `kubectl top` reads metrics.k8s.io, which is an
-aggregated API: the API server does not answer it, metrics-server does, and the
-API server has to reach that pod to ask. The API server is a macOS process and
-is not on the pod network, so it cannot -- the request times out and kubectl
-says "Metrics API not available".
-
-Giving it a route means binding ClusterIPs on the Mac, which needs root:
-
-  FERRY_HOST_CLUSTER_IPS=1 ferry up
-
-Everything below metrics-server works without that: the kubelet serves real
-container CPU and memory, which you can see directly with
-
-  kubectl get --raw /api/v1/nodes/<node>/proxy/metrics/resource
+This used to come with a warning that the aggregated API could not be reached
+unless ClusterIPs were bound on the Mac with FERRY_HOST_CLUSTER_IPS=1. That is
+no longer true: the Mac is on the pod network now, so the API server reaches
+metrics-server the same way it would on any other cluster, with no root and no
+extra flag.

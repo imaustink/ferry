@@ -179,7 +179,13 @@ done
 
 echo "==> building darwin/arm64 kubelet ($K8S_VERSION)"
 cd "$src"
-GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
+# cgo is on because the node's CPU usage has no other source. macOS publishes no
+# kern.cp_time and no /proc/stat, so cumulative machine CPU comes from the Mach
+# host port, and that is a C call. Without it node_cpu_usage_seconds_total is
+# zero, metrics-server drops the node, and `kubectl top nodes` fails while
+# `kubectl top pods` works. This builds on the Mac that will run it, so the C
+# toolchain is the one already installed for Swift.
+GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
   go build -ldflags "$ldflags" -o "$out" ./cmd/kubelet
 
 echo "==> $out"
