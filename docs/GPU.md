@@ -205,7 +205,7 @@ no package graph to fetch and no weights to ship before a pod can use it.
 | `GET /v1/device` | what the GPU is -- name, architecture, unified memory, limits |
 | `GET /v1/model` | whether the on-device model is usable, and why not if it is not |
 | `POST /v1/matmul` | a square matrix multiply on the GPU, `{size, iterations}` |
-| `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}` |
+| `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}`; reports how often it yielded |
 | `GET /v1/usage` | this pod's own accounting, and no one else's |
 
 The control socket adds `/capacity`, `/pods`, `/stats` and `/metrics`.
@@ -326,7 +326,47 @@ boundary is the gate, not the file mode.
 
 ## Sharing it
 
-One GPU, many pods, so something has to decide the order -- and a plain lock
+### Two lanes, because the Mac has two answers
+
+"The GPU" turned out to be the wrong unit. Measured on this M4 Max
+([experiment 12](../experiments/12-gpu-contention/FINDINGS.md)):
+
+```
+two matmuls        one alone 12768 GFLOP/s
+                   two at once 6505 + 6424 = 12930 (101% of one)
+
+matmul + generation   matmul -0.9%, generation -12.0% per character
+```
+
+Two Metal matmuls split one GPU and the total does not move, so running them at
+once buys one percent and makes both of them half as fast. A matmul and a
+generation ignore each other entirely -- Apple's model does not run on the
+shaders, and the Neural Engine is separate silicon.
+
+So there is a lane per unit rather than one token for the machine: **compute**
+for Metal work, serialised, and **model** for the on-device model, independent.
+Within a lane everything below applies. Across lanes, nothing does: a pod
+generating text and a pod multiplying matrices never wait for each other,
+because the hardware does not make them.
+
+What a small matmul waits for, through the daemon:
+
+```
+nothing else running                         0.096s 0.083s 0.083s
+a generation running (other lane)            0.104s 0.086s 0.087s   <- no wait
+another matmul running (same lane)           0.098s 0.580s 0.579s   <- the slice
+```
+
+That middle row used to cost 0.26-0.77s. It is now indistinguishable from an
+idle machine, and the generation is not interrupted at all -- it reports zero
+yields, because nothing needs it to step aside.
+
+`GET /capacity` and `/metrics` report what is queued per lane, which is the
+number that says *which* resource is short rather than that something is.
+
+### Sharing a lane
+
+One lane, many pods, so something has to decide the order -- and a plain lock
 decides it badly. `ferry-gpud` hands out a device token behind a queue that is
 bounded, fair, deadlined, preemptible and cancellable.
 
@@ -361,6 +401,31 @@ hog   round 1: waited 35.4s for 3000 passes
 The work runs on the caller's own thread, so a job's progress is just that
 thread's stack: handing the device over and taking it back costs nothing but the
 handoff. Nothing is re-run and no progress is serialised anywhere.
+
+**Generation yields too**, which is not obvious, because a generation looks
+opaque: hand over a prompt, wait, get a paragraph. It is not, if it is streamed.
+The model emits snapshots as it goes -- measured on this one, a 5s generation
+arrives as 27 snapshots a median of 0.153s apart -- and the gap between them is
+a checkpoint as good as the gap between matmul passes.
+
+So `/v1/generate` streams internally even though nothing shows partial output to
+anyone. It is streamed for the checkpoint. A matmul asking while a 4.6s
+generation runs:
+
+```
+with the generation yielding      0.26s  0.65s  0.61s  0.77s
+with it holding the device        3.37s  0.08s  0.08s  0.08s   <- waited it out
+```
+
+The second row is the same test with the slice raised past the generation's run
+time, which is what the old behaviour was: the first matmul waits for the whole
+generation, and the rest are fast only because there is nothing left to wait
+for. Streaming costs the generation nothing beyond the time it hands over.
+
+It buys two other things that were previously impossible. A generation can now
+be **cancelled** when its pod goes away -- 499 within a snapshot of the pod being
+deleted, rather than after the whole paragraph -- and its **deadline** is checked
+per snapshot rather than only at the end.
 
 What **cannot** be preempted is a single Metal command buffer, which runs to
 completion whatever anyone wants. That is the real floor on how long a co-tenant
@@ -411,10 +476,16 @@ at 5.00s against a 5s budget) and while queued.
 queued *and* running requests, and the caller gets a 499 rather than waiting.
 
 **The queue is bounded** -- 64 waiting by default, 8 from any one pod -- and a
-full queue is a 503 rather than an unbounded backlog. A request may allocate at
-most a quarter of the GPU's recommended working set; unified memory is shared
+full queue is a 503 rather than an unbounded backlog.
+
+Each lane also bounds how big one request may be, and they need different
+bounds because they consume different things. A compute request may allocate at
+most a quarter of the GPU's recommended working set: unified memory is shared
 with the whole Mac and the allocation is the host's, so an unbounded one is a
-denial of service against the Mac rather than against the pod.
+denial of service against the Mac rather than against the pod. A model request
+is capped at 4096 response tokens, which is the same idea for the thing the
+model actually spends -- `maximumResponseTokens` previously went to the
+framework exactly as the pod sent it, so "as long as it likes" was the policy.
 
 | flag | default | |
 |---|---|---|
@@ -505,12 +576,14 @@ daemon and it is back within a tick.
 
 ## Open questions
 
-- **One pass is the floor.** A co-tenant's worst wait is the time slice plus
-  whatever command buffer is already running, and the second half of that is not
-  ours to interrupt. At the largest allowed matmul it is about 0.9s.
-- **Generation cannot yield.** `/v1/generate` is opaque to us once the model has
-  the prompt, so it holds the device for its whole run and is bounded only by the
-  request deadline. A matmul submitted alongside waits for it.
+- **One pass is the floor, in the compute lane.** A co-tenant's worst wait there
+  is the time slice plus whatever command buffer is already running, and the
+  second half of that is not ours to interrupt. At the largest allowed matmul it
+  is about 0.9s.
+- **Two lanes because two were measured.** A third kind of work -- a Core ML
+  model, a video encode, a matmul too small to fill the GPU -- would need its own
+  measurement before anyone could say which lane it belongs in. The lane is a
+  claim about hardware, not a label.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 
@@ -518,6 +591,5 @@ daemon and it is back within a tick.
 
 Another backend behind `/v1/generate` -- MLX or llama.cpp with real weights, for
 a model larger than the one the OS ships. The endpoint was shaped so that lands
-without the pod noticing, and it is also where the yielding question gets
-interesting: a token loop has an obvious checkpoint between tokens, which the
-system model's API does not give us.
+without the pod noticing, and the yielding is already solved for it: a token
+loop has the same checkpoint between tokens that the stream gives us here.

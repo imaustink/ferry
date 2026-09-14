@@ -38,6 +38,9 @@ struct Capacity: Encodable {
     /// Requests queued or running right now. The number that says whether
     /// `limit` is set too high for what these pods actually do.
     var pending: Int
+    /// The same, split by lane. "Something is queued" is much less useful than
+    /// "the GPU is backed up and the model is idle".
+    var pendingByLane: [String: Int]
 }
 
 enum ServiceError: Error, CustomStringConvertible {
@@ -57,7 +60,7 @@ enum ServiceError: Error, CustomStringConvertible {
 final class Service: @unchecked Sendable {
     private let gpu: GPU
     private let generator = Generator()
-    private let scheduler: GPUScheduler
+    private let lanes: GPULanes
     private let socketDirectory: String
     /// How many pods may hold a relay at once. There is one GPU; this is a
     /// policy number, not a discovered one, and it is what the node advertises
@@ -69,10 +72,10 @@ final class Service: @unchecked Sendable {
     private let lock = NSLock()
     private var pods: [String: (registration: PodRegistration, server: UnixHTTPServer)] = [:]
 
-    init(gpu: GPU, scheduler: GPUScheduler, socketDirectory: String,
+    init(gpu: GPU, lanes: GPULanes, socketDirectory: String,
          limit: Int, requestTimeout: TimeInterval) {
         self.gpu = gpu
-        self.scheduler = scheduler
+        self.lanes = lanes
         self.socketDirectory = socketDirectory
         self.limit = limit
         self.requestTimeout = requestTimeout
@@ -114,7 +117,7 @@ final class Service: @unchecked Sendable {
     /// Called with the lock held. Binds the socket and tells the scheduler what
     /// this pod is worth, before it can ask for anything.
     private func bind(_ registration: PodRegistration) throws {
-        scheduler.setPriority(registration.priority ?? 0, for: registration.uid)
+        lanes.setPriority(registration.priority ?? 0, for: registration.uid)
         let path = socketPath(uid: registration.uid)
         let server = UnixHTTPServer(path: path, identity: registration.uid) { [weak self] request, identity in
             self?.handlePod(request, identity: identity) ?? .error("shutting down", status: 503)
@@ -133,9 +136,9 @@ final class Service: @unchecked Sendable {
         guard removed else { return false }
         // Anything this pod had queued or running goes with it. The container is
         // gone; finishing its matmul would only make the next pod wait.
-        let stopped = scheduler.cancel(pod: uid)
+        let stopped = lanes.cancel(pod: uid)
         if stopped > 0 { log("cancelled \(stopped) in-flight request(s) for \(uid)") }
-        scheduler.forget(pod: uid)
+        lanes.forget(pod: uid)
         persist()
         return true
     }
@@ -155,7 +158,7 @@ final class Service: @unchecked Sendable {
             pods.removeAll()
             return uids
         }
-        for uid in held { scheduler.cancel(pod: uid) }
+        for uid in held { lanes.cancel(pod: uid) }
         if forget { persist() }
     }
 
@@ -204,14 +207,15 @@ final class Service: @unchecked Sendable {
 
     var capacity: Capacity {
         let granted = lock.withLock { pods.count }
-        return Capacity(limit: limit, granted: granted, pending: scheduler.pending)
+        return Capacity(limit: limit, granted: granted, pending: lanes.pending,
+                        pendingByLane: lanes.pendingByLane)
     }
 
     /// Called with the lock held.
     private func entry(uid: String, registration: PodRegistration) -> PodEntry {
         PodEntry(uid: uid, namespace: registration.namespace, name: registration.name,
                  socket: socketPath(uid: uid), grantedAt: registration.grantedAt,
-                 priority: registration.priority ?? 0, usage: scheduler.usage(for: uid))
+                 priority: registration.priority ?? 0, usage: lanes.ledger.usage(for: uid))
     }
 
     private func describe(_ registration: PodRegistration) -> String {
@@ -222,7 +226,7 @@ final class Service: @unchecked Sendable {
     }
 
     func drain(timeout: TimeInterval) {
-        scheduler.drain(timeout: timeout)
+        lanes.drain(timeout: timeout)
         revokeAll(forget: false)
     }
 
@@ -241,7 +245,7 @@ final class Service: @unchecked Sendable {
             return .json(listing)
 
         case ("GET", ["stats"]):
-            return .json(scheduler.stats)
+            return .json(lanes.ledger.all)
 
         case ("GET", ["metrics"]):
             return metrics()
@@ -290,14 +294,15 @@ final class Service: @unchecked Sendable {
 
         case ("GET", ["v1", "usage"]):
             // A pod may see its own accounting and nobody else's.
-            return .json(scheduler.usage(for: pod))
+            return .json(lanes.ledger.usage(for: pod))
 
         case ("POST", ["v1", "matmul"]):
             struct Body: Decodable { var size: Int?; var iterations: Int? }
             let body = (try? request.json(Body.self)) ?? Body(size: nil, iterations: nil)
             let size = body.size ?? 1024
             let iterations = body.iterations ?? 10
-            return run(pod: pod, what: "matmul \(size)x\(size) x\(iterations)") { job in
+            return run(pod: pod, lane: .compute,
+                       what: "matmul \(size)x\(size) x\(iterations)") { job in
                 try self.gpu.matmul(size: size, iterations: iterations, job: job)
             }
 
@@ -305,10 +310,9 @@ final class Service: @unchecked Sendable {
             guard let body = try? request.json(GenerateRequest.self) else {
                 return .error("expected {\"prompt\": \"...\"}", status: 400)
             }
-            return run(pod: pod, what: "generate \(body.prompt.count) chars") { job in
-                try awaitResult {
-                    try await self.generator.generate(body, deadline: job.remaining)
-                }
+            return run(pod: pod, lane: .model,
+                       what: "generate \(body.prompt.count) chars") { job in
+                try self.generator.generate(body, job: job)
             }
 
         default:
@@ -330,6 +334,11 @@ final class Service: @unchecked Sendable {
             "# HELP ferry_gpu_pending Requests queued or running.",
             "# TYPE ferry_gpu_pending gauge",
             "ferry_gpu_pending \(capacity.pending)",
+        ]
+        for (lane, pending) in capacity.pendingByLane.sorted(by: { $0.key < $1.key }) {
+            lines.append("ferry_gpu_lane_pending{lane=\"\(lane)\"} \(pending)")
+        }
+        lines += [
             "# HELP ferry_gpu_seconds_total Seconds spent holding the device, by pod.",
             "# TYPE ferry_gpu_seconds_total counter",
             "# HELP ferry_gpu_queued_seconds_total Seconds spent waiting for it, by pod.",
@@ -344,7 +353,7 @@ final class Service: @unchecked Sendable {
         // The pod uid is the only label: names come and go, uids do not, and a
         // label per anything else would be cardinality for its own sake.
         let held = lock.withLock { pods }
-        for (uid, usage) in scheduler.stats.sorted(by: { $0.key < $1.key }) {
+        for (uid, usage) in lanes.ledger.all.sorted(by: { $0.key < $1.key }) {
             let pod = held[uid]?.registration
             let labels = "pod=\"\(pod?.name ?? "")\",namespace=\"\(pod?.namespace ?? "")\",uid=\"\(uid)\""
             lines.append("ferry_gpu_seconds_total{\(labels)} \(usage.gpuSeconds)")
@@ -362,11 +371,11 @@ final class Service: @unchecked Sendable {
     /// into a response, with the status the caller needs to tell a "try again"
     /// from a "you asked for too much".
     private func run<T: Encodable>(
-        pod: String, what: String, _ work: @escaping (GPUJob) throws -> T
+        pod: String, lane: GPULane, what: String, _ work: @escaping (GPUJob) throws -> T
     ) -> HTTPResponse {
         log("\(what) for \(pod)")
         do {
-            return .json(try scheduler.run(pod: pod, timeout: requestTimeout, work))
+            return .json(try lanes.run(lane: lane, pod: pod, timeout: requestTimeout, work))
         } catch let error as SchedulerError {
             log("\(what) for \(pod): \(error)")
             return .error("\(error)", status: error.status)

@@ -120,6 +120,7 @@ experiments/05-real-pods/            the whole stack, with real VMs per pod
 experiments/06-kube-proxy-on-macos/  kube-proxy's rule generation, rendered on darwin
 experiments/07-vmnet-leak/           what a refused vmnet subnet actually means
 experiments/08-vsock-socket-relay/   a host socket, inside a pod, over vsock
+experiments/12-gpu-contention/       what shares this Mac's silicon and what does not
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-streamer/                      SPDY streaming for exec, attach and port-forward
 ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
