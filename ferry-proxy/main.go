@@ -244,6 +244,29 @@ func (c *controller) reconcile() {
 			}
 		}
 
+		// A Service asking for SCTP on the outside edge gets an explanation
+		// rather than silence. Its ClusterIP still works.
+		for _, port := range service.Spec.Ports {
+			if port.Protocol != corev1.ProtocolSCTP {
+				continue
+			}
+			if service.Spec.Type != corev1.ServiceTypeNodePort &&
+				service.Spec.Type != corev1.ServiceTypeLoadBalancer {
+				continue
+			}
+			key := fmt.Sprintf("sctp/%s:%d", name, port.Port)
+			if !c.complained[key] {
+				c.complained[key] = true
+				klog.InfoS("SCTP is not served on the node edge; the ClusterIP still works",
+					"service", name, "port", port.Port, "type", service.Spec.Type)
+				warnOnService(context.Background(), c.client, service, "SCTPNotExposed",
+					fmt.Sprintf("ferry cannot expose SCTP port %d as %s: macOS has no SCTP "+
+						"sockets, so the Mac cannot listen for it. Pod-to-pod SCTP works, "+
+						"including through this Service's ClusterIP.",
+						port.Port, service.Spec.Type))
+			}
+		}
+
 		published := false
 		for _, e := range wanted {
 			desired[e.key] = true
