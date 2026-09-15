@@ -32,11 +32,18 @@ re-measure rather than reasoning from the source.
 
 ## Expected, and missing
 
-- **SCTP Services.** UDP is carried end to end now. SCTP is not: `ferry-proxy`
-  skips it outright on the host edge, and the guest kernel is built from Apple's
-  configuration plus four netfilter symbols, which does not include
-  `CONFIG_IP_SCTP`. Both halves would have to change, and the kernel build is
-  the slow one that needs Docker.
+- **SCTP on the node edge.** Pod-to-pod SCTP works, including through a
+  ClusterIP -- see `docs/SERVICES.md`. A NodePort or LoadBalancer cannot: a node
+  port is a listener on macOS and macOS has no SCTP sockets to listen with.
+  ferry records that on the Service rather than leaving the port unserved, and
+  there is no way around it short of a userspace SCTP stack.
+
+  An earlier revision of this list said the guest kernel lacked
+  `CONFIG_IP_SCTP`. That was assumed and wrong -- Apple's configuration enables
+  it, and `build-kernel.sh` only verifies four NAT symbols rather than
+  restricting the set. It also said macOS "has no SCTP sockets", which overstates
+  things: macOS ships no SCTP *stack*, and whether a userspace one could serve
+  the node edge is open, in issue #38.
 - **Cluster upgrades.** No path from one version to another. `ferry build
   --kubernetes-version` changes what a *new* cluster is built from; it does not
   move a running one, and nothing drains, replaces or rolls back a node.

@@ -67,4 +67,13 @@ for plugin in $GUEST_PLUGINS; do
   echo "    $(basename "$plugin")"
 done
 
+# ferry's own guest plugin. Same shape as the upstream ones -- static ELF, run
+# inside the pod -- and built from this repository rather than fetched.
+echo "==> ferry's plugin, for the pod"
+( cd "$here/ferry-sctp" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+    go build -ldflags "-s -w" -o "$guestdir/ferry-sctp" . )
+assert_type "$guestdir/ferry-sctp" "ELF 64-bit LSB executable, ARM aarch64"
+assert_type "$guestdir/ferry-sctp" "statically linked"
+echo "    ferry-sctp"
+
 echo "==> $here/plugins ($(du -sh "$here/plugins" | cut -f1))"

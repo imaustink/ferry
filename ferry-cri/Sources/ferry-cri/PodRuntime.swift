@@ -386,7 +386,8 @@ actor PodRuntime {
         if let supplied = config.cniConflist, !supplied.isEmpty {
             conflist = supplied
         } else {
-            try CNIRuntime.writeDefaultConflist(at: defaultConflistPath.path())
+            try CNIRuntime.writeDefaultConflist(at: defaultConflistPath.path(),
+                                                clusterCIDR: config.clusterCIDR)
             conflist = defaultConflistPath.path()
         }
         let cache = config.stateDir.appending(component: "cni-cache")

@@ -78,8 +78,19 @@ func exposuresFor(service *corev1.Service, loadBalancerIP string) []exposure {
 		if port.Protocol != "" {
 			protocol = port.Protocol
 		}
+		// SCTP reaches pods from other pods -- ferry routes it over its own
+		// switch, which carries it -- but not from the Mac. A node port is a
+		// listener on macOS, and macOS registers nothing to handle SCTP:
+		// socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP) is EPROTONOSUPPORT.
+		//
+		// That is the absence of a stack, not a law of nature. The protocol
+		// number is defined and a raw socket for it fails on privilege rather
+		// than protocol, so a userspace stack running as root might serve this.
+		// Issue #38 has the measurements. Until then a ClusterIP SCTP Service
+		// works, a NodePort or LoadBalancer one does not, and the caller says
+		// so on the Service rather than here.
 		if protocol != corev1.ProtocolTCP && protocol != corev1.ProtocolUDP {
-			continue // SCTP has no forwarder here
+			continue
 		}
 
 		// NodePort is allocated for both NodePort and LoadBalancer services.

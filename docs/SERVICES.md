@@ -88,8 +88,28 @@ of which is `kubectl exec` starting a process in a VM.
 
 ## Known limits
 
-- **UDP and SCTP are rendered but not verified.** kube-proxy emits rules for
-  them; ferry has only tested TCP.
+- **SCTP works between pods and does not reach the node edge.** A ClusterIP SCTP
+  Service carries traffic, same node or across machines. A NodePort or
+  LoadBalancer one does not: a node port is a listener on macOS, and macOS ships
+  no SCTP stack to listen with -- `socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)`
+  returns `EPROTONOSUPPORT`, because nothing is registered to handle the
+  protocol. `ferry-proxy` records that on the Service as an `SCTPNotExposed`
+  event rather than leaving the port quietly unserved.
+
+  Not the same as impossible. The protocol number is defined and a *raw* socket
+  for it fails on privilege rather than protocol, so a userspace stack such as
+  usrsctp, running as root, might serve the node edge. What stands in the way is
+  probably that a kernel with no handler for SCTP answers it with ICMP protocol
+  unreachable. Measured and written up in issue #38 rather than guessed at here.
+
+  Pod-to-pod SCTP needs one thing that TCP and UDP do not, and it is worth
+  knowing why. Two pods on the same Mac normally reach each other over `eth0`,
+  the vmnet datapath, which is the faster path -- and vmnet carries TCP, UDP and
+  ICMP and silently drops everything else. So SCTP is given a routing table of
+  its own, selected by a rule matching the protocol, whose route to the pod
+  network leaves by `eth1` -- ferry's switch, which carries any protocol. The
+  `ferry-sctp` CNI plugin installs that rule inside each pod. TCP and UDP keep
+  the fast path untouched.
 - **Conntrack is not reconciled.** kube-proxy clears stale entries against a live
   connection table; the host has none, and the entries that matter are in each
   pod's kernel. Traffic can keep flowing to a removed endpoint until entries age

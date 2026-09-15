@@ -214,11 +214,8 @@ extension CNIRuntime {
     /// ferry is not choosing addresses -- vmnet already did, and the runtime
     /// hands that address to `static` per pod. What is left in the file is the
     /// shape of the chain, which is the part worth being able to read and edit.
-    static func writeDefaultConflist(at path: String) throws {
-        let conflist: [String: Any] = [
-            "cniVersion": "1.0.0",
-            "name": "ferry",
-            "plugins": [
+    static func writeDefaultConflist(at path: String, clusterCIDR: String?) throws {
+        var plugins: [[String: Any]] = [
                 [
                     "type": "ferry-vm",
                     // The address arrives as a runtime capability, because it is
@@ -243,7 +240,29 @@ extension CNIRuntime {
                     "snat": false,
                     "capabilities": ["portMappings": true],
                 ],
-            ],
+        ]
+
+        // SCTP takes the switch rather than vmnet, which does not carry it.
+        // Only meaningful once there is a cluster network to have a switch on,
+        // so a vmnet-only cluster does not get the plugin at all.
+        //
+        // The network to redirect is deliberately not written here. ferry asks
+        // vmnet for a subnet matching the cluster slice and does not always get
+        // it; when it does not, the pods are somewhere else entirely and a CIDR
+        // recorded at this point would name a network none of them are on. The
+        // plugin reads it from the switch interface instead, which is by
+        // definition right.
+        if let clusterCIDR, !clusterCIDR.isEmpty {
+            plugins.append([
+                "type": "ferry-sctp",
+                "device": "eth1",
+            ])
+        }
+
+        let conflist: [String: Any] = [
+            "cniVersion": "1.0.0",
+            "name": "ferry",
+            "plugins": plugins,
         ]
         let encoded = try JSONSerialization.data(withJSONObject: conflist,
                                                  options: [.prettyPrinted, .sortedKeys])
