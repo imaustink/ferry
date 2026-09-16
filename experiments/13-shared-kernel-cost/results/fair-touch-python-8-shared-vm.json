@@ -1,0 +1,182 @@
+{
+  "shape": "shared-vm",
+  "workload": "touch",
+  "image": "docker.io/library/python:3.12",
+  "count": 8,
+  "create_seconds": 0.73102825,
+  "baseline": {
+    "at": "18:45:48",
+    "free_mib": 2446.625,
+    "used_mib": 16911.65625,
+    "compressed_mib": 2323.265625,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:45:54",
+      "free_mib": 359.578125,
+      "used_mib": 18180.296875,
+      "compressed_mib": 2323.046875,
+      "vms": 1,
+      "vm_resident_mib": 7846.703125,
+      "vm_cpu_percent": 81.4
+    },
+    {
+      "at": "18:46:00",
+      "free_mib": 324.4375,
+      "used_mib": 18116.953125,
+      "compressed_mib": 2329.71875,
+      "vms": 1,
+      "vm_resident_mib": 7848.859375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:05",
+      "free_mib": 315.75,
+      "used_mib": 18125.875,
+      "compressed_mib": 2329.71875,
+      "vms": 1,
+      "vm_resident_mib": 7849.4375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:11",
+      "free_mib": 324.484375,
+      "used_mib": 18118.578125,
+      "compressed_mib": 2329.71875,
+      "vms": 1,
+      "vm_resident_mib": 7850.46875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:17",
+      "free_mib": 343.3125,
+      "used_mib": 18098.953125,
+      "compressed_mib": 2329.71875,
+      "vms": 1,
+      "vm_resident_mib": 7850.71875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:22",
+      "free_mib": 338.875,
+      "used_mib": 18104.234375,
+      "compressed_mib": 2329.78125,
+      "vms": 1,
+      "vm_resident_mib": 7851.0625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:28",
+      "free_mib": 453.4375,
+      "used_mib": 17987.765625,
+      "compressed_mib": 2329.765625,
+      "vms": 1,
+      "vm_resident_mib": 7851.34375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:34",
+      "free_mib": 433.015625,
+      "used_mib": 18009.234375,
+      "compressed_mib": 2329.75,
+      "vms": 1,
+      "vm_resident_mib": 7851.734375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:39",
+      "free_mib": 435.609375,
+      "used_mib": 18008.078125,
+      "compressed_mib": 2329.8125,
+      "vms": 1,
+      "vm_resident_mib": 7852.0625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:45",
+      "free_mib": 428.015625,
+      "used_mib": 18012.375,
+      "compressed_mib": 2329.8125,
+      "vms": 1,
+      "vm_resident_mib": 7852.34375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:51",
+      "free_mib": 392.515625,
+      "used_mib": 18049.984375,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7852.53125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:46:56",
+      "free_mib": 327.34375,
+      "used_mib": 18116.03125,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7852.84375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:02",
+      "free_mib": 394.328125,
+      "used_mib": 18046.28125,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7853.140625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:08",
+      "free_mib": 392.71875,
+      "used_mib": 18048.5,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7853.234375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:13",
+      "free_mib": 295.640625,
+      "used_mib": 18146.765625,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7853.21875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:19",
+      "free_mib": 324.125,
+      "used_mib": 18117.296875,
+      "compressed_mib": 2329.28125,
+      "vms": 1,
+      "vm_resident_mib": 7853.15625,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:47:08",
+    "free_mib": 392.71875,
+    "used_mib": 18048.5,
+    "compressed_mib": 2329.28125,
+    "vms": 1,
+    "vm_resident_mib": 7853.234375,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 4096,
+  "logs": [
+    "ctr-00.log: 2026-09-14T01:45:53.719Z stdout F TOUCHED",
+    "ctr-01.log: 2026-09-14T01:45:53.983Z stdout F TOUCHED",
+    "ctr-02.log: 2026-09-14T01:45:53.900Z stdout F TOUCHED",
+    "ctr-03.log: 2026-09-14T01:45:53.859Z stdout F TOUCHED",
+    "ctr-04.log: 2026-09-14T01:45:54.001Z stdout F TOUCHED",
+    "ctr-05.log: 2026-09-14T01:45:54.136Z stdout F TOUCHED",
+    "ctr-06.log: 2026-09-14T01:45:53.903Z stdout F TOUCHED",
+    "ctr-07.log: 2026-09-14T01:45:53.543Z stdout F TOUCHED"
+  ]
+}

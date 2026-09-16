@@ -1,0 +1,77 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "docker.io/library/debian:12",
+  "count": 1,
+  "create_seconds": 0.408248875,
+  "baseline": {
+    "at": "07:27:20",
+    "free_mib": 5944.015625,
+    "used_mib": 16271.734375,
+    "compressed_mib": 2438.75,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "07:27:41",
+      "free_mib": 5202.40625,
+      "used_mib": 16599.46875,
+      "compressed_mib": 2438.78125,
+      "vms": 1,
+      "vm_resident_mib": 1066.03125,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "07:28:02",
+      "free_mib": 5118.125,
+      "used_mib": 16719.84375,
+      "compressed_mib": 2438.78125,
+      "vms": 1,
+      "vm_resident_mib": 1184.921875,
+      "vm_cpu_percent": 0.2
+    },
+    {
+      "at": "07:28:23",
+      "free_mib": 4851.171875,
+      "used_mib": 16875.875,
+      "compressed_mib": 2438.78125,
+      "vms": 1,
+      "vm_resident_mib": 1185,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "07:28:44",
+      "free_mib": 5063.015625,
+      "used_mib": 16782.421875,
+      "compressed_mib": 2438.78125,
+      "vms": 1,
+      "vm_resident_mib": 1185.03125,
+      "vm_cpu_percent": 0.1
+    }
+  ],
+  "peak": {
+    "at": "07:28:44",
+    "free_mib": 5063.015625,
+    "used_mib": 16782.421875,
+    "compressed_mib": 2438.78125,
+    "vms": 1,
+    "vm_resident_mib": 1185.03125,
+    "vm_cpu_percent": 0.1
+  },
+  "footprint_mib": 923,
+  "logs": [
+    "pod-00.log: 2026-09-14T14:27:21.278Z stdout F SUBTREE_OK=1",
+    "pod-00.log: 2026-09-14T14:27:21.397Z stdout F CONTAINERD_READY_MS=100",
+    "pod-00.log: 2026-09-14T14:27:24.498Z stdout F PULL_MS=3098",
+    "pod-00.log: 2026-09-14T14:27:25.407Z stdout F START_TOTAL_MS=903",
+    "pod-00.log: 2026-09-14T14:27:25.407Z stdout F START_PER_CONTAINER_MS=45",
+    "pod-00.log: 2026-09-14T14:27:25.407Z stdout F CONTAINERS_RUNNING=20",
+    "pod-00.log: 2026-09-14T14:27:45.415Z stdout F GUEST_MEM_TOTAL_MIB=9942",
+    "pod-00.log: 2026-09-14T14:27:45.416Z stdout F GUEST_MEM_AVAILABLE_MIB=9545",
+    "pod-00.log: 2026-09-14T14:27:45.416Z stdout F GUEST_CACHED_MIB=275",
+    "pod-00.log: 2026-09-14T14:27:45.422Z stdout F CONTAINERD_DISK_MIB=14",
+    "pod-00.log: 2026-09-14T14:27:45.422Z stdout F BENCH_DONE=1"
+  ]
+}

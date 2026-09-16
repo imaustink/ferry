@@ -1,0 +1,104 @@
+{
+  "shape": "shared-vm",
+  "workload": "touch",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 20,
+  "create_seconds": 1.2283481250000001,
+  "baseline": {
+    "at": "18:35:56",
+    "free_mib": 4861.265625,
+    "used_mib": 16014.9375,
+    "compressed_mib": 2224.546875,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:36:03",
+      "free_mib": 4304.53125,
+      "used_mib": 16302.9375,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 556.0625,
+      "vm_cpu_percent": 0.2
+    },
+    {
+      "at": "18:36:09",
+      "free_mib": 4293.859375,
+      "used_mib": 16312.703125,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 556.53125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:36:14",
+      "free_mib": 4281.015625,
+      "used_mib": 16330.3125,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 557.078125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:36:20",
+      "free_mib": 4284.734375,
+      "used_mib": 16328.75,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 558.015625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:36:26",
+      "free_mib": 4298.828125,
+      "used_mib": 16324.53125,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 558.265625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:36:31",
+      "free_mib": 4300.3125,
+      "used_mib": 16320.765625,
+      "compressed_mib": 2224.53125,
+      "vms": 1,
+      "vm_resident_mib": 558.8125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:36:31",
+    "free_mib": 4300.3125,
+    "used_mib": 16320.765625,
+    "compressed_mib": 2224.53125,
+    "vms": 1,
+    "vm_resident_mib": 558.8125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 441.5,
+  "logs": [
+    "ctr-00.log: 2026-09-14T01:35:57.634Z stdout F TOUCHED",
+    "ctr-01.log: 2026-09-14T01:35:57.674Z stdout F TOUCHED",
+    "ctr-02.log: 2026-09-14T01:35:57.706Z stdout F TOUCHED",
+    "ctr-03.log: 2026-09-14T01:35:57.721Z stdout F TOUCHED",
+    "ctr-04.log: 2026-09-14T01:35:57.750Z stdout F TOUCHED",
+    "ctr-05.log: 2026-09-14T01:35:57.789Z stdout F TOUCHED",
+    "ctr-06.log: 2026-09-14T01:35:57.842Z stdout F TOUCHED",
+    "ctr-07.log: 2026-09-14T01:35:57.858Z stdout F TOUCHED",
+    "ctr-08.log: 2026-09-14T01:35:57.894Z stdout F TOUCHED",
+    "ctr-09.log: 2026-09-14T01:35:57.926Z stdout F TOUCHED",
+    "ctr-10.log: 2026-09-14T01:35:57.940Z stdout F TOUCHED",
+    "ctr-11.log: 2026-09-14T01:35:57.959Z stdout F TOUCHED",
+    "ctr-12.log: 2026-09-14T01:35:58.015Z stdout F TOUCHED",
+    "ctr-13.log: 2026-09-14T01:35:58.046Z stdout F TOUCHED",
+    "ctr-14.log: 2026-09-14T01:35:58.062Z stdout F TOUCHED",
+    "ctr-15.log: 2026-09-14T01:35:58.098Z stdout F TOUCHED",
+    "ctr-16.log: 2026-09-14T01:35:58.125Z stdout F TOUCHED",
+    "ctr-17.log: 2026-09-14T01:35:58.166Z stdout F TOUCHED",
+    "ctr-18.log: 2026-09-14T01:35:58.210Z stdout F TOUCHED",
+    "ctr-19.log: 2026-09-14T01:35:58.227Z stdout F TOUCHED"
+  ]
+}
