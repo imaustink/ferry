@@ -276,6 +276,15 @@ and `kubectl get nodes` shows the truth.
    CNI plugin, and no `/etc/hosts` for containerd to copy. What it is *not* is
    a node image: the software is staged into a `ferry-cri` pod VM, which is
    exactly why those four bit.
+1b. **The node image.** **Done** —
+   [experiment 18](../experiments/18-node-image/FINDINGS.md). Docker builds it,
+   `ferry-node build` unpacks it into an ext4 disk, and `ferry-node run` boots
+   that disk as a machine with a vmnet address and its joining details on the
+   kernel command line. Ready in **13.8s**, and pods on it now reach the
+   internet, which the staged-into-a-pod version could not do for want of
+   `iptables`. `ferry-node`'s two verbs are the shape `ferry-machined` needs:
+   image in, machine out.
+
 2. **`Machine` CRD and `ferry-machined`.** Create and delete a node by applying
    and deleting a resource. Status reflects the VM and the `Node`.
 3. **Pod network between machines.** One vmnet network, per-node CIDR, routes.

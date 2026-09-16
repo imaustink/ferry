@@ -1,0 +1,203 @@
+#!/bin/sh
+# PID 1 on a ferry node.
+#
+# Everything it needs is on the kernel command line, because a VM booted by a
+# controller has no other channel at first boot and a config drive is a second
+# device to build and mount. The controller writes the address it allocated,
+# the API server to join, and the token to join with; this brings the machine
+# up and hands it to the kubelet.
+set -u
+
+# The kernel hands PID 1 an empty environment, so there is no PATH unless one is
+# made. Everything here calls binaries by absolute path and did not notice --
+# until the kubelet shelled out to `mount` for a projected volume and could not
+# find it, leaving pods stuck in ContainerCreating with the reason three layers
+# down in an event message.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+log() { echo "ferry-node: $*" > /dev/console; }
+started=$(date +%s%N 2>/dev/null || echo 0)
+elapsed() { echo $(( ($(date +%s%N) - started) / 1000000 )); }
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /run /tmp /sys/fs/cgroup
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+
+# This is the whole point of being a machine rather than a container: /proc is
+# ours and writable, so the kubelet's ContainerManager can set the kernel flags
+# it insists on instead of refusing to start.
+log "proc writable: $([ -w /proc/sys/vm/overcommit_memory ] && echo yes || echo no)"
+
+param() { # key
+  sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline
+}
+NODE_NAME=$(param ferry.node)
+API_SERVER=$(param ferry.api)
+TOKEN=$(param ferry.token)
+ADDRESS=$(param ferry.address)      # CIDR, e.g. 192.168.66.5/24
+GATEWAY=$(param ferry.gateway)
+POD_CIDR=$(param ferry.podcidr)
+DNS=$(param ferry.dns)
+
+hostname "$NODE_NAME" 2>/dev/null
+echo "$NODE_NAME" > /etc/hostname
+# Written here rather than in the image: a Docker build bind-mounts /etc/hosts
+# read-only, so it cannot be baked in. containerd copies this into every
+# sandbox and refuses to start one without it.
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 %s\n' "$NODE_NAME" > /etc/hosts
+
+# vmnet networks here have DHCP disabled -- the host allocates the address and
+# tells the guest what it is, which is also how ferry addresses pods.
+ip link set lo up
+ip link set eth0 up
+ip addr add "$ADDRESS" dev eth0
+[ -n "$GATEWAY" ] && ip route add default via "$GATEWAY"
+printf 'nameserver %s\n' "${DNS:-1.1.1.1}" > /etc/resolv.conf
+log "address $ADDRESS via ${GATEWAY:-none} ($(elapsed)ms)"
+
+# A pod network for this node's own pods. ipMasq is on because this image has
+# iptables, which is what experiment 17 could not do.
+cat > /etc/cni/net.d/10-ferry-node.conflist <<CNI
+{
+  "cniVersion": "1.0.0",
+  "name": "ferry-node",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": "${POD_CIDR:-10.88.0.0/16}"}]],
+        "routes": [{"dst": "0.0.0.0/0"}]
+      }
+    },
+    {"type": "portmap", "capabilities": {"portMappings": true}}
+  ]
+}
+CNI
+
+log "binaries: $(ls -l /usr/local/bin/containerd 2>&1 | awk '{print $1, $5}') kubelet $(ls -l /usr/local/bin/kubelet 2>&1 | awk '{print $5}')"
+log "starting containerd"
+/usr/local/bin/containerd > /var/log/containerd.log 2>&1 &
+containerd_pid=$!
+n=0
+# `ctr version` talks to the socket and will wait on it, so the readiness check
+# is the socket appearing rather than a command that may not come back.
+until [ -S /run/containerd/containerd.sock ]; do
+  n=$((n + 1))
+  if ! kill -0 "$containerd_pid" 2>/dev/null; then
+    log "containerd exited"
+    tail -5 /var/log/containerd.log > /dev/console 2>&1
+    break
+  fi
+  [ "$n" -gt 600 ] && { log "containerd never opened its socket"; tail -5 /var/log/containerd.log > /dev/console 2>&1; break; }
+  sleep 0.1
+done
+log "containerd ready ($(elapsed)ms)"
+
+mkdir -p /etc/kubernetes /var/lib/kubelet
+# vdb is this node's configuration: one read-only filesystem carrying what
+# differs between machines. The certificate authority is too big for a kernel
+# command line, and is the reason this disk exists at all.
+mkdir -p /mnt/config
+if mount -t ext4 -o ro /dev/vdb /mnt/config 2>/dev/null; then
+  cp /mnt/config/ca.crt /etc/kubernetes/ca.crt
+  log "config disk mounted, ca.crt $([ -s /etc/kubernetes/ca.crt ] && echo present || echo MISSING)"
+else
+  log "no config disk on /dev/vdb"
+fi
+
+cat > /etc/kubernetes/bootstrap-kubelet.conf <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: ferry
+  cluster:
+    server: $API_SERVER
+    certificate-authority: /etc/kubernetes/ca.crt
+contexts:
+- name: bootstrap
+  context: {cluster: ferry, user: bootstrap}
+current-context: bootstrap
+users:
+- name: bootstrap
+  user: {token: $TOKEN}
+EOF
+
+cat > /var/lib/kubelet/config.yaml <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous: {enabled: false}
+  webhook: {enabled: true}
+  x509: {clientCAFile: /etc/kubernetes/ca.crt}
+authorization: {mode: Webhook}
+clusterDomain: cluster.local
+${DNS_SERVICE:+clusterDNS: [$DNS_SERVICE]}
+cgroupDriver: cgroupfs
+failSwapOn: false
+readOnlyPort: 0
+# Sized to this machine's disk rather than to a Mac's. Asking for gigabytes
+# free on a node whose root filesystem is a few gigabytes means DiskPressure
+# from the first heartbeat, and everything scheduled here is evicted.
+evictionHard:
+  memory.available: "200Mi"
+  nodefs.available: "500Mi"
+  imagefs.available: "500Mi"
+  nodefs.inodesFree: "5%"
+EOF
+
+/usr/local/bin/kubelet \
+  --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
+  --kubeconfig=/etc/kubernetes/kubelet.conf \
+  --config=/var/lib/kubelet/config.yaml \
+  --cert-dir=/var/lib/kubelet/pki \
+  --hostname-override="$NODE_NAME" \
+  --node-ip="${ADDRESS%%/*}" \
+  --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
+  --v=2 > /var/log/kubelet.log 2>&1 &
+kubelet_pid=$!
+
+# Stream the lines that matter to the console as they happen. Sampling the log
+# every few seconds kept catching the startup flag dump and missing the reason
+# the node was not joining.
+(tail -f /var/log/kubelet.log 2>/dev/null \
+  | grep --line-buffered -E '^[EW][0-9]|Successfully registered|Attempting to register' \
+  > /dev/console) &
+
+# Report early rather than after three minutes of silence: a node that cannot
+# reach its cluster says so in the first seconds, and waiting out the timeout
+# to find out is how an afternoon goes missing.
+sleep 8
+log "route: $(ip route show default 2>&1 | head -1)"
+# Whether this is a network problem or an authentication one, said plainly.
+# A kubelet blocked in TLS bootstrap logs nothing at all while it waits.
+log "api /healthz: $(curl -sk -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 8 "$API_SERVER/healthz" 2>&1)"
+# klog marks errors with a leading E and warnings with W; the flag dump at
+# startup contains the word "fail" and is not what is wanted here.
+log "kubelet alive: $(kill -0 $kubelet_pid 2>/dev/null && echo yes || echo NO), log lines $(wc -l < /var/log/kubelet.log 2>/dev/null)"
+# Everything except the flag dump, which is two hundred lines of noise that
+# swallowed every attempt to sample this log.
+log "--- kubelet, first lines that are not flags ---"
+grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
+log "--- end ---"
+
+n=0
+until grep -q "Successfully registered node" /var/log/kubelet.log 2>/dev/null; do
+  n=$((n + 1))
+  [ "$n" -gt 1800 ] && { log "kubelet never registered"; tail -20 /var/log/kubelet.log > /dev/console; break; }
+  sleep 0.1
+done
+log "registered ($(elapsed)ms)"
+log "up"
+
+# PID 1 may not exit: the kernel panics if it does.
+while true; do sleep 3600; done

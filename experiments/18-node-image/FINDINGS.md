@@ -1,0 +1,117 @@
+# Experiment 18 — The node image
+
+**Question.** [Experiment 17](../17-node-vm/FINDINGS.md) proved a Linux node can
+join ferry's control plane, by staging a node's software into a `ferry-cri` pod
+VM. Four things stopped it dead along the way, and none were about
+virtualization — they were the difference between an image built to be a
+container and one built to be a node. This builds the second kind.
+
+**Method.** Docker builds the image, because that is the tooling everyone has.
+`ferry-node build` unpacks it into an ext4 disk; `ferry-node run` boots that disk
+as a virtual machine with a vmnet address and everything it needs to join on the
+kernel command line. It is never run as a container.
+
+`ferry-node` is written against `Virtualization.framework` and Apple's
+Containerization package, and is the seed of what docs/MACHINES.md calls
+`ferry-machined`: it does the two things a Machine controller does per node --
+turn an image into a root filesystem, and start a machine that can join.
+
+Run on macOS 26.6.2, Apple M1 Max, 10 cores, 32 GiB.
+
+## Results
+
+### It boots, joins, and runs pods with a working pod network
+
+```
+NAME             STATUS   VERSION    INTERNAL-IP    OS-IMAGE      KERNEL-VERSION   CONTAINER-RUNTIME
+ferry-node-img   Ready    v1.34.11   192.168.79.2   Debian 12     6.18.5-ferry     containerd://2.3.5
+
+NAME    READY   STATUS    IP           NODE
+smoke   1/1     Running   10.88.0.2    ferry-node-img
+--- logs ---
+POD_ON_NODE_IMAGE
+EGRESS_OK
+```
+
+`EGRESS_OK` is the line worth noticing. Experiment 17 had to disable `ipMasq`
+and portmap because the base image carried no `iptables`, which cost pods their
+route out. This image has it, so a pod reaches the internet through its node.
+
+| | |
+|---|---|
+| VM started | 0.09s |
+| network configured, in-guest | 40ms |
+| containerd answering | 147ms |
+| kubelet registered | 12.5s |
+| **boot to Ready** | **13.8s** |
+
+Slower than experiment 17's 6.5s, and the difference is honest: this is a real
+init bringing up a real machine from a disk, and almost all of it is the kubelet
+between "process started" and "registered". Both numbers are far inside what the
+provisioner needs — a cloud autoscaler's node takes 60 to 120 seconds.
+
+### The disk costs what it holds, not what it claims
+
+```
+8192 MiB apparent
+ 387 MiB actually on disk
+```
+
+Sized generously on purpose: a node whose root filesystem fills up reports
+DiskPressure and evicts everything on it, and the file is sparse, so the
+generosity is nearly free.
+
+### Four more things a machine needs that a container does not
+
+Experiment 17 found four. Building the image properly answered those and found
+four more, which is the argument for having built it:
+
+- **PID 1 gets an empty environment.** No `PATH`. Everything in the init calls
+  binaries by absolute path and never noticed -- until the kubelet shelled out
+  to `mount` for a projected ServiceAccount volume and could not find it. Pods
+  sat in `ContainerCreating` with the reason three layers down an event message.
+- **`/etc/hosts` cannot be baked in.** A Docker build bind-mounts it read-only,
+  so `RUN ... > /etc/hosts` fails outright. The init writes it at boot, which it
+  must do anyway because containerd copies it into every sandbox.
+- **Readiness checks must not block.** `ctr version` waits on containerd's socket
+  rather than failing, so a readiness loop built on it hangs forever instead of
+  retrying. Waiting for the socket file to appear is the check that works.
+- **A certificate does not fit on a kernel command line.** Per-node
+  configuration travels on a second small ext4 -- a config drive by another
+  name -- built from scratch per machine and mounted at boot.
+
+And one bug of my own worth recording, because it fails silently: an
+`InputStream` handed to the ext4 formatter reads nothing unless it is opened
+first, which produced a config disk carrying a zero-byte certificate. The node
+mounted it, reported `ca.crt present`, and then could not authenticate.
+
+## What this means
+
+- **The node image is real**, and `ferry-node` build/run is the shape
+  `ferry-machined` needs: image in, machine out.
+- **Boot to Ready is 13.8s**, still fast enough that nodes are disposable and
+  consolidation can be aggressive.
+- **The remaining milestone-1 gap is cluster DNS**: pods fall back to the node's
+  resolver, because nothing has told this node where CoreDNS lives.
+
+## Caveats
+
+- **One node, one cluster.** Cross-node pod networking is milestone 3: this
+  node's pods live on its own bridge, and nothing routes between two nodes yet.
+- **The control plane is a throwaway** on shifted ports, not a `ferry up`
+  cluster.
+- **No cluster DNS**, as above.
+- **The image is Debian-based and built by Docker.** Nothing requires that; it
+  is what makes the build legible to anyone who has used a Dockerfile.
+- **Boot-to-Ready is one measurement** on an otherwise idle Mac, and most of it
+  is the kubelet's own startup rather than anything ferry controls.
+
+## Reproduce
+
+```sh
+../17-node-vm/stage.sh   # kubelet, containerd, runc, CNI plugins
+./build.sh               # image -> OCI layout -> ext4 disk, and the tool
+./run.sh                 # control plane, token, machine, boot-to-Ready
+KEEP=1 ./run.sh          # and leave it up to schedule pods against
+FERRY_NODE_VERBOSE=1 KEEP=1 ./run.sh   # with the guest's whole console
+```
