@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Everything a Linux node needs, downloaded once on the host.
+#
+# The guest gets these through a shared directory rather than fetching them
+# itself: the versions stay fixed, the measured path has no network in it, and a
+# node that boots twenty times does not download twenty times.
+#
+# The kubelet's version is not a free choice -- it has to match the control
+# plane it joins, which ferry builds at v1.34.x.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+STAGE="${STAGE:-$here/stage}"
+mkdir -p "$STAGE"
+
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.34.11}"
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-2.3.5}"
+RUNC_VERSION="${RUNC_VERSION:-1.5.1}"
+CNI_VERSION="${CNI_VERSION:-1.9.1}"
+
+get() { # url dest
+  [ -f "$2" ] && return 0
+  echo "==> $(basename "$2")"
+  curl -sSL -o "$2" "$1"
+}
+
+get "https://dl.k8s.io/release/$KUBERNETES_VERSION/bin/linux/arm64/kubelet" "$STAGE/kubelet"
+chmod +x "$STAGE/kubelet"
+
+get "https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-arm64.tar.gz" \
+  "$STAGE/containerd.tar.gz"
+
+get "https://github.com/opencontainers/runc/releases/download/v$RUNC_VERSION/runc.arm64" "$STAGE/runc"
+chmod +x "$STAGE/runc"
+
+# The kubelet reports the node NotReady until the runtime says its network is
+# ready, and containerd says that only once a CNI configuration and its plugins
+# are present. A node with no pod network is not a node.
+get "https://github.com/containernetworking/plugins/releases/download/v$CNI_VERSION/cni-plugins-linux-arm64-v$CNI_VERSION.tgz" \
+  "$STAGE/cni-plugins.tgz"
+
+if [ ! -f "$STAGE/ca-certificates.crt" ]; then
+  echo "==> CA bundle"
+  cp /etc/ssl/cert.pem "$STAGE/ca-certificates.crt"
+fi
+
+ls -lh "$STAGE"
+echo "==> staged in $STAGE"

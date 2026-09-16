@@ -260,11 +260,22 @@ and `kubectl get nodes` shows the truth.
 
 ## Milestones
 
-1. **One machine, by hand.** A node image that boots under
-   `Virtualization.framework` and joins the cluster with an existing bootstrap
-   token. Proves the image and the join; no controller yet. **Measure
-   boot-to-Ready** — every decision about how disposable nodes can be rests on
-   that number.
+1. ~~**One machine, by hand.**~~ **Done** —
+   [experiment 17](../experiments/17-node-vm/FINDINGS.md). A VM carrying
+   containerd, the CNI plugins and kubelet v1.34.11 joins the native control
+   plane with a bootstrap token, is approved through a CSR, and goes **Ready in
+   6.5 seconds**; pods scheduled to it run as ordinary Linux containers and
+   reach Running in under a second once the image is present.
+
+   The number settles the provisioner's shape: six seconds to replace a node
+   means consolidation can be aggressive and warm pools are an optimisation
+   rather than a requirement. It also produced most of the node image's
+   specification, because four things stopped the node dead and none of them
+   were about virtualization — a read-only `/proc/sys`, eviction thresholds
+   sized for a Mac rather than a 2 GiB root filesystem, no `iptables` for the
+   CNI plugin, and no `/etc/hosts` for containerd to copy. What it is *not* is
+   a node image: the software is staged into a `ferry-cri` pod VM, which is
+   exactly why those four bit.
 2. **`Machine` CRD and `ferry-machined`.** Create and delete a node by applying
    and deleting a resource. Status reflects the VM and the `Node`.
 3. **Pod network between machines.** One vmnet network, per-node CIDR, routes.
