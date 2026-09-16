@@ -1,14 +1,10 @@
 # What ferry does not do yet
 
 Measured against minikube and kind, which are what people will compare it to.
-Everything below was checked against a running two-node cluster rather than
-assumed -- with one exception, which has a section of its own so that the
-difference is not glossed over: cluster upgrades are built and tested, but no
-cluster has yet been upgraded.
+Everything below was checked against a running cluster rather than assumed.
 
 Most of the original list is closed. What is left is three features that are
-honestly absent, one that is written and unproven, and one correction, which is
-worth reading first.
+honestly absent and one correction, which is worth reading first.
 
 ## A correction
 
@@ -49,37 +45,52 @@ re-measure rather than reasoning from the source.
   before, the kubelet and the control plane had separate defaults that nothing
   reconciled, so asking for a version newer than the control plane's default
   produced a kubelet newer than the API server with nothing saying so.
-  v1.34.0 and v1.34.11 have been built; only v1.34.0 has been run. The patches
+  v1.34.0 and v1.34.11 have both been built and run, and a cluster moved
+  between them in both directions. The patches
   in `patches/` are written against a particular tree; `build-kubelet.sh`
   verifies every seam it edits and fails loudly when one has moved, so a drifted
   version fails at build time rather than at runtime, which is the best that can
   be said for it.
 
-## Built, and not yet exercised on a running cluster
+## Upgrades, and what an upgrade does not cover
 
-**Cluster upgrades.** There is now a path from one version to another --
-`ferry upgrade plan|apply|node|nodes|rollback|status`, documented in
-[UPGRADES.md](UPGRADES.md). The control plane restarts in place against the same
-etcd data directory, each node is drained and its kubelet replaced while the
-runtime keeps holding the pod VMs, and rollback flips a symlink and restores an
-etcd snapshot. This section exists because that is not the same standard as the
-rest of this document.
+**Cluster upgrades work** -- `ferry upgrade plan|apply|node|nodes|rollback|
+status`, documented in [UPGRADES.md](UPGRADES.md) -- and were run on a real
+cluster rather than reasoned about. v1.34.0 up to v1.34.11, back down, and up
+again:
 
-Verified, on this machine:
+- the control plane restarted against the same etcd data directory and the
+  workload did not notice. Same pods, same names, same IPs, **zero restarts**,
+  and their ages carried straight through the switch;
+- the node drained with eviction, its kubelet was replaced while `ferry-cri`
+  kept running, and it came back Ready at the new version and uncordoned;
+- rollback took the cluster back to v1.34.0 -- same etcd minor, so nothing was
+  restored from the snapshot and nothing written since was lost, which is what
+  it says it will do;
+- restarting with the checkout built at a *different* version started the
+  cluster at its own recorded version and said so, which is the guard against a
+  build quietly becoming an upgrade.
 
-- the version store, the skew rules and the cluster-version bookkeeping, by 100
-  assertions in `tests/` -- including that adopting a pre-store checkout keeps
-  the kubelet's inode, so a running one stays runnable;
-- an etcd snapshot taken the way `ferry upgrade` takes it, restored the way it
-  restores it, with the data still in it and post-snapshot writes correctly
-  gone;
-- a real v1.34.11 kubelet built from the v1.34.0 patch overlay -- every seam in
-  `build-kubelet.sh` applied and asserted clean across a patch bump -- and the
-  real control plane and etcd for it fetched, stored, linked and run;
-- the whole preflight against the live GitHub releases and the kubernetes tag.
+Underneath that, 100 assertions in `tests/` cover the store, the skew rules and
+the cluster-version bookkeeping, and a separate suite does a real etcd
+snapshot-and-restore round trip with the flags ferry passes.
 
-Not verified: the act itself. No cluster has been upgraded. The sequence to run
-is at the end of [UPGRADES.md](UPGRADES.md).
+Three bugs were found by running it, which is the argument for running it:
+
+- the node upgrade read the kubelet's version as soon as the node went Ready,
+  but a node object keeps the old kubelet's status until the new one posts its
+  own -- so a node that had upgraded correctly was reported as not having;
+- the summary afterwards listed local nodes under "nodes on other Macs",
+  contradicting the line above it, because it filtered by version and not by
+  which Mac runs them;
+- the restart guard pointed at `ferry upgrade apply <older>`, a command that
+  correctly refuses, instead of at `rollback`.
+
+What is still only reasoned about is a **minor** bump. Everything above is
+within v1.34, which drives every path except patch drift. A new minor means
+porting `patches/`, and `build-kubelet.sh` failing loudly on a moved seam --
+during the build, before anything is switched -- remains the best that can be
+said for it.
 
 Known limits, which are not bugs:
 

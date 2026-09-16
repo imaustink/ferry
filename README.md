@@ -90,14 +90,15 @@ cost time.
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
-- 🚧 **Cluster upgrades are written, and no cluster has been upgraded yet.**
-  `ferry upgrade plan|apply|nodes|rollback` moves the control plane in place
-  against the same etcd, then drains and replaces each kubelet while the runtime
-  keeps holding the pod VMs. One version now drives the kubelet, the control
-  plane and etcd together, which it did not before. The store, the skew rules,
-  an etcd snapshot-and-restore round trip and a real v1.34.11 kubelet build all
-  check out; the act itself has not been run. See
-  [docs/UPGRADES.md](docs/UPGRADES.md).
+- ✅ **Cluster upgrades work.** `ferry upgrade plan|apply|nodes|rollback` moves
+  the control plane in place against the same etcd, then drains and replaces
+  each kubelet while the runtime keeps holding the pod VMs. A cluster went
+  v1.34.0 → v1.34.11, back, and forward again: the workload kept the same pods,
+  the same IPs and zero restarts across the control plane switch, and rollback
+  lost nothing because the etcd minor did not change. One version now drives the
+  kubelet, the control plane and etcd together, which it did not before — asking
+  for a newer one used to produce a kubelet newer than the API server, silently.
+  See [docs/UPGRADES.md](docs/UPGRADES.md).
 
 ## Why this can work
 

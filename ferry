@@ -487,7 +487,19 @@ align_to_cluster_version() {
     return 1
   fi
   warn "this cluster is $want; the checkout is built at $have"
-  echo "      Starting it at $want. To move it: ferry upgrade apply $have"
+  # Which way to point depends on the direction. 'apply' refuses to go
+  # backwards, so offering it for an older build is offering a command that
+  # will decline -- the way back is rollback, and only if this is where the
+  # cluster came from.
+  if [ -z "$(ferry_skew_reason "$want" "$have")" ]; then
+    echo "      Starting it at $want. To move it: ferry upgrade apply $have"
+  elif [ "$(ferry_previous_field kubernetes 2>/dev/null)" = "$have" ]; then
+    echo "      Starting it at $want. $have is older, so the way back is:"
+    echo "      ferry upgrade rollback"
+  else
+    echo "      Starting it at $want, because $have is older and a control plane"
+    echo "      does not go backwards in place."
+  fi
   ferry_activate_version "$want"
 }
 
@@ -1468,11 +1480,22 @@ stop_kubelet() { # pidfile
   kill -KILL "$pid" 2>/dev/null
 }
 
-wait_node_ready() { # name seconds
+node_ready() { # name
+  [ "$(kube get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]
+}
+
+# Ready is not enough to read a version from.
+#
+# A node object keeps the old kubelet's status until the new one posts its own,
+# so a Ready observed in the first moments after a restart can still be the
+# previous kubelet's -- and reading nodeInfo then reports the version that was
+# just replaced. The first run of this upgraded a node correctly and then said
+# it had not, because it asked too early. Wait for the version to change, which
+# is the thing actually being waited for.
+wait_node_version() { # name version seconds
   local _
-  for _ in $(seq 1 "$2"); do
-    [ "$(kube get node "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ] \
-      && return 0
+  for _ in $(seq 1 "$3"); do
+    if node_ready "$1" && [ "$(node_kubelet_version "$1")" = "$2" ]; then return 0; fi
     sleep 1
   done
   return 1
@@ -1936,10 +1959,14 @@ cmd_upgrade_node() {
   ok "kubelet stopped, runtime left up"
 
   start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap"
-  if wait_node_ready "$name" 120; then
-    ok "node Ready, kubelet $(node_kubelet_version "$name")"
+  if wait_node_version "$name" "$target" 120; then
+    ok "node Ready, kubelet $target"
   else
-    bad "$name did not come back Ready"
+    if node_ready "$name"; then
+      bad "$name is Ready but reports $(node_kubelet_version "$name"), not $target"
+    else
+      bad "$name did not come back Ready"
+    fi
     tail -10 "$logfile" | sed 's/^/    /'
     echo "    The node is still cordoned. Fix it and uncordon: kubectl uncordon $name"
     return 1
@@ -1969,9 +1996,16 @@ cmd_upgrade_nodes() {
     return 1
   fi
   bold "every node on this Mac is $target"
+  # Nodes this Mac does not run, that are not at the target yet. The local ones
+  # have to be excluded by name rather than by version: this Mac's nodes were
+  # just upgraded, and listing one of them here as a node "on another Mac" is
+  # both wrong and a direct contradiction of the line above.
   local others
-  others="$(kube get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.nodeInfo.kubeletVersion}{"\n"}{end}' 2>/dev/null \
-            | awk -v t="$target" '$2 != t {print "      " $1 " (" $2 ")"}')"
+  others="$( { local_nodes | awk '{print "L", $2}'
+               kube get nodes -o jsonpath='{range .items[*]}{"N "}{.metadata.name}{" "}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' 2>/dev/null; } \
+             | awk -v t="$target" '
+                 $1 == "L" { mine[$2] = 1; next }
+                 $1 == "N" && !mine[$2] && $3 != t { print "      " $2 " (" $3 ")" }')"
   if [ -n "$others" ]; then
     echo
     echo "  Nodes on other Macs are still behind. Each is upgraded from its own"

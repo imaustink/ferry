@@ -235,33 +235,44 @@ this reason. That is the honest position, not a claim that any minor works.
 - `tests/etcd-snapshot-test.sh` — a real save and restore with the real etcd
   from the store, on ports of its own. Skipped until something has been built.
 
-### What the tests do not cover
+### What the tests do not cover, and what was run instead
 
-They run without a cluster, so they cover the decisions and not the act. The
-following has to be run by hand on a Mac with a cluster on it, and the honest
-statement today is that **the machinery has not yet been exercised against a
-running cluster**:
+The suites run without a cluster, so they cover the decisions and not the act.
+The act was run by hand, on a real cluster, in both directions:
 
 ```
-ferry build                       # v1.34.0
+ferry build --kubernetes-version v1.34.0
 ferry up
-kubectl create deployment web --image=nginx --replicas=3
+kubectl create deployment web --replicas=2 ...
 
-ferry upgrade plan v1.34.11       # expect: a supported step, no warnings
-ferry upgrade apply v1.34.11      # expect: API back in seconds, pods untouched
-kubectl get pods                  # expect: same pods, same ages
-ferry upgrade status              # expect: cluster v1.34.11, nodes v1.34.0
+ferry upgrade plan v1.34.11    # a supported step; node skew checked against the live API
+ferry upgrade apply v1.34.11   # snapshot, stop, flip, restart, verify
+kubectl get pods               # same pods, same names, same IPs, 0 restarts,
+                               # ages carried straight through the switch
+ferry upgrade nodes            # drain with eviction, kubelet replaced, Ready, uncordon
 
-ferry upgrade nodes               # expect: drain, replace, Ready, uncordon
-kubectl get nodes                 # expect: every node v1.34.11
+ferry upgrade rollback         # back to v1.34.0; same etcd minor, so nothing
+                               # restored and nothing written since was lost
+ferry upgrade nodes            # kubelets back to v1.34.0
 
-ferry upgrade rollback            # expect: back to v1.34.0, same etcd minor,
-                                  #         so nothing restored and nothing lost
+ferry upgrade apply v1.34.11   # and forward again
 ferry upgrade nodes
 ```
 
-A patch bump within v1.34 is the right first exercise: it drives every code path
-in this document except patch drift, and it also closes the gap where the
-kubelet and the control plane had different defaults. A minor bump is a
+Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`
+— which started the cluster at its own recorded version and said so, rather
+than letting the build become an upgrade.
+
+Running it found three things the tests could not, all since fixed. The node
+upgrade read the kubelet's version the moment the node went Ready, but a node
+object keeps the old kubelet's status until the new one posts its own, so a node
+that had upgraded correctly was reported as not having. The summary afterwards
+listed local nodes under "nodes on other Macs", contradicting the line above it,
+because it filtered by version rather than by which Mac runs them. And the
+restart guard pointed at `ferry upgrade apply <older>`, which correctly refuses,
+instead of at `rollback`.
+
+**A minor bump has not been run.** Everything above is within v1.34, which
+drives every path in this document except patch drift. A minor bump is a
 different piece of work — porting `patches/` — and this machinery does not claim
 to own it.
