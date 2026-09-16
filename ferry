@@ -113,6 +113,32 @@ POD_CPUS="${FERRY_POD_CPUS:-2}"
 # margin at all. An absolute figure says what it means. Kubernetes accepts either.
 EVICT_DISK="${FERRY_EVICTION_DISK:-4Gi}"
 EVICT_MEMORY="${FERRY_EVICTION_MEMORY:-500Mi}"
+# The Swift toolchain ferry is built with.
+#
+# SWIFT_MIN is what the sources need. SWIFT_RECOMMENDED is what ferry is
+# actually built and run with, and is worth matching across every Mac in a
+# cluster: binaries are copied between machines, and two toolchains produce two
+# builds that are only probably the same.
+SWIFT_MIN=6.2
+SWIFT_RECOMMENDED=6.4
+# How many pods this Mac can actually hold.
+#
+# The kubelet's default is 110 and the hypervisor stops at 128 virtual machines,
+# so the count looked like the binding limit. It is not: a pod here is a VM, and
+# an idle one costs 226 MiB of host memory before the workload does anything --
+# measured flat at 8, 20, 24 and 40 pods, and unmoved by --pod-memory-mib, so it
+# is the price of a kernel rather than a pod using its allowance. 110 of those is
+# 24 GiB, which is three quarters of a 32 GiB machine spent on kernels.
+#
+# So memory decides, and advertising 110 on a machine that cannot hold 110 asks
+# the scheduler to place pods that will fail to start. Half of RAM is the budget
+# for that overhead, which leaves the other half for the workloads themselves.
+# FERRY_MAX_PODS overrides it for anyone who would rather find the wall.
+pod_overhead_mib=226
+default_max_pods="$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 2 / pod_overhead_mib ))"
+[ "$default_max_pods" -gt 110 ] && default_max_pods=110
+[ "$default_max_pods" -lt 1 ] && default_max_pods=1
+MAX_PODS="${FERRY_MAX_PODS:-$default_max_pods}"
 # The cluster pod network: one flat segment every pod shares, on every node and
 # every machine. Pods keep a vmnet NIC for the internet; this is the address
 # Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
@@ -259,6 +285,19 @@ check_binaries_run() {
   return 1
 }
 
+# How to install the toolchain, without naming a version that will not exist.
+#
+# The label Apple offers moves -- the one this file used to print stopped being
+# available -- so ask softwareupdate what it has rather than guessing. The
+# removal is first because `softwareupdate --install` and `xcode-select
+# --install` both lay a version down beside whatever is already there.
+swift_install_hint() {
+  echo "      sudo rm -rf /Library/Developer/CommandLineTools"
+  echo "      softwareupdate --list | grep 'Command Line Tools'   # pick one"
+  echo "      sudo softwareupdate --install \"Command Line Tools for Xcode <version>\""
+  echo "      ferry is built with Swift $SWIFT_RECOMMENDED; use the same one on every Mac."
+}
+
 cmd_doctor() {
   bold "ferry doctor"
   local fatal=0
@@ -275,14 +314,43 @@ cmd_doctor() {
   fi
 
   if command -v swift >/dev/null; then
-    local sv; sv="$(swift --version 2>&1 | grep -oE 'version [0-9]+\.[0-9]+' | head -1 | cut -d' ' -f2)"
-    if [ "$(printf '%s\n6.2\n' "$sv" | sort -V | head -1)" = "6.2" ]; then ok "Swift $sv"
-    else
-      bad "Swift 6.2+ required (found $sv)"
-      warn 'softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"'
+    # "Apple Swift version 6.4", not "swift-driver version: 1.148.6" -- the
+    # driver is named first and its number is lower, so matching any "version"
+    # reports 1.148 and fails the comparison for the wrong reason.
+    local sv; sv="$(swift --version 2>&1 | grep -oE 'Apple Swift version [0-9]+\.[0-9]+' | head -1 | awk '{print $4}')"
+    if [ -z "$sv" ]; then
+      bad "Swift is installed but will not report a version"
+      swift --version 2>&1 | head -2 | sed 's/^/      /'
+      swift_install_hint
       fatal=1
+    elif [ "$(printf '%s\n%s\n' "$sv" "$SWIFT_MIN" | sort -V | head -1)" != "$SWIFT_MIN" ]; then
+      bad "Swift $SWIFT_MIN+ required (found $sv)"
+      swift_install_hint
+      fatal=1
+    # A version number does not prove a working toolchain. The Command Line
+    # Tools install as several packages, and laying one version over another
+    # without removing the first leaves a tree that reports a version and cannot
+    # build: a 6.3 driver reading 6.4 module interfaces, or a swift-package that
+    # dies in dyld before it reads a manifest. Both were seen on a Mac whose
+    # `swift --version` looked perfectly healthy, so this runs the thing rather
+    # than asking it what it is.
+    elif ! swift package --version >/dev/null 2>&1; then
+      bad "Swift $sv is installed but SwiftPM cannot run -- the toolchain is mixed"
+      echo "      Two Command Line Tools versions are installed over each other."
+      echo "      Removing the directory first is the part that matters:"
+      swift_install_hint
+      fatal=1
+    elif [ "$sv" = "$SWIFT_RECOMMENDED" ]; then
+      ok "Swift $sv"
+    else
+      # Not fatal: the sources need SWIFT_MIN and this clears it. Said anyway,
+      # because a cluster spans Macs and binaries are copied between them.
+      ok "Swift $sv"
+      warn "ferry is built with Swift $SWIFT_RECOMMENDED; this Mac has $sv"
+      echo "      Matching the toolchain across every Mac in a cluster avoids"
+      echo "      binaries that differ for reasons nobody is tracking."
     fi
-  else bad "Swift not found"; fatal=1; fi
+  else bad "Swift not found"; swift_install_hint; fatal=1; fi
 
   if command -v go >/dev/null; then ok "$(go version | cut -d' ' -f3)"
   else bad "Go 1.24+ required, needed to build the kubelet"; fatal=1; fi
@@ -514,6 +582,7 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false
@@ -1168,6 +1237,7 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false

@@ -1,0 +1,92 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "touch",
+  "image": "docker.io/library/python:3.12",
+  "count": 8,
+  "create_seconds": 2.735387541,
+  "baseline": {
+    "at": "07:35:57",
+    "free_mib": 6253.578125,
+    "used_mib": 15688.25,
+    "compressed_mib": 2437.953125,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "07:36:21",
+      "free_mib": 439.6875,
+      "used_mib": 18904.4375,
+      "compressed_mib": 3294.953125,
+      "vms": 8,
+      "vm_resident_mib": 7630.15625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:36:42",
+      "free_mib": 409.671875,
+      "used_mib": 18924.640625,
+      "compressed_mib": 3290.390625,
+      "vms": 8,
+      "vm_resident_mib": 7641.34375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:37:04",
+      "free_mib": 311.0625,
+      "used_mib": 18940.171875,
+      "compressed_mib": 3282.703125,
+      "vms": 8,
+      "vm_resident_mib": 7650,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:37:26",
+      "free_mib": 141.453125,
+      "used_mib": 18901.59375,
+      "compressed_mib": 3280.125,
+      "vms": 8,
+      "vm_resident_mib": 7653.8125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:37:47",
+      "free_mib": 175.5625,
+      "used_mib": 18840.296875,
+      "compressed_mib": 3274,
+      "vms": 8,
+      "vm_resident_mib": 7654.21875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:38:09",
+      "free_mib": 181.375,
+      "used_mib": 18874.65625,
+      "compressed_mib": 3273.953125,
+      "vms": 8,
+      "vm_resident_mib": 7655.03125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "07:38:09",
+    "free_mib": 181.375,
+    "used_mib": 18874.65625,
+    "compressed_mib": 3273.953125,
+    "vms": 8,
+    "vm_resident_mib": 7655.03125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 4307.900000000001,
+  "logs": [
+    "pod-00.log: 2026-09-14T14:36:00.524Z stdout F TOUCHED",
+    "pod-01.log: 2026-09-14T14:36:01.050Z stdout F TOUCHED",
+    "pod-02.log: 2026-09-14T14:36:01.364Z stdout F TOUCHED",
+    "pod-03.log: 2026-09-14T14:36:01.825Z stdout F TOUCHED",
+    "pod-04.log: 2026-09-14T14:36:02.227Z stdout F TOUCHED",
+    "pod-05.log: 2026-09-14T14:36:02.370Z stdout F TOUCHED",
+    "pod-06.log: 2026-09-14T14:36:02.515Z stdout F TOUCHED",
+    "pod-07.log: 2026-09-14T14:36:02.714Z stdout F TOUCHED"
+  ]
+}

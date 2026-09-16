@@ -55,6 +55,45 @@ type podContainers struct {
 	// request because sharing one device is exactly the situation where "this
 	// pod matters more" has to mean something.
 	Priority int32 `json:"priority"`
+	// What the pod asked for, aggregated the way Kubernetes defines a pod's
+	// requirements: init containers run one at a time so the largest of them
+	// sets a floor, while regular containers run together and so add up.
+	//
+	// CRI sends resources per container and never for the pod, which is fine
+	// for a runtime whose containers share a machine that already exists. Here
+	// the machine is created for the pod, and it has to be big enough before
+	// the first container starts -- so the aggregate has to come from somewhere,
+	// and this handler already has the spec open.
+	//
+	// Zero means the pod said nothing, and the runtime keeps its default.
+	MemoryLimitBytes int64 `json:"memoryLimitBytes"`
+	CPULimit         int32 `json:"cpuLimit"`
+}
+
+// podResources aggregates what a pod's containers are allowed to use.
+//
+// Limits rather than requests: a VM sized to requests would let a container
+// inside its own limit take memory the machine does not have, which is the
+// failure this exists to prevent. A container with no limit contributes
+// nothing, so a pod of unlimited containers keeps the runtime default.
+func podResources(pod *v1.Pod) (memory int64, cpus int32) {
+	for i := range pod.Spec.Containers {
+		limits := pod.Spec.Containers[i].Resources.Limits
+		memory += limits.Memory().Value()
+		cpus += int32(limits.Cpu().Value())
+	}
+	// Init containers do not overlap with each other or with the rest, so they
+	// raise the floor rather than the total.
+	for i := range pod.Spec.InitContainers {
+		limits := pod.Spec.InitContainers[i].Resources.Limits
+		if m := limits.Memory().Value(); m > memory {
+			memory = m
+		}
+		if c := int32(limits.Cpu().Value()); c > cpus {
+			cpus = c
+		}
+	}
+	return memory, cpus
 }
 
 // wantsGPU reports whether a container asked for the GPU resource. Limits only:
@@ -86,6 +125,7 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 		if pod.Spec.Priority != nil {
 			out.Priority = *pod.Spec.Priority
 		}
+		out.MemoryLimitBytes, out.CPULimit = podResources(pod)
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}

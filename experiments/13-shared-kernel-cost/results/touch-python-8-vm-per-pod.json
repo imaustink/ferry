@@ -1,0 +1,173 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "touch",
+  "image": "docker.io/library/python:3.12",
+  "count": 8,
+  "create_seconds": 2.831596125,
+  "baseline": {
+    "at": "18:36:42",
+    "free_mib": 4660.4375,
+    "used_mib": 16079.25,
+    "compressed_mib": 2224.53125,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:36:52",
+      "free_mib": 433.65625,
+      "used_mib": 18253.28125,
+      "compressed_mib": 2340.734375,
+      "vms": 8,
+      "vm_resident_mib": 7623.8125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:36:58",
+      "free_mib": 396.40625,
+      "used_mib": 18308.875,
+      "compressed_mib": 2332.21875,
+      "vms": 8,
+      "vm_resident_mib": 7625.109375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:04",
+      "free_mib": 403.90625,
+      "used_mib": 18303.59375,
+      "compressed_mib": 2332.21875,
+      "vms": 8,
+      "vm_resident_mib": 7632.46875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:10",
+      "free_mib": 340.859375,
+      "used_mib": 18367.734375,
+      "compressed_mib": 2330.53125,
+      "vms": 8,
+      "vm_resident_mib": 7636.609375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:16",
+      "free_mib": 318.796875,
+      "used_mib": 18385.34375,
+      "compressed_mib": 2330.484375,
+      "vms": 8,
+      "vm_resident_mib": 7639.765625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:23",
+      "free_mib": 324.296875,
+      "used_mib": 18382.84375,
+      "compressed_mib": 2330.34375,
+      "vms": 8,
+      "vm_resident_mib": 7642.234375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:29",
+      "free_mib": 344.25,
+      "used_mib": 18389.828125,
+      "compressed_mib": 2330.34375,
+      "vms": 8,
+      "vm_resident_mib": 7645.015625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:35",
+      "free_mib": 344.84375,
+      "used_mib": 18387.984375,
+      "compressed_mib": 2330.34375,
+      "vms": 8,
+      "vm_resident_mib": 7647.734375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:41",
+      "free_mib": 352.609375,
+      "used_mib": 18379.90625,
+      "compressed_mib": 2330.296875,
+      "vms": 8,
+      "vm_resident_mib": 7650.015625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:48",
+      "free_mib": 344.390625,
+      "used_mib": 18374.140625,
+      "compressed_mib": 2330.265625,
+      "vms": 8,
+      "vm_resident_mib": 7652.375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:37:54",
+      "free_mib": 336.640625,
+      "used_mib": 18381.15625,
+      "compressed_mib": 2329.671875,
+      "vms": 8,
+      "vm_resident_mib": 7654.890625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:38:00",
+      "free_mib": 342.03125,
+      "used_mib": 18377.203125,
+      "compressed_mib": 2329.671875,
+      "vms": 8,
+      "vm_resident_mib": 7657.28125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:38:06",
+      "free_mib": 342.875,
+      "used_mib": 18377.5625,
+      "compressed_mib": 2329.640625,
+      "vms": 8,
+      "vm_resident_mib": 7657.265625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:38:12",
+      "free_mib": 306.296875,
+      "used_mib": 18403.78125,
+      "compressed_mib": 2328.671875,
+      "vms": 8,
+      "vm_resident_mib": 7657.078125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:38:19",
+      "free_mib": 256.828125,
+      "used_mib": 18398.078125,
+      "compressed_mib": 2328.09375,
+      "vms": 8,
+      "vm_resident_mib": 7657.125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:38:00",
+    "free_mib": 342.03125,
+    "used_mib": 18377.203125,
+    "compressed_mib": 2329.671875,
+    "vms": 8,
+    "vm_resident_mib": 7657.28125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 4308.5,
+  "logs": [
+    "pod-00.log: 2026-09-14T01:36:46.327Z stdout F TOUCHED",
+    "pod-01.log: 2026-09-14T01:36:46.864Z stdout F TOUCHED",
+    "pod-02.log: 2026-09-14T01:36:47.490Z stdout F TOUCHED",
+    "pod-03.log: 2026-09-14T01:36:47.789Z stdout F TOUCHED",
+    "pod-04.log: 2026-09-14T01:36:47.993Z stdout F TOUCHED",
+    "pod-05.log: 2026-09-14T01:36:48.159Z stdout F TOUCHED",
+    "pod-06.log: 2026-09-14T01:36:48.413Z stdout F TOUCHED",
+    "pod-07.log: 2026-09-14T01:36:48.612Z stdout F TOUCHED"
+  ]
+}

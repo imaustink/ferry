@@ -1,0 +1,88 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "public.ecr.aws/docker/library/debian:12",
+  "count": 1,
+  "create_seconds": 0.367424959,
+  "baseline": {
+    "at": "08:47:11",
+    "free_mib": 6104.609375,
+    "used_mib": 16082.625,
+    "compressed_mib": 1832.390625,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "08:47:31",
+      "free_mib": 4804.09375,
+      "used_mib": 16745.859375,
+      "compressed_mib": 1832.390625,
+      "vms": 1,
+      "vm_resident_mib": 1714.96875,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "08:47:52",
+      "free_mib": 4670.0625,
+      "used_mib": 16882.546875,
+      "compressed_mib": 1832.4375,
+      "vms": 1,
+      "vm_resident_mib": 1870.515625,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "08:48:12",
+      "free_mib": 4570.34375,
+      "used_mib": 16993.078125,
+      "compressed_mib": 1832.421875,
+      "vms": 1,
+      "vm_resident_mib": 1871.59375,
+      "vm_cpu_percent": 0.3
+    },
+    {
+      "at": "08:48:32",
+      "free_mib": 4660.875,
+      "used_mib": 16933.265625,
+      "compressed_mib": 1832.421875,
+      "vms": 1,
+      "vm_resident_mib": 1872.265625,
+      "vm_cpu_percent": 0.2
+    },
+    {
+      "at": "08:48:53",
+      "free_mib": 4800.125,
+      "used_mib": 16804.21875,
+      "compressed_mib": 1832.390625,
+      "vms": 1,
+      "vm_resident_mib": 1872.328125,
+      "vm_cpu_percent": 0.2
+    }
+  ],
+  "peak": {
+    "at": "08:48:53",
+    "free_mib": 4800.125,
+    "used_mib": 16804.21875,
+    "compressed_mib": 1832.390625,
+    "vms": 1,
+    "vm_resident_mib": 1872.328125,
+    "vm_cpu_percent": 0.2
+  },
+  "footprint_mib": 1228.8,
+  "logs": [
+    "pod-00.log: 2026-09-14T15:47:12.206Z stdout F SUBTREE_OK=1",
+    "pod-00.log: 2026-09-14T15:47:12.326Z stdout F CONTAINERD_READY_MS=100",
+    "pod-00.log: 2026-09-14T15:47:13.368Z stdout F IMAGE_SOURCE=archive",
+    "pod-00.log: 2026-09-14T15:47:13.368Z stdout F IMAGE_REF=docker.io/library/python:3.12-slim",
+    "pod-00.log: 2026-09-14T15:47:13.368Z stdout F PULL_MS=1039",
+    "pod-00.log: 2026-09-14T15:47:13.421Z stdout F START_TOTAL_MS=47",
+    "pod-00.log: 2026-09-14T15:47:13.421Z stdout F START_PER_CONTAINER_MS=47",
+    "pod-00.log: 2026-09-14T15:47:13.421Z stdout F CONTAINERS_RUNNING=1",
+    "pod-00.log: 2026-09-14T15:47:33.432Z stdout F GUEST_MEM_TOTAL_MIB=5930",
+    "pod-00.log: 2026-09-14T15:47:33.432Z stdout F GUEST_MEM_AVAILABLE_MIB=5626",
+    "pod-00.log: 2026-09-14T15:47:33.432Z stdout F GUEST_CACHED_MIB=716",
+    "pod-00.log: 2026-09-14T15:47:33.450Z stdout F CONTAINERD_DISK_MIB=310",
+    "pod-00.log: 2026-09-14T15:47:33.450Z stdout F BENCH_DONE=1"
+  ]
+}

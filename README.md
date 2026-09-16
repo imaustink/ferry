@@ -176,8 +176,16 @@ it.
 - `logs`, `exec`, `port-forward` and `attach` all work. Attach needs the pod to
   set `stdin: true` to accept input, since the stream has to be wired in when
   the container is created.
-- **128 pods, shared.** The VM ceiling belongs to the machine, so every other
-  VM — Docker Desktop included — takes one of ferry's slots.
+- **Memory decides how many pods fit, not the 128-VM ceiling.** An idle pod VM
+  costs **226 MiB** of host memory before its workload does anything — flat at
+  8, 20, 24 and 40 pods, and unmoved by `--pod-memory-mib`, so it is the price
+  of a kernel rather than a pod using its allowance. 110 of those is 24 GiB.
+  ferry therefore sets `maxPods` from the machine's memory, budgeting half of it
+  for that overhead: 72 on a 32 GiB Mac, 110 on a 64 GiB one, overridable with
+  `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared — every
+  other VM, Docker Desktop included, takes one of ferry's slots — but on most
+  Macs memory runs out first. See
+  [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
 - **Restarting in quick succession moves the pod network.** A vmnet subnet stays
   reserved for about a minute after the run using it stops, and there are 32
   networks across the whole Mac, so a restart takes the next free subnet. Pods
@@ -191,11 +199,24 @@ it.
 
 - Apple silicon, macOS 26 (Tahoe)
 - Go 1.24+
-- **Swift 6.2+.** The OS upgrade does not bring the toolchain with it — install
-  it explicitly (no sudo needed):
+- **Swift 6.2+, and 6.4 is what ferry is built with.** Use the same toolchain on
+  every Mac in a cluster: binaries are copied between machines, and two
+  toolchains produce two builds that are only probably the same.
+
+  The OS upgrade does not bring the toolchain with it, and the version Apple
+  offers moves, so ask before installing:
   ```sh
-  softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"
+  softwareupdate --list | grep "Command Line Tools"
+  sudo rm -rf /Library/Developer/CommandLineTools          # see below
+  sudo softwareupdate --install "Command Line Tools for Xcode <version>"
   ```
+
+  **Remove the old one first.** Both `softwareupdate --install` and
+  `xcode-select --install` lay a version down beside whatever is already there,
+  and the result reports a healthy version number while being unable to build
+  anything — a 6.3 driver reading 6.4 module interfaces, or a `swift-package`
+  that dies in dyld before it reads a manifest. `ferry doctor` checks for this
+  by running SwiftPM rather than by asking it its version.
 
 Most of this was developed on macOS 15. What actually needs 26 is routable
 per-pod addressing (`VZVmnetNetworkDeviceAttachment`) and the toolchain Apple's

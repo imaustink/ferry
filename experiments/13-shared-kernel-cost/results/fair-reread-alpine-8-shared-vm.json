@@ -1,0 +1,118 @@
+{
+  "shape": "shared-vm",
+  "workload": "reread",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 8,
+  "create_seconds": 1.096849875,
+  "baseline": {
+    "at": "18:47:34",
+    "free_mib": 4374.921875,
+    "used_mib": 16399.390625,
+    "compressed_mib": 2329.15625,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:47:41",
+      "free_mib": 11648.1875,
+      "used_mib": 13134.375,
+      "compressed_mib": 2329.03125,
+      "vms": 1,
+      "vm_resident_mib": 2575.265625,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "18:47:47",
+      "free_mib": 11520.015625,
+      "used_mib": 13267.078125,
+      "compressed_mib": 2328.578125,
+      "vms": 1,
+      "vm_resident_mib": 2575.71875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:53",
+      "free_mib": 11537.96875,
+      "used_mib": 13248.328125,
+      "compressed_mib": 2328.578125,
+      "vms": 1,
+      "vm_resident_mib": 2576.265625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:47:58",
+      "free_mib": 11533.90625,
+      "used_mib": 13259.46875,
+      "compressed_mib": 2328.5625,
+      "vms": 1,
+      "vm_resident_mib": 2577.234375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:48:04",
+      "free_mib": 11537.390625,
+      "used_mib": 13258.84375,
+      "compressed_mib": 2328.5625,
+      "vms": 1,
+      "vm_resident_mib": 2577.53125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:48:10",
+      "free_mib": 11541.421875,
+      "used_mib": 13259.484375,
+      "compressed_mib": 2328.5625,
+      "vms": 1,
+      "vm_resident_mib": 2577.84375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:48:15",
+      "free_mib": 11568.0625,
+      "used_mib": 13265.390625,
+      "compressed_mib": 2328.5625,
+      "vms": 1,
+      "vm_resident_mib": 2578.15625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:48:21",
+      "free_mib": 11573.171875,
+      "used_mib": 13261.375,
+      "compressed_mib": 2328.5,
+      "vms": 1,
+      "vm_resident_mib": 2578.546875,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:48:21",
+    "free_mib": 11573.171875,
+    "used_mib": 13261.375,
+    "compressed_mib": 2328.5,
+    "vms": 1,
+    "vm_resident_mib": 2578.546875,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 1433.6,
+  "logs": [
+    "ctr-00.log: 2026-09-14T01:47:35.745Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.014654 seconds, 8.5GB/s",
+    "ctr-00.log: 2026-09-14T01:47:35.751Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004631 seconds, 27.0GB/s",
+    "ctr-01.log: 2026-09-14T01:47:35.787Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.011966 seconds, 10.4GB/s",
+    "ctr-01.log: 2026-09-14T01:47:35.788Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004646 seconds, 26.9GB/s",
+    "ctr-02.log: 2026-09-14T01:47:35.853Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.009660 seconds, 12.9GB/s",
+    "ctr-02.log: 2026-09-14T01:47:35.859Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.005491 seconds, 22.8GB/s",
+    "ctr-03.log: 2026-09-14T01:47:35.897Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.007744 seconds, 16.1GB/s",
+    "ctr-03.log: 2026-09-14T01:47:35.902Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004455 seconds, 28.1GB/s",
+    "ctr-04.log: 2026-09-14T01:47:35.943Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.006445 seconds, 19.4GB/s",
+    "ctr-04.log: 2026-09-14T01:47:35.948Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004536 seconds, 27.6GB/s",
+    "ctr-05.log: 2026-09-14T01:47:36.454Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.017790 seconds, 7.0GB/s",
+    "ctr-05.log: 2026-09-14T01:47:36.460Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.005282 seconds, 23.7GB/s",
+    "ctr-06.log: 2026-09-14T01:47:36.454Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.020097 seconds, 6.2GB/s",
+    "ctr-06.log: 2026-09-14T01:47:36.460Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.005765 seconds, 21.7GB/s",
+    "ctr-07.log: 2026-09-14T01:47:36.446Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.012151 seconds, 10.3GB/s",
+    "ctr-07.log: 2026-09-14T01:47:36.452Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.005516 seconds, 22.7GB/s"
+  ]
+}

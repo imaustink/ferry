@@ -1,0 +1,112 @@
+{
+  "shape": "shared-vm",
+  "workload": "touch",
+  "image": "docker.io/library/python:3.12",
+  "count": 1,
+  "create_seconds": 0.331180167,
+  "baseline": {
+    "at": "18:49:21",
+    "free_mib": 13085.890625,
+    "used_mib": 12168.578125,
+    "compressed_mib": 2327.671875,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:49:32",
+      "free_mib": 10359.765625,
+      "used_mib": 13783.515625,
+      "compressed_mib": 2327.640625,
+      "vms": 1,
+      "vm_resident_mib": 2793.96875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:49:43",
+      "free_mib": 10269.4375,
+      "used_mib": 13879.96875,
+      "compressed_mib": 2327.640625,
+      "vms": 1,
+      "vm_resident_mib": 2795.28125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:49:53",
+      "free_mib": 10384.34375,
+      "used_mib": 13765.296875,
+      "compressed_mib": 2327.625,
+      "vms": 1,
+      "vm_resident_mib": 2795.828125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:04",
+      "free_mib": 10411.140625,
+      "used_mib": 13749.03125,
+      "compressed_mib": 2327.625,
+      "vms": 1,
+      "vm_resident_mib": 2796.328125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:15",
+      "free_mib": 10426.1875,
+      "used_mib": 13734.234375,
+      "compressed_mib": 2327.625,
+      "vms": 1,
+      "vm_resident_mib": 2797.03125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:25",
+      "free_mib": 10503.65625,
+      "used_mib": 13657.65625,
+      "compressed_mib": 2327.625,
+      "vms": 1,
+      "vm_resident_mib": 2797.515625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:36",
+      "free_mib": 10556.875,
+      "used_mib": 13614.109375,
+      "compressed_mib": 2327.53125,
+      "vms": 1,
+      "vm_resident_mib": 2798,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:47",
+      "free_mib": 10464.3125,
+      "used_mib": 13705.78125,
+      "compressed_mib": 2324.671875,
+      "vms": 1,
+      "vm_resident_mib": 2798.109375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:50:57",
+      "free_mib": 10436.46875,
+      "used_mib": 13731.6875,
+      "compressed_mib": 2324.671875,
+      "vms": 1,
+      "vm_resident_mib": 2798.125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:50:57",
+    "free_mib": 10436.46875,
+    "used_mib": 13731.6875,
+    "compressed_mib": 2324.671875,
+    "vms": 1,
+    "vm_resident_mib": 2798.125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 1536,
+  "logs": [
+    "ctr-00.log: 2026-09-14T01:49:23.547Z stdout F TOUCHED"
+  ]
+}

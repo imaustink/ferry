@@ -1,0 +1,118 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "reread",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 8,
+  "create_seconds": 2.514852334,
+  "baseline": {
+    "at": "18:40:23",
+    "free_mib": 865.234375,
+    "used_mib": 16507.125,
+    "compressed_mib": 2325.890625,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "18:40:32",
+      "free_mib": 1147.28125,
+      "used_mib": 18411.59375,
+      "compressed_mib": 2325.859375,
+      "vms": 8,
+      "vm_resident_mib": 4413.90625,
+      "vm_cpu_percent": 0.1
+    },
+    {
+      "at": "18:40:38",
+      "free_mib": 1202.9375,
+      "used_mib": 18356.65625,
+      "compressed_mib": 2325.515625,
+      "vms": 8,
+      "vm_resident_mib": 4415.515625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:40:44",
+      "free_mib": 1203.375,
+      "used_mib": 18355.578125,
+      "compressed_mib": 2325.453125,
+      "vms": 8,
+      "vm_resident_mib": 4422.078125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:40:50",
+      "free_mib": 1219.359375,
+      "used_mib": 18337.078125,
+      "compressed_mib": 2325.453125,
+      "vms": 8,
+      "vm_resident_mib": 4425.203125,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:40:56",
+      "free_mib": 1177.234375,
+      "used_mib": 18380.1875,
+      "compressed_mib": 2325.328125,
+      "vms": 8,
+      "vm_resident_mib": 4428.1875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:41:03",
+      "free_mib": 1212.828125,
+      "used_mib": 18351.046875,
+      "compressed_mib": 2325.25,
+      "vms": 8,
+      "vm_resident_mib": 4430.21875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:41:09",
+      "free_mib": 1264.390625,
+      "used_mib": 18296.65625,
+      "compressed_mib": 2325.1875,
+      "vms": 8,
+      "vm_resident_mib": 4433.140625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "18:41:15",
+      "free_mib": 1109.171875,
+      "used_mib": 18408.46875,
+      "compressed_mib": 2325.171875,
+      "vms": 8,
+      "vm_resident_mib": 4435.8125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "18:41:15",
+    "free_mib": 1109.171875,
+    "used_mib": 18408.46875,
+    "compressed_mib": 2325.171875,
+    "vms": 8,
+    "vm_resident_mib": 4435.8125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 2876,
+  "logs": [
+    "pod-00.log: 2026-09-14T01:40:23.774Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.004491 seconds, 27.8GB/s",
+    "pod-00.log: 2026-09-14T01:40:23.779Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004396 seconds, 28.4GB/s",
+    "pod-01.log: 2026-09-14T01:40:24.181Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.004316 seconds, 29.0GB/s",
+    "pod-01.log: 2026-09-14T01:40:24.185Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004076 seconds, 30.7GB/s",
+    "pod-02.log: 2026-09-14T01:40:24.451Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.004434 seconds, 28.2GB/s",
+    "pod-02.log: 2026-09-14T01:40:24.455Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004147 seconds, 30.1GB/s",
+    "pod-03.log: 2026-09-14T01:40:24.747Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.004472 seconds, 28.0GB/s",
+    "pod-03.log: 2026-09-14T01:40:24.752Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004300 seconds, 29.1GB/s",
+    "pod-04.log: 2026-09-14T01:40:25.058Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.004485 seconds, 27.9GB/s",
+    "pod-04.log: 2026-09-14T01:40:25.063Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004444 seconds, 28.1GB/s",
+    "pod-05.log: 2026-09-14T01:40:25.384Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.026167 seconds, 4.8GB/s",
+    "pod-05.log: 2026-09-14T01:40:25.389Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004367 seconds, 28.6GB/s",
+    "pod-06.log: 2026-09-14T01:40:25.690Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.024104 seconds, 5.2GB/s",
+    "pod-06.log: 2026-09-14T01:40:25.694Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.003983 seconds, 31.4GB/s",
+    "pod-07.log: 2026-09-14T01:40:25.994Z stdout F COLD 134217728 bytes (128.0MB) copied, 0.023057 seconds, 5.4GB/s",
+    "pod-07.log: 2026-09-14T01:40:25.998Z stdout F WARM 134217728 bytes (128.0MB) copied, 0.004161 seconds, 30.0GB/s"
+  ]
+}
