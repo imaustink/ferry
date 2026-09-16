@@ -1488,6 +1488,29 @@ actor PodRuntime {
     /// for a container to write, and an image past roughly 1.5 GiB could not be
     /// run at all -- which is most of the ML images anyone would want a GPU for.
     ///
+    /// A manifest reports compressed layer sizes, and unpacked is larger by a
+    /// factor that has to be guessed at because nothing in the manifest records
+    /// it. Measured on arm64: python:3.12-slim 45 MiB compressed to 145 MiB
+    /// unpacked (3.2x), python:3.12 381 MiB to 1070 MiB (2.8x). Four is that
+    /// with room to be wrong.
+    ///
+    /// Plus 2 GiB for the container's own writes, which is what an image got to
+    /// itself under the old flat figure, and never below that old figure so
+    /// small images are unaffected.
+    ///
+    /// Over-provisioning is close to free: the file is sparse and costs what is
+    /// written to it rather than what it may hold.
+    static let rootfsCompressionFactor: UInt64 = 4
+
+    static func rootfsCapacity(for image: Containerization.Image,
+                               platform: ContainerizationOCI.Platform) async -> UInt64 {
+        let floor = UInt64(2.gib())
+        guard let manifest = try? await image.manifest(for: platform) else { return floor }
+        let compressed = manifest.layers.reduce(Int64(0)) { $0 + $1.size }
+        guard compressed > 0 else { return floor }
+        return max(floor, UInt64(compressed) * rootfsCompressionFactor + UInt64(2.gib()))
+    }
+
     /// Unpacks an image to a root filesystem and records it where the kubelet
     /// will look. Shared by pulling and loading, which differ only in where the
     /// image came from.
@@ -1500,7 +1523,7 @@ actor PodRuntime {
             let path = config.stateDir.appending(component: "image-\(safe).ext4")
             let mount: Containerization.Mount
             do {
-                mount = try await EXT4Unpacker(capacityInBytes: 2.gib())
+                mount = try await EXT4Unpacker(capacityInBytes: Self.rootfsCapacity(for: image, platform: platform))
                     .unpack(image, for: platform, at: path)
             } catch let error as ContainerizationError where error.code == .exists {
                 mount = .block(format: "ext4", source: path.path(), destination: "/", options: [])
