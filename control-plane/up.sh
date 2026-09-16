@@ -131,7 +131,7 @@ start kube-apiserver "$bin/kube-apiserver" \
 echo "    . waiting for /livez"
 for i in $(seq 1 60); do
   curl -sk --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
-    https://127.0.0.1:6443/livez 2>/dev/null | grep -q ok && break
+    https://127.0.0.1:$API_PORT/livez 2>/dev/null | grep -q ok && break
   sleep 1
 done
 
