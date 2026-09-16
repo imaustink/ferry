@@ -120,6 +120,14 @@ struct PodContainers: Decodable {
     /// The pod's priority, from PriorityClass. Travels with the GPU request:
     /// one device shared between pods is exactly where it has to mean something.
     let priority: Int32?
+    /// What the pod's containers are allowed to use between them, aggregated
+    /// the way Kubernetes defines it. CRI sends resources per container and
+    /// never for the pod, and the VM has to be sized before the first container
+    /// starts, so the aggregate comes from the pod spec instead.
+    ///
+    /// Nil or zero means the pod set no limits and the default size stands.
+    let memoryLimitBytes: Int64?
+    let cpuLimit: Int32?
 }
 
 extension StreamerClient {

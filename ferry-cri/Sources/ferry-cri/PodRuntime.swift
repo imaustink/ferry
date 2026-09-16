@@ -109,6 +109,10 @@ struct SandboxRecord {
     var gpuContainerNames: [String] = []
     /// What this pod is worth against other pods waiting for the GPU.
     var priority: Int32 = 0
+    /// How the VM was sized, so a rebuild after a failed start makes the same
+    /// machine rather than falling back to the default.
+    var vmMemoryBytes: UInt64 = 0
+    var vmCPUs: Int = 0
     /// Whether ferry-gpud has bound a socket for this pod, so it can be handed
     /// back when the pod goes away.
     var gpuGranted: Bool = false
@@ -510,20 +514,31 @@ actor PodRuntime {
             }
         }
 
-        // Kubernetes sends resource limits per container, not per sandbox, so
-        // the VM is sized from defaults here and containers are bounded inside
-        // it by cgroups. Right-sizing the VM from the pod's aggregate requests
-        // is a worthwhile refinement, not a correctness issue.
+        // The pod's spec is read before the machine is made, because it decides
+        // how big the machine has to be.
+        //
+        // CRI sends resource limits per container and never for the sandbox,
+        // which suits a runtime whose containers share a machine that already
+        // exists. Here the machine is created for the pod and cannot be resized
+        // afterwards -- Virtualization.framework's memory balloon only shrinks a
+        // guest below its boot size -- so sizing from a node-wide default meant a
+        // pod with `limits.memory: 2Gi` got a 512 MiB machine, and its container
+        // died of a guest OOM well inside the limit Kubernetes had granted it.
+        let expected = await podContainers(
+            namespace: cfg.metadata.namespace, name: cfg.metadata.name)
+        let vmMemory = vmMemory(forPodLimit: expected.memoryLimit)
+        let vmCPUs = expected.cpuLimit > 0
+            ? max(config.defaultCPUs, Int(expected.cpuLimit)) : config.defaultCPUs
+
         let pod = try makePod(id: id, interface: interface, cfg: cfg,
-                              clusterInterface: clusterInterface)
+                              clusterInterface: clusterInterface,
+                              memoryBytes: vmMemory, cpus: vmCPUs)
         if let clusterInterface {
             podSwitch?.attach(podID: id, fd: clusterInterface.hostFD)
         }
-        // Deliberately not created yet. CRI adds containers after the sandbox
-        // exists, and on this hypervisor a container can only be added before
-        // the VM boots -- see startContainer.
-        let expected = await podContainers(
-            namespace: cfg.metadata.namespace, name: cfg.metadata.name)
+        // The VM is deliberately not created yet. CRI adds containers after the
+        // sandbox exists, and on this hypervisor a container can only be added
+        // before the VM boots -- see startContainer.
 
         defer { publishHostPorts() }
         sandboxes[id] = SandboxRecord(
@@ -537,7 +552,9 @@ actor PodRuntime {
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers,
             gpuContainerNames: expected.gpuContainers,
-            priority: expected.priority
+            priority: expected.priority,
+            vmMemoryBytes: vmMemory,
+            vmCPUs: vmCPUs
         )
         return id
     }
@@ -591,25 +608,50 @@ actor PodRuntime {
     /// not fatal: without it single-container pods behave exactly as before,
     /// only sidecars are lost.
     private func podContainers(namespace: String, name: String) async
-        -> (initContainers: [String], containers: [String], gpuContainers: [String], priority: Int32)
+        -> (initContainers: [String], containers: [String], gpuContainers: [String],
+            priority: Int32, memoryLimit: Int64, cpuLimit: Int32)
     {
-        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0) }
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0, 0, 0) }
         do {
             let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
             let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
             return (decoded.initContainers ?? [], decoded.containers ?? [],
-                    decoded.gpuContainers ?? [], decoded.priority ?? 0)
+                    decoded.gpuContainers ?? [], decoded.priority ?? 0,
+                    decoded.memoryLimitBytes ?? 0, decoded.cpuLimit ?? 0)
         } catch {
-            return ([], [], [], 0)
+            return ([], [], [], 0, 0, 0)
         }
     }
 
+    /// How big the VM for a pod has to be.
+    ///
+    /// The pod's own limits plus room for the kernel and vminitd underneath
+    /// them. Without the headroom a pod whose containers are allowed 2 GiB gets
+    /// a 2 GiB machine, and the guest OOMs before the containers reach their
+    /// limit -- the cgroup permits what the machine cannot supply.
+    ///
+    /// A pod that set no limits keeps the configured default, which is also the
+    /// floor: sizing a machine below it makes nothing smaller, since guest
+    /// memory is lazily backed and costs what it touches rather than what it
+    /// was promised.
+    private func vmMemory(forPodLimit limit: Int64) -> UInt64 {
+        guard limit > 0 else { return config.defaultMemoryBytes }
+        return max(config.defaultMemoryBytes, UInt64(limit) + Self.guestMemoryHeadroom)
+    }
+
+    /// What the guest kernel, vminitd and the pod's own page cache need beyond
+    /// the workload's limits. Experiment 13 measured an idle pod VM at 226 MiB
+    /// of host memory with nothing running in it.
+    static let guestMemoryHeadroom: UInt64 = 256 * 1024 * 1024
+
     private func makePod(id: String, interface: any Interface,
                          cfg: Runtime_V1_PodSandboxConfig,
-                         clusterInterface: SwitchInterface? = nil) throws -> LinuxPod {
+                         clusterInterface: SwitchInterface? = nil,
+                         memoryBytes: UInt64? = nil,
+                         cpus: Int? = nil) throws -> LinuxPod {
         try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs)) { c in
-            c.cpus = config.defaultCPUs
-            c.memoryInBytes = config.defaultMemoryBytes
+            c.cpus = cpus ?? config.defaultCPUs
+            c.memoryInBytes = memoryBytes ?? config.defaultMemoryBytes
             // eth0 is vmnet and keeps the default route; eth1, when there is a
             // cluster, is ferry's own segment.
             c.interfaces = clusterInterface.map { [interface, $0] } ?? [interface]
@@ -1016,7 +1058,13 @@ actor PodRuntime {
                     atPath: config.stateDir.appending(component: "\(stale.id).ext4").path())
                 containers.removeValue(forKey: stale.id)
             }
-            let rebuilt = try makePod(id: sandboxID, interface: sandbox.interface, cfg: sandbox.config)
+            // Rebuilt at the size this pod was admitted with, not at the
+            // default: the pod's limits have not changed just because its
+            // first container failed to start.
+            let rebuilt = try makePod(id: sandboxID, interface: sandbox.interface,
+                                      cfg: sandbox.config,
+                                      memoryBytes: sandbox.vmMemoryBytes > 0 ? sandbox.vmMemoryBytes : nil,
+                                      cpus: sandbox.vmCPUs > 0 ? sandbox.vmCPUs : nil)
             sandboxes[sandboxID]?.pod = rebuilt
             sandboxes[sandboxID]?.booted = false
         }
@@ -1433,6 +1481,13 @@ actor PodRuntime {
                                platform: platform)
     }
 
+    /// How big a filesystem an image needs.
+    ///
+    /// This was a flat 2 GiB, which is generous for busybox and too small for
+    /// anything real: `python:3.12` unpacks to about 1.4 GiB and leaves no room
+    /// for a container to write, and an image past roughly 1.5 GiB could not be
+    /// run at all -- which is most of the ML images anyone would want a GPU for.
+    ///
     /// Unpacks an image to a root filesystem and records it where the kubelet
     /// will look. Shared by pulling and loading, which differ only in where the
     /// image came from.
