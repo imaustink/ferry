@@ -90,6 +90,14 @@ cost time.
 - ✅ **Cluster DNS works.** CoreDNS runs as a pod on an address reserved before
   any pod can take it, so the kubelet can be told where DNS lives before DNS
   exists. Pods resolve external names and cluster names.
+- 🚧 **Cluster upgrades are written, and no cluster has been upgraded yet.**
+  `ferry upgrade plan|apply|nodes|rollback` moves the control plane in place
+  against the same etcd, then drains and replaces each kubelet while the runtime
+  keeps holding the pod VMs. One version now drives the kubelet, the control
+  plane and etcd together, which it did not before. The store, the skew rules,
+  an etcd snapshot-and-restore round trip and a real v1.34.11 kubelet build all
+  check out; the act itself has not been run. See
+  [docs/UPGRADES.md](docs/UPGRADES.md).
 
 ## Why this can work
 
@@ -106,11 +114,13 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 ## Layout
 
 ```
-ferry                                the CLI: doctor, build, up, down, status, logs
+ferry                                the CLI: doctor, build, up, down, status, logs, upgrade
+lib/versions.sh                      the version store, and what may follow what
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
+tests/                               what can be checked without a cluster
 docs/                                HANDOFF.md (the full picture), SERVICES.md
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
@@ -129,7 +139,8 @@ ferry-proxy/                         host-side ClusterIP routing (fallback)
 ferry-gpud/                          the Mac's GPU, offered to pods over a socket
 kernel/                              guest kernel with NAT support
 assets/                              the logo
-bin/                                 build output (gitignored)
+bin/versions/<vX.Y.Z>/               kubelet, control plane and etcd per version
+bin/                                 build output, symlinked to a version (gitignored)
 ```
 
 ## Try it

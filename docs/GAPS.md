@@ -2,10 +2,13 @@
 
 Measured against minikube and kind, which are what people will compare it to.
 Everything below was checked against a running two-node cluster rather than
-assumed.
+assumed -- with one exception, which has a section of its own so that the
+difference is not glossed over: cluster upgrades are built and tested, but no
+cluster has yet been upgraded.
 
-Most of the original list is closed. What is left is four features that are
-honestly absent and one correction, which is worth reading first.
+Most of the original list is closed. What is left is three features that are
+honestly absent, one that is written and unproven, and one correction, which is
+worth reading first.
 
 ## A correction
 
@@ -37,19 +40,58 @@ re-measure rather than reasoning from the source.
   configuration plus four netfilter symbols, which does not include
   `CONFIG_IP_SCTP`. Both halves would have to change, and the kernel build is
   the slow one that needs Docker.
-- **Cluster upgrades.** No path from one version to another. `ferry build
-  --kubernetes-version` changes what a *new* cluster is built from; it does not
-  move a running one, and nothing drains, replaces or rolls back a node.
 - **Dashboard**, **registry**, and the rest of the addon ecosystem. The addon
   mechanism exists -- `ferry addons list|enable|disable`, reading
   `addons/<name>/` -- and carries two. minikube has around thirty.
-- **Choosing the Kubernetes version is a build input, not a promise.** `ferry
-  build --kubernetes-version vX.Y.Z` exists and records what the kubelet was
-  built from, so changing it forces a rebuild. Only v1.34.0 has been built and
-  run. The patches in `patches/` are written against a particular tree;
-  `build-kubelet.sh` verifies every seam it edits and fails loudly when one has
-  moved, so a drifted version fails at build time rather than at runtime, which
-  is the best that can be said for it.
+- **Choosing the Kubernetes version is a build input, and now also an upgrade
+  input.** `ferry build --kubernetes-version vX.Y.Z` picks it, and one version
+  now drives the kubelet, `ferry-proxyd`, the control plane and etcd together --
+  before, the kubelet and the control plane had separate defaults that nothing
+  reconciled, so asking for a version newer than the control plane's default
+  produced a kubelet newer than the API server with nothing saying so.
+  v1.34.0 and v1.34.11 have been built; only v1.34.0 has been run. The patches
+  in `patches/` are written against a particular tree; `build-kubelet.sh`
+  verifies every seam it edits and fails loudly when one has moved, so a drifted
+  version fails at build time rather than at runtime, which is the best that can
+  be said for it.
+
+## Built, and not yet exercised on a running cluster
+
+**Cluster upgrades.** There is now a path from one version to another --
+`ferry upgrade plan|apply|node|nodes|rollback|status`, documented in
+[UPGRADES.md](UPGRADES.md). The control plane restarts in place against the same
+etcd data directory, each node is drained and its kubelet replaced while the
+runtime keeps holding the pod VMs, and rollback flips a symlink and restores an
+etcd snapshot. This section exists because that is not the same standard as the
+rest of this document.
+
+Verified, on this machine:
+
+- the version store, the skew rules and the cluster-version bookkeeping, by 100
+  assertions in `tests/` -- including that adopting a pre-store checkout keeps
+  the kubelet's inode, so a running one stays runnable;
+- an etcd snapshot taken the way `ferry upgrade` takes it, restored the way it
+  restores it, with the data still in it and post-snapshot writes correctly
+  gone;
+- a real v1.34.11 kubelet built from the v1.34.0 patch overlay -- every seam in
+  `build-kubelet.sh` applied and asserted clean across a patch bump -- and the
+  real control plane and etcd for it fetched, stored, linked and run;
+- the whole preflight against the live GitHub releases and the kubernetes tag.
+
+Not verified: the act itself. No cluster has been upgraded. The sequence to run
+is at the end of [UPGRADES.md](UPGRADES.md).
+
+Known limits, which are not bugs:
+
+- **There is no zero-downtime control plane upgrade**, and there cannot be with
+  one etcd member and one API server. The API is unreachable for a few seconds.
+  Running pods are not touched.
+- **A checkout has one `bin/`**, so every node on one Mac moves together. The
+  roll is per Mac, not per node.
+- **Nothing distributes binaries to another Mac.** `ferry join` already says to
+  copy them from the first Mac; upgrades say the same.
+- **A minor bump is a different problem** -- porting `patches/` -- and this
+  machinery does not claim to solve it.
 
 ## Known, and deliberate
 
