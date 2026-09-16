@@ -199,11 +199,24 @@ it.
 
 - Apple silicon, macOS 26 (Tahoe)
 - Go 1.24+
-- **Swift 6.2+.** The OS upgrade does not bring the toolchain with it — install
-  it explicitly (no sudo needed):
+- **Swift 6.2+, and 6.4 is what ferry is built with.** Use the same toolchain on
+  every Mac in a cluster: binaries are copied between machines, and two
+  toolchains produce two builds that are only probably the same.
+
+  The OS upgrade does not bring the toolchain with it, and the version Apple
+  offers moves, so ask before installing:
   ```sh
-  softwareupdate --install "Command Line Tools for Xcode 26.6-26.6"
+  softwareupdate --list | grep "Command Line Tools"
+  sudo rm -rf /Library/Developer/CommandLineTools          # see below
+  sudo softwareupdate --install "Command Line Tools for Xcode <version>"
   ```
+
+  **Remove the old one first.** Both `softwareupdate --install` and
+  `xcode-select --install` lay a version down beside whatever is already there,
+  and the result reports a healthy version number while being unable to build
+  anything — a 6.3 driver reading 6.4 module interfaces, or a `swift-package`
+  that dies in dyld before it reads a manifest. `ferry doctor` checks for this
+  by running SwiftPM rather than by asking it its version.
 
 Most of this was developed on macOS 15. What actually needs 26 is routable
 per-pod addressing (`VZVmnetNetworkDeviceAttachment`) and the toolchain Apple's
