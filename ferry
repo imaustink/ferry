@@ -113,6 +113,24 @@ POD_CPUS="${FERRY_POD_CPUS:-2}"
 # margin at all. An absolute figure says what it means. Kubernetes accepts either.
 EVICT_DISK="${FERRY_EVICTION_DISK:-4Gi}"
 EVICT_MEMORY="${FERRY_EVICTION_MEMORY:-500Mi}"
+# How many pods this Mac can actually hold.
+#
+# The kubelet's default is 110 and the hypervisor stops at 128 virtual machines,
+# so the count looked like the binding limit. It is not: a pod here is a VM, and
+# an idle one costs 226 MiB of host memory before the workload does anything --
+# measured flat at 8, 20, 24 and 40 pods, and unmoved by --pod-memory-mib, so it
+# is the price of a kernel rather than a pod using its allowance. 110 of those is
+# 24 GiB, which is three quarters of a 32 GiB machine spent on kernels.
+#
+# So memory decides, and advertising 110 on a machine that cannot hold 110 asks
+# the scheduler to place pods that will fail to start. Half of RAM is the budget
+# for that overhead, which leaves the other half for the workloads themselves.
+# FERRY_MAX_PODS overrides it for anyone who would rather find the wall.
+pod_overhead_mib=226
+default_max_pods="$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 2 / pod_overhead_mib ))"
+[ "$default_max_pods" -gt 110 ] && default_max_pods=110
+[ "$default_max_pods" -lt 1 ] && default_max_pods=1
+MAX_PODS="${FERRY_MAX_PODS:-$default_max_pods}"
 # The cluster pod network: one flat segment every pod shares, on every node and
 # every machine. Pods keep a vmnet NIC for the internet; this is the address
 # Kubernetes knows them by. Setting it empty returns ferry to vmnet addressing
@@ -514,6 +532,7 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false
@@ -1168,6 +1187,7 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
 failSwapOn: false

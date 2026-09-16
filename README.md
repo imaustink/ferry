@@ -176,8 +176,16 @@ it.
 - `logs`, `exec`, `port-forward` and `attach` all work. Attach needs the pod to
   set `stdin: true` to accept input, since the stream has to be wired in when
   the container is created.
-- **128 pods, shared.** The VM ceiling belongs to the machine, so every other
-  VM — Docker Desktop included — takes one of ferry's slots.
+- **Memory decides how many pods fit, not the 128-VM ceiling.** An idle pod VM
+  costs **226 MiB** of host memory before its workload does anything — flat at
+  8, 20, 24 and 40 pods, and unmoved by `--pod-memory-mib`, so it is the price
+  of a kernel rather than a pod using its allowance. 110 of those is 24 GiB.
+  ferry therefore sets `maxPods` from the machine's memory, budgeting half of it
+  for that overhead: 72 on a 32 GiB Mac, 110 on a 64 GiB one, overridable with
+  `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared — every
+  other VM, Docker Desktop included, takes one of ferry's slots — but on most
+  Macs memory runs out first. See
+  [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
 - **Restarting in quick succession moves the pod network.** A vmnet subnet stays
   reserved for about a minute after the run using it stops, and there are 32
   networks across the whole Mac, so a restart takes the next free subnet. Pods

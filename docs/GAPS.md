@@ -68,7 +68,12 @@ re-measure rather than reasoning from the source.
   Intel Macs. ferry's premise is `Virtualization.framework`.
 - **One container runtime.** No containerd/CRI-O/docker choice; `ferry-cri` is
   the runtime.
-- **128 pods, shared with the machine.** Every other VM on the Mac takes a slot.
+- **Memory bounds the pod count before the 128-VM ceiling does.** A pod is a
+  VM, and an idle one costs 226 MiB of host memory whatever the workload does,
+  so `maxPods` is derived from the machine rather than left at Kubernetes' 110 —
+  72 on a 32 GiB Mac. The hypervisor ceiling is still shared with every other VM
+  on the Mac. Measured in
+  [experiments/13-shared-kernel-cost](../experiments/13-shared-kernel-cost/FINDINGS.md).
 - **An image is loaded per node**, not cluster-wide. minikube has the same
   property per profile.
 - **A volume is local to one Mac.** The PersistentVolume says so through node
