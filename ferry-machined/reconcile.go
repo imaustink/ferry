@@ -17,9 +17,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
-	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -43,10 +41,35 @@ const finalizer = "ferry.dev/machine"
 
 type machine struct {
 	name    string
-	cmd     *exec.Cmd
 	address string
 	token   string
+	podCIDR string
 }
+
+// machineSpec is what ferry-node serve reads out of the machines directory.
+// Writing the file asks for a machine; removing it stops one.
+type machineSpec struct {
+	Name      string `json:"name"`
+	Disk      string `json:"disk"`
+	CPUs      int    `json:"cpus"`
+	MemoryMiB int64  `json:"memoryMiB"`
+	Token     string `json:"token"`
+	PodCIDR   string `json:"podCIDR"`
+}
+
+// machineStatus is what it writes back.
+type machineStatus struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	Phase   string `json:"phase"`
+	Message string `json:"message"`
+}
+
+// Pod CIDRs are not ferry's to allocate. kube-controller-manager hands each
+// Node a slice of the cluster CIDR when it registers, every node's routes point
+// at those slices, and a second allocator here produced pods with addresses no
+// other node could reach. The machine is told nothing and reads its own from
+// the API once it has registered; this only reports what was chosen.
 
 type controller struct {
 	kube     kubernetes.Interface
@@ -98,17 +121,11 @@ func (c *controller) reconcile(ctx context.Context, item *unstructured.Unstructu
 		item = updated
 	}
 
-	existing, running := c.machines[name]
-	if running && existing.cmd.ProcessState == nil {
-		// Already up. The remaining work is telling the cluster what the node
-		// is doing, which is the Node object's business rather than the VM's.
+	if existing, running := c.machines[name]; running {
+		// Already asked for. The remaining work is telling the cluster what the
+		// node is doing, which is the Node object's business rather than the VM's.
 		return c.updateStatus(ctx, item, existing)
 	}
-	if running {
-		log.Printf("machine %s: the VM exited, rebuilding", name)
-		delete(c.machines, name)
-	}
-
 	return c.create(ctx, item)
 }
 
@@ -141,37 +158,25 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 		}
 	}
 
-	logFile, err := os.Create(logPath(name))
+	// Asking the server rather than starting a process: one vmnet network
+	// belongs to the process that made it (experiment 19), so every machine has
+	// to be hosted by the same one or they land on networks vmnet keeps apart.
+	spec := machineSpec{
+		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
+		Token: token,
+	}
+	body, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
-		return fmt.Errorf("log file: %w", err)
+		return err
 	}
-	_ = os.Remove(statusPath(name))
-
-	cmd := exec.Command(*ferryNode, "run",
-		"--disk", disk,
-		"--kernel", *kernel,
-		"--ca", *caFile,
-		"--node-name", name,
-		"--api-server", *apiServer,
-		"--token", token,
-		"--cpus", strconv.Itoa(cpus),
-		"--memory-mib", strconv.FormatInt(memoryMiB, 10),
-		"--cluster-dns", *clusterDNS,
-		"--status-file", statusPath(name),
-	)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting ferry-node: %w", err)
+	if err := os.WriteFile(specFile(name), body, 0o644); err != nil {
+		return fmt.Errorf("asking for machine %s: %w", name, err)
 	}
-	// Reaped here so ProcessState is set when it exits, which is how the next
-	// pass notices a machine that died.
-	go func() { _ = cmd.Wait() }()
 
-	m := &machine{name: name, cmd: cmd, token: token}
+	m := &machine{name: name, token: token}
 	c.machines[name] = m
-	log.Printf("machine %s: %d cpu, %d MiB, %d GiB disk, pid %d",
-		name, cpus, memoryMiB, diskGiB, cmd.Process.Pid)
+	log.Printf("machine %s: asked for %d cpu, %d MiB, %d GiB disk",
+		name, cpus, memoryMiB, diskGiB)
 
 	return c.updateStatus(ctx, item, m)
 }
@@ -195,9 +200,9 @@ func (c *controller) delete(ctx context.Context, item *unstructured.Unstructured
 		log.Printf("machine %s: deleting node: %v", name, err)
 	}
 	_ = c.kube.CoreV1().Secrets("kube-system").Delete(ctx, bootstrapSecretName(name), metav1.DeleteOptions{})
+	_ = os.Remove(statusFile(name))
 	_ = os.Remove(diskPath(name))
 	_ = os.Remove(diskPath(name) + ".config.ext4")
-	_ = os.Remove(statusPath(name))
 
 	remaining := []string{}
 	for _, f := range item.GetFinalizers() {
@@ -210,12 +215,10 @@ func (c *controller) delete(ctx context.Context, item *unstructured.Unstructured
 	return err
 }
 
+// stop asks the server to let the machine go, which it does by noticing the
+// spec file is gone.
 func (c *controller) stop(m *machine) {
-	if m.cmd == nil || m.cmd.Process == nil {
-		return
-	}
-	_ = m.cmd.Process.Signal(syscall.SIGTERM)
-	_ = m.cmd.Process.Kill()
+	_ = os.Remove(specFile(m.name))
 }
 
 func (c *controller) shutdown() {
@@ -231,12 +234,13 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 	status := map[string]any{"phase": "Provisioning"}
 
 	if m.address == "" {
-		if body, err := os.ReadFile(statusPath(m.name)); err == nil {
-			var reported struct {
-				Address string `json:"address"`
-			}
+		if body, err := os.ReadFile(statusFile(m.name)); err == nil {
+			var reported machineStatus
 			if json.Unmarshal(body, &reported) == nil {
 				m.address = strings.SplitN(reported.Address, "/", 2)[0]
+				if reported.Phase == "Failed" {
+					status["message"] = reported.Message
+				}
 			}
 		}
 	}
@@ -247,6 +251,10 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 	if node, err := c.kube.CoreV1().Nodes().Get(ctx, m.name, metav1.GetOptions{}); err == nil {
 		status["nodeRef"] = map[string]any{"name": node.Name}
 		status["phase"] = "Running"
+		if node.Spec.PodCIDR != "" {
+			m.podCIDR = node.Spec.PodCIDR
+			status["podCIDR"] = node.Spec.PodCIDR
+		}
 		for _, condition := range node.Status.Conditions {
 			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
 				status["message"] = "node is Ready"

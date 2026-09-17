@@ -62,29 +62,6 @@ ip addr add "$ADDRESS" dev eth0
 printf 'nameserver %s\n' "${DNS:-1.1.1.1}" > /etc/resolv.conf
 log "address $ADDRESS via ${GATEWAY:-none} ($(elapsed)ms)"
 
-# A pod network for this node's own pods. ipMasq is on because this image has
-# iptables, which is what experiment 17 could not do.
-cat > /etc/cni/net.d/10-ferry-node.conflist <<CNI
-{
-  "cniVersion": "1.0.0",
-  "name": "ferry-node",
-  "plugins": [
-    {
-      "type": "bridge",
-      "bridge": "cni0",
-      "isGateway": true,
-      "ipMasq": true,
-      "ipam": {
-        "type": "host-local",
-        "ranges": [[{"subnet": "${POD_CIDR:-10.88.0.0/16}"}]],
-        "routes": [{"dst": "0.0.0.0/0"}]
-      }
-    },
-    {"type": "portmap", "capabilities": {"portMappings": true}}
-  ]
-}
-CNI
-
 log "binaries: $(ls -l /usr/local/bin/containerd 2>&1 | awk '{print $1, $5}') kubelet $(ls -l /usr/local/bin/kubelet 2>&1 | awk '{print $5}')"
 log "starting containerd"
 /usr/local/bin/containerd > /var/log/containerd.log 2>&1 &
@@ -191,6 +168,37 @@ log "--- kubelet, first lines that are not flags ---"
 grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
 log "--- end ---"
 
+# Routes to the other nodes' pods.
+#
+# Every machine is on one vmnet segment now, and each owns a slice of the pod
+# network, so reaching a pod on another node is an ordinary route through that
+# node's address. Nothing hands those out, so each node reads the Node list and
+# keeps its own routing table in step -- which is what flannel's host-gw mode
+# does, in a handful of lines, because the hard parts (one segment, a CIDR per
+# node) are already true here.
+#
+# It authenticates with the kubelet's own certificate: system:node may list
+# nodes, and a second credential would be a second thing to rotate.
+route_agent() {
+  cert=/var/lib/kubelet/pki/kubelet-client-current.pem
+  while [ ! -f "$cert" ]; do sleep 1; done
+  while true; do
+    curl -s --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
+      "$API_SERVER/api/v1/nodes" 2>/dev/null \
+      | jq -r '.items[] | select(.spec.podCIDR != null) |
+               "\(.spec.podCIDR) \(.status.addresses[] | select(.type=="InternalIP") | .address)"' \
+      2>/dev/null | while read -r cidr via; do
+        [ -z "$cidr" ] && continue
+        [ "$cidr" = "$POD_CIDR" ] && continue
+        [ "$via" = "${ADDRESS%%/*}" ] && continue
+        case "$(ip route show "$cidr" 2>/dev/null)" in
+          *"via $via"*) ;;
+          *) ip route replace "$cidr" via "$via" 2>/dev/null && log "route $cidr via $via" ;;
+        esac
+      done
+    sleep 10
+  done
+}
 n=0
 until grep -q "Successfully registered node" /var/log/kubelet.log 2>/dev/null; do
   n=$((n + 1))
@@ -198,6 +206,45 @@ until grep -q "Successfully registered node" /var/log/kubelet.log 2>/dev/null; d
   sleep 0.1
 done
 log "registered ($(elapsed)ms)"
+
+# The pod network for this node's own pods, written now rather than at boot
+# because the subnet is not this machine's to choose. kube-controller-manager
+# allocates a slice per Node, and the routes other nodes install point at that
+# slice -- so configuring the CNI from anything else produces pods with
+# addresses nobody else can reach, which is exactly what happened the first
+# time this ran.
+cert=/var/lib/kubelet/pki/kubelet-client-current.pem
+for _ in $(seq 1 120); do
+  POD_CIDR=$(curl -s --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
+    "$API_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null | jq -r '.spec.podCIDR // empty')
+  [ -n "$POD_CIDR" ] && break
+  sleep 1
+done
+log "pod cidr $POD_CIDR"
+
+mkdir -p /etc/cni/net.d
+cat > /etc/cni/net.d/10-ferry-node.conflist <<CNI
+{
+  "cniVersion": "1.0.0",
+  "name": "ferry-node",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": "$POD_CIDR"}]],
+        "routes": [{"dst": "0.0.0.0/0"}]
+      }
+    },
+    {"type": "portmap", "capabilities": {"portMappings": true}}
+  ]
+}
+CNI
+log "cni configured ($(elapsed)ms)"
+route_agent &
 log "up"
 
 # PID 1 may not exit: the kernel panics if it does.

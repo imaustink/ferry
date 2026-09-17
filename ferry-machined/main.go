@@ -29,14 +29,14 @@ import (
 
 var (
 	kubeconfig = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
-	ferryNode  = flag.String("ferry-node", "", "path to the ferry-node binary")
 	kernel     = flag.String("kernel", "", "guest kernel every machine boots")
 	baseImage  = flag.String("image", "", "node disk image machines are cloned from")
 	stateDir   = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
 	apiServer  = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
 	caFile     = flag.String("ca", "", "cluster CA the machines must trust")
 	clusterDNS = flag.String("cluster-dns", "10.96.0.10", "address of the cluster's DNS service")
-	interval   = flag.Duration("interval", 2*time.Second, "how often to reconcile")
+	interval    = flag.Duration("interval", 2*time.Second, "how often to reconcile")
+	machinesDir = flag.String("machines", "", "directory ferry-node serve watches; defaults to <state>/machines")
 )
 
 func main() {
@@ -46,8 +46,7 @@ func main() {
 	log.SetFlags(log.Ltime)
 
 	for name, value := range map[string]*string{
-		"--kubeconfig": kubeconfig, "--ferry-node": ferryNode, "--kernel": kernel,
-		"--image": baseImage, "--api-server": apiServer, "--ca": caFile,
+		"--kubeconfig": kubeconfig, "--image": baseImage,
 	} {
 		if *value == "" {
 			log.Fatalf("%s is required", name)
@@ -55,6 +54,12 @@ func main() {
 	}
 	if err := os.MkdirAll(*stateDir, 0o755); err != nil {
 		log.Fatalf("state directory: %v", err)
+	}
+	if *machinesDir == "" {
+		*machinesDir = filepath.Join(*stateDir, "machines")
+	}
+	if err := os.MkdirAll(*machinesDir, 0o755); err != nil {
+		log.Fatalf("machines directory: %v", err)
 	}
 
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
@@ -88,6 +93,7 @@ func main() {
 	log.Printf("    kernel  %s", *kernel)
 	log.Printf("    join    %s", *apiServer)
 	log.Printf("    state   %s", *stateDir)
+	log.Printf("    machines %s", *machinesDir)
 
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
@@ -111,10 +117,13 @@ func diskPath(name string) string {
 	return filepath.Join(*stateDir, fmt.Sprintf("%s.ext4", name))
 }
 
-func logPath(name string) string {
-	return filepath.Join(*stateDir, fmt.Sprintf("%s.log", name))
+// The machines directory is the control channel to ferry-node serve: a spec
+// file asks for a machine, and removing it stops one. Shared with the server
+// rather than private to either.
+func specFile(name string) string {
+	return filepath.Join(*machinesDir, fmt.Sprintf("%s.json", name))
 }
 
-func statusPath(name string) string {
-	return filepath.Join(*stateDir, fmt.Sprintf("%s.json", name))
+func statusFile(name string) string {
+	return filepath.Join(*machinesDir, fmt.Sprintf("%s.status.json", name))
 }

@@ -14,7 +14,7 @@ FROM public.ecr.aws/docker/library/debian:12-slim
 # kmod, procps, util-linux: the ordinary furniture an init script expects.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        iptables iproute2 ca-certificates kmod procps util-linux curl \
+        iptables iproute2 ca-certificates kmod procps util-linux curl jq \
     && rm -rf /var/lib/apt/lists/*
 
 # The node's software, staged on the host so the image build does no network

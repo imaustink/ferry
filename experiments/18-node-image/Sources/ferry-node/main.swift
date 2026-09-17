@@ -124,42 +124,12 @@ func run() throws {
         }
     }
 
-    let config = VZVirtualMachineConfiguration()
-    config.cpuCount = cpus
-    config.memorySize = memoryMiB * 1024 * 1024
-
-    let boot = VZLinuxBootLoader(kernelURL: URL(filePath: kernelPath))
-    // Everything the node needs to join, on the command line: there is no other
-    // channel at first boot that does not mean building a second device.
-    boot.commandLine = [
-        "console=hvc0", "root=/dev/vda", "rw", "init=/sbin/ferry-init",
-        "ferry.node=\(nodeName)",
-        "ferry.api=\(apiServer)",
-        "ferry.token=\(token)",
-        "ferry.address=\(address)",
-        "ferry.gateway=\(gateway)",
-        "ferry.podcidr=\(podCIDR)",
-        "ferry.dnssvc=\(clusterDNS)",
-    ].joined(separator: " ")
-    config.bootLoader = boot
-
-    // vda is the node, vdb is its configuration. The init mounts the second and
-    // copies what it needs before anything else starts.
-    let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: URL(filePath: disk), readOnly: false)
-    config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)]
-    if ProcessInfo.processInfo.environment["FERRY_NODE_NO_CONFIG"] == nil {
-        let configAttachment = try VZDiskImageStorageDeviceAttachment(
-            url: URL(filePath: configDisk), readOnly: true)
-        config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: configAttachment))
-    }
-    config.networkDevices = [try interface.device()]
-
     let console = Console()
-    let port = VZVirtioConsoleDeviceSerialPortConfiguration()
-    port.attachment = console.attachment
-    config.serialPorts = [port]
-
-    try config.validate()
+    let config = try machineConfiguration(
+        nodeName: nodeName, disk: disk, configDisk: configDisk, kernelPath: kernelPath,
+        cpus: cpus, memoryMiB: memoryMiB, apiServer: apiServer, token: token,
+        address: address, gateway: gateway, podCIDR: podCIDR, clusterDNS: clusterDNS,
+        interface: interface, console: console)
 
     let queue = DispatchQueue(label: "ferry.node")
     let vm = VZVirtualMachine(configuration: config, queue: queue)
@@ -204,6 +174,52 @@ func run() throws {
 
     // Hold the machine up; the caller stops the process when it is done.
     while true { sleep(3600) }
+}
+
+/// Everything a machine is, in one place, so `run` and `serve` cannot drift
+/// apart on what a node boots with.
+@available(macOS 26.0, *)
+func machineConfiguration(
+    nodeName: String, disk: String, configDisk: String, kernelPath: String,
+    cpus: Int, memoryMiB: UInt64, apiServer: String, token: String,
+    address: String, gateway: String, podCIDR: String, clusterDNS: String,
+    interface: VmnetNetwork.Interface, console: Console
+) throws -> VZVirtualMachineConfiguration {
+    let config = VZVirtualMachineConfiguration()
+    config.cpuCount = cpus
+    config.memorySize = memoryMiB * 1024 * 1024
+
+    let boot = VZLinuxBootLoader(kernelURL: URL(filePath: kernelPath))
+    // Everything the node needs to join, on the command line: there is no other
+    // channel at first boot that does not mean building a second device.
+    boot.commandLine = [
+        "console=hvc0", "root=/dev/vda", "rw", "init=/sbin/ferry-init",
+        "ferry.node=\(nodeName)",
+        "ferry.api=\(apiServer)",
+        "ferry.token=\(token)",
+        "ferry.address=\(address)",
+        "ferry.gateway=\(gateway)",
+        "ferry.podcidr=\(podCIDR)",
+        "ferry.dnssvc=\(clusterDNS)",
+    ].joined(separator: " ")
+    config.bootLoader = boot
+
+    // vda is the node, vdb is its configuration.
+    let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: URL(filePath: disk), readOnly: false)
+    config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)]
+    if ProcessInfo.processInfo.environment["FERRY_NODE_NO_CONFIG"] == nil {
+        let configAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(filePath: configDisk), readOnly: true)
+        config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: configAttachment))
+    }
+    config.networkDevices = [try interface.device()]
+
+    let port = VZVirtioConsoleDeviceSerialPortConfiguration()
+    port.attachment = console.attachment
+    config.serialPorts = [port]
+
+    try config.validate()
+    return config
 }
 
 /// A one-file filesystem carrying what this particular node has to be told.
@@ -301,10 +317,18 @@ case "build":
     do { try await build() } catch { fail("build: \(error)") }
 case "run":
     do { try run() } catch { fail("run: \(error)") }
+case "serve":
+    if #available(macOS 26.0, *) {
+        do { try serve() } catch { fail("serve: \(error)") }
+    } else {
+        fail("serve needs macOS 26")
+    }
 default:
     print("""
     usage:
       ferry-node build --layout <oci-dir> --out <disk.ext4> [--size-gib 8]
+      ferry-node serve --dir <machines-dir> --kernel <vmlinux> --ca <ca.crt> \\
+                       --api-server <url> [--subnet 192.168.200.0/24]
       ferry-node run   --disk <disk.ext4> --kernel <vmlinux> --ca <ca.crt> \\
                        --api-server <url> --token <id.secret> [--node-name n] \\
                        [--cpus 2] [--memory-mib 2048] [--wait-registered]
