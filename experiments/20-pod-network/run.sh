@@ -59,7 +59,10 @@ render "$image_dir/manifests/kube-proxy.yaml" | kubectl apply -f - >/dev/null
 render "$image_dir/manifests/coredns.yaml" | kubectl apply -f - >/dev/null
 
 echo "==> ferry-node serve (one network for every machine)"
+# SWITCH=1 runs the comparison: a second NIC per machine on a segment ferry
+# switches itself, instead of routing pod traffic over vmnet. Both work here.
 "$image_dir/build/ferry-node" serve \
+  ${SWITCH:+--switch} \
   --dir "$STATE/machines" \
   --kernel "$KERNEL" \
   --ca "$STATE/pki/ca.crt" \
@@ -109,17 +112,21 @@ echo "      addresses: $(kubectl get machines -o jsonpath='{range .items[*]}{.st
 echo "==> a pod on each machine"
 kubectl delete pod ping pong --ignore-not-found >/dev/null 2>&1
 kubectl run pong --image=public.ecr.aws/docker/library/alpine:3.20 --overrides='{"spec":{"nodeName":"worker-b"}}' \
-  --restart=Never --command -- sh -c 'echo PONG > /tmp/i; httpd -f -p 8080 -h /tmp' >/dev/null 2>&1
+  --restart=Never --command -- sleep 600 >/dev/null 2>&1
 for _ in $(seq 1 120); do
   [ "$(kubectl get pod pong -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ] && break
   sleep 2
 done
 pong_ip=$(kubectl get pod pong -o jsonpath='{.status.podIP}' 2>/dev/null)
+# It must still be alive when the other pod probes it, or "unreachable" means
+# nothing -- which is exactly how an earlier run of this misled me.
+[ "$(kubectl get pod pong -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ] \
+  && check "the target pod stays running" pass || check "the target pod stays running" fail
 [ -n "$pong_ip" ] && check "pod on worker-b has an address ($pong_ip)" pass || check "pod on worker-b has an address" fail
 
 kubectl run ping --image=public.ecr.aws/docker/library/alpine:3.20 --overrides='{"spec":{"nodeName":"worker-a"}}' \
   --restart=Never --command -- sh -c "
-    wget -qO- -T 10 http://$pong_ip:8080/i 2>/dev/null | grep -q PONG && echo CROSS_NODE_OK || echo CROSS_NODE_FAIL
+    ping -c 3 -W 5 $pong_ip >/dev/null 2>&1 && echo CROSS_NODE_OK || echo CROSS_NODE_FAIL
     sleep 300" >/dev/null 2>&1
 for _ in $(seq 1 120); do
   case "$(kubectl get pod ping -o jsonpath='{.status.phase}' 2>/dev/null)" in Running|Succeeded) break ;; esac

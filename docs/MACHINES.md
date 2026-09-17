@@ -295,20 +295,22 @@ and `kubectl get nodes` shows the truth.
    `ferry-machined` is Go beside the control plane and calls `ferry-node` for
    anything involving a VM, which is the split ferry already uses between
    `ferry-streamer` and `ferry-cri`.
-3. **Pod network between machines.** Per-node CIDR and routes — but *not* the
-   "one vmnet network" this document assumed.
-   [Experiment 19](../experiments/19-machine-crd/FINDINGS.md) measured it: two
-   `ferry-node` processes asking for the same subnet is refused
-   (`failed to create vmnet network with status 1001`), because a vmnet network
-   belongs to the process that made it. With a process per machine, every node
-   lands on its own network and vmnet keeps them apart — and there are only 32
-   networks for the whole Mac.
+3. ~~**Pod network between machines.**~~ **Done** —
+   [experiment 20](../experiments/20-pod-network/FINDINGS.md). One
+   `ferry-node serve` holds one vmnet network and hosts every machine on it;
+   each node takes its `podCIDR` from the cluster and routes to the others'
+   slices, read from the Node list with the kubelet's own certificate. A pod on
+   one machine pings a pod on another.
 
-   So this milestone starts by changing the shape rather than the routing:
-   `ferry-node` becomes a long-lived server holding one vmnet network and
-   hosting every machine on it, which is exactly what `ferry-cri` already does
-   for pod VMs. `ferry-machined` then asks it for machines instead of starting a
-   process per machine.
+   Two corrections to what this document assumed. A vmnet network belongs to
+   the process that made it, so "one network" meant restructuring `ferry-node`
+   into a server rather than configuring a subnet. And vmnet *does* carry
+   pod-addressed traffic between machines on it — an earlier reading said
+   otherwise and was taken against a pod that had already exited. A second
+   interface per machine, switched by ferry, was built before that was noticed;
+   it works, it is off by default, and it is kept only for the case mode 1
+   actually hit, which is traffic between two Macs.
+
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
    creation, and the host budget. A Deployment scaled beyond what exists
    creates the node it needs.

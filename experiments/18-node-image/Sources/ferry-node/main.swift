@@ -183,7 +183,8 @@ func machineConfiguration(
     nodeName: String, disk: String, configDisk: String, kernelPath: String,
     cpus: Int, memoryMiB: UInt64, apiServer: String, token: String,
     address: String, gateway: String, podCIDR: String, clusterDNS: String,
-    interface: VmnetNetwork.Interface, console: Console
+    interface: VmnetNetwork.Interface, console: Console,
+    clusterAddress: String = "", switchInterface: SwitchInterface? = nil
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
@@ -201,7 +202,8 @@ func machineConfiguration(
         "ferry.gateway=\(gateway)",
         "ferry.podcidr=\(podCIDR)",
         "ferry.dnssvc=\(clusterDNS)",
-    ].joined(separator: " ")
+        clusterAddress.isEmpty ? "" : "ferry.cluster=\(clusterAddress)",
+    ].filter { !$0.isEmpty }.joined(separator: " ")
     config.bootLoader = boot
 
     // vda is the node, vdb is its configuration.
@@ -212,7 +214,13 @@ func machineConfiguration(
             url: URL(filePath: configDisk), readOnly: true)
         config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: configAttachment))
     }
+    // eth0 is vmnet: the internet, the Mac, and the API server. eth1, when
+    // there is one, is ferry's own segment and carries everything the cluster
+    // says to itself.
     config.networkDevices = [try interface.device()]
+    if let switchInterface {
+        config.networkDevices.append(try switchInterface.device())
+    }
 
     let port = VZVirtioConsoleDeviceSerialPortConfiguration()
     port.attachment = console.attachment

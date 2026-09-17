@@ -50,6 +50,15 @@ func serve() throws {
     let apiServer = option("--api-server")
     let clusterDNS = option("--cluster-dns", "10.96.0.10")
     let requestedSubnet = option("--subnet", "")
+    // ferry's own segment, which carries cluster traffic because vmnet will not:
+    // it forwards the addresses it assigned and drops pod addresses outright.
+    let clusterSubnet = option("--cluster-subnet", "10.89.0.0/16")
+    // Off by default, because it turned out not to be needed. One vmnet network
+    // does carry pod-addressed traffic between machines on it -- measured, after
+    // an earlier measurement against a pod that had already exited said
+    // otherwise. --switch keeps the alternative available for the case mode 1
+    // actually hit, which is traffic between two Macs.
+    let useSwitch = CommandLine.arguments.contains("--switch")
     let poll = Double(option("--poll", "0.5")) ?? 0.5
 
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -62,22 +71,42 @@ func serve() throws {
     print("    dir      \(dir)")
     print("    network  \(network.value.subnet), gateway \(network.value.ipv4Gateway)")
 
+    let machineSwitch = MachineSwitch()
+    print("    cluster  \(clusterSubnet) on ferry's own switch")
+
     // Held so the machines stay alive: a VZVirtualMachine that goes out of
     // scope takes its guest with it.
     var running: [String: RunningMachine] = [:]
+    // Addresses on the switched segment, handed out in order and remembered, so
+    // a machine that is rebuilt keeps the address its neighbours route to.
+    var clusterAddresses: [String: String] = [:]
+    var nextClusterHost = 2
 
     while true {
         let wanted = readSpecs(in: dir)
 
         for (name, spec) in wanted where running[name] == nil {
             do {
+                let clusterAddress: String
+                if let known = clusterAddresses[name] {
+                    clusterAddress = known
+                } else {
+                    let prefix = clusterSubnet.split(separator: "/").last.map(String.init) ?? "16"
+                    let base = clusterSubnet.split(separator: "/").first.map(String.init) ?? "10.89.0.0"
+                    let octets = base.split(separator: ".").map(String.init)
+                    clusterAddress = "\(octets[0]).\(octets[1]).\(nextClusterHost / 254).\(nextClusterHost % 254 + 1)/\(prefix)"
+                    clusterAddresses[name] = clusterAddress
+                    nextClusterHost += 1
+                }
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
-                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS)
+                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
+                                       clusterAddress: useSwitch ? clusterAddress : "",
+                                       machineSwitch: useSwitch ? machineSwitch : nil)
                 running[name] = machine
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,
                     podCIDR: spec.podCIDR, phase: "Running", message: nil), in: dir)
-                print("==> \(name) at \(machine.address) (\(spec.podCIDR))")
+                print("==> \(name) at \(machine.address), cluster \(clusterAddresses[name] ?? "?")")
             } catch {
                 print("==> \(name) failed: \(error)")
                 write(status: MachineStatus(
@@ -88,6 +117,7 @@ func serve() throws {
 
         for (name, machine) in running where wanted[name] == nil {
             print("==> \(name) stopping")
+            machineSwitch.detach(machine: name)
             machine.stop()
             running.removeValue(forKey: name)
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
@@ -126,7 +156,8 @@ final class RunningMachine {
 
 @available(macOS 26.0, *)
 func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
-          caPath: String, apiServer: String, clusterDNS: String) throws -> RunningMachine {
+          caPath: String, apiServer: String, clusterDNS: String,
+          clusterAddress: String, machineSwitch: MachineSwitch?) throws -> RunningMachine {
     // An interface on the shared network, so every machine is on one segment
     // and a route between two of them is an ordinary route.
     guard let interface = try network.value.createInterface(spec.name) as? VmnetNetwork.Interface else {
@@ -138,12 +169,26 @@ func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
     let configDisk = spec.disk + ".config.ext4"
     try makeConfigDisk(caPath: caPath, out: configDisk)
 
+    // eth1: ferry's segment, where cluster traffic lives -- unless this is the
+    // vmnet-only comparison, in which case there is no second interface.
+    var switchInterface: SwitchInterface? = nil
+    if !clusterAddress.isEmpty {
+        guard let cidr = try? CIDRv4(clusterAddress) else {
+            throw Failure.message("bad cluster address \(clusterAddress)")
+        }
+        switchInterface = try SwitchInterface(address: cidr, mac: nil)
+    }
+
     let console = Console()
     let config = try machineConfiguration(
         nodeName: spec.name, disk: spec.disk, configDisk: configDisk, kernelPath: kernelPath,
         cpus: spec.cpus, memoryMiB: spec.memoryMiB, apiServer: apiServer, token: spec.token,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
-        interface: interface, console: console)
+        interface: interface, console: console,
+        clusterAddress: clusterAddress, switchInterface: switchInterface)
+    if let switchInterface, let machineSwitch {
+        machineSwitch.attach(machine: spec.name, fd: switchInterface.hostFD)
+    }
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)
