@@ -71,11 +71,15 @@ again:
   cluster at its own recorded version and said so, which is the guard against a
   build quietly becoming an upgrade.
 
-Underneath that, 100 assertions in `tests/` cover the store, the skew rules and
-the cluster-version bookkeeping, and a separate suite does a real etcd
-snapshot-and-restore round trip with the flags ferry passes.
+Underneath that, 126 assertions in `tests/` cover the store, the skew rules, the
+cluster-version bookkeeping and the node upgrade itself -- the last against a
+stub `kubectl`, so the paths that need a live API server are reachable without
+one. A separate suite does a real etcd snapshot-and-restore round trip with the
+flags ferry passes.
 
-Three bugs were found by running it, which is the argument for running it:
+Three bugs were found by running it, which is the argument for running it. All
+three are fixed, and all three now have regression tests that were each checked
+to fail when the bug is put back:
 
 - the node upgrade read the kubelet's version as soon as the node went Ready,
   but a node object keeps the old kubelet's status until the new one posts its

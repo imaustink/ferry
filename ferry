@@ -224,6 +224,8 @@ Environment:
   FERRY_KUBECONFIG       admin credentials, for upgrading a node on a Mac that
                          joined and so has only its kubelet's certificate
   FERRY_DRAIN_TIMEOUT    how long to wait for a node to drain, default 300s
+  FERRY_NODE_READY_TIMEOUT  how long to wait for an upgraded node to come back
+                         Ready at the new version, default 120 seconds
 EOF
 }
 
@@ -1959,7 +1961,7 @@ cmd_upgrade_node() {
   ok "kubelet stopped, runtime left up"
 
   start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap"
-  if wait_node_version "$name" "$target" 120; then
+  if wait_node_version "$name" "$target" "${FERRY_NODE_READY_TIMEOUT:-120}"; then
     ok "node Ready, kubelet $target"
   else
     if node_ready "$name"; then

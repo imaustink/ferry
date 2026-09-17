@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# A kubectl that answers from files instead of from a cluster.
+#
+# The three bugs the first real upgrade found all lived on the far side of a
+# running API server, which is exactly where the other suites cannot go. This
+# stands in for it: enough of kubectl to drive 'ferry upgrade node' and
+# 'ferry upgrade nodes' end to end, and -- the part that matters -- able to
+# reproduce a node object that still reports the *old* kubelet's version for a
+# few reads after the kubelet has been replaced. That is a race against a real
+# cluster and a deterministic file here.
+#
+# State lives in $FERRY_STUB:
+#   apiserver        the version 'get --raw /version' reports
+#   nodes            one "<name> <version> <Ready>" per line
+#   stale-<name>     "<reads> <version>": report <version> for the next <reads>
+#                    kubeletVersion reads, then tell the truth
+#   drain-exit       exit code for 'drain', default 0
+#   calls            every invocation, appended, for the test to assert on
+set -uo pipefail
+# No apostrophe in this message: bash does quote processing inside ${var:?word},
+# so one there opens a string that is never closed and the whole file fails to
+# parse, with the error reported at EOF and nothing pointing here.
+stub="${FERRY_STUB:?set FERRY_STUB to the directory holding the stub state}"
+printf '%s\n' "$*" >> "$stub/calls"
+
+nodes_file="$stub/nodes"
+
+node_column() { # name column
+  awk -v n="$1" -v c="$2" '$1 == n { print $c }' "$nodes_file"
+}
+
+# The version a node reports, which is not always the version it is running.
+#
+# A real node object keeps the previous kubelet's status until the new one
+# posts its own, so a version read in the moments after a restart can describe
+# the kubelet that was just replaced. stale-<name> replays that.
+node_version() { # name
+  local stale="$stub/stale-$1"
+  if [ -f "$stale" ]; then
+    local remaining old
+    read -r remaining old < "$stale"
+    if [ "${remaining:-0}" -gt 0 ]; then
+      printf '%s %s\n' "$(( remaining - 1 ))" "$old" > "$stale"
+      printf '%s' "$old"
+      return
+    fi
+  fi
+  printf '%s' "$(node_column "$1" 2)"
+}
+
+command="${1:-}"; shift 2>/dev/null || true
+
+case "$command" in
+  drain)
+    name="$1"
+    printf 'node/%s cordoned\n' "$name"
+    printf 'node/%s drained\n' "$name"
+    exit "$(cat "$stub/drain-exit" 2>/dev/null || echo 0)"
+    ;;
+  uncordon|cordon)
+    exit 0
+    ;;
+  get) : ;;
+  *) exit 0 ;;
+esac
+
+# Everything below is 'kubectl get ...'.
+target="${1:-}"
+all="$*"
+
+case "$target" in
+  --raw)
+    printf '{\n  "major": "1",\n  "gitVersion": "%s",\n  "platform": "darwin/arm64"\n}\n' \
+      "$(cat "$stub/apiserver" 2>/dev/null)"
+    ;;
+  node)
+    name="${2:-}"
+    grep -q "^$name " "$nodes_file" 2>/dev/null || exit 1
+    case "$all" in
+      *nodeInfo.kubeletVersion*) node_version "$name" ;;
+      *Ready*)                   printf '%s' "$(node_column "$name" 3)" ;;
+      *)                         printf '%s' "$name" ;;
+    esac
+    ;;
+  nodes)
+    # custom-columns first: its spec also names nodeInfo.kubeletVersion, so
+    # anything matching on that alone would catch it too. Matching the jsonpath
+    # form by a literal piece of its template is not worth it either -- a case
+    # pattern carrying both quote kinds does not survive bash's parser.
+    case "$all" in
+      *custom-columns*)
+        printf 'NAME VERSION READY\n'
+        while read -r name version ready; do
+          [ -n "$name" ] && printf '%s %s %s\n' "$name" "$version" "$ready"
+        done < "$nodes_file"
+        ;;
+      # The form cmd_upgrade_nodes uses to find nodes on other Macs.
+      *jsonpath*)
+        while read -r name version _; do
+          [ -n "$name" ] && printf 'N %s %s\n' "$name" "$version"
+        done < "$nodes_file"
+        ;;
+      *)
+        printf 'NAME STATUS VERSION\n'
+        while read -r name version ready; do
+          [ -n "$name" ] && printf '%s %s %s\n' "$name" "$ready" "$version"
+        done < "$nodes_file"
+        ;;
+    esac
+    ;;
+esac
+exit 0

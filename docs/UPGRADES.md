@@ -232,8 +232,18 @@ this reason. That is the honest position, not a claim that any minor works.
 - `tests/upgrade-cli-test.sh` — the commands: dispatch, argument handling, and
   every refusal that happens before anything is touched, against a throwaway
   checkout with stub binaries and no cluster.
+- `tests/node-upgrade-test.sh` — the node upgrade and the restart guard, driven
+  against a stub `kubectl` (`tests/stub/kubectl`) that answers from files. This
+  covers the paths that live on the far side of a running API server, which is
+  where all three of the bugs found by the first real upgrade were. The stub can
+  make a node report the *old* kubelet's version for a set number of reads,
+  which turns the race behind the worst of those three into something
+  deterministic.
 - `tests/etcd-snapshot-test.sh` — a real save and restore with the real etcd
   from the store, on ports of its own. Skipped until something has been built.
+
+Each of the three regressions was confirmed to fail the suite when the bug is
+put back, which is the only thing that makes a regression test worth having.
 
 ### What the tests do not cover, and what was run instead
 
@@ -263,7 +273,8 @@ Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`
 — which started the cluster at its own recorded version and said so, rather
 than letting the build become an upgrade.
 
-Running it found three things the tests could not, all since fixed. The node
+Running it found three things the tests could not — all since fixed, and all
+three now covered by `tests/node-upgrade-test.sh`. The node
 upgrade read the kubelet's version the moment the node went Ready, but a node
 object keeps the old kubelet's status until the new one posts its own, so a node
 that had upgraded correctly was reported as not having. The summary afterwards
