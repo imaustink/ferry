@@ -285,8 +285,16 @@ and `kubectl get nodes` shows the truth.
    `iptables`. `ferry-node`'s two verbs are the shape `ferry-machined` needs:
    image in, machine out.
 
-2. **`Machine` CRD and `ferry-machined`.** Create and delete a node by applying
-   and deleting a resource. Status reflects the VM and the `Node`.
+2. ~~**`Machine` CRD and `ferry-machined`.**~~ **Done** —
+   [experiment 19](../experiments/19-machine-crd/FINDINGS.md). `kubectl apply` a
+   `Machine` and a node is Ready **16 seconds** later; `kubectl delete` and it is
+   gone in **3**, VM stopped, `Node` removed, disk and token cleaned up behind a
+   finalizer. `kubectl get machines` reports the address once the machine has
+   one and the node reference once the kubelet has actually registered.
+
+   `ferry-machined` is Go beside the control plane and calls `ferry-node` for
+   anything involving a VM, which is the split ferry already uses between
+   `ferry-streamer` and `ferry-cri`.
 3. **Pod network between machines.** One vmnet network, per-node CIDR, routes.
    Pods on two machines reach each other; Services work.
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine

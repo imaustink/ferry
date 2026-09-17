@@ -104,6 +104,19 @@ func run() throws {
     let gateway = interface.ipv4Gateway.map { "\($0)" } ?? ""
     print("==> \(nodeName) at \(address), gateway \(gateway)")
 
+    // A controller needs the address this machine was given, and parsing it out
+    // of a log line is the kind of coupling that breaks quietly. Written as
+    // JSON, once, before the machine is started.
+    if case let statusPath = option("--status-file", ""), !statusPath.isEmpty {
+        let status: [String: String] = [
+            "name": nodeName, "address": address, "gateway": gateway,
+            "podCIDR": podCIDR, "clusterDNS": clusterDNS,
+        ]
+        if let body = try? JSONSerialization.data(withJSONObject: status, options: [.prettyPrinted]) {
+            try? body.write(to: URL(filePath: statusPath))
+        }
+    }
+
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
     config.memorySize = memoryMiB * 1024 * 1024

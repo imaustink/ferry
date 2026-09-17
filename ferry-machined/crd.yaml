@@ -1,0 +1,86 @@
+# A machine: one virtual machine that is a Kubernetes node.
+#
+# Declared rather than started. The resources are part of the declaration and
+# cannot be changed afterwards -- Virtualization.framework fixes a VM's memory
+# ceiling when it boots and has no runtime equivalent for CPU at all, so a
+# machine of the wrong size is replaced rather than resized. See
+# docs/MACHINES.md and experiments/14-balloon.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: machines.ferry.dev
+spec:
+  group: ferry.dev
+  scope: Cluster
+  names:
+    kind: Machine
+    plural: machines
+    singular: machine
+    shortNames: [ma]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Address, type: string, jsonPath: .status.address}
+        - {name: Node, type: string, jsonPath: .status.nodeRef.name}
+        - {name: CPUs, type: integer, jsonPath: .spec.cpus, priority: 1}
+        - {name: Memory, type: string, jsonPath: .spec.memory, priority: 1}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                cpus:
+                  type: integer
+                  minimum: 1
+                  default: 2
+                memory:
+                  type: string
+                  description: Quantity, e.g. 2Gi. Fixed for the life of the machine.
+                  default: 2Gi
+                disk:
+                  type: string
+                  description: >-
+                    Quantity, e.g. 8Gi. The filesystem is sparse, so this is a
+                    ceiling rather than an allocation.
+                  default: 8Gi
+                image:
+                  type: string
+                  description: >-
+                    Path to a node disk image. A registry reference belongs here
+                    eventually; for now the machine boots what is on disk.
+                role:
+                  type: string
+                  enum: [worker, controlPlane]
+                  default: worker
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Pending, Provisioning, Running, Deleting or Failed.
+                address:
+                  type: string
+                nodeRef:
+                  type: object
+                  properties:
+                    name: {type: string}
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: {type: string}
+                      status: {type: string}
+                      reason: {type: string}
+                      message: {type: string}
+                      lastTransitionTime: {type: string}
