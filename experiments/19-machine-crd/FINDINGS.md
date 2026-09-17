@@ -63,6 +63,57 @@ On delete it stops the VM, deletes the `Node` object — otherwise the scheduler
 keeps placing pods on a machine that no longer exists — removes the token and
 the disk, and only then drops the finalizer.
 
+### Two machines at once, and an edit that is refused
+
+`./two-machines.sh`:
+
+```
+  PASS  both machines reach Ready
+  NAME       PHASE     ADDRESS        NODE       AGE
+  worker-a   Running   192.168.83.2   worker-a   14s
+  worker-b   Running   192.168.84.2   worker-b   14s
+  PASS  each machine has its own address
+  PASS  each machine has its own bootstrap token
+  PASS  each machine has its own disk
+  PASS  editing spec is rejected
+        The Machine "worker-a" is invalid: spec: Invalid value: "object": a machine's
+        spec is immutable, because a running VM cannot be resized; delete this
+        machine and create one of the size you want
+  PASS  worker-a node is gone
+  PASS  worker-b is still Ready
+```
+
+The edit is refused by the API server rather than by the controller, through a
+CEL rule on the CRD. A controller that quietly ignored the edit would leave
+`kubectl get machine` describing a machine that does not exist; refusing it says
+the true thing, which is that a running VM cannot be resized
+([experiment 14](../14-balloon/FINDINGS.md)).
+
+### One vmnet network per machine, and that is a problem for milestone 3
+
+Look at the two addresses above: `192.168.83.2` and `192.168.84.2`. Each
+`ferry-node` process creates its own vmnet network, and vmnet keeps its networks
+apart -- so those two nodes cannot reach each other, and pods on them certainly
+cannot. There are also only 32 networks for the whole Mac
+([experiment 07](../07-vmnet-leak/FINDINGS.md)), which caps machines long before
+memory does.
+
+Asking both machines for the *same* subnet settles what milestone 3 can do:
+
+```
+shared-a   booted, gateway 192.168.211.1
+shared-b   failed to create vmnet network with status 1001
+```
+
+**Two processes cannot share one vmnet network.** So milestone 3 cannot be "put
+every node on one network" while each machine is its own process. The shape that
+works is the one `ferry-cri` already uses: one process holding one vmnet network
+and hosting every VM on it. `ferry-node` would become a long-lived server that
+`ferry-machined` asks for machines, rather than a process per machine.
+
+That is a real design answer, and it is better to have it now than after
+building the routing that assumes otherwise.
+
 ## What this means
 
 - **Milestone 2 is met.** A node is now a declared thing, and the shape the
@@ -80,11 +131,11 @@ the disk, and only then drops the finalizer.
   on one Mac that is the right trade; with hundreds it would not be.
 - **`spec.image` is a path**, not a registry reference. A real Machine should
   name an image the way a pod does.
-- **No `MachineSet`, no replicas, no rolling replacement.** Changing `spec` on
-  an existing machine does nothing — the resources are immutable by design, so
-  the controller ought to reject the edit rather than ignore it.
-- **One Mac, one node tested at a time.** Nothing here has been run with
-  several machines at once, and cross-node pod networking is still milestone 3.
+- **No `MachineSet`, no replicas, no rolling replacement.** Editing `spec` is
+  now refused, which is the honest behaviour, but nothing replaces a machine for
+  you.
+- **Two machines is as far as this goes.** They are independent and correct,
+  but on separate networks, so nothing pod-to-pod between nodes works yet.
 - **The control plane is a throwaway** on shifted ports, and the addons are
   applied by the runner rather than by ferry.
 
@@ -94,5 +145,6 @@ the disk, and only then drops the finalizer.
 ../18-node-image/build.sh           # the node image and ferry-node
 ( cd ../../ferry-machined && go build -o ../bin/ferry-machined . )
 ./run.sh                            # apply, Ready, delete, gone
+./two-machines.sh                   # two at once, and an edit that is refused
 KEEP=1 ./run.sh                     # and leave it up to poke at
 ```

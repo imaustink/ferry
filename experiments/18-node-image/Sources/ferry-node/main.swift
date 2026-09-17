@@ -96,7 +96,14 @@ func run() throws {
     // An address of its own, on ferry's own network, so the Mac can reach the
     // kubelet -- which is what kubectl logs and exec need -- and the node can
     // reach the API server.
-    var network = try VmnetNetwork(subnet: nil)
+    //
+    // --subnet asks for a named network rather than whichever one vmnet hands
+    // out. Two machines on one subnet is what pod-to-pod traffic between nodes
+    // will need, and whether two processes may share one is the question
+    // milestone 3 turns on.
+    let requestedSubnet = option("--subnet", "")
+    var network = try VmnetNetwork(
+        subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet))
     guard let interface = try network.createInterface(nodeName) as? VmnetNetwork.Interface else {
         fail("vmnet gave no interface")
     }
@@ -286,8 +293,14 @@ final class Console: @unchecked Sendable {
 // MARK: - entry
 
 switch CommandLine.arguments.dropFirst().first {
-case "build": try await build()
-case "run":   try run()
+// Caught rather than thrown out of main: an uncaught error here traps with a
+// Swift stack trace, and "failed to create vmnet network with status 1001"
+// reads much better than a crash when the real answer is that another process
+// already holds that subnet.
+case "build":
+    do { try await build() } catch { fail("build: \(error)") }
+case "run":
+    do { try run() } catch { fail("run: \(error)") }
 default:
     print("""
     usage:

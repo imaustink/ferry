@@ -295,8 +295,20 @@ and `kubectl get nodes` shows the truth.
    `ferry-machined` is Go beside the control plane and calls `ferry-node` for
    anything involving a VM, which is the split ferry already uses between
    `ferry-streamer` and `ferry-cri`.
-3. **Pod network between machines.** One vmnet network, per-node CIDR, routes.
-   Pods on two machines reach each other; Services work.
+3. **Pod network between machines.** Per-node CIDR and routes — but *not* the
+   "one vmnet network" this document assumed.
+   [Experiment 19](../experiments/19-machine-crd/FINDINGS.md) measured it: two
+   `ferry-node` processes asking for the same subnet is refused
+   (`failed to create vmnet network with status 1001`), because a vmnet network
+   belongs to the process that made it. With a process per machine, every node
+   lands on its own network and vmnet keeps them apart — and there are only 32
+   networks for the whole Mac.
+
+   So this milestone starts by changing the shape rather than the routing:
+   `ferry-node` becomes a long-lived server holding one vmnet network and
+   hosting every machine on it, which is exactly what `ferry-cri` already does
+   for pod VMs. `ferry-machined` then asks it for machines instead of starting a
+   process per machine.
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
    creation, and the host budget. A Deployment scaled beyond what exists
    creates the node it needs.

@@ -36,6 +36,18 @@ spec:
           properties:
             spec:
               type: object
+              # A machine's resources are fixed when it boots:
+              # Virtualization.framework sets a VM's memory ceiling at creation
+              # and has no runtime equivalent for CPU at all. A controller that
+              # quietly ignored an edit would leave `kubectl get machine` saying
+              # one thing while the machine did another, so the API server
+              # refuses the edit instead and the answer is to replace the
+              # machine -- which is the Cluster API model anyway.
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: >-
+                    a machine's spec is immutable, because a running VM cannot be
+                    resized; delete this machine and create one of the size you want
               properties:
                 cpus:
                   type: integer
