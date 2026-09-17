@@ -70,8 +70,31 @@ node_start=$(python3 -c 'import time; print(time.time())')
   --api-server "https://$LAN_IP:$API_PORT" \
   --token "$TOKEN" \
   --memory-mib "${MEMORY_MIB:-2048}" \
+  --cluster-dns "${DNS_SERVICE_IP:-10.96.0.10}" \
   >"$STATE/node.log" 2>&1 &
 node_pid=$!
+
+# Cluster addons, applied while the machine boots. kube-proxy first: nothing
+# answers a ClusterIP until it has programmed the node, and cluster DNS is
+# reached through one.
+DNS_SERVICE_IP="${DNS_SERVICE_IP:-10.96.0.10}"
+KUBE_PROXY_IMAGE="${KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
+COREDNS_IMAGE="${COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
+UPSTREAM_DNS="${UPSTREAM_DNS:-1.1.1.1}"
+render() { # file
+  sed -e "s|__APISERVER_HOST__|$LAN_IP|g" \
+      -e "s|__APISERVER_PORT__|$API_PORT|g" \
+      -e "s|__CLUSTER_CIDR__|10.88.0.0/16|g" \
+      -e "s|__KUBE_PROXY_IMAGE__|$KUBE_PROXY_IMAGE|g" \
+      -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
+      -e "s|__CLUSTER_DOMAIN__|cluster.local|g" \
+      -e "s|__UPSTREAM_DNS__|$UPSTREAM_DNS|g" \
+      -e "s|__DNS_SERVICE_IP__|$DNS_SERVICE_IP|g" \
+      "$1"
+}
+render "$here/manifests/kube-proxy.yaml" | kubectl apply -f - >/dev/null
+render "$here/manifests/coredns.yaml" | kubectl apply -f - >/dev/null
+echo "==> kube-proxy and CoreDNS applied (cluster DNS $DNS_SERVICE_IP)"
 
 ready_seconds=""
 for _ in $(seq 1 240); do

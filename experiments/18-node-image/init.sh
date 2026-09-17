@@ -44,6 +44,7 @@ ADDRESS=$(param ferry.address)      # CIDR, e.g. 192.168.66.5/24
 GATEWAY=$(param ferry.gateway)
 POD_CIDR=$(param ferry.podcidr)
 DNS=$(param ferry.dns)
+DNS_SERVICE=$(param ferry.dnssvc)
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -141,7 +142,7 @@ authentication:
   x509: {clientCAFile: /etc/kubernetes/ca.crt}
 authorization: {mode: Webhook}
 clusterDomain: cluster.local
-${DNS_SERVICE:+clusterDNS: [$DNS_SERVICE]}
+${DNS_SERVICE:+clusterDNS: ["$DNS_SERVICE"]}
 cgroupDriver: cgroupfs
 failSwapOn: false
 readOnlyPort: 0

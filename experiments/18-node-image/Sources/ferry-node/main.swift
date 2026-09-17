@@ -78,6 +78,10 @@ func run() throws {
     let cpus = Int(option("--cpus", "2")) ?? 2
     let memoryMiB = UInt64(option("--memory-mib", "2048")) ?? 2048
     let podCIDR = option("--pod-cidr", "10.88.0.0/16")
+    // The kubelet has to know where cluster DNS lives before any pod starts, and
+    // it cannot be discovered -- the address is a ClusterIP chosen by the
+    // cluster, so the machine is simply told.
+    let clusterDNS = option("--cluster-dns", "10.96.0.10")
 
     guard #available(macOS 26.0, *) else { fail("vmnet addressing needs macOS 26") }
 
@@ -115,6 +119,7 @@ func run() throws {
         "ferry.address=\(address)",
         "ferry.gateway=\(gateway)",
         "ferry.podcidr=\(podCIDR)",
+        "ferry.dnssvc=\(clusterDNS)",
     ].joined(separator: " ")
     config.bootLoader = boot
 

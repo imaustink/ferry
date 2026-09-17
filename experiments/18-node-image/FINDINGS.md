@@ -37,6 +37,32 @@ EGRESS_OK
 and portmap because the base image carried no `iptables`, which cost pods their
 route out. This image has it, so a pod reaches the internet through its node.
 
+### Services and cluster DNS work
+
+A node with no kube-proxy has no Services, and cluster DNS is reached through
+one -- so the missing DNS was really a missing kube-proxy. Mode 1 does not need
+it: ferry runs kube-proxy's rule generation on the Mac and pushes the ruleset
+into each pod's own kernel, because there is no shared node kernel to program.
+A node VM has one, so the ordinary arrangement applies and Services go back to
+being Kubernetes' problem.
+
+kube-proxy as a DaemonSet, CoreDNS as a Deployment behind a ClusterIP, and the
+kubelet told that address on the kernel command line. `./verify.sh`:
+
+```
+  PASS  node is Ready
+  PASS  kube-proxy is Running
+  PASS  CoreDNS is Ready
+  PASS  probe pod runs
+        DNS_CLUSTER_OK          nslookup kubernetes.default.svc.cluster.local
+        DNS_EXTERNAL_OK         nslookup example.com
+        CLUSTERIP_OK            https://kubernetes.default.svc/healthz -> ok
+        EGRESS_OK               a pod reaching the internet
+```
+
+`CLUSTERIP_OK` is a pod reaching the API server through `10.96.0.1`, which
+means kube-proxy programmed the node and the Service routed.
+
 | | |
 |---|---|
 | VM started | 0.09s |
@@ -91,8 +117,8 @@ mounted it, reported `ca.crt present`, and then could not authenticate.
   `ferry-machined` needs: image in, machine out.
 - **Boot to Ready is 13.8s**, still fast enough that nodes are disposable and
   consolidation can be aggressive.
-- **The remaining milestone-1 gap is cluster DNS**: pods fall back to the node's
-  resolver, because nothing has told this node where CoreDNS lives.
+- **Cluster DNS and Services work**, which took kube-proxy rather than anything
+  DNS-specific. Milestone 1 has nothing outstanding.
 
 ## Caveats
 
@@ -100,7 +126,8 @@ mounted it, reported `ca.crt present`, and then could not authenticate.
   node's pods live on its own bridge, and nothing routes between two nodes yet.
 - **The control plane is a throwaway** on shifted ports, not a `ferry up`
   cluster.
-- **No cluster DNS**, as above.
+- **Addons are applied by the runner**, not by ferry. A real cluster would carry
+  kube-proxy and CoreDNS as part of bringing a mode 2 cluster up.
 - **The image is Debian-based and built by Docker.** Nothing requires that; it
   is what makes the build legible to anyone who has used a Dockerfile.
 - **Boot-to-Ready is one measurement** on an otherwise idle Mac, and most of it
@@ -113,5 +140,6 @@ mounted it, reported `ca.crt present`, and then could not authenticate.
 ./build.sh               # image -> OCI layout -> ext4 disk, and the tool
 ./run.sh                 # control plane, token, machine, boot-to-Ready
 KEEP=1 ./run.sh          # and leave it up to schedule pods against
+./verify.sh              # node, addons, DNS, ClusterIP and egress, against a KEEP=1 cluster
 FERRY_NODE_VERBOSE=1 KEEP=1 ./run.sh   # with the guest's whole console
 ```
