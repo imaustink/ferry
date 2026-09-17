@@ -5,10 +5,21 @@
 # tree this large rot too fast to be worth maintaining.
 set -euo pipefail
 
-K8S_VERSION="${K8S_VERSION:-v1.34.0}"
 here="$(cd "$(dirname "$0")" && pwd)"
+FERRY_ROOT="$here"
+export FERRY_ROOT
+# shellcheck source=lib/versions.sh
+. "$here/lib/versions.sh"
+
+K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+ferry_version_valid "$K8S_VERSION" \
+  || { echo "K8S_VERSION=$K8S_VERSION is not a version like v1.34.0" >&2; exit 1; }
 src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-$K8S_VERSION}"
-out="$here/bin/kubelet"
+# Built into the version store, not over bin/kubelet. Building the version you
+# are currently running is an ordinary thing to do during an upgrade, and
+# writing over a mapped binary is what leaves it killed at launch forever.
+out="$(ferry_version_dir "$K8S_VERSION")/kubelet"
+mkdir -p "$(dirname "$out")"
 
 if [ ! -d "$src" ]; then
   echo "==> cloning kubernetes $K8S_VERSION"
@@ -185,6 +196,7 @@ cd "$src"
 # zero, metrics-server drops the node, and `kubectl top nodes` fails while
 # `kubectl top pods` works. This builds on the Mac that will run it, so the C
 # toolchain is the one already installed for Swift.
+rm -f "$out"
 GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
   go build -ldflags "$ldflags" -o "$out" ./cmd/kubelet
 

@@ -6,7 +6,18 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-bin="$here/../bin"
+FERRY_ROOT="$(cd "$here/.." && pwd)"
+export FERRY_ROOT
+# shellcheck source=../lib/versions.sh
+. "$FERRY_ROOT/lib/versions.sh"
+
+# Which Kubernetes this control plane is. The caller decides -- 'ferry up' says
+# what the checkout is built at, 'ferry upgrade' says what it is moving to --
+# and everything below runs out of that version's directory rather than out of
+# bin/. Running the version by name is what makes an upgrade a restart: the
+# binaries that come up are the ones asked for, not whatever bin/ points at.
+K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+bin="$(ferry_version_dir "$K8S_VERSION")"
 STATE="${STATE:-/tmp/ferry}"
 PKI_DIR="${PKI_DIR:-$STATE/pki}"
 NODE_NAME="${NODE_NAME:-ferry-mac}"
@@ -47,7 +58,7 @@ ETCD_PEER_PORT="${ETCD_PEER_PORT:-2380}"
 
 mkdir -p "$STATE/logs" "$STATE/etcd"
 PKI_DIR="$PKI_DIR" NODE_NAME="$NODE_NAME" VMNET_GW="$POD_GATEWAY" "$here/pki.sh"
-"$here/fetch-binaries.sh" >/dev/null
+K8S_VERSION="$K8S_VERSION" "$here/fetch-binaries.sh" >/dev/null
 
 kubeconfig() { # name certbase
   cat > "$STATE/$1.conf" <<YAML
@@ -183,6 +194,16 @@ subjects:
   kind: Group
   name: system:nodes
 YAML
+
+# Write down what this cluster now is.
+#
+# The store records what a checkout has built; this records what is running.
+# They are different facts -- a build moves one and leaves the other where it
+# was until something restarts -- and an upgrade needs a "from", which before
+# this nothing anywhere recorded.
+FERRY_HOME="$STATE" ferry_write_cluster_version \
+  "$K8S_VERSION" "$(ferry_control_plane_version "$K8S_VERSION")" \
+  "$(ferry_etcd_version "$K8S_VERSION")"
 
 echo "==> control plane up"
 echo "    export KUBECONFIG=$STATE/admin.conf"
