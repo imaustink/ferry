@@ -15,20 +15,23 @@ export KUBECONFIG="$STATE/admin.conf"
 LAN_IP="${LAN_IP:-$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)}"
 KERNEL="${KERNEL:-$root/kernel/vmlinux-arm64}"
 [ -f "$KERNEL" ] || KERNEL="$HOME/ferry/kernel/vmlinux-arm64"
+DNS_SERVICE_IP=10.96.0.10
 failures=0
 
 check() { if [ "$2" = pass ]; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; failures=$((failures+1)); fi; }
 
-machined_pid=""
+machined_pid=""; serve_pid=""
 cleanup() {
   [ -n "$machined_pid" ] && kill "$machined_pid" 2>/dev/null
-  pkill -f "ferry-node run --disk $STATE" 2>/dev/null
+  [ -n "$serve_pid" ] && kill "$serve_pid" 2>/dev/null
+  sleep 1
+  pkill -f "ferry-node serve --dir $STATE" 2>/dev/null
   STATE="$STATE" "$root/control-plane/down.sh" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 echo "==> control plane"
-rm -rf "$STATE"; mkdir -p "$STATE"
+rm -rf "$STATE"; mkdir -p "$STATE/machines"
 STATE="$STATE" PKI_DIR="$STATE/pki" NODE_NAME=cp-node ADVERTISE="$LAN_IP" \
   POD_GATEWAY="$LAN_IP" API_PORT="$API_PORT" \
   CONTROLLER_PORT=18757 SCHEDULER_PORT=18759 \
@@ -37,8 +40,17 @@ STATE="$STATE" PKI_DIR="$STATE/pki" NODE_NAME=cp-node ADVERTISE="$LAN_IP" \
   || { echo "control plane failed"; tail -20 "$STATE/up.log"; exit 1; }
 kubectl apply -f "$root/ferry-machined/crd.yaml" >/dev/null
 
+# One server holds the vmnet network and hosts every machine; ferry-machined
+# asks it for them by writing into the machines directory.
+"$image_dir/build/ferry-node" serve \
+  --dir "$STATE/machines" --kernel "$KERNEL" --ca "$STATE/pki/ca.crt" \
+  --api-server "https://$LAN_IP:$API_PORT" --cluster-dns "$DNS_SERVICE_IP" \
+  >"$STATE/serve.log" 2>&1 &
+serve_pid=$!
+sleep 3
+
 "$root/bin/ferry-machined" \
-  --kubeconfig "$KUBECONFIG" --ferry-node "$image_dir/build/ferry-node" \
+  --kubeconfig "$KUBECONFIG" --machines "$STATE/machines" \
   --kernel "$KERNEL" --image "$image_dir/build/node.ext4" --state "$STATE" \
   --api-server "https://$LAN_IP:$API_PORT" --ca "$STATE/pki/ca.crt" \
   >"$STATE/machined.log" 2>&1 &

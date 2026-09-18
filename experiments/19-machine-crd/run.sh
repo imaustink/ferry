@@ -16,10 +16,12 @@ LAN_IP="${LAN_IP:-$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1)}"
 KERNEL="${KERNEL:-$root/kernel/vmlinux-arm64}"
 [ -f "$KERNEL" ] || KERNEL="$HOME/ferry/kernel/vmlinux-arm64"
 
-machined_pid=""
+machined_pid=""; serve_pid=""
 cleanup() {
   [ -n "$machined_pid" ] && kill "$machined_pid" 2>/dev/null
-  pkill -f "ferry-node run --disk $STATE" 2>/dev/null
+  [ -n "$serve_pid" ] && kill "$serve_pid" 2>/dev/null
+  sleep 1
+  pkill -f "ferry-node serve --dir $STATE" 2>/dev/null
   [ "${KEEP:-0}" = 1 ] && return 0
   STATE="$STATE" "$root/control-plane/down.sh" >/dev/null 2>&1
 }
@@ -29,7 +31,7 @@ trap cleanup EXIT
 [ -f "$image_dir/build/node.ext4" ] || { echo "run 18-node-image/build.sh first"; exit 1; }
 
 echo "==> control plane"
-rm -rf "$STATE"; mkdir -p "$STATE"
+rm -rf "$STATE"; mkdir -p "$STATE/machines"
 STATE="$STATE" PKI_DIR="$STATE/pki" NODE_NAME=cp-node ADVERTISE="$LAN_IP" \
   POD_GATEWAY="$LAN_IP" API_PORT="$API_PORT" \
   CONTROLLER_PORT=18657 SCHEDULER_PORT=18659 \
@@ -50,10 +52,21 @@ sed -e "s|__APISERVER_HOST__|$LAN_IP|g" -e "s|__APISERVER_PORT__|$API_PORT|g" \
     -e "s|__DNS_SERVICE_IP__|$DNS_SERVICE_IP|g" \
     "$image_dir/manifests/coredns.yaml" | kubectl apply -f - >/dev/null
 
+echo "==> ferry-node serve"
+"$image_dir/build/ferry-node" serve \
+  --dir "$STATE/machines" \
+  --kernel "$KERNEL" \
+  --ca "$STATE/pki/ca.crt" \
+  --api-server "https://$LAN_IP:$API_PORT" \
+  --cluster-dns "$DNS_SERVICE_IP" \
+  >"$STATE/serve.log" 2>&1 &
+serve_pid=$!
+sleep 3
+
 echo "==> ferry-machined"
 "$root/bin/ferry-machined" \
   --kubeconfig "$KUBECONFIG" \
-  --ferry-node "$image_dir/build/ferry-node" \
+  --machines "$STATE/machines" \
   --kernel "$KERNEL" \
   --image "$image_dir/build/node.ext4" \
   --state "$STATE" \
@@ -122,4 +135,4 @@ done
 # 2>/dev/null, because "No resources found" goes to stderr and counting it as
 # a line says one machine is left when none is.
 echo "machines left: $(kubectl get machines --no-headers 2>/dev/null | wc -l | tr -d ' ')  nodes named worker-0: $(kubectl get nodes --no-headers 2>/dev/null | grep -c worker-0)"
-pgrep -f "ferry-node run --disk $STATE" >/dev/null && echo "VM_STILL_RUNNING" || echo "VM_STOPPED"
+[ -f "$STATE/machines/worker-0.json" ] && echo "VM_STILL_ASKED_FOR" || echo "VM_STOPPED"
