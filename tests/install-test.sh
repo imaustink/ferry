@@ -604,7 +604,14 @@ pages="$repo/.github/workflows/pages.yml"
 succeeds "there is a workflow to publish it" test -f "$pages"
 host="$(sed -n 's|.*https://\(get\.ferry\.[a-z.]*\).*|\1|p' "$repo/install.sh" | head -1)"
 is "the installer names the host it is served from" "$host" "get.ferry.kurpuis.com"
-contains "and the workflow publishes a CNAME for that host" "$(cat "$pages")" "echo '$host' > _site/CNAME"
+# The domain is a tracked file rather than a string in a workflow step, so it
+# takes deleting something to lose it. The file is still only binding once the
+# job copies it into the artifact -- with the Pages source set to GitHub
+# Actions, nothing in the repository is served by itself.
+succeeds "the domain is a file in the repository" test -f "$repo/CNAME"
+is "naming that host, and nothing else" "$(cat "$repo/CNAME")" "$host"
+contains "and the workflow copies it into the published site" "$(cat "$pages")" "cp CNAME _site/CNAME"
+contains "and republishes when it changes" "$(cat "$pages")" "- CNAME"
 # Served at / so the documented one-liner needs no path on the end.
 contains "serving it at / as well as /install.sh" "$(cat "$pages")" "_site/index.html"
 # ferry prints this host in 'token create' and in its release guards, so the two

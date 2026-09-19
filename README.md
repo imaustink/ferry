@@ -116,6 +116,7 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 
 ```
 install.sh                           what get.ferry.kurpuis.com serves: curl | sh
+CNAME                                the domain, copied into the published site
 .github/workflows/pages.yml          publishes install.sh to that domain from main
 release/build.sh                     package a built checkout into a release tarball
 release/publish.sh                   put one on GitHub Releases

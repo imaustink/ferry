@@ -22,6 +22,7 @@ on:
     # deploy. A README change should not redeploy the installer.
     paths:
       - install.sh
+      - CNAME
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -58,10 +59,18 @@ jobs:
           cp install.sh _site/install.sh
           cp install.sh _site/index.html
           # The CNAME file is what tells Pages this site answers to the custom
-          # domain. It has to be in the artifact: a deployment without it
-          # resets the domain back to <user>.github.io, and the install command
-          # in the README stops working.
-          echo 'get.ferry.kurpuis.com' > _site/CNAME
+          # domain, and it has to be in the *artifact*: with the source set to
+          # GitHub Actions the published site is only what this job uploads, so
+          # a deployment without it resets the domain to <user>.github.io and
+          # the install command in the README stops working.
+          #
+          # Copied from the repository root rather than written here, so the
+          # domain is a tracked file somebody has to delete on purpose instead
+          # of a string inside a workflow step that could be edited away in a
+          # diff nobody reads closely. It does not remove the dependency on
+          # this job -- nothing in the repository is served by itself -- it
+          # makes the dependency visible.
+          cp CNAME _site/CNAME
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
