@@ -2,18 +2,27 @@
 
 # ferry
 
-Kubernetes on a Mac where **the pod is the virtual machine** and there is no
-Linux host anywhere in the system.
+Kubernetes on a Mac where **the pod is the virtual machine**.
 
 The control plane runs as native Mach-O processes on macOS. Each pod is a
 lightweight VM on `Virtualization.framework` with its own kernel. There is no
-node VM to size, nothing nested, and no shared kernel between pods.
+node VM to size, nothing nested, and no shared kernel between pods — and with
+mode 1 alone, no Linux host anywhere in the system.
 
 |  | isolation | overhead |
 |---|---|---|
 | Docker Desktop / colima / kind | one Linux VM, pods share a kernel | a VM you size up front |
 | kiac / Orchard | VM per **node**, pods share the node's kernel | 2–4 GB per node, idle or not |
-| **ferry** | VM per **pod** — every pod its own kernel | pods only |
+| **ferry**, mode 1 | VM per **pod** — every pod its own kernel | pods only |
+| **ferry**, mode 2 | VM per **node** — pods share its kernel | the node you asked for |
+
+Mode 2 is the second half of that: a `Machine` is a Linux node VM, and pods on
+it are ordinary containers sharing its kernel. Both run in one cluster and a pod
+picks with `nodeSelector`, so the same cluster can hold a node where every pod
+has its own kernel and a node where a hundred pods share one. It is off until
+`ferry machines enable`, and [docs/MACHINES.md](docs/MACHINES.md) is the
+argument for it and what it costs — including that "no Linux host anywhere"
+stops being true of ferry and becomes true of mode 1.
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause
@@ -99,6 +108,22 @@ cost time.
   kubelet, the control plane and etcd together, which it did not before — asking
   for a newer one used to produce a kubelet newer than the API server, silently.
   See [docs/UPGRADES.md](docs/UPGRADES.md).
+- ✅ **A second mode, where the node is the VM.** `kubectl apply` a `Machine`
+  and a Linux node VM joins the cluster **Ready in 16 seconds**, running
+  containerd and a stock kubelet; `kubectl delete` takes it away in 3, VM
+  stopped, `Node` removed, disk cleaned up behind a finalizer. Pods on two
+  machines reach each other, each node routing to the others' pod CIDR slices.
+  A pod chooses between the modes with
+  `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}`, which is node selection
+  rather than a new concept. Off until `ferry machines enable`. Built through
+  milestone 3: provisioning on demand, consolidation and cross-mode pod routing
+  are not. See [docs/MACHINES.md](docs/MACHINES.md).
+- ✅ **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
+  sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
+  on the PATH, registers a login agent and starts a cluster — Apple silicon and
+  macOS 26 the only requirement, no Swift, no Go, no Kubernetes source tree and
+  no `sudo`. Another Mac joins with one line carrying a token, so nothing copies
+  binaries by hand any more. See [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Why this can work
 
@@ -120,14 +145,17 @@ CNAME                                the domain, copied into the published site
 .github/workflows/pages.yml          publishes install.sh to that domain from main
 release/build.sh                     package a built checkout into a release tarball
 release/publish.sh                   put one on GitHub Releases
-ferry                                the CLI: doctor, build, up, down, status, logs, upgrade
+ferry                                the CLI: doctor, build, up, down, status, logs,
+                                     upgrade, machines, service, uninstall
 lib/versions.sh                      the version store, and what may follow what
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
+manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines
 tests/                               what can be checked without a cluster
-docs/                                HANDOFF.md (the full picture), INSTALL.md, SERVICES.md
+docs/                                HANDOFF.md (the full picture), INSTALL.md,
+                                     MACHINES.md (mode 2), SERVICES.md
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
@@ -137,7 +165,13 @@ experiments/06-kube-proxy-on-macos/  kube-proxy's rule generation, rendered on d
 experiments/07-vmnet-leak/           what a refused vmnet subnet actually means
 experiments/08-vsock-socket-relay/   a host socket, inside a pod, over vsock
 experiments/12-gpu-contention/       what shares this Mac's silicon and what does not
+experiments/17-node-vm/              a Linux node VM joining, in six and a half seconds
+experiments/18-node-image/           the node image, and ferry-node that boots it
+experiments/19-machine-crd/          a node made by applying a resource
+experiments/20-pod-network/          pods on two machines reaching each other
 ferry-cri/                           the CRI runtime: one VM per pod
+ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
+node-image/ (built)                  mode 2's node image, as an OCI layout
 ferry-streamer/                      SPDY streaming for exec, attach and port-forward
 ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
 guest/                               nft, bundled with its loader for pods

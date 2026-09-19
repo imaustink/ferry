@@ -592,6 +592,55 @@ contains "and refuses that without a version, since there is no API to ask" \
   "$(cat "$repo/install.sh")" "needs FERRY_VERSION too"
 echo
 
+# --- every parameter is written down --------------------------------------
+#
+# The list drifted badly before this: 33 variables the code read appeared in no
+# document at all. They are not read in one place, which is how it happened --
+# most by ferry and install.sh in shell, SERVICE_CIDR and the etcd ports by
+# control-plane/up.sh, and three by the Swift binaries through
+# ProcessInfo.environment, where grepping the shell finds nothing.
+#
+# So both halves are swept, and anything new has to be documented or explicitly
+# exempted. The exemptions are variables that are not ferry's interface:
+# TMPDIR, and the two GitHub Actions set.
+printf '\033[1m%s\033[0m\n' "every parameter is documented"
+params_exempt=" TMPDIR HOME PATH KUBECONFIG "
+
+shell_params="$(grep -rhoE '\$\{(FERRY|K8S|ETCD|SERVICE)_[A-Z0-9_]+' \
+  "$repo/ferry" "$repo/install.sh" "$repo/lib" "$repo/control-plane" 2>/dev/null \
+  | sed 's/.*{//' | sort -u)"
+native_params="$(grep -rhoE 'environment\["[A-Z0-9_]+"\]' \
+  "$repo/ferry-cri/Sources" "$repo/experiments/18-node-image/Sources" 2>/dev/null \
+  | sed 's/environment\["//; s/"\]//' | sort -u)"
+
+undocumented=""
+for param in $shell_params $native_params; do
+  case "$params_exempt" in *" $param "*) continue ;; esac
+  grep -q "$param" "$repo/docs/INSTALL.md" || undocumented="$undocumented $param"
+done
+if [ -z "$undocumented" ]; then
+  ok "every variable the code reads appears in docs/INSTALL.md"
+else
+  bad "read by the code, documented nowhere:$undocumented"
+fi
+
+# The Swift half specifically, because it is the half a shell-only sweep misses
+# and the half that regressed.
+for param in FERRY_ALLOW_OFF_SLICE FERRY_NODE_VERBOSE FERRY_NODE_NO_CONFIG; do
+  contains "  $param, read by a Swift binary, is documented" \
+    "$(cat "$repo/docs/INSTALL.md")" "$param"
+done
+
+# The three ways to add a node are genuinely different things, and conflating
+# them is the most likely way to misread the docs.
+install_doc="$(cat "$repo/docs/INSTALL.md")"
+contains "adding a node on this Mac is documented" "$install_doc" "ferry node add"
+contains "adding another Mac is documented" "$install_doc" "ferry token create"
+contains "and adding a mode 2 machine is documented" "$install_doc" "kind: Machine"
+contains "the SSH restriction on joining is documented" "$install_doc" "FERRY_ALLOW_SSH_JOIN"
+contains "and that a joined Mac does not rejoin itself" "$install_doc" "come back on its own"
+echo
+
 # --- what serves the installer --------------------------------------------
 #
 # The install command in the README is only true while the Pages site answers to
