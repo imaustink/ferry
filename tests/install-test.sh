@@ -128,14 +128,14 @@ contains "so its state is ~/.ferry, like a main checkout's" "$out" "$sandbox/hom
 # toolchain. Failing here, by name, beats failing inside build-kubelet.sh.
 out="$(run_ferry "$dist" build)"
 contains "refuses to build" "$out" "not a checkout"
-contains "and points at installing a release instead" "$out" "get.ferry.dev"
+contains "and points at installing a release instead" "$out" "get.ferry.kurpuis.com"
 
 # The same wall, reached the other way. 'ferry upgrade' compiles a kubelet, so a
 # release cannot do it either -- and has to say so before taking an etcd
 # snapshot and spending several minutes discovering it inside build-kubelet.sh.
 out="$(run_ferry "$dist" upgrade plan v1.35.0)"
 contains "refuses to upgrade kubernetes" "$out" "cannot build a kubelet"
-contains "and says a newer ferry is how you move kubernetes" "$out" "get.ferry.dev"
+contains "and says a newer ferry is how you move kubernetes" "$out" "get.ferry.kurpuis.com"
 echo
 
 # --- reached through a symlink --------------------------------------------
@@ -410,6 +410,38 @@ contains "can be pointed at a mirror or a local release" \
   "$(cat "$repo/install.sh")" "FERRY_DOWNLOAD_BASE"
 contains "and refuses that without a version, since there is no API to ask" \
   "$(cat "$repo/install.sh")" "needs FERRY_VERSION too"
+echo
+
+# --- what serves the installer --------------------------------------------
+#
+# The install command in the README is only true while the Pages site answers to
+# the custom domain, and the thing that binds it is a CNAME file inside the
+# published artifact. A deploy that omits it silently reverts the domain to
+# imaustink.github.io -- the site stays up, so nothing looks broken, and every
+# `curl -sfL https://get.ferry.kurpuis.com | sh -` in the docs stops working.
+printf '\033[1m%s\033[0m\n' "what serves the installer"
+pages="$repo/.github/workflows/pages.yml"
+succeeds "there is a workflow to publish it" test -f "$pages"
+host="$(sed -n 's|.*https://\(get\.ferry\.[a-z.]*\).*|\1|p' "$repo/install.sh" | head -1)"
+is "the installer names the host it is served from" "$host" "get.ferry.kurpuis.com"
+contains "and the workflow publishes a CNAME for that host" "$(cat "$pages")" "echo '$host' > _site/CNAME"
+# Served at / so the documented one-liner needs no path on the end.
+contains "serving it at / as well as /install.sh" "$(cat "$pages")" "_site/index.html"
+# ferry prints this host in 'token create' and in its release guards, so the two
+# must not drift apart.
+contains "and ferry defaults to the same host" \
+  "$(grep FERRY_INSTALL_URL= "$repo/ferry")" "$host"
+
+# `curl … | sh -` hands the script to sh on *stdin*, so the script's own stdin is
+# the pipe, not the terminal. Anything in here that read a line would eat its own
+# source and then run whatever was left of itself -- which is why the confirm
+# prompt lives in `ferry uninstall`, a command run from a terminal, and not in
+# the installer. An installer cannot ask questions.
+case "$(grep -cE '(^|[^a-z])read[[:space:]]+(-[a-z]+[[:space:]]+)*[A-Za-z_]' "$repo/install.sh")" in
+  0) ok "and never reads stdin, which a piped script cannot do" ;;
+  *) bad "install.sh reads stdin; piped into sh that consumes its own source"
+     grep -nE '(^|[^a-z])read[[:space:]]+' "$repo/install.sh" | sed 's/^/      /' ;;
+esac
 echo
 
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"

@@ -115,7 +115,8 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 ## Layout
 
 ```
-install.sh                           what get.ferry.dev serves: curl | sh
+install.sh                           what get.ferry.kurpuis.com serves: curl | sh
+.github/workflows/pages.yml          publishes install.sh to that domain from main
 release/build.sh                     package a built checkout into a release tarball
 release/publish.sh                   put one on GitHub Releases
 ferry                                the CLI: doctor, build, up, down, status, logs, upgrade
@@ -150,7 +151,7 @@ bin/                                 build output, symlinked to a version (gitig
 ## Install
 
 ```sh
-curl -sfL https://get.ferry.dev | sh -
+curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 That downloads a release, puts `ferry` and a matching `kubectl` on your PATH,
@@ -162,7 +163,7 @@ built.
 Adding a second Mac is one line from the first Mac's `ferry token create`:
 
 ```sh
-curl -sfL https://get.ferry.dev | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10… sh -
+curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10… sh -
 ```
 
 Details, the environment variables, and how to uninstall are in
@@ -235,7 +236,7 @@ ferry down
 
 ## Requirements
 
-To **run** ferry, which is what `curl -sfL https://get.ferry.dev | sh -` does:
+To **run** ferry, which is what `curl -sfL https://get.ferry.kurpuis.com | sh -` does:
 
 - Apple silicon, macOS 26 (Tahoe)
 
@@ -295,3 +296,7 @@ git tag -a v0.1.0 -m "..." && git push origin v0.1.0
 `release/build.sh` packages the runtime subset of the checkout and refuses to
 ship one that is missing a piece. `release/publish.sh` refuses a dirty tree, or
 a tarball built from a commit other than the tag's.
+
+`install.sh` itself is served from GitHub Pages, republished from `main`
+whenever it changes, so the installer people run is the one in this repository.
+The one-time DNS and Pages setup is in [docs/INSTALL.md](docs/INSTALL.md).

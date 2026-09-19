@@ -1,7 +1,7 @@
 # Installing ferry
 
 ```sh
-curl -sfL https://get.ferry.dev | sh -
+curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 One line, no `sudo`, no toolchain. This is deliberately the k3s shape, because
@@ -183,6 +183,46 @@ cluster back. With it, there is no undo and no backup taken; it asks you to type
 
 The release directory itself is left for you to `rm -rf`, because ferry is
 executing out of it at the time.
+
+## Where get.ferry.kurpuis.com comes from
+
+GitHub Pages, published from `main` by
+[`.github/workflows/pages.yml`](../.github/workflows/pages.yml) whenever
+`install.sh` changes. The script is served at `/` and at `/install.sh`; the
+workflow runs `sh -n` on it first, because a syntax error here is a broken
+install command for every new user on a path no test of ferry would catch.
+
+Publishing from `main` rather than keeping a copy on a `gh-pages` branch is the
+point: a copy drifts, and the installer people run would slowly stop being the
+one in this repository with nothing saying so.
+
+**One-time setup**, which is DNS and a repository setting rather than anything
+in this tree:
+
+1. **DNS.** A `CNAME` record for `get.ferry.kurpuis.com` pointing at
+   `imaustink.github.io`. Not an `A` record and not the apex — a nested
+   subdomain as a `CNAME` is exactly the supported case.
+2. **Pages source.** In the repository's Settings → Pages, set the source to
+   **GitHub Actions**. The workflow cannot set this itself.
+3. Push to `main`, or run the workflow by hand. It writes a `CNAME` file into
+   the published site, which is what binds the domain — a deployment without it
+   resets the domain to `imaustink.github.io` and the install command in the
+   README stops working.
+4. Once DNS resolves, tick **Enforce HTTPS**. GitHub issues a Let's Encrypt
+   certificate for the subdomain automatically; it cannot do that until the
+   `CNAME` record is in place, so this step comes last.
+
+Until all of that is done, the installer still works by naming the release
+directly:
+
+```sh
+FERRY_VERSION=v0.1.0 \
+  FERRY_DOWNLOAD_BASE=https://github.com/imaustink/ferry/releases/download/v0.1.0 \
+  sh install.sh
+```
+
+`FERRY_INSTALL_URL` overrides the hostname ferry prints in `ferry token create`
+and in its release-guard messages, for anyone serving the installer elsewhere.
 
 ## Notes
 

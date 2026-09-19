@@ -1,0 +1,71 @@
+# Serve install.sh at https://get.ferry.kurpuis.com.
+#
+# The alternative was a hand-maintained gh-pages branch holding a copy of
+# install.sh, and a copy is a thing that drifts: the installer people actually
+# run would slowly stop being the installer in this repository, and nothing
+# would say so. Publishing from main on every change means there is one
+# install.sh and the site is a view of it.
+#
+# The script is served at two paths. `/` is the documented one, because
+# `curl -sfL https://get.ferry.kurpuis.com | sh -` is the whole point and a
+# path on the end spoils it; `/install.sh` is there for anyone who would rather
+# name what they are downloading. GitHub Pages serves `/` from index.html, so
+# index.html *is* the shell script -- which means a browser opening the bare
+# domain gets the script rendered as HTML rather than a page. That is what
+# get.k3s.io does too, and it is the right trade: the command is what matters.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    # Nothing else in the repository is served, so nothing else should trigger a
+    # deploy. A README change should not redeploy the installer.
+    paths:
+      - install.sh
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and let a newer one win: the useful state is "the site
+# matches main", not "every intermediate commit was published".
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer is piped straight into sh by everyone who runs it, so a
+      # syntax error here is a broken install command for every new user, on a
+      # path that no test of ferry itself would catch. It costs nothing to
+      # check before publishing.
+      - name: Check install.sh parses as /bin/sh
+        run: sh -n install.sh
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp install.sh _site/install.sh
+          cp install.sh _site/index.html
+          # The CNAME file is what tells Pages this site answers to the custom
+          # domain. It has to be in the artifact: a deployment without it
+          # resets the domain back to <user>.github.io, and the install command
+          # in the README stops working.
+          echo 'get.ferry.kurpuis.com' > _site/CNAME
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

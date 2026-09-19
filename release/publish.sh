@@ -88,5 +88,5 @@ if [ -n "$draft" ]; then
   echo "  install.sh will not see it until then."
 else
   bold "published"
-  echo "  curl -sfL https://get.ferry.dev | sh -"
+  echo "  curl -sfL https://get.ferry.kurpuis.com | sh -"
 fi

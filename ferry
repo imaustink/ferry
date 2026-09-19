@@ -237,7 +237,7 @@ COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 # not carry, and 'ferry upgrade' in a release fetches rather than compiles.
 # Where install.sh is served. Printed by 'ferry token create', so a second Mac
 # can be told to join in one line whether or not it has ferry yet.
-FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.dev}"
+FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
 
 # Was the cluster stopped on purpose?
 #

@@ -1,11 +1,11 @@
 #!/bin/sh
 # ferry installer.
 #
-#   curl -sfL https://get.ferry.dev | sh -
+#   curl -sfL https://get.ferry.kurpuis.com | sh -
 #
 # and to add this Mac to a cluster already running on another:
 #
-#   curl -sfL https://get.ferry.dev | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10... sh -
+#   curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10... sh -
 #
 # This downloads a release rather than building one. Building ferry needs Swift
 # 6.4, Go, a Kubernetes source tree and, for the guest kernel, Docker -- which
