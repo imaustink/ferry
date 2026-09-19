@@ -1,5 +1,7 @@
 bin/
 .run/
+# Where release/build.sh puts the tarballs it packages.
+dist/
 experiments/03-vm-ceiling/build/
 experiments/03-vm-ceiling/assets/vmlinux-arm64
 kernel/.build/

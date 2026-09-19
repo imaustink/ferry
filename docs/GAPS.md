@@ -99,8 +99,11 @@ Known limits, which are not bugs:
   Running pods are not touched.
 - **A checkout has one `bin/`**, so every node on one Mac moves together. The
   roll is per Mac, not per node.
-- **Nothing distributes binaries to another Mac.** `ferry join` already says to
-  copy them from the first Mac; upgrades say the same.
+- ~~**Nothing distributes binaries to another Mac.**~~ **Closed.** A release
+  tarball is what a Mac installs, and `ferry token create` prints the installer
+  line for the second Mac. Upgrading a *cluster* across Macs is still per Mac —
+  each runs `ferry upgrade nodes` — but nobody copies `bin/` by hand any more.
+  See [INSTALL.md](INSTALL.md).
 - **A minor bump is a different problem** -- porting `patches/` -- and this
   machinery does not claim to solve it.
 
