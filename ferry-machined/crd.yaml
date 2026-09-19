@@ -60,9 +60,12 @@ spec:
                 disk:
                   type: string
                   description: >-
-                    Quantity, e.g. 8Gi. The filesystem is sparse, so this is a
-                    ceiling rather than an allocation.
-                  default: 8Gi
+                    Quantity, e.g. 8Gi. Must match the size of the image this
+                    machine clones: that filesystem is built without
+                    resize_inode and cannot be grown in place, so a disagreeing
+                    size is refused rather than ignored. Omit this to take the
+                    image's size; to change it, build an image with
+                    `ferry-node build --size-gib` and set spec.image.
                 image:
                   type: string
                   description: >-

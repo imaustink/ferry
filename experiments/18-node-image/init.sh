@@ -34,6 +34,11 @@ mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
 # it insists on instead of refusing to start.
 log "proc writable: $([ -w /proc/sys/vm/overcommit_memory ] && echo yes || echo no)"
 
+# The size of the image this was cloned from, and there is no growing it: the
+# ext4 is built without resize_inode. Worth logging, because it is the one
+# number a Machine's spec.disk cannot change.
+log "root filesystem $(df -h / | tail -1 | tr -s ' ' | cut -d' ' -f2)"
+
 param() { # key
   sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline
 }

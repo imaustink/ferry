@@ -88,6 +88,11 @@ func main() {
 		log.Fatalf("bootstrap RBAC: %v", err)
 	}
 
+	// Machines asked for by an earlier controller are still running.
+	if err := controller.adopt(); err != nil {
+		log.Printf("adopting existing machines: %v", err)
+	}
+
 	log.Printf("==> ferry-machined")
 	log.Printf("    image   %s", *baseImage)
 	log.Printf("    kernel  %s", *kernel)
@@ -100,8 +105,9 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("stopping %d machine(s)", len(controller.machines))
-			controller.shutdown()
+			// The machines keep running. A controller is not something a node's
+			// life should depend on, and the next one adopts them.
+			log.Printf("exiting; %d machine(s) keep running", len(controller.machines))
 			return
 		case <-ticker.C:
 			if err := controller.reconcileAll(ctx); err != nil {

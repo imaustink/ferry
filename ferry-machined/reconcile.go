@@ -143,6 +143,13 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 		image = *baseImage
 	}
 
+	// Checked before anything is created: a bootstrap token and a disk clone
+	// are side effects worth not leaving behind on a spec that cannot be met.
+	if err := checkDisk(image, diskGiB); err != nil {
+		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
+		return err
+	}
+
 	token, err := c.createBootstrapToken(ctx, name)
 	if err != nil {
 		return fmt.Errorf("bootstrap token: %w", err)
@@ -175,8 +182,8 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 
 	m := &machine{name: name, token: token}
 	c.machines[name] = m
-	log.Printf("machine %s: asked for %d cpu, %d MiB, %d GiB disk",
-		name, cpus, memoryMiB, diskGiB)
+	log.Printf("machine %s: asked for %d cpu, %d MiB, disk from %s",
+		name, cpus, memoryMiB, image)
 
 	return c.updateStatus(ctx, item, m)
 }
@@ -221,10 +228,59 @@ func (c *controller) stop(m *machine) {
 	_ = os.Remove(specFile(m.name))
 }
 
-func (c *controller) shutdown() {
-	for _, m := range c.machines {
-		c.stop(m)
+// adopt takes back the machines a previous controller asked for.
+//
+// Without it a restart is destructive twice over: an empty map makes reconcile
+// treat a running machine as new, and create() removes the live disk, clones
+// the image over it and mints a fresh token -- so a controller crash would
+// rebuild every node in the cluster. The finalizer exists to let a VM outlive
+// control-plane churn, and this is the other half of that promise.
+func (c *controller) adopt() error {
+	entries, err := os.ReadDir(*machinesDir)
+	if err != nil {
+		return err
 	}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".json") || strings.HasSuffix(n, ".status.json") {
+			continue
+		}
+		body, err := os.ReadFile(specFile(strings.TrimSuffix(n, ".json")))
+		if err != nil {
+			continue
+		}
+		var asked machineSpec
+		if json.Unmarshal(body, &asked) != nil || asked.Name == "" {
+			continue
+		}
+		c.machines[asked.Name] = &machine{name: asked.Name, token: asked.Token}
+		log.Printf("machine %s: adopted, still running", asked.Name)
+	}
+	return nil
+}
+
+// checkDisk holds spec.disk to what a clone can actually deliver.
+//
+// A machine's disk is a clone of the image, and the image's ext4 is built
+// without resize_inode, so it cannot be grown in place -- not online in the
+// guest, not offline on the Mac. Truncating the file up would produce a disk
+// that looks like the size asked for and holds the size of the image, which is
+// worse than the silent no-op this field used to be. So a size that disagrees
+// with the image is refused, and says how to get the one asked for.
+func checkDisk(image string, gib int64) error {
+	if gib <= 0 {
+		return nil // unset: whatever the image is
+	}
+	info, err := os.Stat(image)
+	if err != nil {
+		return fmt.Errorf("reading image %s: %w", image, err)
+	}
+	const giB = 1024 * 1024 * 1024
+	if have := info.Size() / giB; gib != have {
+		return fmt.Errorf("spec.disk is %dGi but the image it clones is %dGi, and that filesystem cannot be resized in place; build one with `ferry-node build --size-gib %d` and point spec.image at it, or omit spec.disk to take the image's size",
+			gib, have, gib)
+	}
+	return nil
 }
 
 // updateStatus reports what is true rather than what was asked for: the address
@@ -239,6 +295,9 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 			if json.Unmarshal(body, &reported) == nil {
 				m.address = strings.SplitN(reported.Address, "/", 2)[0]
 				if reported.Phase == "Failed" {
+					// Without the phase this reads as Provisioning forever,
+					// which is the one thing a machine that died is not.
+					status["phase"] = "Failed"
 					status["message"] = reported.Message
 				}
 			}
@@ -304,15 +363,15 @@ func spec(item *unstructured.Unstructured) (cpus int, memoryMiB int64, diskGiB i
 	}
 	memoryMiB = quantity.Value() / (1024 * 1024)
 
-	disk, _, _ := unstructured.NestedString(item.Object, "spec", "disk")
-	if disk == "" {
-		disk = "8Gi"
+	// Left at zero when unset, which means "whatever the image is" rather than
+	// a number this controller made up.
+	if disk, _, _ := unstructured.NestedString(item.Object, "spec", "disk"); disk != "" {
+		diskQuantity, parseErr := resource.ParseQuantity(disk)
+		if parseErr != nil {
+			return 0, 0, 0, "", fmt.Errorf("spec.disk %q: %w", disk, parseErr)
+		}
+		diskGiB = diskQuantity.Value() / (1024 * 1024 * 1024)
 	}
-	diskQuantity, parseErr := resource.ParseQuantity(disk)
-	if parseErr != nil {
-		return 0, 0, 0, "", fmt.Errorf("spec.disk %q: %w", disk, parseErr)
-	}
-	diskGiB = diskQuantity.Value() / (1024 * 1024 * 1024)
 
 	image, _, _ = unstructured.NestedString(item.Object, "spec", "image")
 	return cpus, memoryMiB, diskGiB, image, nil
