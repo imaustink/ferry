@@ -408,13 +408,18 @@ contains "and checks ferry-node's virtualization entitlement" \
 contains "a release without the node image records that it is missing" \
   "$build_src" "node-image=\$("
 
-machines_src="$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")"
-contains "'machines enable' installs the CRD before starting the controller" \
+# The CRD and the DNS objects live in etcd, so 'ferry down --purge' takes them
+# while the enabled marker -- a file -- survives. Installing them in
+# start_machines rather than only in `machines enable` is what makes a purged
+# and restarted cluster come back whole, instead of running the controller
+# against a cluster with no Machine kind.
+machines_src="$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")"
+contains "starting machines installs the CRD, on every start" \
   "$machines_src" "crd.yaml"
 # Enabling has to survive a restart, or a cluster comes back in mode 1 only and
 # the machines that were running are simply gone.
-contains "and records the choice so the cluster comes back with machines" \
-  "$machines_src" "MACHINES_MARKER"
+contains "and 'machines enable' records the choice, so the cluster comes back with them" \
+  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "MACHINES_MARKER"
 contains "'ferry up' starts them for a cluster that asked" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "machines_enabled"
 # A release built without the image should say so rather than fail obscurely on
@@ -446,8 +451,8 @@ printf '\033[1m%s\033[0m\n' "cluster DNS for machines"
 for f in coredns kube-proxy; do
   succeeds "manifests/machines/$f.yaml exists" test -f "$repo/manifests/machines/$f.yaml"
 done
-contains "'machines enable' installs them" \
-  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "install_machine_dns"
+contains "starting machines installs them, so a purge does not lose them" \
+  "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" "install_machine_dns"
 contains "and ferry-node is told the DNS address" \
   "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" '--cluster-dns "$MACHINE_DNS_IP"'
 # A ClusterIP is immutable, so an existing kube-dns at another address has to be

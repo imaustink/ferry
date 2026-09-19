@@ -807,8 +807,20 @@ start_control_plane() { # version
   local advertise="$gateway"
   [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
 
+  # kube-controller-manager allocates every Node a slice of this, and it has to
+  # be the profile's own network. It was never passed, so it fell back to its
+  # default of 10.244.0.0/16 while a worktree's pods were on 10.15x -- two
+  # different pod networks in one cluster.
+  #
+  # Mode 1 could not see it: ferry-cri ignores node.spec.podCIDR and carves its
+  # own slice from --cluster-cidr and --node-index, so nothing ever read the
+  # allocation. Mode 2 does read it -- a machine's kubelet and CNI use exactly
+  # that field -- so the first machine in a worktree cluster came up with pods
+  # on 10.244.1.x while the Mac's pods were on 10.156.0.x, and kube-proxy was
+  # told a third answer.
   K8S_VERSION="$version" \
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
+    CLUSTER_CIDR="$CLUSTER_CIDR" \
     API_PORT="$(( 6443 + PORT_SHIFT ))" \
     ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
@@ -1125,6 +1137,17 @@ withdraw_gpu() {
 # server rather than a flag -- experiment 20 found that out the hard way.
 start_machines() {
   machines_ready || return 1
+
+  # The CRD and the DNS objects live in etcd, so `ferry down --purge` takes them
+  # with the rest of the cluster while the enabled marker -- which is a file --
+  # survives. Restarting then ran the controller against a cluster with no
+  # Machine kind, logging errors forever at a cluster that looked fine. Both
+  # applies are idempotent, so doing them on every start costs a moment and
+  # removes the difference between a cluster that was enabled and one that was
+  # enabled, purged and brought back.
+  kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
+    || { bad "could not install the Machine CRD"; return 1; }
+  install_machine_dns || return 1
 
   mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
 
@@ -2979,15 +3002,6 @@ cmd_machines_enable() {
   bold "turning on machines (mode 2)"
   machines_ready || return 1
 
-  # The CRD first: ferry-machined watches Machines, and a controller started
-  # against a cluster that has never heard of the kind logs a stream of errors
-  # rather than waiting for it to appear.
-  kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
-    || { bad "could not install the Machine CRD"; return 1; }
-  ok "Machine CRD installed"
-
-  install_machine_dns || return 1
-
   if running ferry-machined; then
     warn "machines are already running"
   else
@@ -2998,15 +3012,22 @@ cmd_machines_enable() {
   bold "machines are on"
   echo "  They come back with the cluster; 'ferry machines disable' turns them off."
   echo
+  # No node.labels in this example. That is MACHINES.md's design rather than
+  # what was built: the CRD has no node field, so a structural schema prunes it
+  # without a word and the labels would quietly do nothing. ferry-machined
+  # applies ferry.dev/mode=shared itself once the node registers.
   echo "  Declare one:"
   echo "    kubectl apply -f - <<'EOF'"
   echo "    apiVersion: ferry.dev/v1alpha1"
   echo "    kind: Machine"
   echo "    metadata: {name: worker-0}"
-  echo "    spec: {cpus: 2, memory: 2Gi, node: {labels: {ferry.dev/mode: shared}}}"
+  echo "    spec: {cpus: 2, memory: 2Gi}"
   echo "    EOF"
   echo
   echo "    kubectl get machines"
+  echo "    kubectl get nodes -L ferry.dev/mode"
+  echo
+  echo "  Pods choose with nodeSelector: {ferry.dev/mode: shared}"
 }
 
 cmd_machines_disable() {
@@ -3065,10 +3086,10 @@ cmd_machines_status() {
 
 cmd_machines() {
   case "${1:-status}" in
-    enable)  shift; cmd_machines_enable ;;
-    disable) shift; cmd_machines_disable ;;
-    status)  shift; cmd_machines_status ;;
-    ls|list) shift; kube get machines ;;
+    enable|on)   shift; cmd_machines_enable ;;
+    disable|off) shift; cmd_machines_disable ;;
+    status)      shift; cmd_machines_status ;;
+    ls|list)     shift; kube get machines ;;
     *) bad "usage: ferry machines [enable|disable|status|ls]"; return 2 ;;
   esac
 }
