@@ -27,6 +27,28 @@ reaches userspace in ~0.12s, so a real Alpine pod is up in **0.33s** and answers
 ping from the Mac in 0.34ms. The 128th VM starts as fast as the first. Nothing
 is nested, and there is no node VM in the path.
 
+### Against kind and minikube, on one Mac
+
+| | up | first pod | memory |
+|---|---|---|---|
+| kind | 13.8 s | 10.3 s | 2354 MiB *of a VM you sized* |
+| minikube | 21.4 s | 1.0 s | 2200 MiB *of a VM you sized* |
+| **ferry** | **12.6 s** | **1.0 s** | **1047 MiB of the Mac** |
+
+Those two memory columns cannot be the same number, and the reason is the point.
+Docker Desktop on that Mac holds **15.6 GiB and 16 cpus before the first pod
+exists**, so a pod on kind costs the Mac nothing extra — it costs a slice of a
+VM already taken, and when the slice is gone, pods stop fitting. ferry reserves
+nothing, and a pod costs 237 MiB of real memory. An idle single-node cluster
+costs kind and minikube 2.2–2.4 GiB of their VM before any workload runs.
+
+Measured with [experiment 21](experiments/21-density-vs-kind-minikube/FINDINGS.md),
+which is also honest about what it could not measure: one run per stack, kind's
+first-pod time probably includes an image pull, and mode 2 did not complete.
+The 237 MiB per pod independently reproduces
+[experiment 13](experiments/13-shared-kernel-cost/FINDINGS.md)'s 226 MiB by a
+different method.
+
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause
 container, no network namespace plumbing.
@@ -180,6 +202,7 @@ experiments/17-node-vm/              a Linux node VM joining, in six and a half 
 experiments/18-node-image/           the node image, and ferry-node that boots it
 experiments/19-machine-crd/          a node made by applying a resource
 experiments/20-pod-network/          pods on two machines reaching each other
+experiments/21-density-vs-kind-minikube/  against kind and minikube, on one Mac
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
 node-image/ (built)                  mode 2's node image, as an OCI layout
