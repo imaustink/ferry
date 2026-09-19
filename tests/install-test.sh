@@ -284,6 +284,14 @@ contains "a running cluster is held, not started again" \
 # cluster gives it a second etcd and a second idea of the cluster.
 contains "a joined worker is never started as a server" \
   "$(sed -n '/^cmd_service_run/,/^}/p' "$repo/ferry")" "joined a cluster on another"
+# An agent that adopted a running cluster must leave it as it found it.
+# `ferry service uninstall` boots the job out, which is a SIGTERM, so a trap
+# that always calls cmd_down stops a cluster the operator started by hand --
+# removing a plist tore down a healthy cluster, seconds later.
+service_run_src="$(sed -n '/^cmd_service_run/,/^}/p' "$repo/ferry")"
+contains "an adopted cluster is left running when the agent is stopped" \
+  "$service_run_src" "adopted it rather than starting it"
+contains "and the agent records which of the two it did" "$service_run_src" "adopted=1"
 echo
 
 # --- the agent's environment ----------------------------------------------
@@ -438,6 +446,14 @@ contains "and keeps its node-index label alongside" \
   "$(sed -n '/^start_kubelet/,/^}/p' "$repo/ferry")" "ferry.dev/node-index="
 contains "a machine's node is labelled shared by the controller" \
   "$(cat "$repo/ferry-machined/reconcile.go")" 'modeShared = "shared"'
+# --node-labels only applies when the kubelet *creates* the Node object, so a
+# cluster that predates the label never gets it: ferry's own node had been in
+# etcd for days and came back Ready and unlabelled, while a freshly made machine
+# was labelled correctly and the vm-per-pod selector matched nothing at all.
+contains "an existing Mac node is labelled too, not just a new one" \
+  "$(sed -n '/^ensure_mode_label/,/^}/p' "$repo/ferry")" "ferry.dev/mode=vm-per-pod"
+contains "and 'ferry up' asserts it once the node is Ready" \
+  "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" 'ensure_mode_label "$NODE_NAME"'
 contains "and it is applied where the controller already has the Node" \
   "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
 

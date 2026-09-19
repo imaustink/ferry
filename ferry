@@ -962,6 +962,7 @@ EOF
   done
   if [ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
     ok "node $NODE_NAME Ready"
+    ensure_mode_label "$NODE_NAME"
   else
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
@@ -1135,6 +1136,22 @@ withdraw_gpu() {
 #
 # The network belongs to the process that created it, which is why serve is a
 # server rather than a flag -- experiment 20 found that out the hard way.
+# Say which mode a node on this Mac is, for a node that already exists.
+#
+# start_kubelet passes --node-labels, but the kubelet only applies those when it
+# *creates* the Node object. A cluster that predates this label therefore never
+# gets it: ferry's own node had been in etcd for days, so it came back Ready and
+# unlabelled while a freshly made machine was labelled correctly, and
+# `nodeSelector: {ferry.dev/mode: vm-per-pod}` matched nothing at all.
+#
+# So the label is also asserted here, once the node is Ready. --overwrite
+# because the answer is not the node's to disagree about: a node ferry started
+# runs ferry-cri, which is vm-per-pod by construction.
+ensure_mode_label() { # node
+  kube label node "$1" ferry.dev/mode=vm-per-pod --overwrite >/dev/null 2>&1 \
+    || warn "could not label $1 ferry.dev/mode=vm-per-pod; nodeSelector will not match it"
+}
+
 start_machines() {
   machines_ready || return 1
 
@@ -1166,8 +1183,23 @@ start_machines() {
     sleep 0.5
   done
   if ! running ferry-node; then
-    bad "ferry-node serve did not start"
-    tail -5 "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null | sed 's/^/    /'
+    # vmnet's own words for "that subnet is still spoken for" are
+    # `vmnet_return_t(rawValue: 1001)`, which tells nobody anything. ferry-cri
+    # already explains this case in prose when it hits it; ferry-node reports
+    # the raw status, so it is translated here rather than left to be
+    # rediscovered. It is the ordinary consequence of restarting quickly: the
+    # subnet is held for about a minute after the last run let it go.
+    if grep -aq "1001" "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null; then
+      bad "the machine network $MACHINE_SUBNET is still held from a recent run"
+      echo "    vmnet keeps a subnet for about a minute after the process using it"
+      echo "    stops, so this usually clears on its own:"
+      echo "        ferry machines enable      # once it does"
+      echo "    Mode 1 is unaffected, and the Machines already declared come back"
+      echo "    with it. FERRY_MACHINE_SUBNET picks a different one."
+    else
+      bad "ferry-node serve did not start"
+      tail -5 "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null | sed 's/^/    /'
+    fi
     return 1
   fi
   ok "machine network $(grep -a 'network' "$FERRY_RUN/logs/ferry-node.log" | head -1 | sed 's/.*network //')"
@@ -1451,6 +1483,9 @@ cmd_node_add() {
   done
   if [ "$(kubectl get node "$name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
     ok "node $name Ready"
+    # Same reason as the Mac's own node: a name reused from an earlier cluster
+    # keeps the Node object, and its labels, from before.
+    ensure_mode_label "$name"
     echo
     kubectl get nodes
   else
@@ -3043,6 +3078,42 @@ cmd_machines_disable() {
 
 stop_machines() {
   local component pidfile pid
+
+  # Ask the machines to stop before killing the server that hosts them.
+  #
+  # Their VMs do go when ferry-node exits -- a machine goes NotReady within
+  # seconds of it -- so this is not about leaked VMs. It is about how they go: a
+  # guest whose host process is killed loses whatever it had not flushed, and a
+  # node VM runs containerd with a real filesystem underneath it. ferry already
+  # takes this care with ferry-cri, waiting for it rather than killing it.
+  #
+  # A spec file in the machines directory is the request for a machine and
+  # removing it is the request to stop one, so this asks through the channel
+  # ferry-machined already uses rather than hunting for VM processes. The
+  # Machine objects stay in etcd, so the next start brings them back.
+  #
+  # It does not make the next 'ferry up' any quicker: vmnet holds the machine
+  # subnet for about a minute after the network goes either way, so an
+  # immediate restart still fails to create it (status 1001) and mode 2 reports
+  # that rather than coming back.
+  if running ferry-node && [ -d "$FERRY_RUN/machines" ]; then
+    # ferry-machined first, or it writes the spec files straight back.
+    if running ferry-machined; then
+      kill -TERM "$(cat "$FERRY_RUN/ferry-machined.pid")" 2>/dev/null
+      for _ in $(seq 1 20); do running ferry-machined || break; sleep 0.5; done
+    fi
+    if ls "$FERRY_RUN/machines"/*.json >/dev/null 2>&1; then
+      rm -f "$FERRY_RUN/machines"/*.json
+      # Long enough for a guest to shut down and vmnet to be given back; a
+      # machine that has not gone by then is stopped with its server anyway.
+      for _ in $(seq 1 60); do
+        ls "$FERRY_RUN/machines"/*.status.json >/dev/null 2>&1 || break
+        sleep 0.5
+      done
+      ok "machines stopped"
+    fi
+  fi
+
   for component in ferry-machined ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -3257,7 +3328,28 @@ cmd_service_run() {
   # has to release its vmnet network, and a subnet left claimed by a killed
   # runtime stays claimed for about a minute -- so an unclean stop moves the pod
   # network on the next start.
-  trap 'echo "stopping"; cmd_down; exit 0' TERM INT
+  # Whether this agent started the cluster or merely found one.
+  #
+  # It decides what SIGTERM means. An agent that started the cluster owns it and
+  # should take it down; an agent that adopted a running one must leave it
+  # exactly as it found it -- otherwise `ferry service uninstall`, which boots
+  # the job out and so delivers SIGTERM, stops a cluster the operator started by
+  # hand and never asked the agent to manage. That is what it did: registering
+  # the agent on a running cluster and then deregistering it tore the cluster
+  # down, with `ferry status` showing everything stopped seconds after a command
+  # whose whole job was to remove a plist.
+  adopted=""
+
+  on_term() {
+    if [ -n "$adopted" ]; then
+      echo "leaving the cluster up; this agent adopted it rather than starting it"
+      exit 0
+    fi
+    echo "stopping"
+    cmd_down
+    exit 0
+  }
+  trap on_term TERM INT
 
   # A cluster that is already up is held, not started again. Without this,
   # registering the agent on a running cluster -- which is what re-running the
@@ -3265,6 +3357,7 @@ cmd_service_run() {
   # exit, which is the KeepAlive condition: launchd would restart this every few
   # seconds forever against a perfectly healthy cluster.
   if running ferry-cri && running kubelet; then
+    adopted=1
     echo "cluster is already up; holding it"
   else
     cmd_up || exit 1
