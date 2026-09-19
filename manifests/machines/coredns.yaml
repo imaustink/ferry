@@ -1,0 +1,129 @@
+# Cluster DNS for pods inside machines (mode 2).
+#
+# Mode 1's CoreDNS cannot serve these. It runs as a ferry-cri pod on the Mac's
+# own vmnet network, machines sit on a vmnet network of their own, and vmnet
+# keeps its networks apart (experiment 09) -- so a pod in a machine has no route
+# to that address. Until cross-mode pod routing exists (MACHINES.md milestone
+# 6), each mode resolves through its own CoreDNS.
+#
+# Everything here is named for machines rather than reusing mode 1's names, and
+# that is not tidiness. Mode 1 already has a Deployment called `coredns` in
+# kube-system carrying `k8s-app: kube-dns`; applying a second one under those
+# names replaces mode 1's DNS with a copy pinned to nodes mode 1 has not got.
+# The Service is the sharper version of the same trap: a selector of
+# `k8s-app: kube-dns` matches mode 1's CoreDNS pods too, so kube-dns would load
+# balance across pods that half of the cluster cannot reach, and DNS would work
+# intermittently -- which is worse than not working.
+#
+# The Service itself is new: mode 1 has none, because its kubelet is told
+# CoreDNS's pod address directly. A mode 1 pod therefore never resolves through
+# this Service, and nothing here changes what mode 1 does.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns-machines
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferry:coredns-machines
+rules:
+  - apiGroups: [""]
+    resources: [endpoints, services, pods, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferry:coredns-machines
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferry:coredns-machines
+subjects:
+  - kind: ServiceAccount
+    name: coredns-machines
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-machines
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        kubernetes __CLUSTER_DOMAIN__ in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+        }
+        forward . __UPSTREAM_DNS__
+        cache 30
+        loop
+        reload
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns-machines
+  namespace: kube-system
+  labels: {k8s-app: kube-dns-machines}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {k8s-app: kube-dns-machines}
+  template:
+    metadata:
+      labels: {k8s-app: kube-dns-machines}
+    spec:
+      # Only on machines. On the Mac node this would become a pod VM running
+      # CoreDNS for an audience that cannot reach it, next to the CoreDNS that
+      # already serves mode 1.
+      nodeSelector: {ferry.dev/mode: shared}
+      serviceAccountName: coredns-machines
+      # Its own resolution must not depend on itself.
+      dnsPolicy: Default
+      containers:
+        - name: coredns
+          image: __COREDNS_IMAGE__
+          args: ["-conf", "/etc/coredns/Corefile"]
+          # Reaches the API server directly: the kubernetes Service is one of
+          # the things it would otherwise need DNS and kube-proxy to resolve.
+          env:
+            - {name: KUBERNETES_SERVICE_HOST, value: "__APISERVER_HOST__"}
+            - {name: KUBERNETES_SERVICE_PORT, value: "__APISERVER_PORT__"}
+          ports:
+            - {containerPort: 53, name: dns, protocol: UDP}
+            - {containerPort: 53, name: dns-tcp, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /ready, port: 8181}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - {name: config, mountPath: /etc/coredns, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: coredns-machines
+            items: [{key: Corefile, path: Corefile}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels: {k8s-app: kube-dns-machines}
+spec:
+  clusterIP: __DNS_SERVICE_IP__
+  selector: {k8s-app: kube-dns-machines}
+  ports:
+    - {name: dns, port: 53, protocol: UDP, targetPort: 53}
+    - {name: dns-tcp, port: 53, protocol: TCP, targetPort: 53}

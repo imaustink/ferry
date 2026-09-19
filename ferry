@@ -2,7 +2,37 @@
 # ferry -- Kubernetes on a Mac, one virtual machine per pod.
 set -uo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where ferry's own files are.
+#
+# An installed ferry is reached through a symlink -- ~/.local/bin/ferry ->
+# ~/.ferry-dist/current/ferry -- and dirname of the symlink is the bin
+# directory, which contains none of the kernel, manifests, plugins or binaries
+# this script opens. So the link is followed to the file itself.
+#
+# It is followed only that far. 'current' is itself a symlink to the installed
+# version, and this deliberately does not resolve it: the root stays
+# ~/.ferry-dist/current, so everything that writes this path down -- above all
+# the LaunchAgent plist, which is written once and read at every login -- keeps
+# pointing at whichever release is current rather than at the one that happened
+# to be installed the day the agent was registered. Upgrading ferry is then
+# moving one symlink, which is the whole reason 'current' exists. `cd` resolves
+# directory symlinks logically, so this falls out rather than being arranged.
+#
+# readlink -f would resolve the lot, and is GNU besides; macOS has had it only
+# since Ventura and this has to run from a LaunchAgent with almost no
+# environment, so the loop is written out. It is bounded because a symlink cycle
+# is otherwise a hang.
+ferry_self="${BASH_SOURCE[0]}"
+for _ in 1 2 3 4 5 6 7 8; do
+  [ -L "$ferry_self" ] || break
+  link="$(readlink "$ferry_self")"
+  case "$link" in
+    /*) ferry_self="$link" ;;
+    *)  ferry_self="$(cd "$(dirname "$ferry_self")" && pwd)/$link" ;;
+  esac
+done
+here="$(cd "$(dirname "$ferry_self")" && pwd)"
+unset ferry_self link
 FERRY_ROOT="$here"
 export FERRY_ROOT
 # Which Kubernetes this checkout has built, where those binaries live, and what
@@ -42,8 +72,18 @@ ferry_profile() {
   local common top
   common="$(git -C "$here" rev-parse --git-common-dir 2>/dev/null)"
   top="$(git -C "$here" rev-parse --git-dir 2>/dev/null)"
+  # Not a checkout at all, which is what an installed release is. There is one
+  # of those per Mac and it is the cluster people mean, so it is "default" --
+  # the same ports, state directory and pod network a main checkout gets.
+  #
+  # Without this the release directory's own name became the profile:
+  # ~/.ferry-dist/versions/ferry-v0.1.0 reads as a worktree called
+  # "ferry-v0-1-0", on shifted ports and its own pod CIDR. Every upgrade would
+  # then have been a different cluster, and the old one's etcd would still be
+  # sitting in ~/.ferry-ferry-v0-1-0 holding the workload.
+  [ -z "$common" ] && { echo default; return; }
   # In the main checkout these are the same directory; in a worktree they differ.
-  if [ -n "$common" ] && [ "$common" = "$top" ]; then echo default; return; fi
+  if [ "$common" = "$top" ]; then echo default; return; fi
   basename "$here" | tr -c 'a-zA-Z0-9_-' '-' | sed 's/-*$//' | cut -c1-24
 }
 PROFILE="$(ferry_profile)"
@@ -189,6 +229,85 @@ if [ -f "$NAT_KERNEL" ]; then KERNEL="$NAT_KERNEL"; else KERNEL="$FALLBACK_KERNE
 CLUSTER_DOMAIN="${FERRY_CLUSTER_DOMAIN:-cluster.local}"
 COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 
+# Whether this is an installed release or a checkout.
+#
+# A release carries a VERSION file and no sources; a checkout has sources and no
+# VERSION. The difference decides what ferry can honestly offer: 'ferry build'
+# and 'ferry kernel' need a toolchain and a Kubernetes tree that a release does
+# not carry, and 'ferry upgrade' in a release fetches rather than compiles.
+# Where install.sh is served. Printed by 'ferry token create', so a second Mac
+# can be told to join in one line whether or not it has ferry yet.
+FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
+
+# Was the cluster stopped on purpose?
+#
+# launchd restarts a job that exits non-zero, which is how the login agent
+# notices a cluster that fell over. It cannot tell that apart from 'ferry down'
+# on its own: both end with ferry-cri and the kubelet gone. Without a way to say
+# which, 'ferry down' stops the cluster and launchd starts it again five seconds
+# later, and there is no way to turn ferry off at all.
+#
+# So 'ferry down' writes this and 'ferry up' removes it, and the agent reads it
+# to decide whether its exit means "restart me". In FERRY_HOME rather than
+# FERRY_RUN because /tmp does not survive a reboot -- though the asymmetry is
+# deliberate: after a reboot the marker is still there and the agent still
+# starts, because 'ferry down' means this session, not forever.
+# --- mode 2: machines -----------------------------------------------------
+#
+# The second mode, where the node is the VM and pods inside it are ordinary
+# Linux containers sharing its kernel. See docs/MACHINES.md.
+#
+# Off unless asked for. Mode 2 is complete through milestone 3 -- a Machine
+# becomes a node and pods on two machines reach each other -- but provisioning,
+# consolidation and mixed-cluster scheduling are not built, so what it does
+# today is turn `kubectl apply -f machine.yaml` into a node. Starting two more
+# daemons and holding a vmnet network on every cluster, including the ones that
+# will never declare a Machine, is not a fair default for that.
+#
+# The marker is in FERRY_HOME so the choice outlives a restart: 'ferry up' and
+# the login agent bring machines back for a cluster that had them.
+MACHINES_MARKER="$FERRY_HOME/machines-enabled"
+machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
+# Where the node image lives in a checkout and in a release. 'ferry node-image'
+# writes it; release/build.sh ships it.
+NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
+# Unpacked from that layout on first use, and kept: it is ~400MB and rebuilding
+# it on every start would be minutes of nothing. FERRY_HOME rather than
+# FERRY_RUN because /tmp does not survive a reboot.
+NODE_DISK="${FERRY_NODE_DISK:-$FERRY_HOME/node.ext4}"
+# Every machine sits on one vmnet network -- that is what makes mode 2's pod
+# networking ordinary routing rather than mode 1's flooded switch. Profiles get
+# their own, because a vmnet network is claimed for the whole Mac and a second
+# cluster asking for the same one gets none.
+MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
+# Cluster DNS for pods inside machines, as a ClusterIP.
+#
+# Mode 1's CoreDNS cannot serve them: it is a ferry-cri pod on the Mac's vmnet
+# network, machines are on a vmnet network of their own, and vmnet keeps its
+# networks apart. So machines get their own CoreDNS behind a Service, which
+# kube-proxy inside each machine resolves -- the ordinary Kubernetes
+# arrangement, which works there because a node VM has a kernel to program.
+# Cross-mode resolution is MACHINES.md milestone 6.
+MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
+MACHINE_KUBE_PROXY_IMAGE="${FERRY_KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
+
+STOPPED_MARKER="$FERRY_HOME/stopped"
+mark_stopped()   { mkdir -p "$FERRY_HOME" 2>/dev/null; : > "$STOPPED_MARKER"; }
+clear_stopped()  { rm -f "$STOPPED_MARKER"; }
+was_stopped()    { [ -f "$STOPPED_MARKER" ]; }
+
+ferry_release_version() {
+  [ -f "$here/VERSION" ] || return 1
+  sed -n 's/^ferry=//p' "$here/VERSION" | head -1
+}
+is_release() { [ -f "$here/VERSION" ]; }
+# Whether the release was packaged with the mode 2 node image. Recorded by
+# release/build.sh, because "the directory is missing" and "this build never had
+# one" are different facts and only the second has a useful answer.
+release_has_node_image() {
+  [ "$(sed -n 's/^node-image=//p' "$here/VERSION" 2>/dev/null | head -1)" = yes ]
+}
+
 # macOS pgrep does not count reliably with -c, so count lines.
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
 
@@ -202,7 +321,9 @@ usage() {
 ferry -- Kubernetes on a Mac, one virtual machine per pod
 
   ferry doctor      check that this machine can run ferry
+  ferry version     what this is, and what Kubernetes it runs
   ferry kernel      build a guest kernel with NAT support (slow, needs docker)
+  ferry node-image  build the mode 2 node image (slow, needs docker)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry up          start the cluster
@@ -210,6 +331,9 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
   ferry kubeconfig  print the path to the admin kubeconfig
+                    --merge to add it to ~/.kube/config as a context
+  ferry service     start the cluster at login (install|uninstall|status)
+  ferry uninstall   stop everything and unlink ferry (--purge to delete the cluster)
   ferry node add <name>   add another node on this Mac
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
@@ -219,6 +343,12 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry addons enable <n> turn one on
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
+
+Machines -- mode 2, where the node is the VM and pods share its kernel:
+  ferry machines status   whether mode 2 is on, and what it is running
+  ferry machines enable   install the Machine CRD and start the controller
+  ferry machines disable  stop it; Machines and the CRD are left alone
+  ferry machines ls       the machines in this cluster
 
 Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
@@ -338,7 +468,16 @@ cmd_doctor() {
     fatal=1
   fi
 
-  if command -v swift >/dev/null; then
+  # An installed release carries binaries, not sources. Swift and Go are how
+  # those binaries were made on somebody else's Mac; requiring them here would
+  # tell a person their working cluster is "not ready" for want of a compiler it
+  # will never run.
+  local swift_built
+  if is_release; then
+    ok "ferry $(ferry_release_version), installed release"
+    swift_built="$(sed -n 's/^swift=//p' "$here/VERSION" | head -1)"
+    [ -n "$swift_built" ] && echo "      built with Swift $swift_built; this Mac needs no toolchain"
+  elif command -v swift >/dev/null; then
     # "Apple Swift version 6.4", not "swift-driver version: 1.148.6" -- the
     # driver is named first and its number is lower, so matching any "version"
     # reports 1.148 and fails the comparison for the wrong reason.
@@ -377,11 +516,19 @@ cmd_doctor() {
     fi
   else bad "Swift not found"; swift_install_hint; fatal=1; fi
 
-  if command -v go >/dev/null; then ok "$(go version | cut -d' ' -f3)"
+  if is_release; then :
+  elif command -v go >/dev/null; then ok "$(go version | cut -d' ' -f3)"
   else bad "Go 1.24+ required, needed to build the kubelet"; fatal=1; fi
 
   if command -v kubectl >/dev/null; then ok "kubectl present"
   else warn "kubectl not found; you will want it to talk to the cluster"; fi
+
+  # A release that was installed but never put on the PATH is a common enough
+  # half-finished state to name.
+  if is_release && ! command -v ferry >/dev/null; then
+    warn "ferry is not on your PATH; you are running it by its full path"
+    echo "      echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh"
+  fi
 
   # Only worth saying anything about once something has been built.
   if [ -d "$here/bin" ]; then
@@ -412,7 +559,9 @@ cmd_doctor() {
   else warn "${free}G free disk; images and pod root filesystems need room"; fi
 
   echo
-  if [ "$fatal" -eq 0 ]; then bold "ready -- run: ferry build && ferry up"; return 0
+  if [ "$fatal" -eq 0 ]; then
+    if is_release; then bold "ready -- run: ferry up"; else bold "ready -- run: ferry build && ferry up"; fi
+    return 0
   else bold "not ready"; return 1; fi
 }
 
@@ -478,6 +627,23 @@ cmd_build() {
     bad "--kubernetes-version $K8S_VERSION is not a version like v1.34.0"; return 2; }
   export K8S_VERSION
 
+  # An installed release has the binaries and none of the sources. Saying so
+  # here is better than failing four steps in on a missing build-kubelet.sh,
+  # and the thing the person almost certainly wants -- a different Kubernetes --
+  # is available to them without a toolchain.
+  if is_release; then
+    bad "this is an installed ferry $(ferry_release_version), not a checkout -- there is nothing here to build"
+    echo
+    echo "    It already carries kubernetes $(ferry_active_version), built and tested"
+    echo "    as a set with the runtime and the guest kernel. To move to another,"
+    echo "    install a ferry release that carries it:"
+    echo "        curl -sfL $FERRY_INSTALL_URL | sh -"
+    echo
+    echo "    To build ferry from source instead:"
+    echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry build"
+    return 1
+  fi
+
   bold "building ferry"
   echo "  kubernetes $K8S_VERSION (control plane $(ferry_control_plane_version "$K8S_VERSION"), etcd $(ferry_etcd_version "$K8S_VERSION"))"
   "$here/experiments/03-vm-ceiling/fetch-kernel.sh" || return 1
@@ -516,10 +682,64 @@ cmd_build() {
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
   echo "==> $here/bin/ferry-streamer"
   echo
+  # Mode 2: the controller that turns a Machine into a node, and the tool that
+  # makes the VM for it. Both are quick. The node *image* they boot is not, and
+  # is built separately by 'ferry node-image' -- it needs Docker, which is the
+  # same bargain 'ferry kernel' makes.
+  echo "==> ferry-machined"
+  ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
+  echo "==> $here/bin/ferry-machined"
+  echo
+  echo "==> ferry-node"
+  OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" || return 1
+  echo
   # nft, for applying those rules inside pods.
   "$here/guest/build-nft.sh" || return 1
   echo
   bold "built -- run: ferry up"
+  if [ ! -d "$NODE_IMAGE_LAYOUT" ]; then
+    echo "  For mode 2 machines as well: ferry node-image  (slow, needs docker)"
+  fi
+}
+
+# The mode 2 node image: a Linux userspace with containerd, a kubelet and the
+# CNI plugins, built by Docker and exported as an OCI layout.
+#
+# Separate from 'ferry build' for the same reason 'ferry kernel' is: it needs
+# Docker and it takes minutes, and neither is worth imposing on someone who only
+# wants mode 1. A release carries the result, so the Mac installing one needs
+# none of this.
+cmd_node_image() {
+  if is_release; then
+    if release_has_node_image; then
+      bad "this is an installed ferry $(ferry_release_version); it already carries the node image"
+    else
+      bad "this ferry $(ferry_release_version) was packaged without a node image, and a release cannot build one"
+      echo "    It needs Docker and a Kubernetes staging step that a release does not carry."
+      echo "    Install a release built with one, or build ferry from source:"
+    fi
+    echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry node-image"
+    return 1
+  fi
+  command -v docker >/dev/null || { bad "docker is required to build the node image"; return 1; }
+  docker info >/dev/null 2>&1 || { bad "docker is installed but not running"; return 1; }
+
+  bold "building the mode 2 node image"
+  # The node's kubelet has to match the control plane it joins, so the staging
+  # step is told which Kubernetes this checkout is on rather than keeping its
+  # own default -- the same drift lib/versions.sh exists to prevent.
+  local k8s; k8s="$(ferry_active_version)"
+  k8s="${k8s:-$K8S_VERSION}"
+  echo "  kubernetes $(ferry_control_plane_version "$k8s") inside the node"
+  KUBERNETES_VERSION="$(ferry_control_plane_version "$k8s")" \
+    "$here/experiments/17-node-vm/stage.sh" || return 1
+  echo
+  LAYOUT="$NODE_IMAGE_LAYOUT" DISK="$here/node-image/node.ext4" \
+    "$here/experiments/18-node-image/build.sh" || return 1
+  echo
+  bold "node image built"
+  echo "  $NODE_IMAGE_LAYOUT"
+  echo "  turn mode 2 on with: ferry machines enable"
 }
 
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
@@ -587,8 +807,20 @@ start_control_plane() { # version
   local advertise="$gateway"
   [ "$LAN_IP" != "127.0.0.1" ] && advertise="$LAN_IP"
 
+  # kube-controller-manager allocates every Node a slice of this, and it has to
+  # be the profile's own network. It was never passed, so it fell back to its
+  # default of 10.244.0.0/16 while a worktree's pods were on 10.15x -- two
+  # different pod networks in one cluster.
+  #
+  # Mode 1 could not see it: ferry-cri ignores node.spec.podCIDR and carves its
+  # own slice from --cluster-cidr and --node-index, so nothing ever read the
+  # allocation. Mode 2 does read it -- a machine's kubelet and CNI use exactly
+  # that field -- so the first machine in a worktree cluster came up with pods
+  # on 10.244.1.x while the Mac's pods were on 10.156.0.x, and kube-proxy was
+  # told a third answer.
   K8S_VERSION="$version" \
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
+    CLUSTER_CIDR="$CLUSTER_CIDR" \
     API_PORT="$(( 6443 + PORT_SHIFT ))" \
     ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
@@ -609,6 +841,12 @@ cmd_up() {
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_GPUD_SOCK"
+  # This cluster is wanted again, so the login agent should treat its next
+  # disappearance as a failure rather than as an intention.
+  clear_stopped
+  # Which kind of node this Mac is, for the login agent to read after a reboot.
+  # A server can be started again from FERRY_HOME alone; a worker cannot.
+  echo server > "$FERRY_HOME/role"
 
   bold "starting ferry"
 
@@ -714,7 +952,7 @@ authorization: {mode: Webhook}
 EOF
 
   start_kubelet "$NODE_NAME" "$FERRY_RUN" "$FERRY_HOME/kubelet.conf" \
-    "$FERRY_RUN/kubelet.pid" "$FERRY_RUN/logs/kubelet.log"
+    "$FERRY_RUN/kubelet.pid" "$FERRY_RUN/logs/kubelet.log" "" "$NODE_INDEX"
 
   export KUBECONFIG="$FERRY_HOME/admin.conf"
   for _ in $(seq 1 60); do
@@ -744,9 +982,20 @@ EOF
   advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
+  # Mode 2, for a cluster that asked for it. After the node is Ready, because
+  # ferry-machined reads the Node list to work out each machine's pod CIDR.
+  if machines_enabled; then
+    if ! start_machines; then
+      warn "machines did not start; mode 1 is unaffected"
+      echo "      ferry machines status"
+    fi
+  fi
+
   echo
   bold "ferry is up"
   echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+  echo "  ferry kubeconfig --merge      to put it in ~/.kube/config instead"
+  echo "  ferry token create            to add another Mac to this cluster"
 }
 
 # NetworkPolicy, enforced where the packets are.
@@ -875,6 +1124,104 @@ withdraw_gpu() {
 # the same mechanism every other ferry mount uses. That makes it local to one
 # machine, so the volume carries node affinity and binding waits for the
 # scheduler to choose a node.
+# Mode 2's two daemons.
+#
+# ferry-node serve holds the one vmnet network and boots a VM for every spec
+# that appears in the machines directory; ferry-machined watches Machine objects
+# and writes those specs. The split is the one ferry already uses between
+# ferry-streamer and ferry-cri: the thing that talks to Kubernetes is Go beside
+# the control plane, and the thing that makes VMs is Swift with the
+# virtualization entitlement.
+#
+# The network belongs to the process that created it, which is why serve is a
+# server rather than a flag -- experiment 20 found that out the hard way.
+start_machines() {
+  machines_ready || return 1
+
+  # The CRD and the DNS objects live in etcd, so `ferry down --purge` takes them
+  # with the rest of the cluster while the enabled marker -- which is a file --
+  # survives. Restarting then ran the controller against a cluster with no
+  # Machine kind, logging errors forever at a cluster that looked fine. Both
+  # applies are idempotent, so doing them on every start costs a moment and
+  # removes the difference between a cluster that was enabled and one that was
+  # enabled, purged and brought back.
+  kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
+    || { bad "could not install the Machine CRD"; return 1; }
+  install_machine_dns || return 1
+
+  mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
+
+  "$here/bin/ferry-node" serve \
+    --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
+    --ca "$FERRY_HOME/pki/ca.crt" \
+    --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
+    --subnet "$MACHINE_SUBNET" \
+    --cluster-dns "$MACHINE_DNS_IP" \
+    >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-node.pid"
+  local _
+  for _ in $(seq 1 60); do
+    grep -aq "network" "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null && break
+    running ferry-node || break
+    sleep 0.5
+  done
+  if ! running ferry-node; then
+    bad "ferry-node serve did not start"
+    tail -5 "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  ok "machine network $(grep -a 'network' "$FERRY_RUN/logs/ferry-node.log" | head -1 | sed 's/.*network //')"
+
+  "$here/bin/ferry-machined" \
+    --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
+    --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
+    --machines "$FERRY_RUN/machines" \
+    --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
+    --ca "$FERRY_HOME/pki/ca.crt" \
+    >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-machined.pid"
+  sleep 1
+  if running ferry-machined; then
+    ok "machines reconciling -- kubectl apply -f <machine.yaml>"
+  else
+    bad "ferry-machined did not start"
+    tail -5 "$FERRY_RUN/logs/ferry-machined.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+}
+
+# Everything mode 2 needs before it can start, checked in the order that gives
+# the most useful answer first.
+machines_ready() {
+  local binary
+  for binary in ferry-machined ferry-node; do
+    [ -x "$here/bin/$binary" ] || {
+      bad "bin/$binary is missing -- run 'ferry build'"
+      return 1; }
+  done
+  [ -d "$NODE_IMAGE_LAYOUT" ] || {
+    bad "no node image at $NODE_IMAGE_LAYOUT"
+    if is_release; then
+      echo "    This release was packaged without one. Mode 2 needs a release built"
+      echo "    with 'ferry node-image'; mode 1 is unaffected."
+    else
+      echo "    Build it: ferry node-image   (slow, needs docker)"
+    fi
+    return 1; }
+  # Unpacked once, from the layout the release carries. Doing it here rather
+  # than at install time keeps the cost off every Mac that never uses mode 2.
+  if [ ! -f "$NODE_DISK" ]; then
+    echo "  unpacking the node image (once, ~400MB)"
+    "$here/bin/ferry-node" build --layout "$NODE_IMAGE_LAYOUT" --out "$NODE_DISK" \
+      >"$FERRY_RUN/logs/ferry-node-build.log" 2>&1 || {
+        bad "could not unpack the node image"
+        tail -5 "$FERRY_RUN/logs/ferry-node-build.log" 2>/dev/null | sed 's/^/    /'
+        rm -f "$NODE_DISK"
+        return 1; }
+    ok "node disk at $NODE_DISK"
+  fi
+}
+
 start_storage() {
   [ -x "$here/bin/ferry-storage" ] || { warn "ferry-storage not built; PersistentVolumeClaims will stay Pending"; return 0; }
   "$here/bin/ferry-storage" --kubeconfig "$FERRY_HOME/admin.conf" \
@@ -1027,8 +1374,17 @@ cmd_node_add() {
   running ferry-cri || { bad "ferry is not up; run 'ferry up' first"; return 1; }
 
   # Find the first free index. Node 0 is the one 'ferry up' started.
-  local index=1
-  while [ -f "$FERRY_RUN/node-$index.pid" ]; do index=$((index + 1)); done
+  #
+  # Free across the whole cluster, not just this Mac: an index is a /24 of the
+  # cluster CIDR, and a Mac that joined took one without this Mac's pid files
+  # knowing. Scanning locally alone is how two Macs end up handing out the same
+  # pod addresses. The local scan is the fallback for a cluster whose API is not
+  # answering, where one node on one Mac is the only thing that can be true.
+  local index
+  index="$(free_node_index)" || {
+    index=1
+    while [ -f "$FERRY_RUN/node-$index.pid" ]; do index=$((index + 1)); done
+  }
   [ "$index" -le 200 ] || { bad "too many nodes"; return 1; }
 
   local sock="/tmp/ferry-cri-$index.sock"
@@ -1086,7 +1442,7 @@ cmd_node_add() {
       "$FERRY_RUN/kubelet.yaml" > "$run/kubelet.yaml"
 
   start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf" \
-    "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log"
+    "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log" "" "$index"
 
   export KUBECONFIG="$FERRY_HOME/admin.conf"
   for _ in $(seq 1 90); do
@@ -1119,6 +1475,48 @@ cmd_node_rm() {
   done
   kubectl delete node "$name" >/dev/null 2>&1
   ok "node $name removed"
+}
+
+# --- the join token -------------------------------------------------------
+#
+# Joining needs two secrets and one fact: the bootstrap token's id and secret,
+# and the hash of the CA to pin the discovery fetch against. Passing those as
+# three flags made 'ferry join' a four-line command, which is a four-line
+# command nobody can paste into a chat window without it wrapping -- and one
+# whose --ca-hash people were always going to be tempted to drop.
+#
+# So they travel as one opaque string, the way k3s' does:
+#
+#   F10<64 hex of the CA's public key>::<id>.<secret>
+#
+# F10 is a version marker, so a later token that carries something else can be
+# told apart from this one rather than silently misparsed. The separator is ::
+# because neither half can contain it: the hash is hex and the credential is
+# [a-z0-9] by construction.
+#
+# The hash is not a secret -- it is a fingerprint of a public key, published in
+# kube-public for anyone to read. It rides along because the joining Mac has to
+# pin the CA it fetches over an unverified connection, and a token that carries
+# the pin is a token that cannot be used without it.
+ferry_token_encode() { # ca-hash-hex id secret
+  printf 'F10%s::%s.%s\n' "$1" "$2" "$3"
+}
+
+# Prints "<ca-hash-hex> <id.secret>", or nothing if this is not one of ours.
+ferry_token_decode() { # token
+  case "$1" in
+    F10*::*.*) : ;;
+    *) return 1 ;;
+  esac
+  local rest="${1#F10}"
+  local hash="${rest%%::*}" credential="${rest#*::}"
+  # A truncated paste is the common failure and it must not read as a valid
+  # token with a short hash, which would then fail to match the real CA and
+  # report the wrong problem.
+  [ "${#hash}" -eq 64 ] || return 1
+  case "$hash" in *[!0-9a-f]*) return 1 ;; esac
+  case "$credential" in *.*) : ;; *) return 1 ;; esac
+  printf '%s %s\n' "$hash" "$credential"
 }
 
 # A token another Mac can join with.
@@ -1171,6 +1569,24 @@ EOF
     --clusterrole=system:node-proxier \
     --group=system:nodes >/dev/null 2>&1
 
+  # Let a node that has not joined yet read the node list.
+  #
+  # Every node owns one /24 of the cluster CIDR, chosen by its --node-index, and
+  # two nodes on the same index means two Macs handing out the same pod
+  # addresses. Until now the operator picked that number by hand and the token
+  # printed one that was correct at the moment it was printed -- so a token used
+  # twice, or used after another Mac joined, partitioned the pod network
+  # silently.
+  #
+  # A joining Mac can pick a free index itself if it can see which are taken.
+  # That is a read of the node list, and a bootstrap token is already an
+  # authenticated identity, so it gets exactly that and nothing else.
+  kubectl create clusterrole ferry-node-index \
+    --verb=list --resource=nodes >/dev/null 2>&1
+  kubectl create clusterrolebinding ferry-node-index \
+    --clusterrole=ferry-node-index \
+    --group=system:bootstrappers:ferry >/dev/null 2>&1
+
   # A joining Mac trusts nothing yet, so it cannot fetch the CA over a verified
   # connection -- and the CA is not on the wire either, because the API server
   # serves only its own certificate. So the CA is published where anyone can read
@@ -1183,24 +1599,26 @@ EOF
   kubectl create rolebinding ferry-cluster-info -n kube-public \
     --role=ferry-cluster-info --user=system:anonymous >/dev/null 2>&1
 
-  local hash count index
+  local hash token server
   hash="$(openssl x509 -pubkey -in "$FERRY_HOME/pki/ca.crt" \
           | openssl pkey -pubin -outform der 2>/dev/null \
           | openssl dgst -sha256 -hex | awk '{print $NF}')"
-  count="$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-  index="$count"
+  token="$(ferry_token_encode "$hash" "$id" "$secret")"
+  server="$LAN_IP:$(( 6443 + PORT_SHIFT ))"
 
   bold "join token"
   echo
-  echo "  On the other Mac, in a ferry checkout with the binaries copied over:"
+  echo "  On the other Mac:"
   echo
-  echo "    ./ferry join --server $LAN_IP:$(( 6443 + PORT_SHIFT )) \\"
-  echo "      --token $id.$secret \\"
-  echo "      --ca-hash sha256:$hash \\"
-  echo "      --node-index $index"
+  echo "    curl -sfL $FERRY_INSTALL_URL | \\"
+  echo "      FERRY_URL=$server FERRY_TOKEN=$token sh -"
   echo
-  echo "  The token is good for 24 hours. Each node needs its own --node-index;"
-  echo "  it decides which /24 of $CLUSTER_CIDR that node's pods come from."
+  echo "  Or, if that Mac already has ferry:"
+  echo
+  echo "    ferry join --server $server --token $token"
+  echo
+  echo "  Good for 24 hours, and reusable -- each Mac claims a free slice of"
+  echo "  $CLUSTER_CIDR for its own pods when it joins."
 }
 
 # Join this Mac to a cluster running on another.
@@ -1216,15 +1634,45 @@ cmd_join() {
       *) bad "unknown option $1"; return 2 ;;
     esac
   done
-  [ -n "$server" ] && [ -n "$token" ] && [ -n "$index" ] || {
-    bad "usage: ferry join --server <host:6443> --token <id.secret> --ca-hash sha256:<hash> --node-index <n>"
+  [ -n "$server" ] && [ -n "$token" ] || {
+    bad "usage: ferry join --server <host:6443> --token <token from 'ferry token create'>"
     return 2; }
+
+  # ferry builds "https://$server" itself, so a server given with a scheme
+  # produces https://https://mac1:6443 and fails with "could not read
+  # cluster-info", which sends people to look at their token. Half the places
+  # this address is typed are prose -- an installer environment variable, a
+  # README -- and https:// in front of a host:port is what anyone would write.
+  case "$server" in
+    https://*) server="${server#https://}" ;;
+    http://*)  server="${server#http://}" ;;
+  esac
+  server="${server%/}"
+
+  # A one-piece token carries the CA hash with it. The three-flag form still
+  # works, because a token minted by an older ferry is still a valid bootstrap
+  # token and refusing it would strand a cluster mid-upgrade.
+  local decoded
+  if decoded="$(ferry_token_decode "$token")"; then
+    ca_hash="sha256:${decoded%% *}"
+    token="${decoded#* }"
+  elif [ -z "$ca_hash" ]; then
+    bad "that does not look like a token from 'ferry token create'"
+    echo "    A token looks like F10<64 hex>::<id>.<secret>. If you have the older"
+    echo "    three-part form, pass it as --token <id.secret> --ca-hash sha256:<hash>."
+    return 2
+  fi
   node_name="${node_name:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
 
+  # An installed release carries these; a checkout has to have built them.
   for binary in ferry-cri kubelet ferry-streamer; do
-    [ -x "$here/bin/$binary" ] || { bad "bin/$binary is missing; copy it from the first Mac"; return 1; }
+    [ -x "$here/bin/$binary" ] || {
+      bad "bin/$binary is missing -- run 'ferry build', or install a release: curl -sfL $FERRY_INSTALL_URL | sh -"
+      return 1; }
   done
-  [ -f "$KERNEL" ] || { bad "no guest kernel at $KERNEL; copy it from the first Mac"; return 1; }
+  [ -f "$KERNEL" ] || {
+    bad "no guest kernel at $KERNEL -- run 'ferry kernel', or install a release: curl -sfL $FERRY_INSTALL_URL | sh -"
+    return 1; }
 
   # macOS grants access to the local network per launching session, and an SSH
   # session ends when the command returns. A node started over SSH therefore runs
@@ -1289,10 +1737,91 @@ users:
   user: {token: "$token"}
 EOF
 
+  # Which /24 of the cluster CIDR this Mac's pods come from.
+  #
+  # Asked for now, with the bootstrap credential, because the answer has to be
+  # right before ferry-cri starts handing out addresses -- by the time the
+  # kubelet has its own certificate the runtime is already running on whatever
+  # slice it was told.
+  if [ -z "$index" ]; then
+    index="$(free_node_index "$FERRY_RUN/bootstrap.conf")" || {
+      bad "could not work out which pod network slice is free on $server"
+      echo
+      echo "    Every Mac owns one /24 of $CLUSTER_CIDR, and two on the same one"
+      echo "    hand out the same pod addresses. ferry reads the other nodes'"
+      echo "    ferry.dev/node-index labels to find a free one -- but nodes that"
+      echo "    joined before those labels existed do not carry one, and it will"
+      echo "    not guess where guessing can partition the network."
+      echo
+      echo "    Check what is in use, then pick one no node holds:"
+      echo "        kubectl get nodes -L ferry.dev/node-index"
+      echo "        ferry join --server $server --token <token> --node-index <n>"
+      return 1; }
+    ok "claiming node index $index, so these pods come from $(node_slice "$index")"
+  fi
+
   NODE_NAME="$node_name"
   NODE_INDEX="$index"
   RELAY_PORT=$((RELAY_PORT))
+  clear_stopped
+  echo worker > "$FERRY_HOME/role"
   start_worker "$node_name" "$index" || return 1
+}
+
+# The /24 of the cluster CIDR an index owns. For saying so out loud; ferry-cri
+# does the real arithmetic.
+node_slice() { # index
+  local base="${CLUSTER_CIDR%%/*}"
+  printf '%s.%s.%s.0/24\n' "$(echo "$base" | cut -d. -f1)" "$(echo "$base" | cut -d. -f2)" "$1"
+}
+
+# The lowest index no node in the cluster holds, and no node on this Mac holds.
+#
+# Both halves are needed and neither is enough. The cluster knows what other
+# Macs took, through the ferry.dev/node-index label each kubelet registers with.
+# This Mac knows what its own 'ferry node add' nodes took, including ones whose
+# kubelet has not registered yet -- a node that is starting has a pid file and
+# no node object, and handing its index to someone else is exactly the race this
+# has to avoid.
+#
+# Nodes that predate the label are counted as index 0, which is what they are:
+# a single-Mac cluster's 'ferry up' node.
+free_node_index() { # [kubeconfig]
+  local listing taken index
+  # custom-columns rather than jsonpath: an unlabelled node prints "<none>",
+  # where jsonpath prints nothing at all and the empty field disappears into the
+  # separators around it. The distinction matters -- an unlabelled node is a
+  # node holding index 0, not a node holding none.
+  listing="$(KUBECONFIG="${1:-$(kube_config)}" kubectl get nodes --no-headers \
+              -o 'custom-columns=I:.metadata.labels.ferry\.dev/node-index' 2>/dev/null)" \
+    || return 1
+  [ -n "$listing" ] || return 1
+
+  # A node only gets this label when its kubelet *creates* the node object, so
+  # every node in a cluster that predates the label stays unlabelled for the
+  # life of that node -- restarting the kubelet does not add it.
+  #
+  # One unlabelled node is readable: it is the 'ferry up' node, which is index
+  # 0. Two or more are not. Counting them all as 0 would report 1 as the lowest
+  # free index in a cluster whose second Mac already owns 1, and hand a joining
+  # Mac a /24 that is in use -- which is precisely the silent partition this
+  # function exists to stop, reintroduced by the code meant to stop it. So it
+  # declines to guess, and the caller asks for --node-index.
+  local unlabelled
+  unlabelled="$(echo "$listing" | grep -c '<none>')"
+  [ "$unlabelled" -gt 1 ] && return 1
+
+  taken=" $(echo "$listing" | sed 's/<none>/0/' | tr '\n' ' ')"
+  for index in $(seq 0 200); do
+    case "$taken" in *" $index "*) continue ;; esac
+    # Ones this Mac has started but the cluster has not seen yet. A node whose
+    # kubelet is still coming up has a pid file and no node object, and handing
+    # its index to a second node is exactly the race this exists to avoid.
+    [ -f "$FERRY_RUN/node-$index.pid" ] && continue
+    [ "$index" = 0 ] && [ -f "$FERRY_RUN/ferry-cri.pid" ] && continue
+    echo "$index"; return 0
+  done
+  return 1
 }
 
 # The parts of a node that are not the control plane: a runtime, a streamer and
@@ -1360,7 +1889,7 @@ authorization: {mode: Webhook}
 EOF
 
   start_kubelet "$name" "$FERRY_RUN" "$FERRY_RUN/kubelet.conf" \
-    "$FERRY_RUN/kubelet.pid" "$FERRY_RUN/logs/kubelet.log" "$FERRY_RUN/bootstrap.conf"
+    "$FERRY_RUN/kubelet.pid" "$FERRY_RUN/logs/kubelet.log" "$FERRY_RUN/bootstrap.conf" "$index"
 
   for _ in $(seq 1 120); do
     [ -f "$FERRY_RUN/kubelet.conf" ] && break
@@ -1578,13 +2107,25 @@ wait_node_version() { # name version seconds
 # the config file. Written once here so that restarting a kubelet during an
 # upgrade brings back exactly the process that was there, rather than a fourth
 # transcription of the same argument list.
-start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfig]
+start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfig] [node-index]
   local name="$1" run="$2" kubeconfig="$3" pidfile="$4" logfile="$5" bootstrap="${6:-}"
+  local index="${7:-}"
+  # The node publishes which /24 of the cluster CIDR it owns, so the next Mac to
+  # join can pick one that is free instead of being told a number by hand. The
+  # label is registered by the kubelet itself, at the moment the node object is
+  # created, which is the only point early enough to be race-free.
+  #
+  # It also says which mode it is. docs/MACHINES.md specifies
+  # `nodeSelector: {ferry.dev/mode: shared}` as how a pod chooses between a
+  # kernel of its own and a shared one -- and that selector matched nothing,
+  # because no node carried the label on either side. A Mac node is always
+  # vm-per-pod: that is what ferry-cri does.
   FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
   "$here/bin/kubelet" \
     --config="$run/kubelet.yaml" \
     ${bootstrap:+--bootstrap-kubeconfig="$bootstrap"} \
     --kubeconfig="$kubeconfig" \
+    --node-labels="ferry.dev/mode=vm-per-pod${index:+,ferry.dev/node-index=$index}" \
     --hostname-override="$name" --root-dir="$run/kubelet" \
     --cert-dir="$run/pki" --v=2 >"$logfile" 2>&1 &
   echo $! > "$pidfile"
@@ -1671,6 +2212,31 @@ etcd_restore() { # snapshot
 # one.
 upgrade_preflight() { # from to
   local from="$1" to="$2" fatal=0
+
+  # An installed release cannot move Kubernetes, and the reason is the kubelet.
+  # The control plane and etcd are downloads, so those would be fine; the
+  # kubelet is compiled here from a patched Kubernetes tree, and a release
+  # carries neither the tree nor a toolchain to build it with.
+  #
+  # This is checked first because the alternative is finding out several minutes
+  # in, from build-kubelet.sh, after a snapshot has already been taken.
+  #
+  # It is also not much of a limitation: moving Kubernetes by installing a newer
+  # ferry is how k3s works too, and a release pins one Kubernetes on purpose --
+  # the kubelet, ferry-proxyd, the control plane and etcd are built and tested
+  # together.
+  if is_release; then
+    bad "this is an installed ferry $(ferry_release_version), which cannot build a kubelet"
+    echo
+    echo "    A release carries one Kubernetes, built and tested as a set. To move"
+    echo "    to another, install a ferry release that carries it:"
+    echo "        curl -sfL $FERRY_INSTALL_URL | sh -"
+    echo
+    echo "    Or build from source, where any version is a build input:"
+    echo "        git clone https://github.com/imaustink/ferry && cd ferry"
+    echo "        ./ferry upgrade plan $to"
+    return 1
+  fi
 
   if ! ferry_version_valid "$to"; then
     bad "$to is not a version like v1.34.0"; return 1
@@ -2028,7 +2594,7 @@ cmd_upgrade_node() {
   stop_kubelet "$pidfile"
   ok "kubelet stopped, runtime left up"
 
-  start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap"
+  start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap" "$index"
   if wait_node_version "$name" "$target" 120; then
     ok "node Ready, kubelet $target"
   else
@@ -2308,6 +2874,9 @@ cmd_down() {
     *) bad "usage: ferry down [--purge]"; return 2 ;;
   esac
   bold "stopping ferry"
+  # Written before anything is stopped, so the login agent's watch loop cannot
+  # see the processes go and exit non-zero before it knows this was deliberate.
+  mark_stopped
   # ferry-proxy runs as root, so stopping it does too.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
     sudo kill -TERM "$(cat "$FERRY_RUN/ferry-proxy.pid")" 2>/dev/null \
@@ -2330,6 +2899,10 @@ cmd_down() {
     rm -f "/tmp/ferry-cri-$index.sock" "/tmp/ferry-exec-$index.sock" "/tmp/ferry-str-$index.sock"
     ok "node $index stopped"
   done
+
+  # Mode 2 first: a machine is a VM holding pods, and it should go down before
+  # the control plane it reports to does.
+  stop_machines
 
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
     local pidfile="$FERRY_RUN/$component.pid"
@@ -2369,6 +2942,557 @@ cmd_down() {
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK"
 }
 
+# kube-proxy and CoreDNS for machines.
+#
+# Both are pinned to `ferry.dev/mode: shared` so they never land on the Mac
+# node, where kube-proxy would be a pod VM programming a node kernel that does
+# not exist and CoreDNS would be a second copy serving an audience that cannot
+# reach it.
+#
+# Applied at 'machines enable' rather than at 'ferry up': they are only useful
+# once there is somewhere for them to run, and until a machine exists they would
+# sit Pending against a selector nothing matches.
+install_machine_dns() {
+  local rendered="$FERRY_RUN/machines-dns.yaml"
+  mkdir -p "$FERRY_RUN"
+  local advertise="$LAN_IP"
+  [ "$advertise" = "127.0.0.1" ] && advertise="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null || echo 127.0.0.1)"
+
+  # The `---` between them is load-bearing. A YAML file need not end with a
+  # document separator, so concatenating two of them runs the last document of
+  # the first into the first document of the second: the kube-proxy DaemonSet
+  # and the CoreDNS ServiceAccount merge into one object that is neither, and
+  # kube-proxy is silently never created. What that looks like from outside is
+  # machines whose pods cannot resolve anything, with a manifest that applies
+  # without error.
+  { cat "$here/manifests/machines/kube-proxy.yaml"; echo "---"
+    cat "$here/manifests/machines/coredns.yaml"; } \
+    | sed -e "s|__CLUSTER_DOMAIN__|$CLUSTER_DOMAIN|g" \
+          -e "s|__UPSTREAM_DNS__|$(host_resolvers)|g" \
+          -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
+          -e "s|__KUBE_PROXY_IMAGE__|$MACHINE_KUBE_PROXY_IMAGE|g" \
+          -e "s|__CLUSTER_CIDR__|$CLUSTER_CIDR|g" \
+          -e "s|__DNS_SERVICE_IP__|$MACHINE_DNS_IP|g" \
+          -e "s|__APISERVER_HOST__|$advertise|g" \
+          -e "s|__APISERVER_PORT__|$(( 6443 + PORT_SHIFT ))|g" \
+    > "$rendered"
+
+  # The Service may already exist at a different address, and a ClusterIP is
+  # immutable -- so an apply that would move it fails, rather than silently
+  # leaving machines pointed at an address nothing serves.
+  local existing
+  existing="$(kube get service kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+  if [ -n "$existing" ] && [ "$existing" != "$MACHINE_DNS_IP" ]; then
+    bad "kube-dns already exists at $existing, not $MACHINE_DNS_IP"
+    echo "    A Service's ClusterIP cannot be changed. Either set"
+    echo "    FERRY_MACHINE_DNS_IP=$existing, or delete the Service and re-enable:"
+    echo "        kubectl -n kube-system delete service kube-dns"
+    return 1
+  fi
+
+  kube apply -f "$rendered" >/dev/null 2>&1 \
+    || { bad "could not apply kube-proxy and CoreDNS for machines"; return 1; }
+  ok "kube-proxy and cluster DNS for machines ($MACHINE_DNS_IP)"
+  echo "      they stay Pending until a machine exists to run them on"
+}
+
+# --- mode 2 -----------------------------------------------------------------
+cmd_machines_enable() {
+  require_cluster || return 1
+  bold "turning on machines (mode 2)"
+  machines_ready || return 1
+
+  if running ferry-machined; then
+    warn "machines are already running"
+  else
+    start_machines || return 1
+  fi
+  : > "$MACHINES_MARKER"
+  echo
+  bold "machines are on"
+  echo "  They come back with the cluster; 'ferry machines disable' turns them off."
+  echo
+  # No node.labels in this example. That is MACHINES.md's design rather than
+  # what was built: the CRD has no node field, so a structural schema prunes it
+  # without a word and the labels would quietly do nothing. ferry-machined
+  # applies ferry.dev/mode=shared itself once the node registers.
+  echo "  Declare one:"
+  echo "    kubectl apply -f - <<'EOF'"
+  echo "    apiVersion: ferry.dev/v1alpha1"
+  echo "    kind: Machine"
+  echo "    metadata: {name: worker-0}"
+  echo "    spec: {cpus: 2, memory: 2Gi}"
+  echo "    EOF"
+  echo
+  echo "    kubectl get machines"
+  echo "    kubectl get nodes -L ferry.dev/mode"
+  echo
+  echo "  Pods choose with nodeSelector: {ferry.dev/mode: shared}"
+}
+
+cmd_machines_disable() {
+  bold "turning off machines"
+  # The marker first, so a crash between here and the kills does not leave a
+  # cluster that restarts machines its operator just turned off.
+  rm -f "$MACHINES_MARKER"
+  stop_machines
+  echo
+  echo "  Machine objects and the CRD are left alone; deleting a Machine is how"
+  echo "  its node and disk go away. The node image and $NODE_DISK are kept."
+}
+
+stop_machines() {
+  local component pidfile pid
+  for component in ferry-machined ferry-node; do
+    pidfile="$FERRY_RUN/$component.pid"
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile")"; rm -f "$pidfile"
+    kill -TERM "$pid" 2>/dev/null || continue
+    # ferry-node has to release its vmnet network before another run can claim
+    # the same subnet, exactly as ferry-cri does.
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$pid" 2>/dev/null
+    ok "$component stopped"
+  done
+}
+
+cmd_machines_status() {
+  bold "machines (mode 2)"
+  if machines_enabled; then ok "enabled for this cluster"
+  else bad "not enabled -- ferry machines enable"; fi
+  for component in ferry-machined ferry-node; do
+    if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
+    else bad "$component"; fi
+  done
+  # Telling someone on a release to run 'ferry node-image' is telling them to
+  # run a command that refuses on a release. What to do differs by where you
+  # are, so the answer does too.
+  if [ -d "$NODE_IMAGE_LAYOUT" ]; then
+    ok "node image $NODE_IMAGE_LAYOUT"
+  elif is_release; then
+    bad "no node image -- this release was packaged without one"
+    echo "      mode 2 needs a release built with it; mode 1 is unaffected"
+  else
+    bad "no node image -- ferry node-image   (slow, needs docker)"
+  fi
+  [ -f "$NODE_DISK" ] && ok "node disk $NODE_DISK ($(du -h "$NODE_DISK" | awk '{print $1}') used)" \
+    || echo "  node disk not unpacked yet; the first 'machines enable' does it"
+  echo "  network   $MACHINE_SUBNET"
+  if have_cluster; then
+    echo
+    kube get machines 2>/dev/null || echo "  no Machine CRD installed yet"
+  fi
+}
+
+cmd_machines() {
+  case "${1:-status}" in
+    enable|on)   shift; cmd_machines_enable ;;
+    disable|off) shift; cmd_machines_disable ;;
+    status)      shift; cmd_machines_status ;;
+    ls|list)     shift; kube get machines ;;
+    *) bad "usage: ferry machines [enable|disable|status|ls]"; return 2 ;;
+  esac
+}
+
+# --- starting at login ----------------------------------------------------
+#
+# k3s installs a systemd unit and the cluster is simply there after a reboot.
+# The macOS equivalent is a LaunchAgent, and it has to be an *Agent* rather than
+# a Daemon for reasons that are not cosmetic:
+#
+#   - Virtualization.framework will not create a VM from a process outside a
+#     user session, so a LaunchDaemon running before login cannot start a pod.
+#   - macOS grants local network access per session. ferry already knows what
+#     that costs: 'ferry join' refuses to run over SSH because a node started
+#     from a session that ends loses the network a few seconds later. A
+#     LaunchAgent lives in the login session, which is a session that stays.
+#
+# So the cluster comes up at login rather than at boot. On a Mac that is logged
+# in and stays logged in -- which is what a Mac running a cluster is -- the
+# difference is invisible. On one that reboots to the login window, the cluster
+# waits there, and that is the honest behaviour rather than a daemon that starts
+# and cannot make a VM.
+#
+# The agent is per profile, so a worktree's cluster and the main one do not
+# fight over one plist.
+service_label()  { echo "dev.ferry.${PROFILE}"; }
+service_plist()  { echo "$HOME/Library/LaunchAgents/$(service_label).plist"; }
+
+cmd_service_install() {
+  local quiet=""
+  [ "${1:-}" = --quiet ] && quiet=1
+  local plist; plist="$(service_plist)"
+  mkdir -p "$(dirname "$plist")"
+
+  # launchd gives an agent almost no environment, and ferry shells out to
+  # kubectl, openssl and curl. kubectl is the one that matters: cmd_up waits on
+  # the node going Ready with it, and installs CoreDNS with it. Without it on
+  # PATH the login-started cluster times out waiting for a node that is actually
+  # fine, and comes up with no DNS -- reported as a failure nowhere near its
+  # cause.
+  #
+  # So the directory kubectl is actually in is recorded, not guessed. The
+  # installer puts it beside the launcher, and falls back to ~/.local/bin
+  # whenever /usr/local/bin is not writable, which is stock macOS.
+  local launcher="$here/ferry" path kubectl_dir=""
+  kubectl_dir="$(command -v kubectl 2>/dev/null)"
+  [ -n "$kubectl_dir" ] && kubectl_dir="$(cd "$(dirname "$kubectl_dir")" && pwd)"
+  path="$(dirname "$launcher")"
+  [ -n "$kubectl_dir" ] && path="$path:$kubectl_dir"
+  [ -n "${FERRY_BIN_DIR:-}" ] && path="$path:$FERRY_BIN_DIR"
+  path="$path:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+  if [ -z "$kubectl_dir" ]; then
+    warn "kubectl is not on your PATH; the login-started cluster will not find one either"
+  fi
+
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(service_label)</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$launcher</string>
+    <string>service</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$path</string>
+    <key>FERRY_PROFILE</key><string>$PROFILE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart a cluster that died, but not one that was stopped on purpose.
+       launchd cannot tell those apart -- both end with the processes gone --
+       so 'ferry service run' decides, and exits 0 when 'ferry down' left its
+       marker behind. An agent that came back from 'ferry down' could never be
+       turned off. -->
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>$FERRY_HOME/logs/service.log</string>
+  <key>StandardErrorPath</key><string>$FERRY_HOME/logs/service.log</string>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+PLIST
+  mkdir -p "$FERRY_HOME/logs"
+  [ -n "$quiet" ] || ok "wrote $plist"
+
+  # bootstrap loads the job, and RunAtLoad starts it -- so this does start a
+  # cluster, and pretending otherwise is how the installer ended up racing
+  # itself. 'ferry service run' is written to cope: it holds a cluster that is
+  # already up rather than failing on it, so registering the agent before,
+  # during or after 'ferry up' all converge on one running cluster.
+  launchctl bootout "gui/$(id -u)/$(service_label)" 2>/dev/null
+  if launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    [ -n "$quiet" ] || ok "registered; the cluster starts now and at every login"
+  else
+    # bootstrap fails if the agent is already loaded, which is not an error
+    # worth reporting to someone reinstalling.
+    launchctl enable "gui/$(id -u)/$(service_label)" 2>/dev/null
+    [ -n "$quiet" ] || warn "could not register the agent with launchd; 'ferry up' still works"
+  fi
+}
+
+cmd_service_uninstall() {
+  local plist; plist="$(service_plist)"
+  launchctl bootout "gui/$(id -u)/$(service_label)" 2>/dev/null
+  if [ -f "$plist" ]; then rm -f "$plist"; ok "removed $plist"
+  else ok "no login agent was registered"; fi
+}
+
+cmd_service_status() {
+  local plist; plist="$(service_plist)"
+  bold "ferry service ($(service_label))"
+  if [ ! -f "$plist" ]; then
+    bad "not registered -- ferry will not start at login"
+    echo "      register it: ferry service install"
+    return 1
+  fi
+  ok "$plist"
+  if launchctl print "gui/$(id -u)/$(service_label)" >/dev/null 2>&1; then
+    ok "loaded by launchd"
+  else
+    bad "not loaded -- ferry service install"
+  fi
+  echo "  log  $FERRY_HOME/logs/service.log"
+}
+
+# What launchd runs. Starts the cluster and stays in the foreground holding it,
+# because launchd tracks a job by its process: a script that starts the cluster
+# in the background and exits looks to launchd like a job that finished, and
+# with KeepAlive it would be started again immediately, forever.
+cmd_service_run() {
+  # Nothing to do if no cluster was ever made here, or one was torn down with
+  # --purge.
+  if [ ! -f "$FERRY_HOME/pki/ca.crt" ] && [ ! -f "$FERRY_RUN/kubelet.conf" ]; then
+    echo "no cluster has been created on this Mac yet; nothing to start"
+    exit 0
+  fi
+
+  # A Mac that joined someone else's cluster cannot be restarted from here.
+  #
+  # Its kubelet's certificate, its kubeconfig and its bootstrap config all live
+  # under FERRY_RUN, which is /tmp -- deliberately, because macOS caps a unix
+  # socket path near 104 bytes and the kubelet builds its podresources socket
+  # beneath --root-dir. /tmp does not survive a reboot, so by the time this runs
+  # at the next login the node's credentials are gone and the only way back is
+  # to bootstrap again with a fresh token.
+  #
+  # Calling cmd_up here would be much worse than doing nothing: it would start a
+  # *control plane* on a machine that is supposed to be a worker, with its own
+  # etcd and its own idea of the cluster.
+  if [ "$(cat "$FERRY_HOME/role" 2>/dev/null)" = worker ] && [ ! -f "$FERRY_RUN/kubelet.conf" ]; then
+    echo "this Mac joined a cluster on another, and a worker's credentials live"
+    echo "in $FERRY_RUN, which does not survive a reboot."
+    echo "Rejoin from a Terminal window on this Mac:"
+    echo "    ferry join --server <host:6443> --token <token from 'ferry token create'>"
+    exit 0
+  fi
+
+  # launchd sends SIGTERM when the session ends or the job is booted out. Taking
+  # the cluster down properly matters more here than anywhere else: ferry-cri
+  # has to release its vmnet network, and a subnet left claimed by a killed
+  # runtime stays claimed for about a minute -- so an unclean stop moves the pod
+  # network on the next start.
+  trap 'echo "stopping"; cmd_down; exit 0' TERM INT
+
+  # A cluster that is already up is held, not started again. Without this,
+  # registering the agent on a running cluster -- which is what re-running the
+  # installer does -- makes cmd_up refuse with "already up", which is a non-zero
+  # exit, which is the KeepAlive condition: launchd would restart this every few
+  # seconds forever against a perfectly healthy cluster.
+  if running ferry-cri && running kubelet; then
+    echo "cluster is already up; holding it"
+  else
+    cmd_up || exit 1
+  fi
+
+  # Hold the job open, and notice if the cluster falls over underneath it. An
+  # exit here is a non-zero exit, which is the KeepAlive condition, so launchd
+  # brings it back.
+  #
+  # The sleep is short because bash runs a trap only after the foreground child
+  # returns: whatever this waits on is added to how long the SIGTERM handler
+  # takes to start, and launchd follows SIGTERM with SIGKILL after 20 seconds.
+  # Being killed there means ferry-cri never releases its vmnet network, and a
+  # subnet left claimed stays claimed for about a minute -- so the pod network
+  # moves on the next start. Five seconds leaves ample room for the teardown.
+  while running ferry-cri && running kubelet; do sleep 5; done
+
+  # Which kind of stop this was decides whether launchd brings it back. 'ferry
+  # down' is the whole reason this distinction exists: without it, stopping the
+  # cluster by hand is undone five seconds later and ferry cannot be turned off.
+  if was_stopped; then
+    echo "cluster was stopped with 'ferry down'; not restarting it"
+    exit 0
+  fi
+  echo "ferry-cri or the kubelet stopped on their own; exiting so launchd restarts the cluster"
+  exit 1
+}
+
+cmd_service() {
+  case "${1:-status}" in
+    install)   shift; cmd_service_install "$@" ;;
+    uninstall) shift; cmd_service_uninstall ;;
+    status)    shift; cmd_service_status ;;
+    run)       shift; cmd_service_run ;;
+    *) bad "usage: ferry service [install|uninstall|status]"; return 2 ;;
+  esac
+}
+
+# --- removing ferry --------------------------------------------------------
+#
+# The counterpart to install.sh, and the reason it is a command rather than a
+# script the installer drops somewhere: ferry knows where its state is, and that
+# is per profile.
+cmd_uninstall() {
+  local purge="" yes=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1; shift ;;
+      --yes|-y) yes=1; shift ;;
+      *) bad "usage: ferry uninstall [--purge] [--yes]"; return 2 ;;
+    esac
+  done
+
+  # Before anything, including the prompt. This guard was written below, next to
+  # the `rm -rf "$FERRY_HOME"` it protects, which made it useless: `cmd_down
+  # --purge` runs first and is itself destructive -- it deletes $FERRY_HOME/etcd
+  # through control-plane/down.sh, plus $FERRY_HOME/version and version.previous.
+  # With FERRY_HOME=$HOME those three are gone by the time the guard downstairs
+  # says it is refusing. A guard on the last destructive step is not a guard.
+  if [ -n "$purge" ]; then
+    [ -n "${FERRY_HOME:-}" ] && [ "$FERRY_HOME" != "/" ] && [ "$FERRY_HOME" != "$HOME" ] \
+      || { bad "refusing to purge FERRY_HOME='${FERRY_HOME:-}'"; return 1; }
+  fi
+
+  bold "uninstalling ferry ($PROFILE)"
+  echo "  stops the cluster, removes the login agent, and unlinks the CLI"
+  if [ -n "$purge" ]; then
+    echo "  --purge also deletes $FERRY_HOME -- etcd, the cluster's certificates,"
+    echo "  and every object in it. There is no undo and no backup taken."
+  else
+    echo "  $FERRY_HOME is kept, so reinstalling brings the same cluster back."
+  fi
+  echo
+  if [ -z "$yes" ]; then
+    printf '  type the word yes to continue: '
+    local answer; read -r answer
+    [ "$answer" = yes ] || { echo "  nothing was changed"; return 1; }
+  fi
+  echo
+
+  # The agent goes first. launchd restarts a cluster whose processes vanish, so
+  # tearing one down while its agent is still loaded is a race against a
+  # relaunch -- and the relaunch wins, because cmd_down's waits give it time.
+  cmd_service_uninstall
+  cmd_down ${purge:+--purge} || true
+
+  # The launcher, but only when it is a link to the ferry that is running right
+  # now. A prefix match on the install directory would be close enough and is
+  # not the same thing: someone else's ferry on the PATH is not ours to delete,
+  # and this is the one step here that removes a file outside ferry's own
+  # directories. Resolving and comparing is exact.
+  local dir link
+  for dir in /usr/local/bin "$HOME/.local/bin" "${FERRY_BIN_DIR:-}"; do
+    [ -n "$dir" ] && [ -L "$dir/ferry" ] || continue
+    link="$(readlink "$dir/ferry")"
+    case "$link" in
+      /*) : ;;
+      *) link="$(cd "$dir" && pwd)/$link" ;;
+    esac
+    if [ "$(cd "$(dirname "$link")" 2>/dev/null && pwd)" = "$here" ]; then
+      rm -f "$dir/ferry"
+      ok "unlinked $dir/ferry"
+    fi
+  done
+
+  if [ -n "$purge" ]; then
+    rm -rf "$FERRY_HOME"
+    ok "removed $FERRY_HOME"
+  else
+    echo "  kept $FERRY_HOME"
+  fi
+
+  # The release itself goes last, and is left for the person to remove: this
+  # script is executing out of that directory, and deleting it from underneath
+  # a running bash produces failures that are very hard to read.
+  #
+  # Where it is comes from $here rather than from FERRY_INSTALL_DIR. That
+  # variable is an input to install.sh, set once at install time and gone by the
+  # time anybody runs uninstall, so reading it here names the default and misses
+  # every install that used something else. ferry is standing in the directory;
+  # it does not need to guess. $here is .../ferry-dist/current, so the
+  # installation is its parent.
+  if is_release; then
+    local dist; dist="$(cd "$here/.." 2>/dev/null && pwd)"
+    echo
+    if [ -n "$dist" ] && [ -d "$dist/versions" ]; then
+      echo "  The releases themselves are still at $dist. To remove them:"
+      echo "      rm -rf $dist"
+    else
+      echo "  This release is still at $here. To remove it:"
+      echo "      rm -rf $here"
+    fi
+  fi
+  echo
+  bold "done"
+}
+
+# Where the admin credentials are, and optionally putting them where kubectl
+# looks by default.
+#
+# 'export KUBECONFIG=...' is a line every Kubernetes distribution makes people
+# paste, and the one people forget when they open a second terminal. Merging is
+# the offer, not the default: ~/.kube/config is usually pointed at clusters that
+# matter, and an installer that rewrites it uninvited is an installer that
+# eventually breaks someone's day.
+cmd_kubeconfig() {
+  local conf="$FERRY_HOME/admin.conf"
+  case "${1:-}" in
+    "") echo "$conf"; return 0 ;;
+    --merge) : ;;
+    *) bad "usage: ferry kubeconfig [--merge]"; return 2 ;;
+  esac
+
+  [ -f "$conf" ] || { bad "no cluster on this Mac yet -- run: ferry up"; return 1; }
+  command -v kubectl >/dev/null || { bad "kubectl is not installed"; return 1; }
+
+  local context="ferry${SUFFIX}"
+  local target="${KUBECONFIG:-$HOME/.kube/config}"
+  # KUBECONFIG can be a list; the first entry is where kubectl writes, so that
+  # is the file being merged into and the one to back up.
+  target="${target%%:*}"
+
+  # 'ferry up' prints `export KUBECONFIG=<admin.conf>` and, on the next line,
+  # offers this command. Anyone who followed both in one shell arrives here with
+  # target and source being the same file -- and the merge then backs admin.conf
+  # up, flattens it over itself, renames its context and reports success, while
+  # ~/.kube/config is never touched. It looks exactly like it worked.
+  if [ "$target" = "$conf" ]; then
+    target="$HOME/.kube/config"
+    echo "  KUBECONFIG points at ferry's own admin.conf; merging into $target"
+  fi
+  mkdir -p "$(dirname "$target")"
+
+  if [ -f "$target" ]; then
+    local backup; backup="$target.before-ferry.$(date -u +%Y%m%dT%H%M%SZ)"
+    cp "$target" "$backup"
+    ok "backed up $target to $(basename "$backup")"
+  fi
+
+  # kubectl's own merge, renaming ferry's entries so they cannot collide with a
+  # cluster already called "ferry" in there. Written to a temporary file first:
+  # KUBECONFIG=a:b `kubectl config view --flatten` reads both and a redirect
+  # into one of them truncates it before it is read.
+  local tmp; tmp="$(mktemp)"
+  if KUBECONFIG="$target:$conf" kubectl config view --flatten > "$tmp" 2>/dev/null \
+     && [ -s "$tmp" ]; then
+    mv "$tmp" "$target"
+    chmod 600 "$target"
+  else
+    rm -f "$tmp"
+    bad "could not merge into $target"; return 1
+  fi
+
+  kubectl config rename-context "$(KUBECONFIG="$conf" kubectl config current-context)" \
+    "$context" >/dev/null 2>&1 || true
+  kubectl config use-context "$context" >/dev/null 2>&1
+  ok "merged into $target as context '$context'"
+  echo "  kubectl config use-context $context"
+}
+
+cmd_version() {
+  local release
+  if release="$(ferry_release_version)"; then
+    echo "ferry $release"
+  else
+    echo "ferry (checkout $(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown))"
+  fi
+
+  # Three places know a version, and they are three different facts: what this
+  # Mac's cluster is running, what this copy of ferry carries, and -- before
+  # either exists -- what the release was packaged with. Asked in that order,
+  # because the first one that answers is the one that is true right now.
+  local k8s; k8s="$(ferry_cluster_field kubernetes 2>/dev/null || ferry_active_version)"
+  version_of() { # field
+    ferry_cluster_field "$1" 2>/dev/null && return 0
+    [ -n "$k8s" ] && ferry_manifest_field "$k8s" "$1" 2>/dev/null && return 0
+    [ -f "$here/VERSION" ] && sed -n "s/^$1=//p" "$here/VERSION" | head -1 | grep . && return 0
+    echo unknown
+  }
+  echo "  kubernetes    ${k8s:-not built}"
+  echo "  control plane $(version_of control-plane)"
+  echo "  etcd          $(version_of etcd)"
+  unset -f version_of
+  echo "  profile       $PROFILE"
+  echo "  root          $here"
+  if running kubelet; then echo "  cluster       up"; else echo "  cluster       not running"; fi
+}
+
 cmd_status() {
   bold "ferry status"
   local cluster active
@@ -2387,6 +3511,12 @@ cmd_status() {
     if [ -f "$FERRY_HOME/$component.pid" ] && kill -0 "$(cat "$FERRY_HOME/$component.pid")" 2>/dev/null
     then ok "$component"; else bad "$component"; fi
   done
+  if machines_enabled; then
+    for component in ferry-node ferry-machined; do
+      if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
+      else bad "$component (machines are enabled)"; fi
+    done
+  fi
   echo "  $(count_vms) pod VMs running"
   if [ -f "$FERRY_HOME/admin.conf" ] && running kubelet; then
     echo
@@ -2397,16 +3527,26 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node>"; return 1 ;;
   esac
 }
 
 case "${1:-}" in
   doctor)     shift; cmd_doctor "$@" ;;
-  kernel)     shift; "$here/kernel/build-kernel.sh" "$@" ;;
+  kernel)     shift
+              # A release ships the built kernel and not the script that makes
+              # it, so without this the command fails with a bare "No such file
+              # or directory" -- while usage() still advertises it.
+              if is_release; then
+                bad "this is an installed ferry $(ferry_release_version); it already carries the guest kernel"
+                echo "    Building one needs a checkout and Docker:"
+                echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry kernel"
+                exit 1
+              fi
+              "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
   profile)    shift; cmd_profile ;;
@@ -2427,10 +3567,15 @@ case "${1:-}" in
                 *)   bad "usage: ferry node [add <name>|rm <name>|ls]"; exit 2 ;;
               esac ;;
   upgrade)    shift; cmd_upgrade "$@" ;;
+  machines)   shift; cmd_machines "$@" ;;
+  node-image) shift; cmd_node_image "$@" ;;
+  service)    shift; cmd_service "$@" ;;
+  uninstall)  shift; cmd_uninstall "$@" ;;
   down)       shift; cmd_down "$@" ;;
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
-  kubeconfig) echo "$FERRY_HOME/admin.conf" ;;
+  kubeconfig) shift; cmd_kubeconfig "$@" ;;
+  version|--version) shift; cmd_version ;;
   -h|--help|help|"") usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 1 ;;
 esac

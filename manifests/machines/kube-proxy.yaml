@@ -1,0 +1,108 @@
+# kube-proxy, as a node in mode 2 expects it.
+#
+# Mode 1 does not have this: ferry runs kube-proxy's rule generation on the Mac
+# and pushes the ruleset into each pod's own kernel, because there is no shared
+# node kernel to program. A node VM has one, so the ordinary arrangement works
+# and Services are Kubernetes' problem again rather than ferry's.
+#
+# Cluster DNS depends on it: CoreDNS is reached through a ClusterIP, and nothing
+# answers a ClusterIP until kube-proxy has programmed the node.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferry:kube-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+  - kind: ServiceAccount
+    name: kube-proxy
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  # kube-proxy authenticates with its ServiceAccount token. The API server's
+  # address is given directly rather than through the kubernetes Service,
+  # because that Service is itself something kube-proxy has not programmed yet.
+  kubeconfig: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: ferry
+        cluster:
+          server: https://__APISERVER_HOST__:__APISERVER_PORT__
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    contexts:
+      - name: ferry
+        context: {cluster: ferry, user: kube-proxy}
+    current-context: ferry
+    users:
+      - name: kube-proxy
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+  labels: {k8s-app: kube-proxy}
+spec:
+  selector:
+    matchLabels: {k8s-app: kube-proxy}
+  template:
+    metadata:
+      labels: {k8s-app: kube-proxy}
+    spec:
+      serviceAccountName: kube-proxy
+      # Machines only. The toleration below is deliberately total, so without
+      # this selector the DaemonSet also lands on the Mac node -- where it would
+      # become a pod VM whose whole job is to program a node kernel that ferry
+      # does not have one of, duplicating what ferry-proxyd already does for
+      # mode 1.
+      nodeSelector: {ferry.dev/mode: shared}
+      # It programs the node's own netfilter tables, so it runs in the node's
+      # network namespace with the privileges to do so.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: kube-proxy
+          image: __KUBE_PROXY_IMAGE__
+          command:
+            - /usr/local/bin/kube-proxy
+            - --kubeconfig=/var/lib/kube-proxy/kubeconfig
+            - --cluster-cidr=__CLUSTER_CIDR__
+            - --proxy-mode=iptables
+            - --hostname-override=$(NODE_NAME)
+            - --v=2
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: kubeconfig, mountPath: /var/lib/kube-proxy, readOnly: true}
+            - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
+            - {name: xtables-lock, mountPath: /run/xtables.lock}
+      volumes:
+        - name: kubeconfig
+          configMap:
+            name: kube-proxy
+            items: [{key: kubeconfig, path: kubeconfig}]
+        - name: lib-modules
+          hostPath: {path: /lib/modules, type: DirectoryOrCreate}
+        - name: xtables-lock
+          hostPath: {path: /run/xtables.lock, type: FileOrCreate}

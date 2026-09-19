@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
@@ -310,6 +311,7 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 	if node, err := c.kube.CoreV1().Nodes().Get(ctx, m.name, metav1.GetOptions{}); err == nil {
 		status["nodeRef"] = map[string]any{"name": node.Name}
 		status["phase"] = "Running"
+		c.ensureModeLabel(ctx, node)
 		if node.Spec.PodCIDR != "" {
 			m.podCIDR = node.Spec.PodCIDR
 			status["podCIDR"] = node.Spec.PodCIDR
@@ -321,6 +323,40 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 		}
 	}
 	return c.setStatus(ctx, item, status)
+}
+
+// modeLabel says which of ferry's two modes a node is, and is how a pod picks
+// between them: `nodeSelector: {ferry.dev/mode: shared}` for a kernel shared
+// with its neighbours, `vm-per-pod` for one of its own. The Mac node sets
+// vm-per-pod on its own kubelet; a machine's is set here.
+const (
+	modeLabel  = "ferry.dev/mode"
+	modeShared = "shared"
+)
+
+// Applied here rather than through the kubelet's --node-labels, which would be
+// the race-free place to do it, because the kubelet inside a machine is
+// configured from the kernel command line and adding a label there means
+// threading it through ferry-machined, ferry-node, the boot arguments and
+// init.sh for a value that is the same on every machine.
+//
+// The cost of that shortcut is a window between the node registering and the
+// label arriving, up to one reconcile interval, in which a pod selecting
+// `shared` will not schedule here. That is the safe direction: the label is
+// missing rather than wrong, so the scheduler declines to place a pod rather
+// than placing it somewhere it does not belong.
+func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node) {
+	if node.Labels[modeLabel] == modeShared {
+		return
+	}
+	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, modeLabel, modeShared)
+	if _, err := c.kube.CoreV1().Nodes().Patch(ctx, node.Name,
+		types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		// Not fatal: the machine is running and useful, it just will not match
+		// a selector yet. Logged because a node that never gets the label is a
+		// pod that never schedules, and that is hard to diagnose from outside.
+		log.Printf("machine %s: could not label node %s: %v", node.Name, modeLabel, err)
+	}
 }
 
 func (c *controller) setStatus(ctx context.Context, item *unstructured.Unstructured, status map[string]any) error {
