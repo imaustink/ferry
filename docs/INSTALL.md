@@ -279,16 +279,37 @@ in this tree:
 
 1. **DNS.** A `CNAME` record for `get.ferry.kurpuis.com` pointing at
    `imaustink.github.io`. Not an `A` record and not the apex — a nested
-   subdomain as a `CNAME` is exactly the supported case.
+   subdomain as a `CNAME` is exactly the supported case. This one is declared
+   in the homelab repository as an ExternalName Service that ExternalDNS turns
+   into the record.
 2. **Pages source.** In the repository's Settings → Pages, set the source to
-   **GitHub Actions**. The workflow cannot set this itself.
-3. Push to `main`, or run the workflow by hand. It writes a `CNAME` file into
-   the published site, which is what binds the domain — a deployment without it
-   resets the domain to `imaustink.github.io` and the install command in the
-   README stops working.
+   **GitHub Actions**. The workflow cannot set this itself: `configure-pages`
+   fails with *"Get Pages site failed… verify that the repository has Pages
+   enabled"* until it is set.
+3. Push to `main`, or run the workflow by hand.
 4. Once DNS resolves, tick **Enforce HTTPS**. GitHub issues a Let's Encrypt
    certificate for the subdomain automatically; it cannot do that until the
    `CNAME` record is in place, so this step comes last.
+
+### The domain is two files that have to agree
+
+The [`CNAME`](../CNAME) file at the root of this repository holds the domain,
+and the workflow copies it into the published site. That copy is what binds the
+domain on GitHub's side, and it has to match the DNS record pointing at Pages.
+
+Keeping the domain in a tracked file rather than in a workflow step is so that
+losing it takes deleting something on purpose. It does **not** remove the
+dependency on the workflow: with the Pages source set to GitHub Actions, the
+published site is only what the job uploads, so nothing in this repository is
+served by itself. A deployment whose artifact lacks `CNAME` resets the domain
+to `imaustink.github.io`, and the site stays up while every install command in
+these docs stops working — which is why a test asserts the file exists, names
+the same host as `install.sh`, and is copied into `_site`.
+
+Serving the file directly, with no workflow at all, would mean switching Pages
+to *Deploy from a branch*. That also needs the served content committed — an
+`index.html` holding a second copy of `install.sh` — which is the drift this
+arrangement exists to avoid.
 
 Until all of that is done, the installer still works by naming the release
 directly:

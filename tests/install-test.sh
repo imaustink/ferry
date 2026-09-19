@@ -284,6 +284,14 @@ contains "a running cluster is held, not started again" \
 # cluster gives it a second etcd and a second idea of the cluster.
 contains "a joined worker is never started as a server" \
   "$(sed -n '/^cmd_service_run/,/^}/p' "$repo/ferry")" "joined a cluster on another"
+# An agent that adopted a running cluster must leave it as it found it.
+# `ferry service uninstall` boots the job out, which is a SIGTERM, so a trap
+# that always calls cmd_down stops a cluster the operator started by hand --
+# removing a plist tore down a healthy cluster, seconds later.
+service_run_src="$(sed -n '/^cmd_service_run/,/^}/p' "$repo/ferry")"
+contains "an adopted cluster is left running when the agent is stopped" \
+  "$service_run_src" "adopted it rather than starting it"
+contains "and the agent records which of the two it did" "$service_run_src" "adopted=1"
 echo
 
 # --- the agent's environment ----------------------------------------------
@@ -438,6 +446,14 @@ contains "and keeps its node-index label alongside" \
   "$(sed -n '/^start_kubelet/,/^}/p' "$repo/ferry")" "ferry.dev/node-index="
 contains "a machine's node is labelled shared by the controller" \
   "$(cat "$repo/ferry-machined/reconcile.go")" 'modeShared = "shared"'
+# --node-labels only applies when the kubelet *creates* the Node object, so a
+# cluster that predates the label never gets it: ferry's own node had been in
+# etcd for days and came back Ready and unlabelled, while a freshly made machine
+# was labelled correctly and the vm-per-pod selector matched nothing at all.
+contains "an existing Mac node is labelled too, not just a new one" \
+  "$(sed -n '/^ensure_mode_label/,/^}/p' "$repo/ferry")" "ferry.dev/mode=vm-per-pod"
+contains "and 'ferry up' asserts it once the node is Ready" \
+  "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" 'ensure_mode_label "$NODE_NAME"'
 contains "and it is applied where the controller already has the Node" \
   "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
 
@@ -588,7 +604,14 @@ pages="$repo/.github/workflows/pages.yml"
 succeeds "there is a workflow to publish it" test -f "$pages"
 host="$(sed -n 's|.*https://\(get\.ferry\.[a-z.]*\).*|\1|p' "$repo/install.sh" | head -1)"
 is "the installer names the host it is served from" "$host" "get.ferry.kurpuis.com"
-contains "and the workflow publishes a CNAME for that host" "$(cat "$pages")" "echo '$host' > _site/CNAME"
+# The domain is a tracked file rather than a string in a workflow step, so it
+# takes deleting something to lose it. The file is still only binding once the
+# job copies it into the artifact -- with the Pages source set to GitHub
+# Actions, nothing in the repository is served by itself.
+succeeds "the domain is a file in the repository" test -f "$repo/CNAME"
+is "naming that host, and nothing else" "$(cat "$repo/CNAME")" "$host"
+contains "and the workflow copies it into the published site" "$(cat "$pages")" "cp CNAME _site/CNAME"
+contains "and republishes when it changes" "$(cat "$pages")" "- CNAME"
 # Served at / so the documented one-liner needs no path on the end.
 contains "serving it at / as well as /install.sh" "$(cat "$pages")" "_site/index.html"
 # ferry prints this host in 'token create' and in its release guards, so the two
