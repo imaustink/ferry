@@ -260,15 +260,59 @@ and `kubectl get nodes` shows the truth.
 
 ## Milestones
 
-1. **One machine, by hand.** A node image that boots under
-   `Virtualization.framework` and joins the cluster with an existing bootstrap
-   token. Proves the image and the join; no controller yet. **Measure
-   boot-to-Ready** — every decision about how disposable nodes can be rests on
-   that number.
-2. **`Machine` CRD and `ferry-machined`.** Create and delete a node by applying
-   and deleting a resource. Status reflects the VM and the `Node`.
-3. **Pod network between machines.** One vmnet network, per-node CIDR, routes.
-   Pods on two machines reach each other; Services work.
+1. ~~**One machine, by hand.**~~ **Done** —
+   [experiment 17](../experiments/17-node-vm/FINDINGS.md). A VM carrying
+   containerd, the CNI plugins and kubelet v1.34.11 joins the native control
+   plane with a bootstrap token, is approved through a CSR, and goes **Ready in
+   6.5 seconds**; pods scheduled to it run as ordinary Linux containers and
+   reach Running in under a second once the image is present.
+
+   The number settles the provisioner's shape: six seconds to replace a node
+   means consolidation can be aggressive and warm pools are an optimisation
+   rather than a requirement. It also produced most of the node image's
+   specification, because four things stopped the node dead and none of them
+   were about virtualization — a read-only `/proc/sys`, eviction thresholds
+   sized for a Mac rather than a 2 GiB root filesystem, no `iptables` for the
+   CNI plugin, and no `/etc/hosts` for containerd to copy. What it is *not* is
+   a node image: the software is staged into a `ferry-cri` pod VM, which is
+   exactly why those four bit.
+1b. **The node image.** **Done** —
+   [experiment 18](../experiments/18-node-image/FINDINGS.md). Docker builds it,
+   `ferry-node build` unpacks it into an ext4 disk, and `ferry-node run` boots
+   that disk as a machine with a vmnet address and its joining details on the
+   kernel command line. Ready in **13.8s**, and pods on it now reach the
+   internet, which the staged-into-a-pod version could not do for want of
+   `iptables`. `ferry-node`'s two verbs are the shape `ferry-machined` needs:
+   image in, machine out.
+
+2. ~~**`Machine` CRD and `ferry-machined`.**~~ **Done** —
+   [experiment 19](../experiments/19-machine-crd/FINDINGS.md). `kubectl apply` a
+   `Machine` and a node is Ready **16 seconds** later; `kubectl delete` and it is
+   gone in **3**, VM stopped, `Node` removed, disk and token cleaned up behind a
+   finalizer. `kubectl get machines` reports the address once the machine has
+   one and the node reference once the kubelet has actually registered.
+
+   `ferry-machined` is Go beside the control plane and calls `ferry-node` for
+   anything involving a VM, which is the split ferry already uses between
+   `ferry-streamer` and `ferry-cri`.
+3. ~~**Pod network between machines.**~~ **Done** —
+   [experiment 20](../experiments/20-pod-network/FINDINGS.md). One
+   `ferry-node serve` holds one vmnet network and hosts every machine on it;
+   each node takes its `podCIDR` from the cluster and routes to the others'
+   slices, read from the Node list with the kubelet's own certificate. A pod on
+   one machine pings a pod on another.
+
+   Two corrections to what this document assumed. A vmnet network belongs to
+   the process that made it, so "one network" meant restructuring `ferry-node`
+   into a server rather than configuring a subnet. And vmnet *does* carry
+   pod-addressed traffic between machines on it — an earlier reading said
+   otherwise and was taken against a pod that had already exited. A second
+   interface per machine, switched by ferry, was built before that was noticed
+   and has since been removed — it duplicated the kernel datapath, and the one
+   case it was briefly kept for, traffic between two Macs, is the thing it could
+   not do: it had neither the UDP relay nor the peer list that mode 1's
+   `PodSwitch` carries.
+
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
    creation, and the host budget. A Deployment scaled beyond what exists
    creates the node it needs.
