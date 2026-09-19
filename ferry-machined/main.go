@@ -28,13 +28,13 @@ import (
 )
 
 var (
-	kubeconfig = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
-	kernel     = flag.String("kernel", "", "guest kernel every machine boots")
-	baseImage  = flag.String("image", "", "node disk image machines are cloned from")
-	stateDir   = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
-	apiServer  = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
-	caFile     = flag.String("ca", "", "cluster CA the machines must trust")
-	clusterDNS = flag.String("cluster-dns", "10.96.0.10", "address of the cluster's DNS service")
+	kubeconfig  = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
+	kernel      = flag.String("kernel", "", "guest kernel every machine boots")
+	baseImage   = flag.String("image", "", "node disk image machines are cloned from")
+	stateDir    = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
+	apiServer   = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
+	caFile      = flag.String("ca", "", "cluster CA the machines must trust")
+	clusterDNS  = flag.String("cluster-dns", "10.96.0.10", "address of the cluster's DNS service")
 	interval    = flag.Duration("interval", 2*time.Second, "how often to reconcile")
 	machinesDir = flag.String("machines", "", "directory ferry-node serve watches; defaults to <state>/machines")
 )
@@ -79,8 +79,8 @@ func main() {
 	defer stop()
 
 	controller := &controller{
-		kube:    clientset,
-		dynamic: dynamicClient,
+		kube:     clientset,
+		dynamic:  dynamicClient,
 		machines: map[string]*machine{},
 	}
 
