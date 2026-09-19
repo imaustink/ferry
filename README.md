@@ -2,31 +2,42 @@
 
 # ferry
 
-Kubernetes on a Mac where **the pod is the virtual machine**.
+Kubernetes on a Mac with **nothing to size and nothing to wait for**.
 
-The control plane runs as native Mach-O processes on macOS. Each pod is a
-lightweight VM on `Virtualization.framework` with its own kernel. There is no
-node VM to size, nothing nested, and no shared kernel between pods — and with
-mode 1 alone, no Linux host anywhere in the system.
+There is no Linux VM to allocate memory to before you start, no machine to keep
+running between sessions, and no boot to sit through. A pod is a virtual machine
+that starts in **a third of a second**, and the control plane is native Mach-O
+processes on macOS — so `ferry up` is a few processes starting, not a VM coming
+up.
 
-|  | isolation | overhead |
+|  | what you size up front | what it costs idle |
 |---|---|---|
-| Docker Desktop / colima / kind | one Linux VM, pods share a kernel | a VM you size up front |
-| kiac / Orchard | VM per **node**, pods share the node's kernel | 2–4 GB per node, idle or not |
-| **ferry**, mode 1 | VM per **pod** — every pod its own kernel | pods only |
-| **ferry**, mode 2 | VM per **node** — pods share its kernel | the node you asked for |
+| Docker Desktop / colima / kind | a Linux VM: memory and CPUs, before the first pod | the whole VM, used or not |
+| kiac / Orchard | a node VM, per node | 2–4 GB per node, idle or not |
+| **ferry** | nothing | nothing — pods pay for what they touch |
 
-Mode 2 is the second half of that: a `Machine` is a Linux node VM, and pods on
-it are ordinary containers sharing its kernel. Both run in one cluster and a pod
-picks with `nodeSelector`, so the same cluster can hold a node where every pod
-has its own kernel and a node where a hundred pods share one. It is off until
-`ferry machines enable`, and [docs/MACHINES.md](docs/MACHINES.md) is the
-argument for it and what it costs — including that "no Linux host anywhere"
-stops being true of ferry and becomes true of mode 1.
+The last column is measured, not aspirational. 128 pod VMs configured with
+512 MiB each — 64 GiB asked for — consumed **1.6 GiB** of host memory, because
+guests are lazily backed and pay for the pages they actually touch. Sizing is a
+guess you make before you know the answer, and this removes the guess: ask for
+what the workload says it wants, and the Mac spends what the workload uses.
+
+**Startup, measured:** the hypervisor starts a VM in 0.06–0.09s and the guest
+reaches userspace in ~0.12s, so a real Alpine pod is up in **0.33s** and answers
+ping from the Mac in 0.34ms. The 128th VM starts as fast as the first. Nothing
+is nested, and there is no node VM in the path.
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause
 container, no network namespace plumbing.
+
+None of that changes if you want density instead. A `Machine` is a Linux node VM
+whose pods are ordinary containers sharing its kernel — ~45ms to start one
+against ~300ms for a pod VM — and a pod picks with
+`nodeSelector: {ferry.dev/mode: shared}` or `vm-per-pod`. It is still nothing to
+size up front: a machine is sized when you declare one and gone when you delete
+it. Off until `ferry machines enable`; [docs/MACHINES.md](docs/MACHINES.md) is
+the case for it and what it costs.
 
 ## Status
 
