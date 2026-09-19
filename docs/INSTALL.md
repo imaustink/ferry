@@ -180,10 +180,43 @@ A release can be built without it (`release/build.sh --without-node-image`); its
 `VERSION` records that, and `ferry machines` says so rather than failing on a
 missing directory. Mode 1 is unaffected either way.
 
-Known gaps, since they will be met before the milestones close: cluster DNS for
-pods on a machine uses the default `10.96.0.10` rather than ferry's own
-CoreDNS address, and nothing schedules between the Mac node and machines
-automatically — a pod picks with `nodeSelector: {ferry.dev/mode: shared}`.
+### Choosing a mode
+
+A pod picks with a node selector, which is what `kubectl get nodes` already
+shows:
+
+```sh
+kubectl get nodes -L ferry.dev/mode
+```
+
+```yaml
+nodeSelector: {ferry.dev/mode: shared}       # dense, one kernel for many pods
+nodeSelector: {ferry.dev/mode: vm-per-pod}   # a kernel each
+```
+
+The Mac node sets `vm-per-pod` on its own kubelet; `ferry-machined` labels each
+machine `shared` once its node registers. Nothing balances between them: the
+scheduler places a pod wherever it fits unless the pod says. Provisioning a
+machine because a pod needs one, and removing it when it does not, are
+MACHINES.md milestones 4 and 5.
+
+### Cluster DNS inside machines
+
+Machines resolve through their own CoreDNS, behind `kube-dns` at `10.96.0.10`,
+with kube-proxy running on each machine to answer that address. `ferry machines
+enable` installs both, pinned to `ferry.dev/mode: shared`; they stay `Pending`
+until a machine exists to run them on.
+
+Mode 1's CoreDNS cannot serve machines. It is a `ferry-cri` pod on the Mac's
+vmnet network, machines are on a vmnet network of their own, and vmnet keeps its
+networks apart — so a pod inside a machine has no route to it. Each mode
+resolving through its own CoreDNS is the honest arrangement until cross-mode pod
+routing exists, which is milestone 6. Nothing here changes mode 1: its kubelet
+is told CoreDNS's pod address directly and never consults this Service.
+
+`FERRY_MACHINE_DNS_IP` moves the address. A `kube-dns` Service that already
+exists somewhere else is reported rather than applied over — a ClusterIP cannot
+be changed once set.
 
 ## kubeconfig
 

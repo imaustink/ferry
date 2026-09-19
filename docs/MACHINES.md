@@ -1,6 +1,16 @@
 # Machines — the second mode
 
-**Status: design. Nothing here is built yet.**
+**Status: built through milestone 3, and shipped off by default.** A `Machine`
+becomes a Ready node, `kubectl delete` takes it away again, and pods on two
+machines reach each other — [milestones](#milestones) 1, 1b, 2 and 3 below.
+Provisioning on demand (4), consolidation (5), mixed-cluster scheduling (6) and
+GPU (7) are not built. An installed ferry carries all of it; `ferry machines
+enable` turns it on. See [INSTALL.md](INSTALL.md).
+
+This document was written before any of it existed and is kept as the design it
+argued for, with each milestone marked as it landed and corrected where
+building it proved the design wrong — which happened twice, both recorded in
+milestone 3.
 
 Ferry has one mode today: the pod is the virtual machine. This proposes a
 second, where the *node* is the virtual machine and pods inside it are ordinary
@@ -243,6 +253,25 @@ VM gets routes to its peers' slices via their addresses, and cluster traffic is
 ordinary routing between a handful of machines rather than a flooded switch
 between a hundred pods.
 
+### Cluster DNS is per mode, for now
+
+Machines resolve through their own CoreDNS, behind a `kube-dns` ClusterIP that
+kube-proxy answers on each machine — the ordinary Kubernetes arrangement, which
+works here because a node VM has a kernel to program.
+
+Mode 1's CoreDNS cannot serve them, and the reason is the same vmnet isolation
+that shaped the rest of this section: it is a `ferry-cri` pod on the Mac's vmnet
+network, machines are on a vmnet network of their own, and a pod inside a
+machine has no route to it. Two CoreDNS deployments is the honest arrangement
+until cross-mode pod routing exists, which is milestone 6.
+
+They are named apart on purpose. Mode 1 already owns `Deployment/coredns` and
+`ConfigMap/coredns` in `kube-system` and labels its pods `k8s-app: kube-dns`;
+reusing those names replaces mode 1's DNS with a copy pinned to nodes it does
+not have, and reusing that label makes the `kube-dns` Service load-balance
+across pods half the cluster cannot reach — DNS that works intermittently,
+which is worse than DNS that does not work.
+
 ## How a pod chooses
 
 It does not need a new concept. The Mac is a node and each machine is a node,
@@ -257,6 +286,25 @@ Taint the Mac node so pods land on machines by default and opt in to
 VM-per-pod, or the reverse, per cluster. This is better than the `RuntimeClass`
 split considered earlier: no new admission behaviour, no runtime negotiation,
 and `kubectl get nodes` shows the truth.
+
+**Built.** The Mac node's kubelet registers `ferry.dev/mode=vm-per-pod`, and
+`ferry-machined` labels each machine `shared` once its node appears —
+`kubectl get nodes -L ferry.dev/mode`. The label was the missing half: this
+document specified the selector before anything set it, so for a while the
+selector above matched nothing on either side.
+
+The machine's label is patched by the controller rather than registered by its
+kubelet, which would be the race-free place for it. The kubelet inside a machine
+is configured from the kernel command line, and putting a label there means
+threading a value that is identical on every machine through `ferry-machined`,
+`ferry-node`, the boot arguments and `init.sh`. The cost is a window of up to one
+reconcile interval where the node is Ready and unlabelled, and a pod selecting
+`shared` will not schedule there yet. That is the safe direction — the label is
+missing rather than wrong, so the scheduler declines to place the pod rather
+than placing it somewhere it does not belong.
+
+Nothing balances between the two. A pod with no selector goes wherever it fits,
+which is milestone 4's job to make deliberate.
 
 ## Milestones
 

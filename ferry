@@ -280,6 +280,16 @@ NODE_DISK="${FERRY_NODE_DISK:-$FERRY_HOME/node.ext4}"
 # their own, because a vmnet network is claimed for the whole Mac and a second
 # cluster asking for the same one gets none.
 MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
+# Cluster DNS for pods inside machines, as a ClusterIP.
+#
+# Mode 1's CoreDNS cannot serve them: it is a ferry-cri pod on the Mac's vmnet
+# network, machines are on a vmnet network of their own, and vmnet keeps its
+# networks apart. So machines get their own CoreDNS behind a Service, which
+# kube-proxy inside each machine resolves -- the ordinary Kubernetes
+# arrangement, which works there because a node VM has a kernel to program.
+# Cross-mode resolution is MACHINES.md milestone 6.
+MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
+MACHINE_KUBE_PROXY_IMAGE="${FERRY_KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
 
 STOPPED_MARKER="$FERRY_HOME/stopped"
 mark_stopped()   { mkdir -p "$FERRY_HOME" 2>/dev/null; : > "$STOPPED_MARKER"; }
@@ -1123,6 +1133,7 @@ start_machines() {
     --ca "$FERRY_HOME/pki/ca.crt" \
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --subnet "$MACHINE_SUBNET" \
+    --cluster-dns "$MACHINE_DNS_IP" \
     >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-node.pid"
   local _
@@ -2080,12 +2091,18 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
   # join can pick one that is free instead of being told a number by hand. The
   # label is registered by the kubelet itself, at the moment the node object is
   # created, which is the only point early enough to be race-free.
+  #
+  # It also says which mode it is. docs/MACHINES.md specifies
+  # `nodeSelector: {ferry.dev/mode: shared}` as how a pod chooses between a
+  # kernel of its own and a shared one -- and that selector matched nothing,
+  # because no node carried the label on either side. A Mac node is always
+  # vm-per-pod: that is what ferry-cri does.
   FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
   "$here/bin/kubelet" \
     --config="$run/kubelet.yaml" \
     ${bootstrap:+--bootstrap-kubeconfig="$bootstrap"} \
     --kubeconfig="$kubeconfig" \
-    ${index:+--node-labels="ferry.dev/node-index=$index"} \
+    --node-labels="ferry.dev/mode=vm-per-pod${index:+,ferry.dev/node-index=$index}" \
     --hostname-override="$name" --root-dir="$run/kubelet" \
     --cert-dir="$run/pki" --v=2 >"$logfile" 2>&1 &
   echo $! > "$pidfile"
@@ -2902,6 +2919,60 @@ cmd_down() {
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK"
 }
 
+# kube-proxy and CoreDNS for machines.
+#
+# Both are pinned to `ferry.dev/mode: shared` so they never land on the Mac
+# node, where kube-proxy would be a pod VM programming a node kernel that does
+# not exist and CoreDNS would be a second copy serving an audience that cannot
+# reach it.
+#
+# Applied at 'machines enable' rather than at 'ferry up': they are only useful
+# once there is somewhere for them to run, and until a machine exists they would
+# sit Pending against a selector nothing matches.
+install_machine_dns() {
+  local rendered="$FERRY_RUN/machines-dns.yaml"
+  mkdir -p "$FERRY_RUN"
+  local advertise="$LAN_IP"
+  [ "$advertise" = "127.0.0.1" ] && advertise="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null || echo 127.0.0.1)"
+
+  # The `---` between them is load-bearing. A YAML file need not end with a
+  # document separator, so concatenating two of them runs the last document of
+  # the first into the first document of the second: the kube-proxy DaemonSet
+  # and the CoreDNS ServiceAccount merge into one object that is neither, and
+  # kube-proxy is silently never created. What that looks like from outside is
+  # machines whose pods cannot resolve anything, with a manifest that applies
+  # without error.
+  { cat "$here/manifests/machines/kube-proxy.yaml"; echo "---"
+    cat "$here/manifests/machines/coredns.yaml"; } \
+    | sed -e "s|__CLUSTER_DOMAIN__|$CLUSTER_DOMAIN|g" \
+          -e "s|__UPSTREAM_DNS__|$(host_resolvers)|g" \
+          -e "s|__COREDNS_IMAGE__|$COREDNS_IMAGE|g" \
+          -e "s|__KUBE_PROXY_IMAGE__|$MACHINE_KUBE_PROXY_IMAGE|g" \
+          -e "s|__CLUSTER_CIDR__|$CLUSTER_CIDR|g" \
+          -e "s|__DNS_SERVICE_IP__|$MACHINE_DNS_IP|g" \
+          -e "s|__APISERVER_HOST__|$advertise|g" \
+          -e "s|__APISERVER_PORT__|$(( 6443 + PORT_SHIFT ))|g" \
+    > "$rendered"
+
+  # The Service may already exist at a different address, and a ClusterIP is
+  # immutable -- so an apply that would move it fails, rather than silently
+  # leaving machines pointed at an address nothing serves.
+  local existing
+  existing="$(kube get service kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+  if [ -n "$existing" ] && [ "$existing" != "$MACHINE_DNS_IP" ]; then
+    bad "kube-dns already exists at $existing, not $MACHINE_DNS_IP"
+    echo "    A Service's ClusterIP cannot be changed. Either set"
+    echo "    FERRY_MACHINE_DNS_IP=$existing, or delete the Service and re-enable:"
+    echo "        kubectl -n kube-system delete service kube-dns"
+    return 1
+  fi
+
+  kube apply -f "$rendered" >/dev/null 2>&1 \
+    || { bad "could not apply kube-proxy and CoreDNS for machines"; return 1; }
+  ok "kube-proxy and cluster DNS for machines ($MACHINE_DNS_IP)"
+  echo "      they stay Pending until a machine exists to run them on"
+}
+
 # --- mode 2 -----------------------------------------------------------------
 cmd_machines_enable() {
   require_cluster || return 1
@@ -2914,6 +2985,8 @@ cmd_machines_enable() {
   kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
     || { bad "could not install the Machine CRD"; return 1; }
   ok "Machine CRD installed"
+
+  install_machine_dns || return 1
 
   if running ferry-machined; then
     warn "machines are already running"

@@ -29,6 +29,9 @@ is() { # description actual expected
 contains() { # description haystack needle
   case "$2" in *"$3"*) ok "$1" ;; *) bad "$1"; echo "      '$2' does not contain '$3'" ;; esac
 }
+empty() { # description actual
+  if [ -z "$2" ]; then ok "$1"; else bad "$1"; echo "      expected nothing, got '$2'"; fi
+}
 succeeds() { # description command...
   local description="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$description"; else bad "$description"; fi
@@ -418,6 +421,107 @@ contains "'ferry up' starts them for a cluster that asked" \
 # a missing directory.
 contains "a missing node image explains itself on a release" \
   "$(sed -n '/^machines_ready/,/^}/p' "$repo/ferry")" "packaged without one"
+
+# --- choosing a mode ------------------------------------------------------
+#
+# docs/MACHINES.md specifies `nodeSelector: {ferry.dev/mode: shared}` as how a
+# pod picks between a kernel of its own and a shared one. That selector matched
+# nothing: no node carried the label on either side.
+contains "the Mac node says it is vm-per-pod" \
+  "$(sed -n '/^start_kubelet/,/^}/p' "$repo/ferry")" "ferry.dev/mode=vm-per-pod"
+contains "and keeps its node-index label alongside" \
+  "$(sed -n '/^start_kubelet/,/^}/p' "$repo/ferry")" "ferry.dev/node-index="
+contains "a machine's node is labelled shared by the controller" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" 'modeShared = "shared"'
+contains "and it is applied where the controller already has the Node" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
+
+# --- cluster DNS for machines ---------------------------------------------
+#
+# Mode 1's CoreDNS is a ferry-cri pod on the Mac's vmnet network; machines are
+# on a vmnet network of their own and vmnet keeps them apart. So machines need
+# their own CoreDNS behind a ClusterIP, with kube-proxy inside the node to
+# answer it -- and ferry-node has to be told that address, which it was not.
+printf '\033[1m%s\033[0m\n' "cluster DNS for machines"
+for f in coredns kube-proxy; do
+  succeeds "manifests/machines/$f.yaml exists" test -f "$repo/manifests/machines/$f.yaml"
+done
+contains "'machines enable' installs them" \
+  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "install_machine_dns"
+contains "and ferry-node is told the DNS address" \
+  "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" '--cluster-dns "$MACHINE_DNS_IP"'
+# A ClusterIP is immutable, so an existing kube-dns at another address has to be
+# reported rather than applied over.
+contains "an existing kube-dns at another address is refused, not overwritten" \
+  "$(sed -n '/^install_machine_dns/,/^}/p' "$repo/ferry")" "cannot be changed"
+# The flag that looked like the knob and went nowhere.
+case "$(grep -c 'cluster-dns' "$repo/ferry-machined/main.go")" in
+  0) bad "ferry-machined lost the note explaining where --cluster-dns went" ;;
+  *) case "$(grep -c 'flag.String("cluster-dns"' "$repo/ferry-machined/main.go")" in
+       0) ok "ferry-machined no longer declares a --cluster-dns it never read" ;;
+       *) bad "ferry-machined still declares an unread --cluster-dns flag" ;;
+     esac ;;
+esac
+
+# Both workloads must be pinned to machines. Unpinned, kube-proxy tolerates
+# everything and lands on the Mac node as a pod VM programming a node kernel
+# ferry has not got, and CoreDNS becomes a second copy serving nobody.
+if command -v ruby >/dev/null 2>&1; then
+  pinning="$(ruby -ryaml -e '
+    objs=[]
+    ["manifests/machines/kube-proxy.yaml","manifests/machines/coredns.yaml"].each do |f|
+      YAML.load_stream(File.read(f)){|d| objs << d if d}
+    end
+    bad=[]
+    objs.each do |o|
+      next unless %w[Deployment DaemonSet].include?(o["kind"])
+      sel = o.dig("spec","template","spec","nodeSelector")
+      bad << o.dig("metadata","name") unless sel && sel["ferry.dev/mode"] == "shared"
+    end
+    svc = objs.find{|o| o["kind"]=="Service"}
+    dep = objs.find{|o| o["kind"]=="Deployment"}
+    bad << "service-selector" unless svc && svc.dig("spec","selector") == dep.dig("spec","template","metadata","labels")
+    bad << "selects-mode-1-coredns" if svc && svc.dig("spec","selector","k8s-app") == "kube-dns"
+    print bad.empty? ? "ok" : bad.join(",")
+  ' 2>/dev/null)"
+  is "every machine workload is pinned to ferry.dev/mode=shared" "$pinning" "ok"
+
+  # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
+  # Applying a second set under those names replaces mode 1's DNS with a copy
+  # pinned to nodes mode 1 does not have.
+  clash="$(ruby -ryaml -e '
+    def ids(files)
+      s=[]
+      files.each{|f| YAML.load_stream(File.read(f)){|d| s << "#{d["kind"]}/#{d.dig("metadata","name")}" if d}}
+      s
+    end
+    print (ids(["manifests/coredns.yaml"]) & ids(["manifests/machines/coredns.yaml","manifests/machines/kube-proxy.yaml"])).join(",")
+  ' 2>/dev/null)"
+  empty "and collides with none of mode 1's own DNS objects" "$clash"
+
+  # The two manifests are rendered together, and a YAML file need not end with a
+  # document separator -- so concatenating them runs the kube-proxy DaemonSet
+  # into the CoreDNS ServiceAccount and produces one object that is neither.
+  # kube-proxy is then silently never created, machines cannot resolve anything,
+  # and the apply reports no error at all. Counting the objects on both sides of
+  # the join is what catches it.
+  joined="$sandbox/joined.yaml"
+  cp "$repo/manifests/machines/kube-proxy.yaml" "$joined"
+  echo "---" >> "$joined"
+  cat "$repo/manifests/machines/coredns.yaml" >> "$joined"
+  counts="$(ruby -ryaml -e '
+    sep = YAML.load_stream(File.read(ARGV[0])).compact.size +
+          YAML.load_stream(File.read(ARGV[1])).compact.size
+    joined = YAML.load_stream(File.read(ARGV[2])).compact
+    has_ds = joined.any?{|o| o["kind"] == "DaemonSet"}
+    print "#{sep}/#{joined.size}/#{has_ds}"
+  ' "$repo/manifests/machines/kube-proxy.yaml" "$repo/manifests/machines/coredns.yaml" "$joined" 2>/dev/null)"
+  is "no object is lost where the two manifests are joined" "$counts" "10/10/true"
+  contains "and ferry writes the separator that keeps them apart" \
+    "$(sed -n '/^install_machine_dns/,/^}/p' "$repo/ferry")" 'echo "---"'
+else
+  ok "ruby not present; skipping the manifest shape checks"
+fi
 
 # A release built with --without-node-image told the operator two contradictory
 # things: 'machines status' said to run 'ferry node-image', and 'ferry
