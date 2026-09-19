@@ -2,6 +2,9 @@ bin/
 .run/
 # Where release/build.sh puts the tarballs it packages.
 dist/
+# The mode 2 node image: an OCI layout and the ext4 unpacked from it, both
+# produced by 'ferry node-image' and both build output.
+node-image/
 experiments/03-vm-ceiling/build/
 experiments/03-vm-ceiling/assets/vmlinux-arm64
 kernel/.build/

@@ -38,13 +38,20 @@ die()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 
 version=""
 out="$root/dist"
+node_image=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) version="${2:-}"; shift 2 ;;
     --version=*) version="${1#*=}"; shift ;;
     --out) out="${2:-}"; shift 2 ;;
     --out=*) out="${1#*=}"; shift ;;
-    *) die "usage: release/build.sh [--version vX.Y.Z] [--out <dir>]" ;;
+    # Mode 2 is opt-in on the Mac that installs this, but the image it needs
+    # weighs a couple of hundred megabytes and takes a Docker build to make. A
+    # release without it is a legitimate thing to want; a release that quietly
+    # lacks it is not, so this is a flag rather than a silent skip, and VERSION
+    # records the answer for 'ferry machines' to read.
+    --without-node-image) node_image=""; shift ;;
+    *) die "usage: release/build.sh [--version vX.Y.Z] [--out <dir>] [--without-node-image]" ;;
   esac
 done
 
@@ -93,7 +100,12 @@ cp "$root/control-plane/"*.sh "$dir/control-plane/"
 
 cp -R "$root/manifests" "$dir/manifests"
 cp -R "$root/addons" "$dir/addons"
-ok "cli, control plane scripts, manifests and addons"
+# Mode 2's CRD. It is applied by 'ferry machines enable', so it is a runtime
+# asset in exactly the way manifests/coredns.yaml is -- the Go sources beside it
+# are not shipped.
+mkdir -p "$dir/ferry-machined"
+cp "$root/ferry-machined/crd.yaml" "$dir/ferry-machined/"
+ok "cli, control plane scripts, manifests, addons and the Machine CRD"
 
 # --- the guest ------------------------------------------------------------
 # The NAT-capable kernel is the one that matters: without it Services fall back
@@ -138,19 +150,41 @@ ok "kubernetes $k8s"
 
 # ferry's own binaries, which are this checkout's code rather than Kubernetes'
 # and so are not in the version store.
-for name in ferry-cri ferry-cni ferry-gpud ferry-netpol ferry-proxy ferry-storage ferry-streamer; do
+for name in ferry-cri ferry-cni ferry-gpud ferry-netpol ferry-proxy ferry-storage ferry-streamer \
+            ferry-machined ferry-node; do
   [ -x "$root/bin/$name" ] || die "bin/$name is missing -- run: ./ferry build"
   cp "$root/bin/$name" "$dir/bin/$name"
   chmod +x "$dir/bin/$name"
 done
-ok "runtime, streamer, cni, proxy, netpol, storage, gpud"
+ok "runtime, streamer, cni, proxy, netpol, storage, gpud, machined, node"
 
 # The entitlement is the one thing in here that copying the file again cannot
 # repair, so it is checked rather than assumed.
 if ! codesign -d --entitlements - "$dir/bin/ferry-cri" 2>&1 | grep -q virtualization; then
   die "bin/ferry-cri has no virtualization entitlement -- rebuild it: (cd ferry-cri && ./build.sh)"
 fi
-ok "ferry-cri carries com.apple.security.virtualization"
+# ferry-node makes the VM a machine runs in, so it needs the same entitlement
+# and fails the same way without it: Virtualization.framework simply refuses.
+if ! codesign -d --entitlements - "$dir/bin/ferry-node" 2>&1 | grep -q virtualization; then
+  die "bin/ferry-node has no virtualization entitlement -- rebuild it: ./ferry build"
+fi
+ok "ferry-cri and ferry-node carry com.apple.security.virtualization"
+
+# --- the mode 2 node image ------------------------------------------------
+# The OCI layout rather than the unpacked ext4: the layout is the compressed
+# layers, and 'ferry machines enable' unpacks it to a disk on first use with
+# ferry-node's own unpacker. That keeps Docker off the installing Mac -- Docker
+# is only needed to *create* the layout -- and keeps ~400MB of mostly-zero
+# sparse file out of the tarball.
+if [ -n "$node_image" ]; then
+  [ -d "$root/node-image/oci" ] \
+    || die "no node image at node-image/oci -- run: ./ferry node-image (slow, needs docker), or pass --without-node-image"
+  mkdir -p "$dir/node-image"
+  cp -R "$root/node-image/oci" "$dir/node-image/oci"
+  ok "mode 2 node image ($(du -sh "$root/node-image/oci" | awk '{print $1}'))"
+else
+  ok "no node image (--without-node-image); mode 2 will say so rather than fail oddly"
+fi
 
 # --- what the far side reads to know what it has --------------------------
 # The Swift version is recorded because a cluster spans Macs and two toolchains
@@ -161,6 +195,7 @@ ferry=$version
 kubernetes=$k8s
 control-plane=$(ferry_manifest_field "$k8s" control-plane 2>/dev/null || echo unknown)
 etcd=$(ferry_manifest_field "$k8s" etcd 2>/dev/null || echo unknown)
+node-image=$([ -n "$node_image" ] && echo yes || echo no)
 commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
 swift=$(swift --version 2>&1 | grep -oE 'Apple Swift version [0-9.]+' | head -1 | awk '{print $4}')
 built=$(date -u +%Y-%m-%dT%H:%M:%SZ)

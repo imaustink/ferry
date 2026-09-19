@@ -166,6 +166,9 @@ Adding a second Mac is one line from the first Mac's `ferry token create`:
 curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10… sh -
 ```
 
+A release also carries **mode 2** — the node as the VM, pods sharing its kernel
+([docs/MACHINES.md](docs/MACHINES.md)) — off until `ferry machines enable`.
+
 Details, the environment variables, and how to uninstall are in
 [docs/INSTALL.md](docs/INSTALL.md). To build ferry instead of installing it, see
 [Building from source](#building-from-source).
@@ -287,15 +290,16 @@ Containerization framework requires to build.
 ### Cutting a release
 
 ```sh
-./ferry build && ./ferry kernel     # everything the tarball carries
+./ferry build && ./ferry kernel && ./ferry node-image   # everything the tarball carries
 git tag -a v0.1.0 -m "..." && git push origin v0.1.0
 ./release/build.sh --version v0.1.0
 ./release/publish.sh --version v0.1.0      # a draft; --publish to go live
 ```
 
 `release/build.sh` packages the runtime subset of the checkout and refuses to
-ship one that is missing a piece. `release/publish.sh` refuses a dirty tree, or
-a tarball built from a commit other than the tag's.
+ship one that is missing a piece — including mode 2's node image, unless told
+`--without-node-image`, which the release then records. `release/publish.sh`
+refuses a dirty tree, or a tarball built from a commit other than the tag's.
 
 `install.sh` itself is served from GitHub Pages, republished from `main`
 whenever it changes, so the installer people run is the one in this repository.

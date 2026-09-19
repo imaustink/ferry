@@ -140,6 +140,51 @@ podresources socket beneath `--root-dir`. Those do not survive a reboot, so the
 agent says what happened and leaves it alone rather than starting a control
 plane on a machine that is meant to be a worker. Rejoin with a fresh token.
 
+## Machines — mode 2
+
+A release carries mode 2, where the node is the VM and pods inside it are
+ordinary Linux containers sharing its kernel ([MACHINES.md](MACHINES.md)). It is
+**off until you ask for it**:
+
+```sh
+ferry machines enable
+kubectl apply -f - <<'EOF'
+apiVersion: ferry.dev/v1alpha1
+kind: Machine
+metadata: {name: worker-0}
+spec: {cpus: 2, memory: 2Gi, node: {labels: {ferry.dev/mode: shared}}}
+EOF
+kubectl get machines
+```
+
+Off by default because of what mode 2 does *today*: it is complete through
+milestone 3 — a `Machine` becomes a node, and pods on two machines reach each
+other — but provisioning, consolidation and mixed-cluster scheduling are not
+built. Starting two more daemons and holding a vmnet network on every cluster,
+including the ones that will never declare a `Machine`, is not a fair default
+for that. Enabling is remembered per cluster, so `ferry up` and the login agent
+bring machines back.
+
+The release ships the node image as an **OCI layout**, not as a disk. The first
+`ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB, once) using
+`ferry-node`'s own unpacker — so Docker is not needed on the installing Mac.
+Docker is only needed to *create* the layout, which happens on the machine
+cutting the release:
+
+```sh
+./ferry build         # adds ferry-machined and ferry-node
+./ferry node-image    # the node image itself (slow, needs docker)
+```
+
+A release can be built without it (`release/build.sh --without-node-image`); its
+`VERSION` records that, and `ferry machines` says so rather than failing on a
+missing directory. Mode 1 is unaffected either way.
+
+Known gaps, since they will be met before the milestones close: cluster DNS for
+pods on a machine uses the default `10.96.0.10` rather than ferry's own
+CoreDNS address, and nothing schedules between the Mac node and machines
+automatically — a pod picks with `nodeSelector: {ferry.dev/mode: shared}`.
+
 ## kubeconfig
 
 ```sh

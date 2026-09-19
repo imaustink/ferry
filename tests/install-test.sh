@@ -339,6 +339,9 @@ not_shipped="
   ferry-streamer                                go sources
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
+  experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
+  experiments/18-node-image/build.sh            builds the node image with docker; a release ships it built
+  experiments/18-node-image/rebuild-tool.sh     builds ferry-node; a release ships it built
   VERSION                                       written by release/build.sh, not copied
 "
 exempt() { # path
@@ -371,7 +374,8 @@ fi
 # remembering to add it to a release.
 # shellcheck source=../lib/versions.sh
 . "$repo/lib/versions.sh"
-for binary in ferry-cri ferry-cni ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-proxy; do
+for binary in ferry-cri ferry-cni ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-proxy \
+              ferry-machined ferry-node; do
   if grep -q "$binary" "$repo/release/build.sh"; then ok "packages $binary"
   else bad "release/build.sh does not package $binary"; fi
 done
@@ -380,6 +384,57 @@ if grep -q 'for name in \$FERRY_VERSIONED_BINARIES' "$repo/release/build.sh"; th
 else
   bad "release/build.sh does not walk FERRY_VERSIONED_BINARIES, so kubelet, ferry-proxyd, the control plane and etcd may be missing"
 fi
+echo
+
+# --- mode 2 ----------------------------------------------------------------
+#
+# Mode 2 is opt-in on the Mac, but a release has to *carry* it or enabling it
+# there is impossible: the controller, the tool that makes the VM, the CRD, and
+# the node image the machines boot.
+printf '\033[1m%s\033[0m\n' "mode 2 reaches an installed Mac"
+build_src="$(cat "$repo/release/build.sh")"
+contains "the release carries the Machine CRD" "$build_src" "ferry-machined/crd.yaml"
+# The OCI layout, not the unpacked ext4: the layout is the compressed layers and
+# ferry-node unpacks it on the far side, which keeps Docker off the installing
+# Mac and a 400MB mostly-zero sparse file out of the tarball.
+contains "and the node image as an OCI layout" "$build_src" "node-image/oci"
+# ferry-node boots the machine's VM, so it needs the entitlement as much as
+# ferry-cri does, and fails the same unhelpful way without it.
+contains "and checks ferry-node's virtualization entitlement" \
+  "$build_src" 'entitlements - "$dir/bin/ferry-node"'
+contains "a release without the node image records that it is missing" \
+  "$build_src" "node-image=\$("
+
+machines_src="$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")"
+contains "'machines enable' installs the CRD before starting the controller" \
+  "$machines_src" "crd.yaml"
+# Enabling has to survive a restart, or a cluster comes back in mode 1 only and
+# the machines that were running are simply gone.
+contains "and records the choice so the cluster comes back with machines" \
+  "$machines_src" "MACHINES_MARKER"
+contains "'ferry up' starts them for a cluster that asked" \
+  "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "machines_enabled"
+# A release built without the image should say so rather than fail obscurely on
+# a missing directory.
+contains "a missing node image explains itself on a release" \
+  "$(sed -n '/^machines_ready/,/^}/p' "$repo/ferry")" "packaged without one"
+
+# A release built with --without-node-image told the operator two contradictory
+# things: 'machines status' said to run 'ferry node-image', and 'ferry
+# node-image' on a release answered "it already carries the node image". Both
+# read the recorded fact now instead of guessing from a missing directory.
+dist2="$sandbox/.ferry-dist/versions/ferry-v0.2.0"
+fake_release "$dist2" "v0.2.0"
+sed -i '' 's/^ferry=v0.2.0$/ferry=v0.2.0\nnode-image=no/' "$dist2/VERSION"
+out="$(run_ferry "$dist2" machines status)"
+contains "a release without the image does not send you to a command it refuses" \
+  "$out" "packaged without one"
+case "$out" in
+  *"ferry node-image   (slow"*) bad "still tells a release to build a node image" ;;
+  *) ok "and does not offer the checkout's build command" ;;
+esac
+out="$(run_ferry "$dist2" node-image)"
+contains "and 'node-image' does not claim an image it never had" "$out" "packaged without a node image"
 echo
 
 # --- the installer --------------------------------------------------------

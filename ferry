@@ -252,6 +252,35 @@ FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
 # FERRY_RUN because /tmp does not survive a reboot -- though the asymmetry is
 # deliberate: after a reboot the marker is still there and the agent still
 # starts, because 'ferry down' means this session, not forever.
+# --- mode 2: machines -----------------------------------------------------
+#
+# The second mode, where the node is the VM and pods inside it are ordinary
+# Linux containers sharing its kernel. See docs/MACHINES.md.
+#
+# Off unless asked for. Mode 2 is complete through milestone 3 -- a Machine
+# becomes a node and pods on two machines reach each other -- but provisioning,
+# consolidation and mixed-cluster scheduling are not built, so what it does
+# today is turn `kubectl apply -f machine.yaml` into a node. Starting two more
+# daemons and holding a vmnet network on every cluster, including the ones that
+# will never declare a Machine, is not a fair default for that.
+#
+# The marker is in FERRY_HOME so the choice outlives a restart: 'ferry up' and
+# the login agent bring machines back for a cluster that had them.
+MACHINES_MARKER="$FERRY_HOME/machines-enabled"
+machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
+# Where the node image lives in a checkout and in a release. 'ferry node-image'
+# writes it; release/build.sh ships it.
+NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
+# Unpacked from that layout on first use, and kept: it is ~400MB and rebuilding
+# it on every start would be minutes of nothing. FERRY_HOME rather than
+# FERRY_RUN because /tmp does not survive a reboot.
+NODE_DISK="${FERRY_NODE_DISK:-$FERRY_HOME/node.ext4}"
+# Every machine sits on one vmnet network -- that is what makes mode 2's pod
+# networking ordinary routing rather than mode 1's flooded switch. Profiles get
+# their own, because a vmnet network is claimed for the whole Mac and a second
+# cluster asking for the same one gets none.
+MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
+
 STOPPED_MARKER="$FERRY_HOME/stopped"
 mark_stopped()   { mkdir -p "$FERRY_HOME" 2>/dev/null; : > "$STOPPED_MARKER"; }
 clear_stopped()  { rm -f "$STOPPED_MARKER"; }
@@ -262,6 +291,12 @@ ferry_release_version() {
   sed -n 's/^ferry=//p' "$here/VERSION" | head -1
 }
 is_release() { [ -f "$here/VERSION" ]; }
+# Whether the release was packaged with the mode 2 node image. Recorded by
+# release/build.sh, because "the directory is missing" and "this build never had
+# one" are different facts and only the second has a useful answer.
+release_has_node_image() {
+  [ "$(sed -n 's/^node-image=//p' "$here/VERSION" 2>/dev/null | head -1)" = yes ]
+}
 
 # macOS pgrep does not count reliably with -c, so count lines.
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
@@ -278,6 +313,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry doctor      check that this machine can run ferry
   ferry version     what this is, and what Kubernetes it runs
   ferry kernel      build a guest kernel with NAT support (slow, needs docker)
+  ferry node-image  build the mode 2 node image (slow, needs docker)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry up          start the cluster
@@ -297,6 +333,12 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry addons enable <n> turn one on
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
+
+Machines -- mode 2, where the node is the VM and pods share its kernel:
+  ferry machines status   whether mode 2 is on, and what it is running
+  ferry machines enable   install the Machine CRD and start the controller
+  ferry machines disable  stop it; Machines and the CRD are left alone
+  ferry machines ls       the machines in this cluster
 
 Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
@@ -630,10 +672,64 @@ cmd_build() {
   ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
   echo "==> $here/bin/ferry-streamer"
   echo
+  # Mode 2: the controller that turns a Machine into a node, and the tool that
+  # makes the VM for it. Both are quick. The node *image* they boot is not, and
+  # is built separately by 'ferry node-image' -- it needs Docker, which is the
+  # same bargain 'ferry kernel' makes.
+  echo "==> ferry-machined"
+  ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
+  echo "==> $here/bin/ferry-machined"
+  echo
+  echo "==> ferry-node"
+  OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" || return 1
+  echo
   # nft, for applying those rules inside pods.
   "$here/guest/build-nft.sh" || return 1
   echo
   bold "built -- run: ferry up"
+  if [ ! -d "$NODE_IMAGE_LAYOUT" ]; then
+    echo "  For mode 2 machines as well: ferry node-image  (slow, needs docker)"
+  fi
+}
+
+# The mode 2 node image: a Linux userspace with containerd, a kubelet and the
+# CNI plugins, built by Docker and exported as an OCI layout.
+#
+# Separate from 'ferry build' for the same reason 'ferry kernel' is: it needs
+# Docker and it takes minutes, and neither is worth imposing on someone who only
+# wants mode 1. A release carries the result, so the Mac installing one needs
+# none of this.
+cmd_node_image() {
+  if is_release; then
+    if release_has_node_image; then
+      bad "this is an installed ferry $(ferry_release_version); it already carries the node image"
+    else
+      bad "this ferry $(ferry_release_version) was packaged without a node image, and a release cannot build one"
+      echo "    It needs Docker and a Kubernetes staging step that a release does not carry."
+      echo "    Install a release built with one, or build ferry from source:"
+    fi
+    echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry node-image"
+    return 1
+  fi
+  command -v docker >/dev/null || { bad "docker is required to build the node image"; return 1; }
+  docker info >/dev/null 2>&1 || { bad "docker is installed but not running"; return 1; }
+
+  bold "building the mode 2 node image"
+  # The node's kubelet has to match the control plane it joins, so the staging
+  # step is told which Kubernetes this checkout is on rather than keeping its
+  # own default -- the same drift lib/versions.sh exists to prevent.
+  local k8s; k8s="$(ferry_active_version)"
+  k8s="${k8s:-$K8S_VERSION}"
+  echo "  kubernetes $(ferry_control_plane_version "$k8s") inside the node"
+  KUBERNETES_VERSION="$(ferry_control_plane_version "$k8s")" \
+    "$here/experiments/17-node-vm/stage.sh" || return 1
+  echo
+  LAYOUT="$NODE_IMAGE_LAYOUT" DISK="$here/node-image/node.ext4" \
+    "$here/experiments/18-node-image/build.sh" || return 1
+  echo
+  bold "node image built"
+  echo "  $NODE_IMAGE_LAYOUT"
+  echo "  turn mode 2 on with: ferry machines enable"
 }
 
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
@@ -864,6 +960,15 @@ EOF
   advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
+  # Mode 2, for a cluster that asked for it. After the node is Ready, because
+  # ferry-machined reads the Node list to work out each machine's pod CIDR.
+  if machines_enabled; then
+    if ! start_machines; then
+      warn "machines did not start; mode 1 is unaffected"
+      echo "      ferry machines status"
+    fi
+  fi
+
   echo
   bold "ferry is up"
   echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
@@ -997,6 +1102,92 @@ withdraw_gpu() {
 # the same mechanism every other ferry mount uses. That makes it local to one
 # machine, so the volume carries node affinity and binding waits for the
 # scheduler to choose a node.
+# Mode 2's two daemons.
+#
+# ferry-node serve holds the one vmnet network and boots a VM for every spec
+# that appears in the machines directory; ferry-machined watches Machine objects
+# and writes those specs. The split is the one ferry already uses between
+# ferry-streamer and ferry-cri: the thing that talks to Kubernetes is Go beside
+# the control plane, and the thing that makes VMs is Swift with the
+# virtualization entitlement.
+#
+# The network belongs to the process that created it, which is why serve is a
+# server rather than a flag -- experiment 20 found that out the hard way.
+start_machines() {
+  machines_ready || return 1
+
+  mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
+
+  "$here/bin/ferry-node" serve \
+    --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
+    --ca "$FERRY_HOME/pki/ca.crt" \
+    --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
+    --subnet "$MACHINE_SUBNET" \
+    >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-node.pid"
+  local _
+  for _ in $(seq 1 60); do
+    grep -aq "network" "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null && break
+    running ferry-node || break
+    sleep 0.5
+  done
+  if ! running ferry-node; then
+    bad "ferry-node serve did not start"
+    tail -5 "$FERRY_RUN/logs/ferry-node.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  ok "machine network $(grep -a 'network' "$FERRY_RUN/logs/ferry-node.log" | head -1 | sed 's/.*network //')"
+
+  "$here/bin/ferry-machined" \
+    --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
+    --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
+    --machines "$FERRY_RUN/machines" \
+    --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
+    --ca "$FERRY_HOME/pki/ca.crt" \
+    >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-machined.pid"
+  sleep 1
+  if running ferry-machined; then
+    ok "machines reconciling -- kubectl apply -f <machine.yaml>"
+  else
+    bad "ferry-machined did not start"
+    tail -5 "$FERRY_RUN/logs/ferry-machined.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+}
+
+# Everything mode 2 needs before it can start, checked in the order that gives
+# the most useful answer first.
+machines_ready() {
+  local binary
+  for binary in ferry-machined ferry-node; do
+    [ -x "$here/bin/$binary" ] || {
+      bad "bin/$binary is missing -- run 'ferry build'"
+      return 1; }
+  done
+  [ -d "$NODE_IMAGE_LAYOUT" ] || {
+    bad "no node image at $NODE_IMAGE_LAYOUT"
+    if is_release; then
+      echo "    This release was packaged without one. Mode 2 needs a release built"
+      echo "    with 'ferry node-image'; mode 1 is unaffected."
+    else
+      echo "    Build it: ferry node-image   (slow, needs docker)"
+    fi
+    return 1; }
+  # Unpacked once, from the layout the release carries. Doing it here rather
+  # than at install time keeps the cost off every Mac that never uses mode 2.
+  if [ ! -f "$NODE_DISK" ]; then
+    echo "  unpacking the node image (once, ~400MB)"
+    "$here/bin/ferry-node" build --layout "$NODE_IMAGE_LAYOUT" --out "$NODE_DISK" \
+      >"$FERRY_RUN/logs/ferry-node-build.log" 2>&1 || {
+        bad "could not unpack the node image"
+        tail -5 "$FERRY_RUN/logs/ferry-node-build.log" 2>/dev/null | sed 's/^/    /'
+        rm -f "$NODE_DISK"
+        return 1; }
+    ok "node disk at $NODE_DISK"
+  fi
+}
+
 start_storage() {
   [ -x "$here/bin/ferry-storage" ] || { warn "ferry-storage not built; PersistentVolumeClaims will stay Pending"; return 0; }
   "$here/bin/ferry-storage" --kubeconfig "$FERRY_HOME/admin.conf" \
@@ -2669,6 +2860,10 @@ cmd_down() {
     ok "node $index stopped"
   done
 
+  # Mode 2 first: a machine is a VM holding pods, and it should go down before
+  # the control plane it reports to does.
+  stop_machines
+
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
     local pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -2705,6 +2900,104 @@ cmd_down() {
   # 'ferry up' that this cluster has other nodes, before there is an API server
   # to ask. 'ferry node rm' and a fresh join rewrite it.
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" "$FERRY_NETPOL_SOCK"
+}
+
+# --- mode 2 -----------------------------------------------------------------
+cmd_machines_enable() {
+  require_cluster || return 1
+  bold "turning on machines (mode 2)"
+  machines_ready || return 1
+
+  # The CRD first: ferry-machined watches Machines, and a controller started
+  # against a cluster that has never heard of the kind logs a stream of errors
+  # rather than waiting for it to appear.
+  kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
+    || { bad "could not install the Machine CRD"; return 1; }
+  ok "Machine CRD installed"
+
+  if running ferry-machined; then
+    warn "machines are already running"
+  else
+    start_machines || return 1
+  fi
+  : > "$MACHINES_MARKER"
+  echo
+  bold "machines are on"
+  echo "  They come back with the cluster; 'ferry machines disable' turns them off."
+  echo
+  echo "  Declare one:"
+  echo "    kubectl apply -f - <<'EOF'"
+  echo "    apiVersion: ferry.dev/v1alpha1"
+  echo "    kind: Machine"
+  echo "    metadata: {name: worker-0}"
+  echo "    spec: {cpus: 2, memory: 2Gi, node: {labels: {ferry.dev/mode: shared}}}"
+  echo "    EOF"
+  echo
+  echo "    kubectl get machines"
+}
+
+cmd_machines_disable() {
+  bold "turning off machines"
+  # The marker first, so a crash between here and the kills does not leave a
+  # cluster that restarts machines its operator just turned off.
+  rm -f "$MACHINES_MARKER"
+  stop_machines
+  echo
+  echo "  Machine objects and the CRD are left alone; deleting a Machine is how"
+  echo "  its node and disk go away. The node image and $NODE_DISK are kept."
+}
+
+stop_machines() {
+  local component pidfile pid
+  for component in ferry-machined ferry-node; do
+    pidfile="$FERRY_RUN/$component.pid"
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile")"; rm -f "$pidfile"
+    kill -TERM "$pid" 2>/dev/null || continue
+    # ferry-node has to release its vmnet network before another run can claim
+    # the same subnet, exactly as ferry-cri does.
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$pid" 2>/dev/null
+    ok "$component stopped"
+  done
+}
+
+cmd_machines_status() {
+  bold "machines (mode 2)"
+  if machines_enabled; then ok "enabled for this cluster"
+  else bad "not enabled -- ferry machines enable"; fi
+  for component in ferry-machined ferry-node; do
+    if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
+    else bad "$component"; fi
+  done
+  # Telling someone on a release to run 'ferry node-image' is telling them to
+  # run a command that refuses on a release. What to do differs by where you
+  # are, so the answer does too.
+  if [ -d "$NODE_IMAGE_LAYOUT" ]; then
+    ok "node image $NODE_IMAGE_LAYOUT"
+  elif is_release; then
+    bad "no node image -- this release was packaged without one"
+    echo "      mode 2 needs a release built with it; mode 1 is unaffected"
+  else
+    bad "no node image -- ferry node-image   (slow, needs docker)"
+  fi
+  [ -f "$NODE_DISK" ] && ok "node disk $NODE_DISK ($(du -h "$NODE_DISK" | awk '{print $1}') used)" \
+    || echo "  node disk not unpacked yet; the first 'machines enable' does it"
+  echo "  network   $MACHINE_SUBNET"
+  if have_cluster; then
+    echo
+    kube get machines 2>/dev/null || echo "  no Machine CRD installed yet"
+  fi
+}
+
+cmd_machines() {
+  case "${1:-status}" in
+    enable)  shift; cmd_machines_enable ;;
+    disable) shift; cmd_machines_disable ;;
+    status)  shift; cmd_machines_status ;;
+    ls|list) shift; kube get machines ;;
+    *) bad "usage: ferry machines [enable|disable|status|ls]"; return 2 ;;
+  esac
 }
 
 # --- starting at login ----------------------------------------------------
@@ -3124,6 +3417,12 @@ cmd_status() {
     if [ -f "$FERRY_HOME/$component.pid" ] && kill -0 "$(cat "$FERRY_HOME/$component.pid")" 2>/dev/null
     then ok "$component"; else bad "$component"; fi
   done
+  if machines_enabled; then
+    for component in ferry-node ferry-machined; do
+      if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
+      else bad "$component (machines are enabled)"; fi
+    done
+  fi
   echo "  $(count_vms) pod VMs running"
   if [ -f "$FERRY_HOME/admin.conf" ] && running kubelet; then
     echo
@@ -3134,10 +3433,10 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd>"; return 1 ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node>"; return 1 ;;
   esac
 }
 
@@ -3174,6 +3473,8 @@ case "${1:-}" in
                 *)   bad "usage: ferry node [add <name>|rm <name>|ls]"; exit 2 ;;
               esac ;;
   upgrade)    shift; cmd_upgrade "$@" ;;
+  machines)   shift; cmd_machines "$@" ;;
+  node-image) shift; cmd_node_image "$@" ;;
   service)    shift; cmd_service "$@" ;;
   uninstall)  shift; cmd_uninstall "$@" ;;
   down)       shift; cmd_down "$@" ;;
