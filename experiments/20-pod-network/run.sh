@@ -59,10 +59,7 @@ render "$image_dir/manifests/kube-proxy.yaml" | kubectl apply -f - >/dev/null
 render "$image_dir/manifests/coredns.yaml" | kubectl apply -f - >/dev/null
 
 echo "==> ferry-node serve (one network for every machine)"
-# SWITCH=1 runs the comparison: a second NIC per machine on a segment ferry
-# switches itself, instead of routing pod traffic over vmnet. Both work here.
 "$image_dir/build/ferry-node" serve \
-  ${SWITCH:+--switch} \
   --dir "$STATE/machines" \
   --kernel "$KERNEL" \
   --ca "$STATE/pki/ca.crt" \

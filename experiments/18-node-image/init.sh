@@ -45,7 +45,6 @@ GATEWAY=$(param ferry.gateway)
 POD_CIDR=$(param ferry.podcidr)
 DNS=$(param ferry.dns)
 DNS_SERVICE=$(param ferry.dnssvc)
-CLUSTER_ADDRESS=$(param ferry.cluster)
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -61,14 +60,7 @@ ip link set eth0 up
 ip addr add "$ADDRESS" dev eth0
 [ -n "$GATEWAY" ] && ip route add default via "$GATEWAY"
 printf 'nameserver %s\n' "${DNS:-1.1.1.1}" > /etc/resolv.conf
-# eth1 is ferry's own segment. vmnet carries the addresses it assigned and
-# drops everything else, so pod traffic between nodes goes here instead --
-# which is the arrangement mode 1 arrived at for pods.
-if [ -n "$CLUSTER_ADDRESS" ]; then
-  ip link set eth1 up
-  ip addr add "$CLUSTER_ADDRESS" dev eth1
-fi
-log "address $ADDRESS via ${GATEWAY:-none}, cluster ${CLUSTER_ADDRESS:-none} ($(elapsed)ms)"
+log "address $ADDRESS via ${GATEWAY:-none} ($(elapsed)ms)"
 
 log "binaries: $(ls -l /usr/local/bin/containerd 2>&1 | awk '{print $1, $5}') kubelet $(ls -l /usr/local/bin/kubelet 2>&1 | awk '{print $5}')"
 log "starting containerd"
@@ -194,12 +186,11 @@ route_agent() {
     curl -s --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
       "$API_SERVER/api/v1/nodes" 2>/dev/null \
       | jq -r '.items[] | select(.spec.podCIDR != null) |
-               "\(.spec.podCIDR) \(.metadata.annotations["ferry.dev/switch-address"]
-                  // (.status.addresses[] | select(.type=="InternalIP") | .address))"' \
+               "\(.spec.podCIDR) \(.status.addresses[]
+                  | select(.type=="InternalIP") | .address)"' \
       2>/dev/null | while read -r cidr via; do
         [ -z "$cidr" ] && continue
         [ "$cidr" = "$POD_CIDR" ] && continue
-        [ "$via" = "${CLUSTER_ADDRESS%%/*}" ] && continue
         [ "$via" = "${ADDRESS%%/*}" ] && continue
         case "$(ip route show "$cidr" 2>/dev/null)" in
           *"via $via"*) ;;
@@ -255,17 +246,6 @@ cat > /etc/cni/net.d/10-ferry-node.conflist <<CNI
 CNI
 log "cni configured ($(elapsed)ms)"
 
-# Publish this node's address on ferry's segment. The Node's InternalIP stays
-# on vmnet so the Mac can still reach the kubelet for logs and exec; routes
-# between nodes use this instead, and an annotation is somewhere a kubelet is
-# allowed to write about itself.
-if [ -n "$CLUSTER_ADDRESS" ]; then
-  curl -s -X PATCH --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
-    -H "Content-Type: application/merge-patch+json" \
-    -d "{\"metadata\":{\"annotations\":{\"ferry.dev/switch-address\":\"${CLUSTER_ADDRESS%%/*}\"}}}" \
-    "$API_SERVER/api/v1/nodes/$NODE_NAME" >/dev/null 2>&1
-  log "published switch address ${CLUSTER_ADDRESS%%/*}"
-fi
 route_agent &
 log "up"
 

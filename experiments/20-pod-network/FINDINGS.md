@@ -15,7 +15,7 @@ Run on macOS 26.6.2, Apple M1 Max, 10 cores, 32 GiB.
 ```
   PASS  both machines are Ready
   PASS  both machines are on one network
-        addresses: 192.168.93.2 192.168.93.3
+        addresses: 192.168.96.2 192.168.96.3
   PASS  the target pod stays running
   PASS  pod on worker-b has an address (10.88.1.2)
         ping says: CROSS_NODE_OK
@@ -60,10 +60,19 @@ With a pod that stays alive, both arrangements work:
 | over ferry's own switched segment | `CROSS_NODE_OK` |
 | over vmnet, no second interface | `CROSS_NODE_OK` |
 
-So vmnet is the default and the switch is off behind `--switch`. It is kept
-rather than deleted because mode 1 met a real version of this problem —
-traffic between two *Macs*, where vmnet rewrites source addresses — and this
-milestone has not been near that case.
+**The switch has been removed.** It was kept for one more round on the grounds
+that mode 1 met a real version of this problem — traffic between two *Macs*,
+where vmnet rewrites the source address — but that is precisely the case
+`MachineSwitch` could not serve. Mode 1's `PodSwitch` spans machines because it
+carries a UDP relay and a peer list; this copy had neither, and forwarded only
+between ports on one Mac. So it duplicated the kernel datapath for traffic vmnet
+already carries, and was reserved for traffic it could not carry. Cross-Mac work
+in mode 2, when it comes, is a port of `PodSwitch`, not a revival of this.
+
+Removing it took a second NIC, a socketpair, a 143-line switch, an annotation
+the node published about itself, and a kernel command-line parameter out of the
+node image. `BOOT_TO_READY_SECONDS` is 13.1 against 13.8 before, which is within
+the run-to-run spread rather than a saving worth claiming.
 
 The lesson is the one ferry's own GAPS.md keeps relearning: a failing probe
 proves nothing until the thing being probed is known to be alive. Two
@@ -73,7 +82,7 @@ observations agreed with a theory that was still wrong.
 
 - **Milestone 3 is met** for one Mac: pods on two machines reach each other
   over ordinary routes.
-- **The switch was not needed**, and saying so is worth more than the code.
+- **The switch was not needed**, and deleting it is worth more than the code.
 - **Milestones 4 and 5** — provisioning from pending pods, and consolidation —
   are now writing and deleting `Machine` objects, which experiment 19 showed
   works.
@@ -87,15 +96,12 @@ observations agreed with a theory that was still wrong.
   boundary here.
 - **No NetworkPolicy** between machines, and no measurement of what the route
   agent costs when nodes come and go quickly.
-- **The switch has been run, not tested.** It carried this traffic once; it has
-  no test of its own.
 
 ## Reproduce
 
 ```sh
 ../18-node-image/build.sh
 ( cd ../../ferry-machined && go build -o ../bin/ferry-machined . )
-./run.sh              # vmnet routing, the default
-SWITCH=1 ./run.sh     # the same, over ferry's own switched segment
+./run.sh              # vmnet routing
 KEEP=1 ./run.sh       # and leave it up
 ```

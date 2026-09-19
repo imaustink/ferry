@@ -307,9 +307,11 @@ and `kubectl get nodes` shows the truth.
    into a server rather than configuring a subnet. And vmnet *does* carry
    pod-addressed traffic between machines on it — an earlier reading said
    otherwise and was taken against a pod that had already exited. A second
-   interface per machine, switched by ferry, was built before that was noticed;
-   it works, it is off by default, and it is kept only for the case mode 1
-   actually hit, which is traffic between two Macs.
+   interface per machine, switched by ferry, was built before that was noticed
+   and has since been removed — it duplicated the kernel datapath, and the one
+   case it was briefly kept for, traffic between two Macs, is the thing it could
+   not do: it had neither the UDP relay nor the peer list that mode 1's
+   `PodSwitch` carries.
 
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
    creation, and the host budget. A Deployment scaled beyond what exists
