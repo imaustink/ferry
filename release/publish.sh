@@ -51,7 +51,13 @@ git -C "$root" rev-parse "$version" >/dev/null 2>&1 \
   || die "the tree is dirty; commit or stash before publishing a release"
 
 packaged="$(tar -xOzf "$tarball" "ferry-$version/VERSION" 2>/dev/null | sed -n 's/^commit=//p')"
-tagged="$(git -C "$root" rev-parse "$version")"
+# ^{commit}, because an annotated tag is an object of its own and rev-parse on
+# its name returns *that* object's hash rather than the commit it points at.
+# Comparing the two directly meant every annotated tag -- which is the kind
+# `git tag -a` makes, and the kind the release instructions say to make --
+# failed this check and told the maintainer to rebuild a tarball that was
+# perfectly correct.
+tagged="$(git -C "$root" rev-parse "$version^{commit}")"
 [ "$packaged" = "$tagged" ] \
   || die "the tarball was built from $packaged but $version is $tagged -- rebuild it"
 ok "tarball matches tag $version"
