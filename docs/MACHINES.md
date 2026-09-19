@@ -272,6 +272,40 @@ not have, and reusing that label makes the `kube-dns` Service load-balance
 across pods half the cluster cannot reach — DNS that works intermittently,
 which is worse than DNS that does not work.
 
+## Which mode is the default, and what has to be true first
+
+Mode 1 is the default today, and the reason is provisioning rather than
+confidence.
+
+The case for making mode 2 the default is real and gets stronger the smaller
+the Mac. A pod VM costs 226 MiB idle whatever it runs, so `maxPods` is derived
+from memory and a 16 GiB Mac advertises around 36 pods; mode 2's marginal
+container is ~17 MiB and eight containers of one image cost what one costs.
+Most people have less memory than the machine this was developed on, and for
+them mode 2 is the difference between running their stack and not.
+
+What blocks it is not that mode 2 is newer. It is that **a `Machine` has to be
+declared, with a size**, and "nothing to size up front" is the thing ferry is
+for. Defaulting to mode 2 as it stands would mean `ferry up` inventing a node
+shape before knowing the workload, which is Docker Desktop's bargain with extra
+steps — and it would do it on the mode whose whole argument is density, where
+guessing too small is a cluster that cannot schedule and guessing too large is
+the memory you were trying to save.
+
+Provisioning removes the guess rather than relocating it. A pending pod that
+fits nothing creates the machine it needs, sized to fit; consolidation gives the
+memory back when it does not. At that point nothing is sized in advance in
+either mode, the claim at the top of the README holds for both, and mode 2
+becoming the default is a change of which node a pod lands on by default rather
+than a change in what ferry asks of you.
+
+So: **milestones 4 and 5 are the precondition, not a nice-to-have afterwards.**
+Until they exist, a small Mac is better served by mode 1 advertising a low
+`maxPods` honestly than by mode 2 asking for a number nobody has.
+
+Worth saying because it is easy to lose: mode 1 does not go away when mode 2 is
+the default. The Mac node is where the provisioner runs.
+
 ## How a pod chooses
 
 It does not need a new concept. The Mac is a node and each machine is a node,
@@ -363,9 +397,14 @@ which is milestone 4's job to make deliberate.
 
 4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
    creation, and the host budget. A Deployment scaled beyond what exists
-   creates the node it needs.
+   creates the node it needs. Likely by implementing Karpenter's cloud-provider
+   interface rather than writing the bin-packer — see
+   [the open decision](#open-decisions). This is also what has to exist before
+   mode 2 can sensibly be the default, because until a machine is created for
+   you, choosing mode 2 means choosing a node size in advance.
 5. **Consolidation.** Cordon, drain honouring PDBs, delete — and the memory
-   returns to the Mac. Without this half, provisioning is a one-way ratchet.
+   returns to the Mac. Without this half, provisioning is a one-way ratchet, and
+   on a laptop a one-way ratchet is just a memory leak with a controller.
 6. **Mixed cluster.** The Mac node and machines in one cluster, `nodeSelector`
    choosing between them, both modes running the same Deployment.
 7. **GPU into machines.** A device plugin inside the node VM proxying to
@@ -419,6 +458,39 @@ which is milestone 4's job to make deliberate.
   from a catalogue rather than arbitrary shapes. Worth a serious look before
   milestone 4 — the shape of `NodePool` above is deliberately close to
   Karpenter's so that either answer stays open.
+
+  **Leaning Karpenter**, and the two objections above turn out to be smaller
+  than they read.
+
+  *Running inside the cluster it provisions for* is the good case here rather
+  than the awkward one. The Mac node always exists and always runs mode 1, so
+  there is somewhere for the controller to live before a single machine does.
+  That removes the bootstrap problem a cloud provider has to solve with a
+  management cluster, and it means the two modes are not alternatives: mode 1 is
+  what makes mode 2 self-starting.
+
+  *A catalogue rather than arbitrary shapes* is a synthesis away. `GetInstanceTypes`
+  can enumerate shapes from the `machine.cpus` and `machine.memory` ranges above
+  — powers of two within the range is enough — and Karpenter will bin-pack
+  against them. A hypervisor does not care that the shapes came from a list.
+
+  The real adaptation is neither of those. **Karpenter assumes capacity is
+  elastic** and a Mac's is not: `spec.limits` is a hard ceiling, and past it
+  `Create` has to fail with an insufficient-capacity error so Karpenter marks
+  the shape unavailable and backs off, rather than retrying into a machine that
+  cannot be made. Getting that wrong is a hot loop against the hypervisor, and
+  it is the part with no upstream precedent to copy.
+
+  The argument against, which is not nothing: Karpenter is a large dependency
+  for a laptop. Its sophistication — multi-zone, spot, instance-type arbitrage —
+  is mostly inapplicable to one Mac with a handful of machines, while its
+  operational surface is fully applicable: CRDs, a controller to keep running,
+  and version skew with the Kubernetes it provisions for. A provisioner that
+  said "pods are pending and do not fit, so make one machine big enough,
+  respecting the budget; delete machines that have been empty for a minute"
+  would be a few hundred lines. What argues against *that* is the second half:
+  drain honouring PodDisruptionBudgets is where the bodies are buried, and
+  Karpenter has already buried them.
 
 ## What this costs
 
