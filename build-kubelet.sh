@@ -41,6 +41,25 @@ echo "==> applying overlay"
       echo "    + ${f#./}"
     done
 
+# A few shims differ by minor -- upstream changes a constructor's signature and
+# the darwin stand-in has to match. Those live in patches/kubelet-vX.Y/ and are
+# laid over the shared tree, so supporting a new minor does not mean forking the
+# whole overlay or breaking the one before it.
+overlay="$here/patches/kubelet-$(ferry_version_mm "$K8S_VERSION")"
+if [ -d "$overlay" ]; then
+  echo "==> overlaying $(basename "$overlay")"
+  (cd "$overlay" && find . -name '*.go' -print0) \
+    | while IFS= read -r -d '' f; do
+        mkdir -p "$(dirname "$src/$f")"
+        install -m 0644 "$overlay/$f" "$src/$f"
+        echo "    + ${f#./}"
+      done
+else
+  echo "==> no per-minor overlay for $(ferry_version_mm "$K8S_VERSION")" >&2
+  echo "    patches/kubelet-vX.Y/ carries the shims whose signatures move between" >&2
+  echo "    minors. Without one the build will fail on those, not silently skip them." >&2
+fi
+
 # Narrow the not-linux-not-windows fallbacks so the darwin files win. Each
 # build tag is widened by hand because the upstream files carry both the new
 # //go:build form and the legacy // +build comment.
@@ -183,6 +202,7 @@ for f in kuberuntime_container helpers kuberuntime_sandbox; do
       -e '/libcontainercgroups "github.com\/opencontainers\/cgroups"/d' \
       -e 's|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g' \
       -e 's|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g' \
+      -e 's|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|' \
       -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
       "$src_file" > "$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
   echo "    + ${f}_darwin.go (from ${f}_linux.go)"

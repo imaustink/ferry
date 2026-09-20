@@ -70,12 +70,19 @@ ferry_version_mm() { echo "v$(ferry_version_major "$1").$(ferry_version_minor "$
 # which is well inside the supported skew -- rather than silently 404ing at
 # download time.
 #
-# Only v1.34 has been built and run. The rest are the shape this takes when
-# another minor is added, not a claim that they work.
+# v1.34 and v1.36 have been built and run. The rest are the shape this takes
+# when another minor is added, not a claim that they work.
+#
+# v1.35 is deliberately absent: it builds, but it is the last minor before the
+# kubelet learned to report a sandbox as ready without waiting to be told by its
+# next relist, so there is nothing to gain by stopping there. v1.37 is absent
+# because it cannot be built at all -- upstream removed the vendored cadvisor
+# packages ferry's darwin shim imports.
 ferry_control_plane_version() { # k8s-version
   [ -n "${K8S_CONTROL_PLANE_VERSION:-}" ] && { echo "$K8S_CONTROL_PLANE_VERSION"; return; }
   case "$(ferry_version_mm "$1")" in
     v1.34) echo "v1.34.11" ;;
+    v1.36) echo "v1.36.4" ;;
     # No pin for this minor: ask for the exact version and let the download say
     # so if kwok-ci has not built it. The error names the override.
     *)     echo "$1" ;;
