@@ -28,6 +28,10 @@ ADD stage/cni-plugins.tgz /opt/cni/bin/
 # comments in it for what that cost.
 COPY files/containerd-config.toml /etc/containerd/config.toml
 
+# The sandbox image every pod needs, exported on the host by build.sh. A node
+# that cannot reach a registry still has to be able to start a pod.
+COPY stage/sandbox-image.tar /opt/ferry/sandbox-image.tar
+
 COPY init.sh /sbin/ferry-init
 
 RUN chmod +x /usr/local/bin/kubelet /usr/local/bin/runc /sbin/ferry-init \

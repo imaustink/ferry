@@ -24,6 +24,19 @@ STAGE="${STAGE:-$here/../17-node-vm/stage}"
 rm -rf stage && mkdir stage
 cp "$STAGE/kubelet" "$STAGE/runc" "$STAGE/containerd.tar.gz" "$STAGE/cni-plugins.tgz" stage/
 
+# The sandbox image, baked in rather than pulled on first use. stage.sh says the
+# node downloads nothing at boot; that was true of every binary and false of
+# this one image, which containerd fetched the first time a pod was scheduled.
+#
+# Which image is not decided here: it is read out of the containerd config that
+# ships in the node image, so the pin and the baked copy cannot drift. The trick
+# is kind's -- see pkg/build/nodeimage/helpers.go.
+SANDBOX_IMAGE="$(grep -oE "sandbox = '[^']+'" files/containerd-config.toml | sed "s/sandbox = '//;s/'//")"
+[ -n "$SANDBOX_IMAGE" ] || { echo "no sandbox image pinned in files/containerd-config.toml"; exit 1; }
+echo "==> sandbox image $SANDBOX_IMAGE"
+docker pull --platform linux/arm64 -q "$SANDBOX_IMAGE" >/dev/null
+docker save -o stage/sandbox-image.tar "$SANDBOX_IMAGE"
+
 # The default buildx driver cannot export an OCI layout, which is the format
 # the image has to arrive in to be unpacked into a filesystem. A
 # docker-container builder can.
