@@ -57,6 +57,8 @@ ferry_overlay_rules=(
   'cm.MilliCPUToShares( s|cm\.MilliCPUToShares(|cm.FerryMilliCPUToShares(|g'
   'cm.MilliCPUToQuota( s|cm\.MilliCPUToQuota(|cm.FerryMilliCPUToQuota(|g'
   'cm.QuotaPeriod s|cm\.QuotaPeriod|cm.FerryQuotaPeriod|g'
+  'cm.MinShares s|cm\.MinShares|cm.FerryMinShares|g'
+  'cm.MinMilliCPULimit s|cm\.MinMilliCPULimit|cm.FerryMinMilliCPULimit|g'
 )
 
 # The names no derived file may still contain, one per line, in table order and
@@ -88,6 +90,25 @@ ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
   sed "${args[@]}" "$1" > "$2"
 }
 
+# The same rules, applied to a file that stays where it is.
+#
+# Most of what package cm gets wrong on darwin is reached from the kuberuntime
+# files, which are derived and so get a _darwin.go of their own. kubelet_pods.go
+# is not: it carries no build tag, so there is one copy and it is compiled here
+# as written. It still names cm.MinShares and cm.MinMilliCPULimit -- Linux
+# floors that helpers_unsupported.go declares as 0 -- to decide what a
+# container's status reports, and from v1.37 it names cm.MilliCPUToShares too.
+#
+# Rewriting it in place rather than copying it is the same bargain
+# build-kubelet.sh already takes with kubelet_node_status.go and predicate.go:
+# the tree is darwin-only and thrown away, and `git checkout -- .` on reuse puts
+# the file back. Rules that match nothing leave it alone, so the build tag rules
+# and the cgroup ones are no-ops here.
+ferry_rewrite_darwin_in_place() { # file
+  local tmp="$1.ferry-rewriting"
+  ferry_derive_darwin_from_linux "$1" "$tmp" && mv "$tmp" "$1"
+}
+
 # Nothing upstream may still be named in a derived file.
 #
 # The two halves fail differently, and the second is why this exists as a check
@@ -103,7 +124,7 @@ ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
 # says so, at build time or after. That silence is the whole reason to check.
 #
 # Prints what it found, and returns non-zero if it found anything.
-ferry_check_derived_darwin() { # darwin-file
+ferry_check_derived_darwin() { # darwin-or-rewritten-file
   # Fixed strings, not expressions: these end in an open parenthesis, which a
   # regex reads as the start of a group. None is a prefix of its own
   # replacement -- cm.MilliCPUToShares( does not occur inside

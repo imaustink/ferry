@@ -67,16 +67,31 @@ import (
 
 const (
 	// What Linux uses, which is what the guest is.
-	ferryLinuxMinShares      = 2
 	ferryLinuxMaxShares      = 262144
 	ferryLinuxSharesPerCPU   = 1024
 	ferryLinuxMilliCPUToCPU  = 1000
 	ferryLinuxMinQuotaPeriod = 1000
 
-	// FerryQuotaPeriod is cfs_period_us, 100ms in microseconds. It stands in
-	// for cm.QuotaPeriod, which helpers_unsupported.go declares as 0.
+	// The three that are named from outside this file, so exported and
+	// Ferry-prefixed: helpers_unsupported.go declares all of them as 0 and is
+	// still compiled here, so it owns the plain names. lib/overlay.sh rewrites
+	// the call sites, in the derived kuberuntime files and in kubelet_pods.go.
+	//
+	// FerryQuotaPeriod is cfs_period_us, 100ms in microseconds.
 	FerryQuotaPeriod = 100000
+	// FerryMinShares is the kernel's floor for cpu.shares, and the value the
+	// kubelet sends for a container that requested nothing.
+	FerryMinShares = 2
+	// FerryMinMilliCPULimit is the smallest limit a CFS quota can express:
+	// the inverse of MilliCPUToQuota at the 1ms quota floor. Below it, two
+	// different limits produce the same quota, so kubelet_pods.go reports the
+	// allocated value rather than the actuated one.
+	FerryMinMilliCPULimit = 10
 )
+
+// The unexported spelling stays for this file's own arithmetic, which reads
+// better without the prefix.
+const ferryLinuxMinShares = FerryMinShares
 
 // FerryMilliCPUToQuota converts milliCPU to CFS quota and period values.
 // Input parameters and resulting value is number of microseconds.

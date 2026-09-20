@@ -72,6 +72,12 @@ func example(pod *v1.Pod, rc *cm.ResourceConfig, cpuLimit resource.Quantity, fac
 	cm.ApplyPodLevelMemoryHigh(pod, rc, factor)
 	_, _, _, _, _, _ = pageSizes, unified, cgroups, err, cpuShares, cpuQuota
 }
+
+// The shape kubelet_pods.go uses these two in: Linux floors, below which it
+// reports what a container was allocated rather than what was actuated.
+func floors(cpuRequest, cpuLimit resource.Quantity) bool {
+	return cpuRequest.MilliValue() > cm.MinShares && cpuLimit.MilliValue() > cm.MinMilliCPULimit
+}
 FIXTURE
 
 out="$work/sample_darwin.go"
@@ -93,6 +99,8 @@ contains "quota uses ferry's arithmetic"     "$out" "cm.FerryMilliCPUToQuota("
 contains "and the period is ferry's"         "$out" "int64(cm.FerryQuotaPeriod)"
 lacks    "no unrewritten shares call"        "$out" "cm.MilliCPUToShares("
 lacks    "no unrewritten quota call"         "$out" "cm.MilliCPUToQuota("
+contains "the shares floor is Linux's"      "$out" "cm.FerryMinShares"
+contains "and so is the smallest limit"     "$out" "cm.FerryMinMilliCPULimit"
 
 printf '\033[1m%s\033[0m\n' "the check that guards all of it"
 succeeds "a fully derived file passes"  ferry_check_derived_darwin "$out"
@@ -107,6 +115,18 @@ refuses "so is a leftover cgroups call" ferry_check_derived_darwin "$work/cgroup
 
 sed 's|ferryApplyPodLevelMemoryHigh(|cm.ApplyPodLevelMemoryHigh(|' "$out" > "$work/memhigh_darwin.go"
 refuses "and a missed memory.high call"  ferry_check_derived_darwin "$work/memhigh_darwin.go"
+
+# kubelet_pods.go has no build tag, so it is rewritten where it lies rather
+# than copied to a _darwin.go. Same rules, same check, no stray temp file.
+printf '\033[1m%s\033[0m\n' "rewriting a file in place"
+cp "$work/sample_linux.go" "$work/in_place.go"
+ferry_rewrite_darwin_in_place "$work/in_place.go"
+contains "the rules applied"                "$work/in_place.go" "cm.FerryMinShares"
+lacks    "nothing was left unrewritten"     "$work/in_place.go" "cm.MinMilliCPULimit"
+if [ -e "$work/in_place.go.ferry-rewriting" ]; then
+  bad "no temporary file survives"
+else ok "no temporary file survives"; fi
+succeeds "and the result passes the check"  ferry_check_derived_darwin "$work/in_place.go"
 
 # Every guard in the table, not the three spelled out above. The rules and the
 # assertions are one list now, so a rule added later arrives here on its own --

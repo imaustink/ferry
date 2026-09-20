@@ -1,0 +1,15 @@
+# limits.cpu: 4 -- more than FERRY_POD_CPUS. The VM should have 4 vCPUs, which
+# is the part that was never broken, and the cgroup should read
+# "400000 100000", which is the part that was.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-limit-4
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "4", memory: 128Mi}

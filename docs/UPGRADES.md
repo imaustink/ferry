@@ -284,6 +284,9 @@ out when you can watch it rather than alongside an unrelated upgrade.
   second for every guard in the table rather than a chosen few. That matters
   most for the CFS conversions: a missed rewrite there still compiles, because
   `cm.MilliCPUToShares` exists on darwin, and simply goes back to sending zero.
+  It covers the in-place rewrite too, which is how `kubelet_pods.go` -- the one
+  file that reads those constants without carrying a build tag -- gets the same
+  rules and the same assertion as the derived ones.
 
 ### What the tests do not cover, and what was run instead
 
@@ -312,6 +315,18 @@ ferry upgrade nodes
 Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`
 — which started the cluster at its own recorded version and said so, rather
 than letting the build become an upgrade.
+
+The CPU change above was run the same way, on v1.36.4, against four builds — the
+one before it, the kubelet half alone, the first attempt at the runtime half,
+and what shipped — reading each container's `cpu.max` from inside its own VM and
+then loading it past its limit to see whether the quota bit. Before, every
+container read `max`: no limit at all, whatever its spec said. After, a 100m
+container is throttled in every one of the fifty 100ms periods in five seconds
+and delivers exactly the one CPU it is allowed, while a BestEffort container is
+throttled in none and takes its whole machine. It also found that the kubelet
+was logging two `not implemented` errors per pod per sync from a pod cgroup that
+does not exist here. Reproducer and numbers in
+[experiments/23-pod-cpu-limits](../experiments/23-pod-cpu-limits/FINDINGS.md).
 
 Running it found three things the tests could not, all since fixed. The node
 upgrade read the kubelet's version the moment the node went Ready, but a node

@@ -222,6 +222,20 @@ for f in kuberuntime_container helpers kuberuntime_sandbox; do
   echo "    + ${f}_darwin.go (from ${f}_linux.go)"
 done
 
+# kubelet_pods.go is the one file outside those that lets package cm's
+# host-cgroup answers decide a guest's numbers. It has no build tag, so there is
+# nothing to derive from and nothing to derive to -- it is rewritten where it
+# lies. See lib/overlay.sh.
+echo "==> rewriting the cgroup constants kubelet_pods.go reads"
+pods_file="$src/pkg/kubelet/kubelet_pods.go"
+if [ -f "$pods_file" ]; then
+  ferry_rewrite_darwin_in_place "$pods_file"
+  ferry_check_derived_darwin "$pods_file" >&2 \
+    || { echo "    !! upstream moved a call this script rewrites; add a seam in lib/overlay.sh" >&2
+         exit 1; }
+  echo "    ~ pkg/kubelet/kubelet_pods.go"
+fi
+
 echo "==> building darwin/arm64 kubelet ($K8S_VERSION)"
 cd "$src"
 # cgo is on because the node's CPU usage has no other source. macOS publishes no

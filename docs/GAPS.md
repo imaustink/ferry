@@ -114,18 +114,27 @@ Known limits, which are not bugs:
   See [INSTALL.md](INSTALL.md).
 - **A minor bump is a different problem** -- porting `patches/` -- and this
   machinery does not claim to solve it.
-- **More of `helpers_unsupported.go` leaks into Linux-guest decisions.** The CFS
-  conversions are handled -- `lib/overlay.sh` redirects them to `cm.Ferry*` and
-  asserts that it did -- but that file also declares
-  `CPUSharesEqualAfterV2RoundTrip` (returns `false`),
-  `CPURequestsFromConfig`, `CPULimitsFromConfig` and `ResourceConfigForPod`
-  (return `nil`), and those are reached from `pkg/kubelet/kubelet_pods.go`,
-  which has no build tag and so compiles on darwin as written. The consequences
-  are in the pod-level-resources and in-place-resize paths rather than in
-  ordinary pod startup, which is why they are recorded here rather than fixed
-  alongside the conversions. The overlay check will not catch them either: it
-  reads the derived `_darwin.go` files, and these call sites are in a file that
-  is not derived.
+- ~~**More of `helpers_unsupported.go` leaks into Linux-guest decisions.**~~
+  **Closed**, and smaller than it looked. `kubelet_pods.go` carries no build
+  tag, so it compiles on darwin as written and reads `cm.MinShares` and
+  `cm.MinMilliCPULimit` -- Linux floors that file declares as `0` -- to decide
+  what a container's status reports, plus `cm.MilliCPUToShares` from v1.37.
+  `lib/overlay.sh` now rewrites it in place from the same rule table as the
+  derived files, so the same assertion covers it. Separately, the pod container
+  manager's `GetPodCgroupConfig` reported `not implemented`, which
+  `convertToAPIPodLevelResourcesStatus` logged as an error twice per pod per
+  sync; darwin answers *no configuration, no error* instead, which is the truth
+  here and what every caller already handles. Measured in
+  [experiments/23-pod-cpu-limits](../experiments/23-pod-cpu-limits/FINDINGS.md).
+
+  What is left of it is not a leak. `ResourceConfigForPod` returns `nil` on
+  darwin and upstream expects that on any platform without pod cgroups: it makes
+  in-place pod resize fail with a message naming the reason, which is the right
+  answer for a machine that cannot be resized after it boots, and it makes an
+  `emptyDir` memory volume fall back to node allocatable. `CPURequestsFromConfig`,
+  `CPULimitsFromConfig`, `MemoryLimitsFromConfig` and v1.37's
+  `CPUSharesEqualAfterV2RoundTrip` are only ever reached with the config that
+  `GetPodCgroupConfig` returns, so on darwin they are dead rather than wrong.
 
 ## Known, and deliberate
 
