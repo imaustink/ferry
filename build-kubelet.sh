@@ -14,6 +14,25 @@ export FERRY_ROOT
 K8S_VERSION="${K8S_VERSION:-v1.34.0}"
 ferry_version_valid "$K8S_VERSION" \
   || { echo "K8S_VERSION=$K8S_VERSION is not a version like v1.34.0" >&2; exit 1; }
+# A few shims differ by minor -- upstream changes a constructor's signature and
+# the darwin stand-in has to match. Those live in patches/kubelet-vX.Y/ and are
+# laid over the shared tree, so supporting a new minor does not mean forking the
+# whole overlay or breaking the one before it.
+#
+# Checked before anything is cloned. Without this directory nothing declares
+# cadvisor.New or cm.NewContainerManager, so the build would clone, retag and
+# derive and then die minutes later in a wall of `undefined:` errors that say
+# nothing about the missing directory. Every other seam in this script that
+# cannot be satisfied stops at the point it is noticed.
+overlay="$here/patches/kubelet-$(ferry_version_mm "$K8S_VERSION")"
+if [ ! -d "$overlay" ]; then
+  echo "no per-minor overlay at patches/kubelet-$(ferry_version_mm "$K8S_VERSION")/" >&2
+  echo "It carries the shims whose signatures move between minors -- cadvisor.New" >&2
+  echo "and cm.NewContainerManager. Copy the nearest minor's and fix the signatures" >&2
+  echo "against upstream's linux implementations for $K8S_VERSION." >&2
+  exit 1
+fi
+
 src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-$K8S_VERSION}"
 # Built into the version store, not over bin/kubelet. Building the version you
 # are currently running is an ordinary thing to do during an upgrade, and
@@ -28,6 +47,13 @@ if [ ! -d "$src" ]; then
 else
   echo "==> reusing source at $src"
   git -C "$src" checkout -- . 2>/dev/null || true
+  # checkout restores what upstream tracks; every file the overlay adds is
+  # untracked, so it survives. That matters now that the per-minor shims are
+  # separate files: a tree built from a checkout that carried
+  # ferry_new_darwin.go, reused by one whose cadvisor_darwin.go still declares
+  # New itself, fails on a redeclaration with nothing pointing at the leftover.
+  # Sweep them so the overlay is always exactly what this checkout says.
+  git -C "$src" clean -fdq 2>/dev/null || true
 fi
 
 echo "==> applying overlay"
@@ -38,6 +64,14 @@ echo "==> applying overlay"
       # create it, so a fresh clone failed here.
       mkdir -p "$(dirname "$src/$f")"
       install -m 0644 "$here/patches/kubelet/$f" "$src/$f"
+      echo "    + ${f#./}"
+    done
+
+echo "==> overlaying $(basename "$overlay")"
+(cd "$overlay" && find . -name '*.go' -print0) \
+  | while IFS= read -r -d '' f; do
+      mkdir -p "$(dirname "$src/$f")"
+      install -m 0644 "$overlay/$f" "$src/$f"
       echo "    + ${f#./}"
     done
 
@@ -183,8 +217,20 @@ for f in kuberuntime_container helpers kuberuntime_sandbox; do
       -e '/libcontainercgroups "github.com\/opencontainers\/cgroups"/d' \
       -e 's|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g' \
       -e 's|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g' \
+      -e 's|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|' \
       -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
       "$src_file" > "$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
+  # The import is deleted unconditionally, so every use of it has to have been
+  # rewritten -- one survivor is an `undefined: libcontainercgroups` at build
+  # time with nothing naming the seam that missed. Asserting on the package
+  # rather than on one substitution is also what makes this survive upstream
+  # moving between the two forms, as it did in v1.35: v1.34 calls
+  # IsCgroup2UnifiedMode(), v1.35 and v1.36 assign the function itself.
+  ! grep -q 'libcontainercgroups\.' "$src/pkg/kubelet/kuberuntime/${f}_darwin.go" \
+    || { echo "    !! ${f}_darwin.go still reaches for libcontainercgroups, whose import was just removed:" >&2
+         grep -n 'libcontainercgroups\.' "$src/pkg/kubelet/kuberuntime/${f}_darwin.go" >&2
+         echo "    upstream moved a cgroup call this script rewrites; add a seam for it above" >&2
+         exit 1; }
   echo "    + ${f}_darwin.go (from ${f}_linux.go)"
 done
 

@@ -59,6 +59,7 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
 	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 )
 
 type cadvisorDarwin struct {
@@ -67,9 +68,7 @@ type cadvisorDarwin struct {
 
 var _ Interface = new(cadvisorDarwin)
 
-func New(imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupsRoots []string, usingLegacyStats, localStorageCapacityIsolation bool) (Interface, error) {
-	return &cadvisorDarwin{rootPath: rootPath}, nil
-}
+// New lives in ferry_new_darwin.go, per minor: its signature moves.
 
 func (c *cadvisorDarwin) Start() error { return nil }
 
@@ -299,12 +298,12 @@ func (c *cadvisorDarwin) fsInfo(path string) (cadvisorapiv2.FsInfo, error) {
 	capacity := st.Blocks * bsize
 	available := st.Bavail * bsize
 	return cadvisorapiv2.FsInfo{
-		Device:    probe,
+		Device:     probe,
 		Mountpoint: probe,
-		Capacity:  capacity,
-		Available: available,
-		Usage:     capacity - st.Bfree*bsize,
-		Inodes:    &st.Files,
+		Capacity:   capacity,
+		Available:  available,
+		Usage:      capacity - st.Bfree*bsize,
+		Inodes:     &st.Files,
 		InodesFree: &st.Ffree,
 	}, nil
 }
@@ -324,3 +323,10 @@ func parentDir(p string) string {
 	}
 	return "/"
 }
+
+// IsPsiEnabled reports whether the kernel exposes pressure stall information.
+// Asked for from v1.36, by the summary server deciding whether to serve PSI
+// metrics. PSI is a Linux kernel feature read from /proc/pressure, and the host
+// here is macOS, so the answer is no. This describes the host: a pod's own
+// pressure metrics, if anything ever wants them, come from the guest.
+func IsPsiEnabled(logger klog.Logger) bool { return false }

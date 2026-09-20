@@ -70,12 +70,24 @@ ferry_version_mm() { echo "v$(ferry_version_major "$1").$(ferry_version_minor "$
 # which is well inside the supported skew -- rather than silently 404ing at
 # download time.
 #
-# Only v1.34 has been built and run. The rest are the shape this takes when
+# v1.34, v1.35 and v1.36 have been built. The rest are the shape this takes when
 # another minor is added, not a claim that they work.
+#
+# The pins have to be an unbroken ladder, because ferry_skew_reason below refuses
+# to skip a minor: a v1.36 pinned with no v1.35 under it is a v1.36 no existing
+# cluster can reach, only a fresh one. So v1.35 is pinned even though nothing
+# wants to stop there for its own sake. It needs a kubelet overlay of its own --
+# by v1.35 NewContainerManager has taken a context but cadvisor.New has not yet
+# taken a logger, so neither neighbour's shims compile against it.
+#
+# v1.37 is absent because it cannot be built at all -- upstream removed the
+# vendored cadvisor packages ferry's darwin shim imports.
 ferry_control_plane_version() { # k8s-version
   [ -n "${K8S_CONTROL_PLANE_VERSION:-}" ] && { echo "$K8S_CONTROL_PLANE_VERSION"; return; }
   case "$(ferry_version_mm "$1")" in
     v1.34) echo "v1.34.11" ;;
+    v1.35) echo "v1.35.8" ;;
+    v1.36) echo "v1.36.4" ;;
     # No pin for this minor: ask for the exact version and let the download say
     # so if kwok-ci has not built it. The error names the override.
     *)     echo "$1" ;;

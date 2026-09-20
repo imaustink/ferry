@@ -31,12 +31,9 @@ package cm
 
 import (
 	"k8s.io/klog/v2"
-	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 )
 
@@ -46,15 +43,8 @@ type darwinContainerManager struct {
 	cadvisor cadvisor.Interface
 }
 
-func NewContainerManager(_ mount.Interface, ci cadvisor.Interface, nodeConfig NodeConfig, failSwapOn bool, recorder record.EventRecorder, kubeClient clientset.Interface) (ContainerManager, error) {
-	if nodeConfig.CgroupsPerQOS {
-		klog.InfoS("cgroupsPerQOS is set but there is no cgroup hierarchy on darwin; pod resource limits are enforced by the runtime instead")
-	}
-	return &darwinContainerManager{
-		ContainerManager: NewStubContainerManager(),
-		cadvisor:         ci,
-	}, nil
-}
+// NewContainerManager lives in ferry_new_container_manager_darwin.go, per
+// minor: its signature moves.
 
 // GetCapacity reports node capacity for resources the container manager owns.
 // The stub returns zero for ephemeral storage, which makes the node advertise

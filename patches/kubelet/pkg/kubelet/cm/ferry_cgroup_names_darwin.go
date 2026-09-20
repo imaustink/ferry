@@ -32,4 +32,8 @@ const (
 	Cgroup2MemoryHigh string = "memory.high"
 	// Cgroup2MaxSwapFilename is memory.swap.max for cgroup v2
 	Cgroup2MaxSwapFilename string = "memory.swap.max"
+	// Cgroup2MemoryLow is memory.low for cgroup v2. Named from v1.36, where
+	// MemoryQoS gained a tiered reservation policy that writes memory.low for
+	// burstable pods where it writes memory.min for guaranteed ones.
+	Cgroup2MemoryLow string = "memory.low"
 )
