@@ -67,13 +67,13 @@ func serve() throws {
 
     // The one network every machine joins. Created once, here, which is the
     // whole point of this mode.
-    let network = Box(try VmnetNetwork(
-        subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet)))
+    let network = try MachineNetwork(
+        subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet))
     let podNetwork = MachineSwitch(relayPort: switchPort, peer: switchPeer)
 
     print("==> ferry-node serve")
     print("    dir      \(dir)")
-    print("    network  \(network.value.subnet), gateway \(network.value.ipv4Gateway)")
+    print("    network  \(network.subnet), gateway \(network.ipv4Gateway)")
     if podNetwork != nil {
         print("    switch   udp/\(switchPort), ferry-cri at \(switchPeer)")
     } else {
@@ -82,17 +82,39 @@ func serve() throws {
 
     // Held so the machines stay alive: a VZVirtualMachine that goes out of
     // scope takes its guest with it.
-    var running: [String: RunningMachine] = [:]
+    let live = Live()
+
+    // Stop the machines and give the subnet back, rather than being killed with
+    // both still held.
+    //
+    // A machine whose host process is killed loses whatever it had not flushed,
+    // and a node VM runs containerd over a real filesystem; and the network
+    // stays reserved, so the next `ferry machines enable` waits for a subnet
+    // this process abandoned. Asking again is the one thing that makes that
+    // worse (experiment 22).
+    let signals = onShutdownSignal {
+        announce("\n==> stopping machines and releasing the machine network")
+        for (name, machine) in live.take() {
+            podNetwork?.detach(name: name)
+            machine.stop()
+            try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
+        }
+        network.release()
+        announce("==> stopped")
+        exit(0)
+    }
+    _ = signals
 
     while true {
         let wanted = readSpecs(in: dir)
 
+        let running = live.all()
         for (name, spec) in wanted where running[name] == nil {
             do {
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
                                        caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
                                        clusterCIDR: clusterCIDR, podNetwork: podNetwork)
-                running[name] = machine
+                live.add(name, machine)
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,
                     podCIDR: spec.podCIDR, phase: "Running", message: nil), in: dir)
@@ -109,7 +131,7 @@ func serve() throws {
             print("==> \(name) stopping")
             podNetwork?.detach(name: name)
             machine.stop()
-            running.removeValue(forKey: name)
+            live.remove(name)
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
         }
 
@@ -145,12 +167,12 @@ final class RunningMachine {
 }
 
 @available(macOS 26.0, *)
-func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
+func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
           caPath: String, apiServer: String, clusterDNS: String,
           clusterCIDR: String = "", podNetwork: MachineSwitch? = nil) throws -> RunningMachine {
     // An interface on the shared network, so every machine is on one segment
     // and a route between two of them is an ordinary route.
-    guard let interface = try network.value.createInterface(spec.name) as? VmnetNetwork.Interface else {
+    guard let interface = try network.createInterface(spec.name) else {
         throw Failure.message("vmnet gave no interface for \(spec.name)")
     }
     let address = "\(interface.ipv4Address)"

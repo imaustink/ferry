@@ -3219,10 +3219,11 @@ stop_machines() {
   # ferry-machined already uses rather than hunting for VM processes. The
   # Machine objects stay in etcd, so the next start brings them back.
   #
-  # It does not make the next 'ferry up' any quicker: vmnet holds the machine
-  # subnet for about a minute after the network goes either way, so an
-  # immediate restart still fails to create it (status 1001) and mode 2 reports
-  # that rather than coming back.
+  # It also makes the next start quicker, which it did not used to. ferry-node
+  # releases the machine network on the way out now, so an immediate restart
+  # takes the same subnet straight back -- measured at five seconds, against a
+  # minute or more of status 1001 before. See experiment 22 for why asking
+  # again was the worst possible response to that.
   if running ferry-node && [ -d "$FERRY_RUN/machines" ]; then
     # ferry-machined first, or it writes the spec files straight back.
     # The provisioner first of all: it exists to replace machines that go

@@ -708,6 +708,18 @@ succeeds "the slice retry is spaced past an expiry window" \
   ' "$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
 succeeds "  and ferry waits for it rather than calling it a failure" \
   grep -q 'waiting for .\*slice' "$repo/ferry"
+# The machines network has the same lifetime and had the same bug: ferry-node
+# was killed with it held, so 'machines disable' then 'enable' waited too.
+succeeds "ferry-node owns the machine network" \
+  test -f "$repo/experiments/18-node-image/Sources/ferry-node/MachineNetwork.swift"
+succeeds "  and stops the machines before releasing it" \
+  ruby -e '
+    b = File.read(ARGV[0])
+    i = b.index("machine.stop()"); j = b.index("network.release()")
+    exit(i && j && i < j ? 0 : 1)
+  ' "$repo/experiments/18-node-image/Sources/ferry-node/Serve.swift"
+succeeds "  from a handler that is not main-actor isolated" \
+  grep -q '@escaping @Sendable () -> Void' "$repo/experiments/18-node-image/Sources/ferry-node/MachineNetwork.swift"
 
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy
