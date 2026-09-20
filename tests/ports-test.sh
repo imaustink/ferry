@@ -51,6 +51,45 @@ else
   bad "node $(( FERRY_MAX_NODES + 1 )) still fits at $over; the cap is too low"
 fi
 
+printf '\033[1m%s\033[0m\n' "the list of what ferry binds"
+
+# Every port 'ferry up' binds, as a base before the profile shift.
+#
+# Written out rather than derived, because the derivation below is a grep and a
+# grep is not a definition. What keeps it honest is that the grep has to agree
+# with it: this list is the test's own statement of what ferry does, and the
+# check that follows is what makes a wrong statement fail here rather than in
+# whichever process loses the race a year from now.
+FERRY_UP_PORTS="6443 2379 2380 10257 10259 10248 10250 10350 8472 8700"
+
+# Anything ferry adds PORT_SHIFT to is a port it binds once per profile, which
+# is exactly what belongs in the list. The node block is not here and should
+# not be: it comes from ferry_node_ports, which this file already calls.
+# Plain sort, not sort -n: comm compares lexicographically, and feeding it a
+# numerically sorted list makes it report differences that are not there.
+bound="$(grep -oE '[0-9]+ \+ PORT_SHIFT' "$repo/ferry" | awk '{print $1}' | sort -u)"
+declared="$(echo "$FERRY_UP_PORTS" | tr ' ' '\n' | sort -u)"
+
+missing="$(comm -23 <(echo "$bound") <(echo "$declared"))"
+if [ -z "$missing" ]; then
+  ok "every profile-shifted port in ferry is one this test knows about"
+else
+  bad "ferry binds these with PORT_SHIFT and the list below does not have them:"
+  for port in $missing; do
+    echo "      $port: $(grep -n "$port + PORT_SHIFT" "$repo/ferry" | head -1 | cut -d: -f1 | sed 's/^/ferry:/')"
+  done
+fi
+
+# The other direction is a weaker claim -- a port in the list that ferry no
+# longer binds only makes the collision check stricter than it needs to be --
+# but it is still the list going stale, so it is still worth saying.
+stale="$(comm -13 <(echo "$bound") <(echo "$declared"))"
+if [ -z "$stale" ]; then
+  ok "and nothing in the list has stopped being a port ferry binds"
+else
+  bad "the list still has $(echo "$stale" | tr '\n' ' ')which ferry no longer binds"
+fi
+
 printf '\033[1m%s\033[0m\n' "nothing collides"
 
 # Every port ferry binds, for every profile it will hand out and every node a
@@ -60,7 +99,7 @@ claims="$(
   for p in $(seq 0 50); do
     shift_p=$(( p * 1000 ))
     # What 'ferry up' binds.
-    for base in 6443 2379 2380 10257 10259 10248 10250 10350 8472 8700; do
+    for base in $FERRY_UP_PORTS; do
       echo "$(( base + shift_p )) profile-$p/ferry-up"
     done
     for i in $(seq 1 "$FERRY_MAX_NODES"); do
