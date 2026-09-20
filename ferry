@@ -206,6 +206,12 @@ else
 fi
 NODE_INDEX="${FERRY_NODE_INDEX:-0}"
 RELAY_PORT="${FERRY_RELAY_PORT:-$(( 8472 + PORT_SHIFT ))}"
+# Where machines join ferry's pod network. A second switch rather than a second
+# network: ferry-cri owns the segment and the learning, and ferry-node holds the
+# machines' end of it, the two speaking the same relay protocol ferry-cri
+# already uses between Macs. Both ports are on loopback, so this is a hop
+# between two processes rather than a hop onto a wire.
+MACHINE_RELAY_PORT="${FERRY_MACHINE_RELAY_PORT:-$(( 8473 + PORT_SHIFT ))}"
 PEERS="${FERRY_PEERS:-}"
 # Kept in FERRY_HOME rather than FERRY_RUN because it has to outlive a restart.
 # ferry-cri reads it before the API server exists, to find out whether this
@@ -881,6 +887,7 @@ cmd_up() {
     ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
+    --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
@@ -1191,6 +1198,8 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --subnet "$MACHINE_SUBNET" \
     --cluster-dns "$MACHINE_DNS_IP" \
+    --cluster-cidr "$CLUSTER_CIDR" \
+    --switch-port "$MACHINE_RELAY_PORT" --switch-peer "127.0.0.1:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-node.pid"
   local _
@@ -1522,6 +1531,15 @@ cmd_node_add() {
   mkdir -p "$run"/{kubelet,pki,podlogs,containerlogs,volume-plugins,cri}
   rm -f "$sock" "$exec_sock" "$streamer_sock"
 
+  # No --machine-switch here, deliberately. An extra node on this Mac shares the
+  # one 'ferry-node serve', and that process relays to a single switch -- this
+  # Mac's first one. Pointing this node at it would carry frames one way only:
+  # its pods could reach a machine, and the machine's reply would arrive at the
+  # first node's switch and stop there, because a switch does not re-flood what
+  # a peer sent it. One direction is worse than none, since it looks like packet
+  # loss rather than a missing feature. So pods on an added node do not reach
+  # machines; pods on the first node do. Fixing it means the machines' switch
+  # holding a peer per node on the Mac rather than one.
   "$here/bin/ferry-cri" \
     --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
@@ -1973,6 +1991,7 @@ start_worker() {
     ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
+    --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"

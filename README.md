@@ -155,8 +155,10 @@ cost time.
   no existing node creates one sized to fit it, and an empty machine is
   reclaimed a minute later — Karpenter, with ferry as its cloud provider,
   running natively beside the control plane rather than as a pod in the cluster
-  it provisions for. Off until `ferry machines enable`. Built through milestone
-  5; cross-mode pod routing is not. See [docs/MACHINES.md](docs/MACHINES.md).
+  it provisions for. Pods reach each other across both modes at their real
+  addresses, so one `Deployment` can span the Mac node and a machine. Off until
+  `ferry machines enable`. Built through milestone 6; GPU into machines is not.
+  See [docs/MACHINES.md](docs/MACHINES.md).
 - ✅ **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
   sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
   on the PATH, registers a login agent and starts a cluster — Apple silicon and

@@ -47,6 +47,17 @@ struct RuntimeConfig: Sendable {
     var peersFile: String?
     /// This node's own endpoint, so it can be skipped in that list.
     var relayEndpoint: String?
+    /// The machines' switch on this Mac, if mode 2 is on: `ferry-node` holds
+    /// the other end of ferry's pod network for the machines it runs.
+    ///
+    /// Deliberately not one of `peers`, though frames are flooded to it exactly
+    /// as they are to one. `peers` answers a second question -- are there other
+    /// nodes whose routes point at this node's slice -- and that question
+    /// decides whether a node that cannot get its slice falls back or refuses.
+    /// Counted as a peer, turning mode 2 on would quietly turn a single-Mac
+    /// cluster from one that starts anyway into one that refuses to, for a
+    /// process on loopback that is not a node and routes to nothing.
+    var machineSwitch: String?
     /// ferry-cni, the CNI runtime. Absent leaves ferry allocating addresses
     /// itself, which is what it did before it had one.
     var cniBinary: String?
@@ -350,9 +361,11 @@ actor PodRuntime {
         // local /24 leaves by eth0 on the kernel's own datapath, the rest of the
         // /16 leaves by eth1, and the source address is the same either way.
         if let cidr = config.clusterCIDR, let slice = Self.nodeSlice(of: cidr, node: config.nodeIndex) {
-            self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers,
-                                       peersFile: config.peersFile,
-                                       self: config.relayEndpoint)
+            self.podSwitch = PodSwitch(
+                relayPort: config.relayPort,
+                peers: config.peers + (config.machineSwitch.map { [$0] } ?? []),
+                peersFile: config.peersFile,
+                self: config.relayEndpoint)
             self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
             self.cni = try makeCNI()
             print("    pod network \(cidr), this node is \(slice)")

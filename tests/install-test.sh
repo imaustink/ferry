@@ -600,6 +600,72 @@ succeeds "  and the guest hands them to --register-with-taints" \
 succeeds "  only when there are some" \
   grep -q 'if !taints.isEmpty' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
 
+# --- both modes on one pod network (milestone 6) --------------------------
+#
+# vmnet will not route between its own networks, so a machine and a mode 1 pod
+# VM on two of them have no path however the Mac is configured. Machines join
+# ferry's own segment instead, as a second switch rather than a second network.
+succeeds "machines get a NIC on ferry's pod network" \
+  test -f "$repo/experiments/18-node-image/Sources/ferry-node/MachineSwitch.swift"
+succeeds "  a datagram socketpair, as a pod's switch NIC is" \
+  grep -q 'socketpair(AF_UNIX, SOCK_DGRAM' \
+    "$repo/experiments/18-node-image/Sources/ferry-node/MachineSwitch.swift"
+succeeds "  attached after eth0, so the guest names it eth1" \
+  ruby -e '
+    b = File.read(ARGV[0])
+    i = b.index("config.networkDevices = [try interface.device()]")
+    j = b.index("podNIC.device()")
+    exit(i && j && i < j ? 0 : 1)
+  ' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  and released when the machine goes" \
+  grep -q 'podNetwork?.detach(name: name)' \
+    "$repo/experiments/18-node-image/Sources/ferry-node/Serve.swift"
+
+# Two switches that flood to each other trade a broadcast forever.
+succeeds "a frame from ferry-cri is never sent back to it" \
+  ruby -e '
+    b = File.read(ARGV[0])[/private func deliverFromPeer.*?\n    \}/m].to_s
+    exit(b.empty? || b.include?("relayFrame") ? 1 : 0)
+  ' "$repo/experiments/18-node-image/Sources/ferry-node/MachineSwitch.swift"
+
+succeeds "ferry wires the two switches to each other" \
+  grep -q 'switch-port "$MACHINE_RELAY_PORT" --switch-peer "127.0.0.1:$RELAY_PORT"' "$repo/ferry"
+succeeds "  and tells ferry-cri to flood to the machines" \
+  grep -q 'machine-switch "127.0.0.1:$MACHINE_RELAY_PORT"' "$repo/ferry"
+
+# The machines' switch is flooded to like a peer but is not one. `peers` also
+# answers "do other nodes route to this node's slice", which decides whether a
+# node that cannot get its slice falls back or refuses -- so counting a loopback
+# process there turned mode 2 on into "this single-Mac cluster now refuses to
+# start off-slice".
+succeeds "  without counting as another node" \
+  ruby -e '
+    b = File.read(ARGV[0])
+    exit(b.include?("--peers \"$PEERS\"") ? 0 : 1)
+  ' "$repo/ferry"
+succeeds "  which the slice decision depends on" \
+  ruby -e '
+    b = File.read(ARGV[0])[/static func otherPeers.*?\n    \}/m].to_s
+    exit(!b.empty? && !b.include?("machineSwitch") ? 0 : 1)
+  ' "$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
+
+# The peers file used to replace --peers wholesale. That was invisible while the
+# file was the only source, and became a one-directional failure the moment a
+# fixed peer existed: frames from a machine still arrived, frames to one were
+# flooded to nobody.
+succeeds "a peer given at startup survives the peers file" \
+  grep -q 'union(self.configured)' "$repo/ferry-cri/Sources/ferry-cri/PodSwitch.swift"
+
+# A machine's own pods reach the segment through it rather than each holding a
+# port on it.
+succeeds "the guest puts its pods on that segment with proxy arp" \
+  grep -q 'proxy_arp=1' "$repo/experiments/18-node-image/init.sh"
+succeeds "  at the cluster prefix, not its own slice's" \
+  grep -q 'prefix=${CLUSTER_CIDR#\*/}' "$repo/experiments/18-node-image/init.sh"
+# A route to the Mac node's pods via its LAN address resolves and then drops.
+succeeds "  and routes only to nodes on its own segment" \
+  grep -q 'ip -o route get' "$repo/experiments/18-node-image/init.sh"
+
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy
   # pinned to nodes mode 1 does not have.

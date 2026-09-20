@@ -1,10 +1,11 @@
 # Machines — the second mode
 
-**Status: built through milestone 5, and shipped off by default.** A `Machine`
-becomes a Ready node, `kubectl delete` takes it away again, pods on two machines
-reach each other, and a pod that does not fit now causes a machine that fits it
-and gives the memory back when it is done — [milestones](#milestones) 1, 1b, 2,
-3, 4 and 5 below. Mixed-cluster scheduling (6) and GPU (7) are not built. An
+**Status: built through milestone 6, and shipped off by default.** A `Machine`
+becomes a Ready node, `kubectl delete` takes it away again, a pod that does not
+fit causes a machine that fits it and gives the memory back when it is done, and
+pods reach each other across both modes at the addresses Kubernetes knows them
+by — [milestones](#milestones) 1, 1b, 2, 3, 4, 5 and 6 below. GPU into machines
+(7) is not built. An
 installed ferry carries all of it; `ferry machines enable` turns it on. See
 [INSTALL.md](INSTALL.md).
 
@@ -260,11 +261,17 @@ Machines resolve through their own CoreDNS, behind a `kube-dns` ClusterIP that
 kube-proxy answers on each machine — the ordinary Kubernetes arrangement, which
 works here because a node VM has a kernel to program.
 
-Mode 1's CoreDNS cannot serve them, and the reason is the same vmnet isolation
-that shaped the rest of this section: it is a `ferry-cri` pod on the Mac's vmnet
-network, machines are on a vmnet network of their own, and a pod inside a
-machine has no route to it. Two CoreDNS deployments is the honest arrangement
-until cross-mode pod routing exists, which is milestone 6.
+Mode 1's CoreDNS could not serve them, and the reason was the same vmnet
+isolation that shaped the rest of this section: it is a `ferry-cri` pod on the
+Mac's vmnet network, machines were on a vmnet network of their own, and a pod
+inside a machine had no route to it.
+
+Milestone 6 removes that obstacle -- a machine's pods are on the same segment as
+mode 1's now, and could resolve through mode 1's CoreDNS. The split stays
+anyway, because the reason for it is no longer the only reason to want it: DNS
+on every machine is node-local, answers without crossing to another node, and
+keeps a machine's pods resolving when nothing else is up. What changes is that
+this is a choice rather than a workaround.
 
 They are named apart on purpose. Mode 1 already owns `Deployment/coredns` and
 `ConfigMap/coredns` in `kube-system` and labels its pods `k8s-app: kube-dns`;
@@ -512,8 +519,46 @@ which is milestone 4's job to make deliberate.
    `Deployment` pinned to machines, which both provisioned a machine on its own
    and then held it against consolidation forever. It is a `DaemonSet` now, for
    the reasons in [Cluster DNS is per mode](#cluster-dns-is-per-mode-for-now).
-6. **Mixed cluster.** The Mac node and machines in one cluster, `nodeSelector`
-   choosing between them, both modes running the same Deployment.
+6. ~~**Mixed cluster.**~~ **Done** — a pod on the Mac node and a pod inside a
+   machine reach each other at their real addresses, both directions, TCP and
+   ICMP, at about 0.9ms.
+
+   The obstacle was never scheduling; it was that the two modes had no path
+   between them. vmnet will not route between its own networks, and the Mac
+   being on both does not help because the drop happens inside vmnet rather
+   than in a routing table. So machines join ferry's own pod network -- the flat
+   layer-2 segment mode 1's pods already sit on -- as a **second switch rather
+   than a second network**. `ferry-node` holds the machines' end and speaks the
+   relay protocol `ferry-cri` already uses between Macs, so the learning, the
+   flooding and the fan-out to other Macs are not reimplemented; the only thing
+   that lives on the machines' side is which machine a frame belongs to.
+
+   Inside a machine, `eth1` takes the machine's own pod address with the
+   *cluster* prefix rather than its slice's -- the arrangement mode 1's pods
+   already use -- and `proxy_arp` puts that machine's pods on the segment
+   without giving each of them a port on it. A mode 1 pod treats the whole
+   cluster CIDR as on-link and ARPs for what it wants; the machine answers for
+   the addresses it routes to `cni0` and forwards what arrives. **Nothing on the
+   mode 1 side needs a route**, which is what makes this work at all: those pods
+   are VMs nobody can reconfigure once they are running.
+
+   Two things had to be corrected, and both were found by measurement rather
+   than reasoning.
+
+   The route agent was installing a route to the Mac node's pods via the Mac's
+   LAN address. That address *is* reachable from a machine -- through vmnet's
+   NAT, as the host -- so the route looked reasonable and silently blackholed.
+   It now only routes to nodes on its own segment, and leaves the rest to the
+   switch.
+
+   And `ferry-cri` was discarding `--peers` wholesale on the first read of the
+   peers file. That was invisible for as long as the file was the only source,
+   and became a one-directional failure the moment a fixed peer existed: frames
+   *from* a machine still arrived, because that direction only needs the address
+   the datagram came from, while frames *to* a machine needed the peer set --
+   so every ARP, which is how a conversation starts, was flooded to nobody. The
+   symptom was a machine that could reach mode 1 while mode 1 could not reach
+   it, which reads like a routing problem and is not one.
 7. **GPU into machines.** A device plugin inside the node VM proxying to
    `ferry-gpud` over vsock — which is *more* standard than what mode 1 does
    today, since a real device plugin API exists inside a Linux node.

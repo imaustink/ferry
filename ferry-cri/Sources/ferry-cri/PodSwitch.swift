@@ -33,6 +33,19 @@ final class PodSwitch: @unchecked Sendable {
     private var macToPod: [UInt64: String] = [:]     // learned, local
     private var macToPeer: [UInt64: String] = [:]    // learned, remote
     private var peers: Set<String> = []              // host:port of other machines
+    /// Peers given at startup rather than discovered.
+    ///
+    /// These are configuration, not state, so the peers file cannot take them
+    /// away -- and it used to. `--peers` was replaced wholesale on the first
+    /// read of that file, which for a long time meant nothing because the file
+    /// was the only source. It stopped being harmless when the machine switch
+    /// arrived as a fixed peer on loopback: its entry vanished about two
+    /// seconds after startup, and the failure was one-directional and therefore
+    /// baffling. Frames from a machine still arrived, because that direction
+    /// only needs the address the datagram came from; frames to a machine need
+    /// this set, so anything not yet learned -- every ARP, which is how the
+    /// conversation starts -- was flooded to nobody.
+    private let configured: Set<String>
     private let queue = DispatchQueue(label: "ferry.switch", attributes: .concurrent)
 
     /// The UDP socket carrying frames to and from other machines.
@@ -45,6 +58,7 @@ final class PodSwitch: @unchecked Sendable {
 
     init(relayPort: UInt16, peers: [String], peersFile: String? = nil, self endpoint: String? = nil) {
         self.relayPort = relayPort
+        self.configured = Set(peers)
         self.peers = Set(peers)
         self.ownEndpoint = endpoint
         if relayPort > 0 { startRelay() }
@@ -72,11 +86,13 @@ final class PodSwitch: @unchecked Sendable {
                     let listed = text.split(whereSeparator: \.isNewline)
                         .map { $0.trimmingCharacters(in: .whitespaces) }
                         .filter { !$0.isEmpty && $0 != self.ownEndpoint }
+                    let live = Set(listed).union(self.configured)
                     self.lock.lock()
-                    self.peers = Set(listed)
-                    self.macToPeer = self.macToPeer.filter { Set(listed).contains($0.value) }
+                    self.peers = live
+                    self.macToPeer = self.macToPeer.filter { live.contains($0.value) }
                     self.lock.unlock()
-                    print("    switch: peers \(listed.isEmpty ? "none" : listed.joined(separator: ", "))")
+                    let shown = live.sorted()
+                    print("    switch: peers \(shown.isEmpty ? "none" : shown.joined(separator: ", "))")
                 }
                 Thread.sleep(forTimeInterval: 2)
             }

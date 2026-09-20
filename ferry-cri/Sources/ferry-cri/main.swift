@@ -58,6 +58,10 @@ let config = RuntimeConfig(
         let endpoint = option("--relay-endpoint", "")
         return endpoint.isEmpty ? nil : endpoint
     }(),
+    machineSwitch: {
+        let endpoint = option("--machine-switch", "")
+        return endpoint.isEmpty ? nil : endpoint
+    }(),
     cniBinary: {
         let path = option("--cni", "")
         return path.isEmpty ? nil : path

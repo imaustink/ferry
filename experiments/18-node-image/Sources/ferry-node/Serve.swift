@@ -55,6 +55,13 @@ func serve() throws {
     let clusterDNS = option("--cluster-dns", "10.96.0.10")
     let requestedSubnet = option("--subnet", "")
     let poll = Double(option("--poll", "0.5")) ?? 0.5
+    // Ferry's pod network, joined as one more switch rather than as a node.
+    // Absent means machines keep to their own vmnet network and mode 1 stays
+    // out of reach -- which is what every version before this did, and is still
+    // what happens when mode 1 is not running.
+    let switchPort = UInt16(option("--switch-port", "0")) ?? 0
+    let switchPeer = option("--switch-peer", "")
+    let clusterCIDR = option("--cluster-cidr", "")
 
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
@@ -62,9 +69,16 @@ func serve() throws {
     // whole point of this mode.
     let network = Box(try VmnetNetwork(
         subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet)))
+    let podNetwork = MachineSwitch(relayPort: switchPort, peer: switchPeer)
+
     print("==> ferry-node serve")
     print("    dir      \(dir)")
     print("    network  \(network.value.subnet), gateway \(network.value.ipv4Gateway)")
+    if podNetwork != nil {
+        print("    switch   udp/\(switchPort), ferry-cri at \(switchPeer)")
+    } else {
+        print("    switch   off; machines cannot reach mode 1 pods")
+    }
 
     // Held so the machines stay alive: a VZVirtualMachine that goes out of
     // scope takes its guest with it.
@@ -76,7 +90,8 @@ func serve() throws {
         for (name, spec) in wanted where running[name] == nil {
             do {
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
-                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS)
+                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
+                                       clusterCIDR: clusterCIDR, podNetwork: podNetwork)
                 running[name] = machine
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,
@@ -92,6 +107,7 @@ func serve() throws {
 
         for (name, machine) in running where wanted[name] == nil {
             print("==> \(name) stopping")
+            podNetwork?.detach(name: name)
             machine.stop()
             running.removeValue(forKey: name)
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
@@ -130,7 +146,8 @@ final class RunningMachine {
 
 @available(macOS 26.0, *)
 func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
-          caPath: String, apiServer: String, clusterDNS: String) throws -> RunningMachine {
+          caPath: String, apiServer: String, clusterDNS: String,
+          clusterCIDR: String = "", podNetwork: MachineSwitch? = nil) throws -> RunningMachine {
     // An interface on the shared network, so every machine is on one segment
     // and a route between two of them is an ordinary route.
     guard let interface = try network.value.createInterface(spec.name) as? VmnetNetwork.Interface else {
@@ -142,12 +159,21 @@ func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
     let configDisk = spec.disk + ".config.ext4"
     try makeConfigDisk(caPath: caPath, out: configDisk)
 
+    // eth1, if mode 1 is around to talk to. Made before the machine so the
+    // switch has the port the moment the guest starts sending: a machine whose
+    // first ARP is dropped waits out a retransmit for no reason.
+    let podNIC: MachineNIC? = podNetwork == nil ? nil : try MachineNIC()
+    if let podNIC, let podNetwork {
+        podNetwork.attach(name: spec.name, fd: podNIC.hostFD)
+    }
+
     let console = Console()
     let config = try machineConfiguration(
         nodeName: spec.name, disk: spec.disk, configDisk: configDisk, kernelPath: kernelPath,
         cpus: spec.cpus, memoryMiB: spec.memoryMiB, apiServer: apiServer, token: spec.token,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
-        taints: spec.taints ?? [], interface: interface, console: console)
+        clusterCIDR: clusterCIDR, taints: spec.taints ?? [],
+        interface: interface, console: console, podNIC: podNIC)
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)

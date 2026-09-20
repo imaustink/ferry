@@ -184,8 +184,10 @@ func machineConfiguration(
     nodeName: String, disk: String, configDisk: String, kernelPath: String,
     cpus: Int, memoryMiB: UInt64, apiServer: String, token: String,
     address: String, gateway: String, podCIDR: String, clusterDNS: String,
+    clusterCIDR: String = "",
     taints: [String] = [],
-    interface: VmnetNetwork.Interface, console: Console
+    interface: VmnetNetwork.Interface, console: Console,
+    podNIC: MachineNIC? = nil
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
@@ -203,6 +205,11 @@ func machineConfiguration(
         "ferry.gateway=\(gateway)",
         "ferry.podcidr=\(podCIDR)",
         "ferry.dnssvc=\(clusterDNS)",
+        // The prefix mode 1's pods treat as on-link. A machine's own slice is a
+        // /24 it learns from the API, but the segment it shares with those pods
+        // is the whole cluster CIDR, and nothing in the guest can derive one
+        // from the other.
+        "ferry.clustercidr=\(clusterCIDR)",
     ]
     // Only when there are some. An empty `ferry.taints=` reaches the guest as a
     // parameter that is set but blank, and `--register-with-taints=""` is an
@@ -226,9 +233,21 @@ func machineConfiguration(
             url: URL(filePath: configDisk), readOnly: true)
         config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: configAttachment))
     }
-    // eth0 is vmnet, and it is the only NIC: the internet, the Mac, the API
-    // server, and pod traffic to every other machine on this network.
+    // eth0 is vmnet: the internet, the Mac, the API server, and pod traffic to
+    // every other machine on this network.
+    //
+    // eth1, when there is one, is ferry's pod network -- the flat segment mode
+    // 1's pods live on. It is a plain datagram socket rather than a vmnet
+    // interface, because vmnet is exactly what cannot carry this: it will not
+    // route between its own networks, so a machine and a pod VM on two of them
+    // have no path however the Mac is configured.
+    //
+    // The order is load bearing. The guest names these eth0 and eth1 in the
+    // order they are attached, and its init configures them by those names.
     config.networkDevices = [try interface.device()]
+    if let podNIC {
+        config.networkDevices.append(podNIC.device())
+    }
 
     let port = VZVirtioConsoleDeviceSerialPortConfiguration()
     port.attachment = console.attachment
