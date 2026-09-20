@@ -90,6 +90,18 @@ func serve() throws {
             print("==> \(name) stopping")
             machine.stop()
             running.removeValue(forKey: name)
+            // The address was allocated against this machine's name, and the
+            // allocator holds it until it is told otherwise. Without this a
+            // Machine that is deleted can never be created again under the same
+            // name -- every attempt fails with "allocation with id <name>
+            // already exists" for as long as ferry-node runs, which for a
+            // resource whose whole model is delete-and-reapply is most of the
+            // time someone would want it.
+            do {
+                try network.value.releaseInterface(name)
+            } catch {
+                print("==> \(name) address not released: \(error)")
+            }
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
         }
 
