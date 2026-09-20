@@ -89,7 +89,11 @@ mkdir -p "$dir"
 cp "$root/ferry" "$dir/ferry"
 chmod +x "$dir/ferry"
 mkdir -p "$dir/lib"
-cp "$root/lib/versions.sh" "$dir/lib/"
+# The whole directory rather than the files ferry happens to source today. A
+# named list is a second place to remember, and the way it fails is a release
+# that builds, publishes and then dies on its first command because the file
+# it sources was never in the tarball.
+cp "$root"/lib/*.sh "$dir/lib/"
 
 # The control plane's own scripts. fetch-binaries.sh comes along even though
 # this tarball already carries the binaries: 'ferry upgrade apply' fetches a

@@ -50,7 +50,7 @@ fake_release() { # dir version
   local dir="$1" version="$2"
   mkdir -p "$dir/lib" "$dir/bin"
   cp "$repo/ferry" "$dir/ferry"
-  cp "$repo/lib/versions.sh" "$dir/lib/"
+  cp "$repo"/lib/*.sh "$dir/lib/"
   cat > "$dir/VERSION" <<META
 ferry=$version
 kubernetes=v1.34.0

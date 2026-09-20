@@ -282,7 +282,7 @@ not in the installer.
 | `FERRY_CLUSTER_DOMAIN` | `cluster.local` | the cluster's DNS domain |
 | `FERRY_COREDNS_IMAGE` | `docker.io/coredns/coredns:1.11.3` | the CoreDNS mode 1 runs, and mode 2's machines run |
 | `FERRY_NODE_INDEX` | `0` | which `/24` of the cluster CIDR this node owns |
-| `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs. The base of a range, not one port: node N added with `ferry node add` uses this plus N, up to 200 |
+| `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs. The base of a range, not one port: node N added with `ferry node add` uses this plus N, up to 99 |
 | `FERRY_PEERS` | read from `$FERRY_HOME/peers` | the other Macs' relay endpoints |
 | `FERRY_ALLOW_OFF_SLICE` | — | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
 | `FERRY_HOST_CLUSTER_IPS` | `false` | `1` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |

@@ -40,6 +40,8 @@ export FERRY_ROOT
 # scripts, which have to agree with this one about all three.
 # shellcheck source=lib/versions.sh
 . "$here/lib/versions.sh"
+# shellcheck source=lib/ports.sh
+. "$here/lib/ports.sh"
 # A checkout from before the store had bin/kubelet as a plain file and the
 # version in bin/.kubelet-version. That is a version directory with one binary
 # in it, so it is moved in rather than rebuilt.
@@ -1592,15 +1594,24 @@ cmd_node_add() {
     index=1
     while [ -f "$FERRY_RUN/node-$index.pid" ]; do index=$((index + 1)); done
   }
-  [ "$index" -le 200 ] || { bad "too many nodes"; return 1; }
+  [ "$index" -le "$FERRY_MAX_NODES" ] || {
+    bad "too many nodes; a profile has room for $FERRY_MAX_NODES"; return 1; }
 
-  local sock="/tmp/ferry-cri-$index.sock"
-  local exec_sock="/tmp/ferry-exec-$index.sock"
-  local streamer_sock="/tmp/ferry-str-$index.sock"
+  # Named after the profile, like every other socket ferry opens. Without the
+  # suffix two checkouts' node 1 share /tmp/ferry-cri-1.sock, and the 'rm -f'
+  # below deletes the other one's live socket on the way past.
+  local sock="/tmp/ferry-cri$SUFFIX-$index.sock"
+  local exec_sock="/tmp/ferry-exec$SUFFIX-$index.sock"
+  local streamer_sock="/tmp/ferry-str$SUFFIX-$index.sock"
   local relay=$((RELAY_PORT + index))
-  local kubelet_port=$(( 10250 + PORT_SHIFT + index ))
-  local healthz_port=$(( 10248 + PORT_SHIFT + index * 100 ))
-  local stream_addr="127.0.0.1:$((10350 + index))"
+
+  # One block of three consecutive ports, from lib/ports.sh -- which is also
+  # where the reasoning about which three lives, and what tests/ports-test.sh
+  # checks against every other port ferry binds.
+  local kubelet_port healthz_port stream_port
+  read -r kubelet_port healthz_port stream_port \
+    <<<"$(ferry_node_ports "$PORT_SHIFT" "$index")"
+  local stream_addr="127.0.0.1:$stream_port"
   local run="$FERRY_RUN/node-$index"
 
   bold "adding node $name"
@@ -1684,7 +1695,7 @@ cmd_node_rm() {
   [ -n "$name" ] || { bad "usage: ferry node rm <name>"; return 2; }
   export KUBECONFIG="$FERRY_HOME/admin.conf"
   local index
-  for index in $(seq 1 200); do
+  for index in $(seq 1 "$FERRY_MAX_NODE_SCAN"); do
     [ -f "$FERRY_RUN/node-$index.pid" ] || continue
     grep -q "hostname-override=$name" "$FERRY_RUN/logs/node-$index-kubelet.log" 2>/dev/null && break
     pgrep -f "hostname-override=$name" >/dev/null && break
@@ -2277,7 +2288,7 @@ local_nodes() {
   elif running kubelet; then echo "0 $NODE_NAME"
   fi
   local index name run
-  for index in $(seq 1 200); do
+  for index in $(seq 1 "$FERRY_MAX_NODE_SCAN"); do
     [ -f "$FERRY_RUN/node-$index-kubelet.pid" ] || continue
     run="$FERRY_RUN/node-$index"
     if [ -f "$run/node-name" ]; then
@@ -3113,7 +3124,7 @@ cmd_down() {
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
   local index
-  for index in $(seq 1 200); do
+  for index in $(seq 1 "$FERRY_MAX_NODE_SCAN"); do
     [ -f "$FERRY_RUN/node-$index.pid" ] || continue
     for suffix in -kubelet -streamer ""; do
       local pidfile="$FERRY_RUN/node-$index$suffix.pid"
@@ -3123,7 +3134,8 @@ cmd_down() {
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
       kill -KILL "$pid" 2>/dev/null
     done
-    rm -f "/tmp/ferry-cri-$index.sock" "/tmp/ferry-exec-$index.sock" "/tmp/ferry-str-$index.sock"
+    rm -f "/tmp/ferry-cri$SUFFIX-$index.sock" "/tmp/ferry-exec$SUFFIX-$index.sock" \
+          "/tmp/ferry-str$SUFFIX-$index.sock"
     ok "node $index stopped"
   done
 

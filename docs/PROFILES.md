@@ -54,10 +54,17 @@ before it was recognised as a design problem rather than an accident.
 | kubelet | 10250 | +n×1000 |
 | streaming | 10350 | +n×1000 |
 | pod switch | udp/8472 | +n×1000 |
+| added nodes | 10701-10995 | +n×1000 |
 | node ports | 30000-30199 | 200 each |
 
 The default profile keeps every path and port it had, so a single checkout is
 unaffected.
+
+`ferry node add` takes three consecutive ports out of that thousand per node --
+a kubelet, its healthz and a streamer -- from 10701 upward, which is the largest
+run of the thousand nothing above has claimed. That is what caps a profile at 99
+added nodes: the arithmetic runs out before the Mac does. An added node's
+sockets are named after the profile too, like every other socket ferry opens.
 
 ## The directory, not the branch
 
