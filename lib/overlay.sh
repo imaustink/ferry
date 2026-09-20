@@ -21,6 +21,13 @@
 # ParseCgroupFile -- describe macOS, which has no cgroups, so they are answered
 # in the negative. ApplyPodLevelMemoryHigh, called from v1.37, joins them: it
 # writes memory.high to a pod cgroup, and ferry's pod boundary is a VM.
+#
+# The CFS conversions are the opposite case. They do apply, because the numbers
+# land in a Linux kernel inside the pod's VM, but on darwin package cm compiles
+# helpers_unsupported.go, where every CFS constant is 0 and both conversions
+# return 0. Left alone, every container reached the runtime with CpuShares and
+# CpuQuota of 0 and its CPU limit never sized the VM. cm.Ferry* in
+# ferry_cpu_conversions_darwin.go does the real arithmetic.
 ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
   sed -e 's|^//go:build linux$|//go:build darwin|' \
       -e 's|^// +build linux$|// +build darwin|' \
@@ -30,10 +37,16 @@ ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
       -e 's|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|' \
       -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
       -e 's|cm\.ApplyPodLevelMemoryHigh(|ferryApplyPodLevelMemoryHigh(|g' \
+      -e 's|cm\.MilliCPUToShares(|cm.FerryMilliCPUToShares(|g' \
+      -e 's|cm\.MilliCPUToQuota(|cm.FerryMilliCPUToQuota(|g' \
+      -e 's|cm\.QuotaPeriod|cm.FerryQuotaPeriod|g' \
       "$1" > "$2"
 }
 
 # Nothing upstream may still be named in a derived file.
+#
+# The two halves fail differently, and the second is why this exists as a check
+# rather than being left to the compiler.
 #
 # libcontainercgroups: the import is deleted unconditionally, so every use of it
 # has to have been rewritten -- one survivor is an `undefined:
@@ -42,13 +55,23 @@ ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
 # this survive upstream moving between the two forms, as it did in v1.35: v1.34
 # calls IsCgroup2UnifiedMode(), v1.35 and v1.36 assign the function itself.
 #
+# The CFS conversions: a survivor here compiles perfectly well, because
+# cm.MilliCPUToShares does exist on darwin. It just returns 0, and the kubelet
+# goes back to telling the runtime that every container wants no CPU. Nothing
+# says so, at build time or after. That silence is the whole reason to check.
+#
 # Prints what it found, and returns non-zero if it found anything.
 ferry_check_derived_darwin() { # darwin-file
-  # Fixed strings, not expressions: these can end in an open parenthesis, which
-  # a regex would read as the start of a group.
+  # Fixed strings, not expressions: these end in an open parenthesis, which a
+  # regex reads as the start of a group. None is a prefix of its own
+  # replacement -- cm.MilliCPUToShares( does not occur inside
+  # cm.FerryMilliCPUToShares( -- so a substring search is exact here.
   local file="$1" found=0 name
   for name in \
     'libcontainercgroups.' \
+    'cm.MilliCPUToShares(' \
+    'cm.MilliCPUToQuota(' \
+    'cm.QuotaPeriod' \
     'cm.ApplyPodLevelMemoryHigh('; do
     if grep -qF "$name" "$file"; then
       echo "$(basename "$file"): still names $name"

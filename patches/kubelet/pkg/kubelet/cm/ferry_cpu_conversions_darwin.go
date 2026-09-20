@@ -16,9 +16,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Reading a container's cpu cgroup values back into Kubernetes quantities.
+// Converting between a container's cpu cgroup values and Kubernetes quantities.
 //
-// From v1.36 the derived darwin copy of kuberuntime_container_linux.go calls
+// Both directions are here, and they failed in different ways.
+//
+// Writing came first and was silently broken from the beginning. The derived
+// darwin copy builds LinuxContainerResources from cm.MilliCPUToShares and
+// cm.MilliCPUToQuota, which on this platform are helpers_unsupported.go's and
+// return 0. Every container therefore reached the runtime asking for
+// CpuShares: 0, CpuQuota: 0, and ferry-cri sizes a machine with
+//
+//	if cpuQuota > 0 && cpuPeriod > 0 { c.cpus = max(1, Int(cpuQuota / cpuPeriod)) }
+//
+// so that branch was never taken and a pod's CPU limit never reached its VM.
+// The Ferry-prefixed pair below does the real arithmetic; build-kubelet.sh
+// rewrites the call sites, because the unsupported file is still compiled here
+// and owns the unprefixed names.
+//
+// Reading back is the case below. From v1.36 the derived copy calls
 // these from toKubeContainerResources, which turns what the runtime reports in
 // ContainerResources.Linux into the resources on a pod's status. The numbers
 // arriving there are the *guest's* cgroup values -- cpu.shares, cpu.cfs_quota_us
@@ -38,14 +53,61 @@ limitations under the License.
 // pkg/kubelet/cm/helpers_linux.go.
 package cm
 
-import "math"
+import (
+	"math"
+
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
+)
 
 const (
 	// What Linux uses, which is what the guest is.
-	ferryLinuxMinShares     = 2
-	ferryLinuxSharesPerCPU  = 1024
-	ferryLinuxMilliCPUToCPU = 1000
+	ferryLinuxMinShares      = 2
+	ferryLinuxMaxShares      = 262144
+	ferryLinuxSharesPerCPU   = 1024
+	ferryLinuxMilliCPUToCPU  = 1000
+	ferryLinuxMinQuotaPeriod = 1000
+
+	// FerryQuotaPeriod is cfs_period_us, 100ms in microseconds. It stands in
+	// for cm.QuotaPeriod, which helpers_unsupported.go declares as 0.
+	FerryQuotaPeriod = 100000
 )
+
+// FerryMilliCPUToQuota converts milliCPU to CFS quota and period values.
+// Input parameters and resulting value is number of microseconds.
+func FerryMilliCPUToQuota(milliCPU int64, period int64) (quota int64) {
+	if milliCPU == 0 {
+		return
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(kubefeatures.CPUCFSQuotaPeriod) {
+		period = FerryQuotaPeriod
+	}
+
+	quota = (milliCPU * period) / ferryLinuxMilliCPUToCPU
+
+	// quota needs to be a minimum of 1ms.
+	if quota < ferryLinuxMinQuotaPeriod {
+		quota = ferryLinuxMinQuotaPeriod
+	}
+	return
+}
+
+// FerryMilliCPUToShares converts the milliCPU to CFS shares.
+func FerryMilliCPUToShares(milliCPU int64) uint64 {
+	if milliCPU == 0 {
+		// The kernel default for unset is 1024; 2 is the real floor.
+		return ferryLinuxMinShares
+	}
+	shares := (milliCPU * ferryLinuxSharesPerCPU) / ferryLinuxMilliCPUToCPU
+	if shares < ferryLinuxMinShares {
+		return ferryLinuxMinShares
+	}
+	if shares > ferryLinuxMaxShares {
+		return ferryLinuxMaxShares
+	}
+	return uint64(shares)
+}
 
 // SharesToMilliCPU converts CpuShares (cpu.shares) to milli-CPU value.
 func SharesToMilliCPU(shares int64) int64 {

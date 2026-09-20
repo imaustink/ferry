@@ -1054,6 +1054,10 @@ actor PodRuntime {
 
     static let gpuResource = "ferry.dev/gpu"
 
+    /// CFS weight for one whole CPU. The kubelet converts a container's CPU
+    /// request to cpu.shares at this scale, so dividing gets the request back.
+    static let cpuSharesPerCPU: Int64 = 1024
+
     // MARK: - Containers
 
     func createContainer(
@@ -1152,6 +1156,7 @@ actor PodRuntime {
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
+        let cpuShares = cfg.linux.resources.cpuShares
 
         // The kubelet assembles volume contents on the host -- projected
         // ServiceAccount tokens, ConfigMaps, Secrets, emptyDir -- and passes
@@ -1232,7 +1237,17 @@ actor PodRuntime {
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
-            if cpuQuota > 0 && cpuPeriod > 0 { c.cpus = max(1, Int(cpuQuota / cpuPeriod)) }
+            // A CPU limit sizes the machine: quota over period is the number of
+            // whole CPUs the container is allowed. Failing that, fall back to
+            // the request, which arrives as cpu.shares at 1024 per CPU -- a pod
+            // with a request and no limit was getting one vCPU regardless of
+            // how many it asked for. Both truncate, so anything under a whole
+            // CPU lands on the floor of one.
+            if cpuQuota > 0 && cpuPeriod > 0 {
+                c.cpus = max(1, Int(cpuQuota / cpuPeriod))
+            } else if cpuShares > 0 {
+                c.cpus = max(1, Int(cpuShares / Self.cpuSharesPerCPU))
+            }
             // Append rather than replace: the defaults carry /proc, /sys and
             // the rest of the standard container filesystem.
             c.mounts.append(contentsOf: shares)

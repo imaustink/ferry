@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Tests for the darwin sources derived from upstream's linux ones.
 #
-# The rewrites in lib/overlay.sh are the part of the build most likely to rot:
-# they match text upstream is free to reshape at any minor. So this checks both
-# directions -- that the rules rewrite what upstream actually writes, and that
-# the checker notices when they do not.
+# The rewrites in lib/overlay.sh are the part of the build most likely to rot,
+# and the most dangerous when it does: a rule that stops matching leaves a call
+# pointing at the real cm.MilliCPUToShares, which exists on darwin and returns
+# 0. That still compiles. The kubelet just goes back to telling the runtime
+# every container wants no CPU, and nothing says so.
+#
+# So this checks both directions -- that the rules rewrite what upstream
+# actually writes, and that the checker notices when they do not.
 #
 #   ./tests/overlay-test.sh
 set -uo pipefail
@@ -78,16 +82,26 @@ contains "and the cgroup2 function value"    "$out" "= func() bool { return fals
 contains "reading /proc/self/cgroup goes"    "$out" "ferryParseCgroupFile()"
 contains "pod memory.high goes to the shim"  "$out" "ferryApplyPodLevelMemoryHigh(pod, rc,"
 
+printf '\033[1m%s\033[0m\n' "the CFS conversions, which fail silently"
+contains "shares use ferry's arithmetic"     "$out" "cm.FerryMilliCPUToShares("
+contains "quota uses ferry's arithmetic"     "$out" "cm.FerryMilliCPUToQuota("
+contains "and the period is ferry's"         "$out" "int64(cm.FerryQuotaPeriod)"
+lacks    "no unrewritten shares call"        "$out" "cm.MilliCPUToShares("
+lacks    "no unrewritten quota call"         "$out" "cm.MilliCPUToQuota("
+
 printf '\033[1m%s\033[0m\n' "the check that guards all of it"
 succeeds "a fully derived file passes"  ferry_check_derived_darwin "$out"
 
-# What rot looks like: upstream moves a call, the rule stops matching, and the
-# derived file still reaches for something that is not there.
-sed 's|ferryHugePageSizes()|libcontainercgroups.HugePageSizes()|' "$out" > "$work/cgroups_darwin.go"
-refuses "a leftover cgroups call is caught" ferry_check_derived_darwin "$work/cgroups_darwin.go"
+# What rot looks like: upstream renames the helper, the rule stops matching,
+# and the call quietly resolves to the zero-returning one.
+sed 's|cm\.FerryMilliCPUToShares(|cm.MilliCPUToShares(|' "$out" > "$work/rotted_darwin.go"
+refuses "a missed rewrite is caught"    ferry_check_derived_darwin "$work/rotted_darwin.go"
 
-sed 's|ferryApplyPodLevelMemoryHigh(|cm.ApplyPodLevelMemoryHigh(|' "$out" > "$work/rotted_darwin.go"
-refuses "so is a missed memory.high call"   ferry_check_derived_darwin "$work/rotted_darwin.go"
+sed 's|ferryHugePageSizes()|libcontainercgroups.HugePageSizes()|' "$out" > "$work/cgroups_darwin.go"
+refuses "so is a leftover cgroups call" ferry_check_derived_darwin "$work/cgroups_darwin.go"
+
+sed 's|ferryApplyPodLevelMemoryHigh(|cm.ApplyPodLevelMemoryHigh(|' "$out" > "$work/memhigh_darwin.go"
+refuses "and a missed memory.high call"  ferry_check_derived_darwin "$work/memhigh_darwin.go"
 
 echo
 if [ "$fail" -eq 0 ]; then

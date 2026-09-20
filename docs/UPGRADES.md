@@ -226,6 +226,25 @@ carry: cadvisor folded `info/v1` and `info/v2` into one `lib/model` package, and
 an import path cannot be overridden from a second file, so that minor overlays
 whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
 
+### Rebuilding changes how pods are sized
+
+Not a version upgrade, but it arrives with one, so it belongs here.
+
+On darwin, package `cm` compiles upstream's `helpers_unsupported.go`, where
+every CFS constant is `0` and both milli-CPU conversions return `0`. The kubelet
+was therefore telling the runtime that every container wanted `CpuShares: 0,
+CpuQuota: 0`, and `ferry-cri` sizes a machine from its quota — so a pod's CPU
+limit never reached its VM and every pod got one vCPU. `lib/overlay.sh` now
+redirects those conversions to `cm.Ferry*`, which does the real arithmetic, and
+`ferry-cri` falls back to the request when there is no limit.
+
+This is not gated by version: the bug was never version-specific, and a kubelet
+rebuilt from this overlay at **any** version will start sizing VMs from CPU
+limits and requests. A pod asking for `cpu: 4` that has been quietly running on
+one vCPU will get four the next time its sandbox is created. That is the fix
+working, but it changes how much of the Mac a busy namespace takes, so roll it
+out when you can watch it rather than alongside an unrelated upgrade.
+
 ## Tests
 
 ```
@@ -244,6 +263,9 @@ whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
 - `tests/overlay-test.sh` — the rewrites in `lib/overlay.sh`, against a fixture
   holding the lines upstream actually writes. It checks both that each rule
   fires and that `ferry_check_derived_darwin` notices when one stops firing.
+  That matters most for the CFS conversions: a missed rewrite there still
+  compiles, because `cm.MilliCPUToShares` exists on darwin, and simply goes back
+  to sending zero.
 
 ### What the tests do not cover, and what was run instead
 
