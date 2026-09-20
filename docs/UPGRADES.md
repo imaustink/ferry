@@ -219,6 +219,13 @@ has moved — so a drifted tree fails during the build, which happens before
 anything is switched. `plan` warns when the target is a new minor for exactly
 this reason. That is the honest position, not a claim that any minor works.
 
+Shims whose signatures move between minors live in `patches/kubelet-vX.Y/`,
+chosen by exact minor, and the build refuses before it clones if the minor being
+built has no directory. v1.37 needs more than the two constructors the others
+carry: cadvisor folded `info/v1` and `info/v2` into one `lib/model` package, and
+an import path cannot be overridden from a second file, so that minor overlays
+whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
+
 ## Tests
 
 ```
@@ -234,6 +241,9 @@ this reason. That is the honest position, not a claim that any minor works.
   checkout with stub binaries and no cluster.
 - `tests/etcd-snapshot-test.sh` — a real save and restore with the real etcd
   from the store, on ports of its own. Skipped until something has been built.
+- `tests/overlay-test.sh` — the rewrites in `lib/overlay.sh`, against a fixture
+  holding the lines upstream actually writes. It checks both that each rule
+  fires and that `ferry_check_derived_darwin` notices when one stops firing.
 
 ### What the tests do not cover, and what was run instead
 

@@ -10,6 +10,8 @@ FERRY_ROOT="$here"
 export FERRY_ROOT
 # shellcheck source=lib/versions.sh
 . "$here/lib/versions.sh"
+# shellcheck source=lib/overlay.sh
+. "$here/lib/overlay.sh"
 
 K8S_VERSION="${K8S_VERSION:-v1.34.0}"
 ferry_version_valid "$K8S_VERSION" \
@@ -206,30 +208,16 @@ ldflags="$(
 # to _darwin.go instead, which also keeps them tracking upstream rather than
 # being forked into patches/.
 #
-# The only parts that genuinely do not apply are three queries about the *host*
-# cgroup hierarchy; those are redirected to the shims in ferry_cgroups_darwin.go.
+# Which calls are redirected and why, and the check that they all were, are in
+# lib/overlay.sh -- shared with tests/overlay-test.sh so the two cannot drift.
 echo "==> deriving darwin container config from the linux implementation"
 for f in kuberuntime_container helpers kuberuntime_sandbox; do
   src_file="$src/pkg/kubelet/kuberuntime/${f}_linux.go"
   [ -f "$src_file" ] || continue
-  sed -e 's|^//go:build linux$|//go:build darwin|' \
-      -e 's|^// +build linux$|// +build darwin|' \
-      -e '/libcontainercgroups "github.com\/opencontainers\/cgroups"/d' \
-      -e 's|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g' \
-      -e 's|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g' \
-      -e 's|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|' \
-      -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
-      "$src_file" > "$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
-  # The import is deleted unconditionally, so every use of it has to have been
-  # rewritten -- one survivor is an `undefined: libcontainercgroups` at build
-  # time with nothing naming the seam that missed. Asserting on the package
-  # rather than on one substitution is also what makes this survive upstream
-  # moving between the two forms, as it did in v1.35: v1.34 calls
-  # IsCgroup2UnifiedMode(), v1.35 and v1.36 assign the function itself.
-  ! grep -q 'libcontainercgroups\.' "$src/pkg/kubelet/kuberuntime/${f}_darwin.go" \
-    || { echo "    !! ${f}_darwin.go still reaches for libcontainercgroups, whose import was just removed:" >&2
-         grep -n 'libcontainercgroups\.' "$src/pkg/kubelet/kuberuntime/${f}_darwin.go" >&2
-         echo "    upstream moved a cgroup call this script rewrites; add a seam for it above" >&2
+  dst_file="$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
+  ferry_derive_darwin_from_linux "$src_file" "$dst_file"
+  ferry_check_derived_darwin "$dst_file" >&2 \
+    || { echo "    !! upstream moved a call this script rewrites; add a seam in lib/overlay.sh" >&2
          exit 1; }
   echo "    + ${f}_darwin.go (from ${f}_linux.go)"
 done

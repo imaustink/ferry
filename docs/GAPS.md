@@ -88,9 +88,13 @@ Three bugs were found by running it, which is the argument for running it:
 
 What is still only reasoned about is a **minor** bump *on a running cluster*.
 Everything above is within v1.34, which drives every path except patch drift.
-Building across minors is no longer reasoned about: v1.34, v1.35 and v1.36
-kubelets all build, from one shared overlay plus a per-minor
+Building across minors is no longer reasoned about: v1.34, v1.35, v1.36 and
+v1.37 kubelets all build, from one shared overlay plus a per-minor
 `patches/kubelet-vX.Y/` carrying the two constructors whose signatures move.
+v1.37 also carries whole copies of `cadvisor_darwin.go` and
+`container_manager_darwin.go`: cadvisor merged `info/v1` and `info/v2` into one
+`lib/model` package, and an import path is not something a second file can
+override.
 What has not been done is draining a node and flipping a control plane across
 that boundary, and `build-kubelet.sh` failing loudly on a moved seam -- during
 the build, before anything is switched -- remains the best that can be said for

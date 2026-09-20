@@ -1,0 +1,31 @@
+//go:build darwin
+
+/*
+Copyright 2024 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// The constructor only, because its signature is the one thing here that moves
+// between minors. v1.36 threads a logger through cadvisor.New and v1.37 adds
+// disableContainerDiscovery; the darwin implementation has nothing to log and
+// discovers no containers in the first place -- per-container statistics come
+// from the CRI -- so both are accepted and dropped, which is what upstream's
+// own unsupported variant does.
+package cadvisor
+
+import "k8s.io/klog/v2"
+
+func New(_ klog.Logger, imageFsInfoProvider ImageFsInfoProvider, rootPath string, cgroupsRoots []string, usingLegacyStats, localStorageCapacityIsolation, disableContainerDiscovery bool) (Interface, error) {
+	return &cadvisorDarwin{rootPath: rootPath}, nil
+}
