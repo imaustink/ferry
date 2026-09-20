@@ -84,6 +84,15 @@ func serve() throws {
     // scope takes its guest with it.
     let live = Live()
 
+    // Every name this process has tried to boot, running or not.
+    //
+    // `live` is not that set: a machine whose boot threw never enters it, and
+    // cleaning up from `live` alone leaves the failed one's vmnet address
+    // assigned for as long as the process lives. Which used to be a slow leak
+    // and now is not: the provisioner makes a machine per pending pod under a
+    // fresh name and takes it away again a minute after it empties.
+    var known: Set<String> = []
+
     // Stop the machines and give the subnet back, rather than being killed with
     // both still held.
     //
@@ -110,6 +119,7 @@ func serve() throws {
 
         let running = live.all()
         for (name, spec) in wanted where running[name] == nil {
+            known.insert(name)
             do {
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
                                        caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
@@ -127,11 +137,20 @@ func serve() throws {
             }
         }
 
-        for (name, machine) in running where wanted[name] == nil {
-            print("==> \(name) stopping")
-            podNetwork?.detach(name: name)
-            machine.stop()
-            live.remove(name)
+        // Over `known` rather than over `running`, so a machine that failed to
+        // boot gives its address back too.
+        for name in known where wanted[name] == nil {
+            if let machine = running[name] {
+                print("==> \(name) stopping")
+                podNetwork?.detach(name: name)
+                machine.stop()
+                live.remove(name)
+            }
+            // After stop(), which waits for the guest: an address handed out
+            // again while the VM holding it is still shutting down is two
+            // machines on one address for as long as that takes.
+            network.releaseInterface(name)
+            known.remove(name)
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
         }
 
@@ -184,9 +203,27 @@ func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
     // eth1, if mode 1 is around to talk to. Made before the machine so the
     // switch has the port the moment the guest starts sending: a machine whose
     // first ARP is dropped waits out a retransmit for no reason.
+    //
+    // Made before the machine also means made before anything that can throw,
+    // and everything below here can: machineConfiguration ends in
+    // VZVirtualMachineConfiguration.validate, which rejects a cpu count or a
+    // memory size the host will not take, and the start can time out. The port
+    // is registered with a live read source over both ends of a socketpair, so
+    // leaving on a throw leaks two descriptors and a source -- and the serve
+    // loop retries the same spec every poll, attaching again over the entry it
+    // left behind, twice a second, until the process runs out of descriptors.
     let podNIC: MachineNIC? = podNetwork == nil ? nil : try MachineNIC()
     if let podNIC, let podNetwork {
         podNetwork.attach(name: spec.name, fd: podNIC.hostFD)
+    }
+    var booted = false
+    defer {
+        if !booted {
+            // detach cancels the source and closes ferry's end; the guest's end
+            // was never handed to a running VM, so it is ours to close.
+            podNetwork?.detach(name: spec.name)
+            podNIC?.closeGuestSide()
+        }
     }
 
     let console = Console()
@@ -224,6 +261,7 @@ func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
         }
     }
 
+    booted = true
     return RunningMachine(vm: vm, queue: queue, console: console, address: address, gateway: gateway)
 }
 

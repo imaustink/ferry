@@ -176,8 +176,13 @@ func (l *FerryNodeClassList) DeepCopyObject() runtime.Object {
 	if l.Items != nil {
 		out.Items = make([]FerryNodeClass, len(l.Items))
 		for i := range l.Items {
-			l.Items[i].DeepCopyObject()
-			out.Items[i] = l.Items[i]
+			// Deep, not the shallow struct assignment this used to be. The type
+			// is in client-go's scheme, so controller-runtime's cache calls
+			// this before handing a list to a reconciler; sharing the labels
+			// map and the conditions slice with the cached object means a
+			// reconciler editing what it believes is its own copy edits the
+			// informer's.
+			out.Items[i] = *l.Items[i].DeepCopy()
 		}
 	}
 	return out

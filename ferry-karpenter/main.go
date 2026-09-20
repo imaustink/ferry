@@ -66,8 +66,18 @@ func main() {
 		conf.bounds.limitCPUs, conf.bounds.limitMemoryGi)
 	log.Printf("    machines %d-%d cpus, %d-%d GiB",
 		conf.bounds.minCPUs, conf.bounds.maxCPUs, conf.bounds.minMemoryGi, conf.bounds.maxMemoryGi)
-	log.Printf("    shapes   %d offered, %s to %s",
-		len(shapes), shapes[0].name(), shapes[len(shapes)-1].name())
+	// Guarded rather than indexed. An empty catalogue is a configuration a
+	// Mac reaches without doing anything strange -- FERRY_MACHINE_MAX_MEMORY_GI
+	// is a quarter of the host's memory, so an 8 GiB Mac with
+	// FERRY_MACHINE_MIN_MEMORY_GI=4 admits no shape at all. The NodeClass
+	// controller already reports that as a NodeClass that is not Ready, which
+	// says what is wrong; a panic here would kill the process before it could.
+	if len(shapes) == 0 {
+		log.Printf("    shapes   none; these cpu and memory ranges admit no machine")
+	} else {
+		log.Printf("    shapes   %d offered, %s to %s",
+			len(shapes), shapes[0].name(), shapes[len(shapes)-1].name())
+	}
 
 	// NewOperator reads the cluster from controller-runtime's ambient config,
 	// which out of cluster is KUBECONFIG -- already set, since it is how this

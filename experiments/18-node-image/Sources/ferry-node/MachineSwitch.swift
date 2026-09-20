@@ -274,6 +274,17 @@ struct MachineNIC {
         self.guestSide = FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
     }
 
+    /// Closes the guest's end, for a machine that never started.
+    ///
+    /// The FileHandle is built with closeOnDealloc false, because the running
+    /// VM owns this descriptor and Foundation closing it out from under
+    /// Virtualization is worse than leaking it. That makes the failure path
+    /// ours: a boot that throws after the socketpair exists has to close both
+    /// ends itself, and ferry's end is closed by the switch's detach.
+    func closeGuestSide() {
+        try? guestSide.close()
+    }
+
     func device() -> VZVirtioNetworkDeviceConfiguration {
         let config = VZVirtioNetworkDeviceConfiguration()
         let attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: guestSide)

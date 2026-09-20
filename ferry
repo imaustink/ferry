@@ -211,7 +211,14 @@ RELAY_PORT="${FERRY_RELAY_PORT:-$(( 8472 + PORT_SHIFT ))}"
 # machines' end of it, the two speaking the same relay protocol ferry-cri
 # already uses between Macs. Both ports are on loopback, so this is a hop
 # between two processes rather than a hop onto a wire.
-MACHINE_RELAY_PORT="${FERRY_MACHINE_RELAY_PORT:-$(( 8473 + PORT_SHIFT ))}"
+#
+# Clear of RELAY_PORT rather than next to it. 'ferry node add' gives node N the
+# switch port RELAY_PORT + N and allows N up to 200, so 8472..8672 is a range
+# and not a port: the neighbouring 8473 is the *first* added node's switch, and
+# whichever of the two bound second lost. That failure reads as "switch off;
+# machines cannot reach mode 1 pods" or as an added node with no pod switch,
+# depending on start order, neither of which points at a port collision.
+MACHINE_RELAY_PORT="${FERRY_MACHINE_RELAY_PORT:-$(( 8700 + PORT_SHIFT ))}"
 PEERS="${FERRY_PEERS:-}"
 # Kept in FERRY_HOME rather than FERRY_RUN because it has to outlive a restart.
 # ferry-cri reads it before the API server exists, to find out whether this
@@ -381,7 +388,8 @@ Environment:
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
-  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
+  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472. The base of
+                         a range: an added node uses this plus its index
   FERRY_ALLOW_OFF_SLICE  1 to start even when vmnet will not give this node its
                          slice of the pod network. Other nodes will not reach
                          these pods; without it ferry refuses rather than

@@ -109,3 +109,31 @@ func TestRoundUpPow2(t *testing.T) {
 		}
 	}
 }
+
+// The catalogue is handed out in the order it is built, and two callers read
+// that order as meaning: `Create` takes the first shape the budget affords, and
+// the startup banner takes both ends as the range offered.
+func TestShapesComeBackCheapestFirst(t *testing.T) {
+	b := bounds{minCPUs: 3, maxCPUs: 8, minMemoryGi: 3, maxMemoryGi: 32}
+	got := b.shapes()
+	for i := 1; i < len(got); i++ {
+		if got[i-1].cost() > got[i].cost() {
+			t.Errorf("%s came before %s, which is cheaper", got[i-1].name(), got[i].name())
+		}
+	}
+	// The floor entry is built last and is the smallest; unsorted, it would sit
+	// at the end and the banner would print it as the ceiling.
+	if len(got) > 0 && (got[0].cpus != 3 || got[0].memoryGi != 3) {
+		t.Errorf("cheapest shape is %s, want the 3-cpu 3-GiB floor", got[0].name())
+	}
+}
+
+// Bounds that cross admit nothing. That is a configuration a Mac reaches
+// without doing anything strange -- the memory ceiling is derived from the
+// host -- so it has to be an empty catalogue rather than a crash.
+func TestImpossibleBoundsOfferNothingRatherThanPanicking(t *testing.T) {
+	b := bounds{minCPUs: 2, maxCPUs: 8, minMemoryGi: 4, maxMemoryGi: 2}
+	if got := b.shapes(); len(got) != 0 {
+		t.Errorf("bounds whose memory floor is above its ceiling offered %d shapes", len(got))
+	}
+}

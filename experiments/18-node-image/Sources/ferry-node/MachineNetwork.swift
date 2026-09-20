@@ -74,8 +74,13 @@ final class MachineNetwork: @unchecked Sendable {
         let host: UInt32
         if let existing = assigned[id] {
             host = existing
-        } else if let recycled = reusable.popLast() {
-            host = recycled
+        } else if !reusable.isEmpty {
+            // Oldest first, rather than the address freed most recently. The
+            // provisioner replaces machines constantly, and handing the address
+            // of the machine that just went away to the machine taking its
+            // place means the neighbour caches that still hold it are wrong
+            // about a live host rather than about a dead one.
+            host = reusable.removeFirst()
             assigned[id] = host
         } else {
             guard next < subnet.upper.value else { return nil }
@@ -90,6 +95,13 @@ final class MachineNetwork: @unchecked Sendable {
             ipv4Gateway: subnet.gateway)
     }
 
+    /// Gives an address back, so the next machine can have it.
+    ///
+    /// Not optional bookkeeping: `next` only ever climbs, so without this a /24
+    /// is exhausted after roughly 252 machines and every boot after that fails
+    /// with "vmnet gave no interface". One long-lived process plus a
+    /// provisioner that makes a machine per pending pod and consolidates it
+    /// away a minute later reaches that in an afternoon.
     func releaseInterface(_ id: String) {
         lock.lock()
         defer { lock.unlock() }

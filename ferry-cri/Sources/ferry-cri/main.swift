@@ -135,11 +135,17 @@ let server = GRPCServer(
 // dispatch calls signal handlers off the main queue, and Swift traps on the
 // isolation check. This handler used to crash on every SIGTERM without ever
 // reaching its first line. See Shutdown.swift.
+//
+// beginGracefulShutdown is part of that, and not decoration: the kubelet is
+// very likely mid-RPC when `ferry down` arrives, and without it those calls are
+// cut by exit(0) and the kubelet sees a connection reset where it should have
+// seen an answer.
 let shutdownSocketPath = socketPath
 let shutdownSignals = onShutdownSignal {
     Task.detached {
         announce("\n==> stopping pods and releasing the pod network")
         await runtime.shutdown()
+        server.beginGracefulShutdown()
         try? FileManager.default.removeItem(atPath: shutdownSocketPath)
         announce("==> stopped")
         exit(0)

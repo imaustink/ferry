@@ -12,14 +12,17 @@ package main
 // one more node, and a Mac does.
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -54,6 +57,9 @@ type Provider struct {
 	// image and what the Mac will spend are facts about the machine ferry is
 	// running on, not about a workload.
 	nodeClass *FerryNodeClass
+	// Held across the whole of Create: read the budget, decide, write the
+	// Machine. See the comment there.
+	creating sync.Mutex
 }
 
 func NewProvider(d dynamic.Interface, n *FerryNodeClass) *Provider {
@@ -98,11 +104,12 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 					scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 					scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
 				),
-				// Everything costs the same here, because it does: the memory
-				// comes from one Mac either way. A non-zero price keeps
-				// Karpenter's cheapest-fit logic choosing the smallest shape
-				// that works rather than an arbitrary one.
-				Price:     float64(s.cpus)*1.0 + float64(s.memoryGi)*0.1,
+				// Everything costs the same here in money, because it does:
+				// the memory comes from one Mac either way. A non-zero price
+				// keeps Karpenter's cheapest-fit logic choosing the smallest
+				// shape that works rather than an arbitrary one, and it is the
+				// same number `Create` orders candidates by.
+				Price:     s.cost(),
 				Available: available,
 			}},
 			Overhead: &cloudprovider.InstanceTypeOverhead{
@@ -176,24 +183,54 @@ func machineShape(m *unstructured.Unstructured) (cpus, memoryGi int64) {
 // --- the lifecycle --------------------------------------------------------
 
 func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
-	s, ok := shapeFromRequirements(claim)
-	if !ok {
+	candidates := shapesFromRequirements(claim)
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("node claim %s names no instance type this provider offers", claim.Name)
 	}
+
+	// Read the budget, decide against it, and write the Machine without letting
+	// another Create in between.
+	//
+	// Karpenter launches a batch of NodeClaims through
+	// workqueue.ParallelizeUntil, one goroutine per claim, so several Creates
+	// run at once whenever more than one pod is pending -- which is the normal
+	// case rather than a rare one. Each would read the same `committed`, each
+	// would find room for itself, and every one of them would be allowed: the
+	// budget holds against one machine at a time and against nothing else. The
+	// lock makes `committed` mean what the next line assumes it means.
+	//
+	// It serialises provisioning to one machine at a time. That is the right
+	// trade here: the API round trip is local, and the thing being protected is
+	// a Mac that has no headroom to discover its limit by exceeding it.
+	p.creating.Lock()
+	defer p.creating.Unlock()
 
 	committed, err := p.committed(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !p.nodeClass.bounds().fits(committed, s) {
+	b := p.nodeClass.bounds()
+
+	// The cheapest candidate that still fits, not the first one.
+	//
+	// Karpenter offers every compatible instance type in the claim's
+	// requirements and leaves the choice to the provider; the values arrive
+	// through Requirement.NodeSelectorRequirement, which serialises them with
+	// sets.List -- sorted by name, with the price ordering thrown away. So the
+	// first value is the lexicographically smallest name. With the shipped
+	// defaults that happens to be the smallest shape; with FERRY_MACHINE_MIN_CPUS=4
+	// it is ferry-4cpu-16gi, and a pod asking for 100m and 128Mi would take the
+	// largest machine in the catalogue and the whole budget with it.
+	s, ok := cheapestThatFits(b, committed, candidates)
+	if !ok {
 		// The error that matters. Karpenter treats this as "that shape is not
 		// available right now", marks it unavailable for a while and stops
 		// asking; any other error is a failure it retries, which against a
 		// hypervisor is a loop that makes and destroys nothing at speed.
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
 			"the Mac has committed %d cpus and %d GiB to machines; %s would exceed the limit of %d cpus and %d GiB",
-			committed.cpus, committed.memoryGi, s.name(),
-			p.nodeClass.bounds().limitCPUs, p.nodeClass.bounds().limitMemoryGi))
+			committed.cpus, committed.memoryGi, candidates[0].name(),
+			b.limitCPUs, b.limitMemoryGi))
 	}
 
 	machine := &unstructured.Unstructured{Object: map[string]any{
@@ -332,19 +369,47 @@ func (p *Provider) IsDrifted(ctx context.Context, claim *karpv1.NodeClaim) (clou
 
 // --- helpers --------------------------------------------------------------
 
-func shapeFromRequirements(claim *karpv1.NodeClaim) (shape, bool) {
+// shapesFromRequirements is every shape the claim says it would accept,
+// cheapest first. Plural on purpose: the choice among them is the provider's,
+// and the order they arrive in does not express it -- see `Create`.
+//
+// Only In requirements are read. A NotIn on the instance type lists shapes the
+// claim has ruled out, and reading its values as candidates would pick one of
+// exactly the shapes it asked not to have.
+func shapesFromRequirements(claim *karpv1.NodeClaim) []shape {
+	var out []shape
 	for _, r := range claim.Spec.Requirements {
-		if r.Key != corev1.LabelInstanceTypeStable {
+		if r.Key != corev1.LabelInstanceTypeStable || r.Operator != corev1.NodeSelectorOpIn {
 			continue
 		}
 		for _, v := range r.Values {
 			if s, ok := parseShapeName(v); ok {
-				return s, true
+				out = append(out, s)
 			}
 		}
 	}
-	if v, ok := claim.Labels[corev1.LabelInstanceTypeStable]; ok {
-		return parseShapeName(v)
+	if len(out) == 0 {
+		// Nothing usable in the requirements: a claim written by hand, or one
+		// Karpenter has already resolved down to a label.
+		if v, ok := claim.Labels[corev1.LabelInstanceTypeStable]; ok {
+			if s, ok := parseShapeName(v); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b shape) int { return cmp.Compare(a.cost(), b.cost()) })
+	return out
+}
+
+// cheapestThatFits walks candidates in cost order and returns the first the
+// budget can still afford. Ordered rather than filtered-then-minimised because
+// the caller wants the answer and the name of the shape it wanted when there
+// is none.
+func cheapestThatFits(b bounds, committed shape, candidates []shape) (shape, bool) {
+	for _, s := range candidates {
+		if b.fits(committed, s) {
+			return s, true
+		}
 	}
 	return shape{}, false
 }
@@ -368,8 +433,15 @@ func parseShapeName(name string) (shape, bool) {
 	return shape{cpus: cpus, memoryGi: mem}, true
 }
 
+// isNotFound asks the API machinery rather than the error text.
+//
+// A substring match on "not found" also matches an admission or conversion
+// webhook reporting a missing service, an RBAC message, and a discovery
+// failure. In `Delete` that reads as success: Karpenter is told the machine is
+// gone, drops the NodeClaim, and nothing is left that would ever reap the VM
+// still running behind it.
 func isNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+	return apierrors.IsNotFound(err)
 }
 
 // Checked at compile time rather than discovered at startup: an interface this

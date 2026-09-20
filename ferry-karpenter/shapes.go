@@ -14,7 +14,9 @@ package main
 // handful of entries that differ enough to matter.
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -27,6 +29,15 @@ type shape struct {
 }
 
 func (s shape) name() string { return fmt.Sprintf("ferry-%dcpu-%dgi", s.cpus, s.memoryGi) }
+
+// cost is what this shape is worth to Karpenter's cheapest-fit logic, and what
+// "smallest" means everywhere else here.
+//
+// Everything on a Mac costs the same in money; what a shape actually spends is
+// the host's cores and memory, so the price is those. Cores dominate because a
+// machine that is not running anything still holds its vcpus against the Mac's
+// scheduler, while untouched guest memory is nearly free (experiment 14).
+func (s shape) cost() float64 { return float64(s.cpus)*1.0 + float64(s.memoryGi)*0.1 }
 
 func (s shape) capacity(maxPods int64) corev1.ResourceList {
 	return corev1.ResourceList{
@@ -82,6 +93,19 @@ func (b bounds) shapes() []shape {
 	// A floor entry, so a NodeClass whose minimum is not a power of two still
 	// has something to offer.
 	add(b.minCPUs, b.minMemoryGi)
+	// Cheapest first, so callers can say "the smallest shape" by taking the
+	// front of the slice and "the range offered" by taking both ends. The floor
+	// entry is appended last and is usually the smallest, so the unsorted order
+	// is not the order anybody reading it would assume.
+	slices.SortFunc(out, func(a, b shape) int {
+		if c := cmp.Compare(a.cost(), b.cost()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.cpus, b.cpus); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.memoryGi, b.memoryGi)
+	})
 	return out
 }
 
