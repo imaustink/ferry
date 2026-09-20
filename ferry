@@ -892,11 +892,22 @@ cmd_up() {
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
-  local ready=
-  for _ in $(seq 1 90); do
+  # Ninety seconds, unless ferry-cri says it is waiting for its slice -- then
+  # longer, because that wait is deliberately slow.
+  #
+  # A refused vmnet create renews the reservation it was refused by
+  # (experiment 22), so the only way to outlast one is to ask rarely: two or
+  # three asks, ninety-five seconds apart. That is longer than a startup wait
+  # should normally be, and giving every failure the same budget would mean
+  # four minutes of silence for a ferry-cri that was never going to start. So
+  # the budget grows only once ferry-cri has said what it is doing.
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     if [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then ready=1; break; fi
     running ferry-cri || break
+    if grep -q "waiting for .*slice" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then limit=260; fi
     sleep 1
+    waited=$(( waited + 1 ))
   done
   # Show the whole failure, not the last five lines of it. ferry-cri explains
   # some of these at length -- a refused pod subnet takes a paragraph to say
@@ -1555,10 +1566,12 @@ cmd_node_add() {
     --relay-endpoint "$LAN_IP:$relay" \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
-  local ready=
-  for _ in $(seq 1 90); do
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     [ -S "$sock" ] && grep -q "serving" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && { ready=1; break; }
+    grep -q "waiting for .*slice" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && limit=260
     sleep 1
+    waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
   ok "runtime on 10.244.$index.0/24, switch udp/$relay"
@@ -1995,10 +2008,15 @@ start_worker() {
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
-  local ready=
-  for _ in $(seq 1 90); do
+  # Same budget rule as cmd_up, and it matters more here: a Mac joining a
+  # cluster always has peers, so it always waits for its slice rather than
+  # falling back to another subnet.
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null && { ready=1; break; }
+    grep -q "waiting for .*slice" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null && limit=260
     sleep 1
+    waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
   ok "runtime on 10.244.$index.0/24, switch udp/$RELAY_PORT"

@@ -129,21 +129,21 @@ let server = GRPCServer(
 // Shut down cleanly on signal. A ferry-cri that is simply killed leaves its
 // pods running and its vmnet network claimed, and the next process to ask for
 // the same subnet is refused.
-signal(SIGTERM, SIG_IGN)
-signal(SIGINT, SIG_IGN)
-let shutdownSignals = [SIGTERM, SIGINT].map { sig -> DispatchSourceSignal in
-    let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-    source.setEventHandler {
-        Task {
-            print("\n==> stopping pods and releasing the pod network")
-            await runtime.shutdown()
-            server.beginGracefulShutdown()
-            try? FileManager.default.removeItem(atPath: socketPath)
-            exit(0)
-        }
+//
+// The handler is built by `onShutdownSignal` rather than written here, and that
+// is not tidiness: a closure written in top-level code inherits `@MainActor`,
+// dispatch calls signal handlers off the main queue, and Swift traps on the
+// isolation check. This handler used to crash on every SIGTERM without ever
+// reaching its first line. See Shutdown.swift.
+let shutdownSocketPath = socketPath
+let shutdownSignals = onShutdownSignal {
+    Task.detached {
+        announce("\n==> stopping pods and releasing the pod network")
+        await runtime.shutdown()
+        try? FileManager.default.removeItem(atPath: shutdownSocketPath)
+        announce("==> stopped")
+        exit(0)
     }
-    source.resume()
-    return source
 }
 _ = shutdownSignals
 

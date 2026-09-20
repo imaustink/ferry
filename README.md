@@ -211,6 +211,7 @@ experiments/18-node-image/           the node image, and ferry-node that boots i
 experiments/19-machine-crd/          a node made by applying a resource
 experiments/20-pod-network/          pods on two machines reaching each other
 experiments/21-density-vs-kind-minikube/  against kind and minikube, on one Mac
+experiments/22-vmnet-lifecycle/      why a vmnet subnet stays reserved
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
 node-image/ (built)                  mode 2's node image, as an OCI layout

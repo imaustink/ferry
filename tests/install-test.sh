@@ -666,6 +666,49 @@ succeeds "  at the cluster prefix, not its own slice's" \
 succeeds "  and routes only to nodes on its own segment" \
   grep -q 'ip -o route get' "$repo/experiments/18-node-image/init.sh"
 
+# --- giving the subnet back -----------------------------------------------
+#
+# A vmnet reservation lives as long as the vmnet_network_ref, and a refused
+# create renews it (experiment 22) -- so a subnet nobody releases is one that
+# asking cannot reclaim. Both halves are asserted, because either one alone
+# leaves restarts waiting.
+succeeds "ferry-cri owns the network it creates" \
+  test -f "$repo/ferry-cri/Sources/ferry-cri/PodNetwork.swift"
+succeeds "  and releases it on the way out" \
+  ruby -e '
+    b = File.read(ARGV[0])[/func shutdown\(\) async \{.*?\n    \}/m].to_s
+    exit(b.include?("release()") ? 0 : 1)
+  ' "$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
+# vmnet_stop_interface releases the network, so every running pod VM holds a
+# reference: the pods have to stop before the release, not after.
+succeeds "  after the pods that hold references to it" \
+  ruby -e '
+    b = File.read(ARGV[0])[/func shutdown\(\) async \{.*?\n    \}/m].to_s
+    exit(b.index("pod.stop()") && b.index("release()") &&
+         b.index("pod.stop()") < b.index("release()") ? 0 : 1)
+  ' "$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
+
+# The handler used to trap on Swift's isolation check before its first line, so
+# none of the above ran. A @Sendable closure cannot carry actor isolation.
+succeeds "the shutdown handler is not main-actor isolated" \
+  grep -q '@escaping @Sendable () -> Void' "$repo/ferry-cri/Sources/ferry-cri/Shutdown.swift"
+succeeds "  and is installed from outside top-level code" \
+  grep -q 'onShutdownSignal' "$repo/ferry-cri/Sources/ferry-cri/main.swift"
+# The crash was invisible because the line that would have named it was still in
+# a block-buffered stdout.
+succeeds "  and what it says on the way out is flushed" \
+  grep -q 'fflush(stdout)' "$repo/ferry-cri/Sources/ferry-cri/Shutdown.swift"
+
+# Asking every three seconds is what made the wait unwinnable.
+succeeds "the slice retry is spaced past an expiry window" \
+  ruby -e '
+    b = File.read(ARGV[0])
+    n = b[/sliceRetrySeconds: TimeInterval = (\d+)/, 1].to_i
+    exit(n >= 90 ? 0 : 1)
+  ' "$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
+succeeds "  and ferry waits for it rather than calling it a failure" \
+  grep -q 'waiting for .\*slice' "$repo/ferry"
+
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy
   # pinned to nodes mode 1 does not have.
