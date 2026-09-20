@@ -86,11 +86,15 @@ Three bugs were found by running it, which is the argument for running it:
 - the restart guard pointed at `ferry upgrade apply <older>`, a command that
   correctly refuses, instead of at `rollback`.
 
-What is still only reasoned about is a **minor** bump. Everything above is
-within v1.34, which drives every path except patch drift. A new minor means
-porting `patches/`, and `build-kubelet.sh` failing loudly on a moved seam --
-during the build, before anything is switched -- remains the best that can be
-said for it.
+What is still only reasoned about is a **minor** bump *on a running cluster*.
+Everything above is within v1.34, which drives every path except patch drift.
+Building across minors is no longer reasoned about: v1.34, v1.35 and v1.36
+kubelets all build, from one shared overlay plus a per-minor
+`patches/kubelet-vX.Y/` carrying the two constructors whose signatures move.
+What has not been done is draining a node and flipping a control plane across
+that boundary, and `build-kubelet.sh` failing loudly on a moved seam -- during
+the build, before anything is switched -- remains the best that can be said for
+that half.
 
 Known limits, which are not bugs:
 

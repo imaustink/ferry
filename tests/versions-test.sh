@@ -62,6 +62,10 @@ printf '\033[1m%s\033[0m\n' "what a version is paired with"
 is "v1.34.0 runs the v1.34.11 control plane" \
    "$(ferry_control_plane_version v1.34.0)" "v1.34.11"
 is "so does v1.34.11" "$(ferry_control_plane_version v1.34.11)" "v1.34.11"
+is "v1.35.0 runs the v1.35.8 control plane" \
+   "$(ferry_control_plane_version v1.35.0)" "v1.35.8"
+is "v1.36.0 runs the v1.36.4 control plane" \
+   "$(ferry_control_plane_version v1.36.0)" "v1.36.4"
 is "an unpinned minor asks for itself" \
    "$(ferry_control_plane_version v1.99.3)" "v1.99.3"
 is "the pin can be overridden" \
@@ -70,6 +74,39 @@ is "v1.34 pairs with etcd 3.6" "$(ferry_etcd_version v1.34.0)" "v3.6.5"
 is "v1.33 pairs with etcd 3.5" "$(ferry_etcd_version v1.33.4)" "v3.5.21"
 is "etcd can be overridden" \
    "$(ETCD_VERSION=v3.5.9 ferry_etcd_version v1.34.0)" "v3.5.9"
+
+printf '\033[1m%s\033[0m\n' "every pinned minor is reachable"
+# The two halves of supporting a minor have to agree, and nothing else notices
+# when they stop. A pin with no patches/kubelet-vX.Y/ is a minor whose kubelet
+# cannot be built; a gap in the ladder is a minor that ferry_skew_reason will
+# refuse to step over, which strands every cluster below the gap on the far side
+# of it. v1.36 shipped with both faults: pinned, but with no v1.35 in between.
+pinned_minors="$(
+  awk '/^ferry_control_plane_version\(\)/,/^}/' "$repo/lib/versions.sh" \
+    | sed -n 's/^ *\(v1\.[0-9]*\)) *echo.*/\1/p'
+)"
+if [ -n "$pinned_minors" ]; then ok "the pins can be read out of lib/versions.sh"
+else bad "no pinned minors found -- this test is reading the wrong thing"; fi
+for mm in $pinned_minors; do
+  if [ -d "$repo/patches/kubelet-$mm" ]; then
+    ok "$mm has a kubelet overlay"
+  else
+    bad "$mm is pinned but patches/kubelet-$mm/ does not exist"
+  fi
+done
+previous=""
+# shellcheck disable=SC2013 # each line is a bare vX.Y, so splitting on it is fine
+for mm in $(sort -t. -k2 -n <<<"$pinned_minors"); do
+  if [ -n "$previous" ]; then
+    step="$(( $(ferry_version_minor "$mm") - $(ferry_version_minor "$previous") ))"
+    if [ "$step" = 1 ]; then
+      ok "$previous steps straight to $mm"
+    else
+      bad "$previous to $mm skips $(( step - 1 )) minor(s), which ferry_skew_reason refuses"
+    fi
+  fi
+  previous="$mm"
+done
 
 printf '\033[1m%s\033[0m\n' "control plane skew"
 empty "a patch bump is allowed"       "$(ferry_skew_reason v1.34.0 v1.34.11)"
