@@ -1,0 +1,26 @@
+# containerd's configuration on a ferry node.
+#
+# Until this file existed containerd ran entirely on its built-in defaults,
+# which left two things worth fixing.
+#
+# The sandbox image was whatever the containerd release happened to default to.
+# That works until containerd is upgraded and the default moves: nothing in this
+# repository names the image, so nothing notices, and the node quietly starts
+# pulling a different one. Pinning it here makes the version a thing you change
+# on purpose. kind pins it for the same reason and then reads its own config to
+# decide what to pre-load -- see pkg/build/nodeimage/helpers.go, and build.sh
+# here, which reads the line below for exactly that reason.
+#
+# And every layer was kept in both its compressed and its unpacked form on a
+# node disk that is 8 GiB and built without resize_inode, so it cannot be grown.
+version = 3
+
+[plugins.'io.containerd.cri.v1.images']
+  snapshotter = 'overlayfs'
+  # Keep the unpacked layer and let the compressed copy be collected. On a disk
+  # this size the difference is an image cache that fits against one that fills
+  # the disk and starts evicting pods.
+  discard_unpacked_layers = true
+
+  [plugins.'io.containerd.cri.v1.images'.pinned_images]
+    sandbox = 'registry.k8s.io/pause:3.10.2'

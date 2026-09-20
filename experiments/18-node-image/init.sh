@@ -86,6 +86,26 @@ until [ -S /run/containerd/containerd.sock ]; do
 done
 log "containerd ready ($(elapsed)ms)"
 
+# The sandbox image, into the k8s.io namespace CRI reads from. Without it
+# containerd pulls it from registry.k8s.io the first time a pod is scheduled,
+# which puts a network round trip in front of the first pod on every node and
+# leaves a node with no route to a registry unable to start one at all.
+if [ -f /opt/ferry/sandbox-image.tar ]; then
+  if /usr/local/bin/ctr -n k8s.io images import /opt/ferry/sandbox-image.tar \
+       >/var/log/sandbox-image-import.log 2>&1; then
+    log "sandbox image imported ($(elapsed)ms)"
+  else
+    # Not fatal -- containerd falls back to pulling. Said loudly because the
+    # symptom otherwise is a slow first pod and nothing else, and with the
+    # reason because the fallback is exactly what a node with no route to a
+    # registry cannot do: the socket being up while the image service is not
+    # yet serving, a truncated tar and a snapshotter error all look the same
+    # from here and are fixed in different places.
+    log "WARNING sandbox image import failed; containerd will pull it instead"
+    tail -2 /var/log/sandbox-image-import.log > /dev/console 2>&1
+  fi
+fi
+
 mkdir -p /etc/kubernetes /var/lib/kubelet
 # vdb is this node's configuration: one read-only filesystem carrying what
 # differs between machines. The certificate authority is too big for a kernel

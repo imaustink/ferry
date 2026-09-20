@@ -1240,18 +1240,75 @@ machines_ready() {
       echo "    Build it: ferry node-image   (slow, needs docker)"
     fi
     return 1; }
-  # Unpacked once, from the layout the release carries. Doing it here rather
-  # than at install time keeps the cost off every Mac that never uses mode 2.
-  if [ ! -f "$NODE_DISK" ]; then
-    echo "  unpacking the node image (once, ~400MB)"
-    "$here/bin/ferry-node" build --layout "$NODE_IMAGE_LAYOUT" --out "$NODE_DISK" \
+  # Unpacked from the layout the release carries, and re-unpacked when that
+  # layout changes. Doing it here rather than at install time keeps the cost off
+  # every Mac that never uses mode 2.
+  #
+  # The stamp is what makes `ferry node-image` mean anything on a Mac that has
+  # already run mode 2 once. This used to unpack only when $NODE_DISK was
+  # missing, so rebuilding the node image left the old disk in place and the
+  # next machine booted the image the user thought they had just replaced --
+  # silently, because everything still works, just not with their changes in it.
+  local stamp="$NODE_DISK.layout"
+  local want; want="$(node_layout_id)"
+  if [ ! -f "$NODE_DISK" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
+    # Not while ferry-machined is running. This function is reached before the
+    # "already running" check below, so re-running 'ferry machines enable' after
+    # 'ferry node-image' would replace the file the controller clones every new
+    # machine's disk from, and a machine created during the rebuild would be
+    # cloned from a partial one. It boots to nothing and the size check that
+    # guards a machine's disk cannot tell.
+    if [ -f "$NODE_DISK" ] && running ferry-machined; then
+      warn "the node image changed, but machines are running; keeping the current node disk"
+      echo "    Replacing it now would hand a half-written file to any machine"
+      echo "    created while it is being written. Take machines down first:"
+      echo "        ferry machines disable && ferry machines enable"
+      return 0
+    fi
+    local rebuilt=no
+    if [ -f "$NODE_DISK" ]; then
+      rebuilt=yes
+      echo "  the node image changed; unpacking it again (~400MB)"
+    else
+      echo "  unpacking the node image (once, ~400MB)"
+    fi
+    # Unpacked beside the real path and moved into place, so a failure -- a bad
+    # layout, or $HOME with less than ~400MB left -- leaves the working disk
+    # exactly where it was. ferry-node removes --out before it writes, so
+    # unpacking straight onto $NODE_DISK would destroy the only copy first and
+    # then fail, with the layout that just failed as the only way back.
+    local tmp="$NODE_DISK.unpacking.$$"
+    rm -f "$tmp"
+    "$here/bin/ferry-node" build --layout "$NODE_IMAGE_LAYOUT" --out "$tmp" \
       >"$FERRY_RUN/logs/ferry-node-build.log" 2>&1 || {
         bad "could not unpack the node image"
         tail -5 "$FERRY_RUN/logs/ferry-node-build.log" 2>/dev/null | sed 's/^/    /'
-        rm -f "$NODE_DISK"
+        rm -f "$tmp"
+        [ -f "$NODE_DISK" ] && echo "    The node disk already there was left alone."
         return 1; }
+    mv -f "$tmp" "$NODE_DISK" || {
+      bad "could not put the unpacked node disk at $NODE_DISK"
+      rm -f "$tmp"
+      return 1; }
+    # After the move: a crash between the two leaves the stamp naming the old
+    # layout, which asks for another unpack rather than trusting a disk nobody
+    # confirmed.
+    printf '%s' "$want" > "$stamp"
     ok "node disk at $NODE_DISK"
+    # Only new machines. ferry-machined adopts an existing Machine's disk as it
+    # is rather than re-cloning it, so a machine declared before this rebuild
+    # keeps booting the old image until it is deleted and applied again.
+    if [ "$rebuilt" = yes ]; then
+      echo "      machines that already exist keep their own disk; delete and"
+      echo "      re-apply a Machine to put it on this image"
+    fi
   fi
+}
+
+# Identifies the OCI layout the node disk was unpacked from. index.json carries
+# the manifest digest, so it changes whenever the image does and not otherwise.
+node_layout_id() {
+  shasum -a 256 "$NODE_IMAGE_LAYOUT/index.json" 2>/dev/null | awk '{print $1}'
 }
 
 start_storage() {

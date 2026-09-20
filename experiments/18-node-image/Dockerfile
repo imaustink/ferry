@@ -24,6 +24,14 @@ COPY stage/runc /usr/local/bin/runc
 ADD stage/containerd.tar.gz /usr/local/
 ADD stage/cni-plugins.tgz /opt/cni/bin/
 
+# containerd ran on its built-in defaults until this file existed. See the
+# comments in it for what that cost.
+COPY files/containerd-config.toml /etc/containerd/config.toml
+
+# The sandbox image every pod needs, exported on the host by build.sh. A node
+# that cannot reach a registry still has to be able to start a pod.
+COPY stage/sandbox-image.tar /opt/ferry/sandbox-image.tar
+
 COPY init.sh /sbin/ferry-init
 
 RUN chmod +x /usr/local/bin/kubelet /usr/local/bin/runc /sbin/ferry-init \
