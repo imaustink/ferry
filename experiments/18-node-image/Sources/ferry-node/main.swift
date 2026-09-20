@@ -226,7 +226,16 @@ func machineConfiguration(
     config.bootLoader = boot
 
     // vda is the node, vdb is its configuration.
-    let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: URL(filePath: disk), readOnly: false)
+    // The two-argument initializer defaults synchronizationMode to .full, which
+    // turns every fsync in the guest into a full host barrier. containerd's
+    // metadata store is bbolt -- a single writer that fsyncs each transaction --
+    // so twenty concurrent RunPodSandbox calls queue on that one lock and each
+    // waits out a barrier. Profiling a burst showed ten goroutines parked on
+    // core/metadata's mutex with another inside a syscall, while the guest used
+    // 48% of one core out of ten.
+    let rootAttachment = try VZDiskImageStorageDeviceAttachment(
+        url: URL(filePath: disk), readOnly: false,
+        cachingMode: .automatic, synchronizationMode: .fsync)
     config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)]
     if ProcessInfo.processInfo.environment["FERRY_NODE_NO_CONFIG"] == nil {
         let configAttachment = try VZDiskImageStorageDeviceAttachment(
