@@ -8,10 +8,8 @@
 # repository names the image, so nothing notices, and the node quietly starts
 # pulling a different one. Pinning it here makes the version a thing you change
 # on purpose. kind pins it for the same reason and then reads its own config to
-# decide what to pre-load -- see pkg/build/nodeimage/helpers.go. ferry does not
-# pre-load it: importing it at boot was tried and reverted, because the first
-# `ctr` call against a just-started containerd in this guest stalls for tens of
-# seconds. Pinning the name is the half that is safe to do now.
+# decide what to pre-load -- see pkg/build/nodeimage/helpers.go, and build.sh
+# here, which reads the line below for exactly that reason.
 #
 # And every layer was kept in both its compressed and its unpacked form on a
 # node disk that is 8 GiB and built without resize_inode, so it cannot be grown.
