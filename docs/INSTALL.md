@@ -166,8 +166,13 @@ for that. Enabling is remembered per cluster, so `ferry up` and the login agent
 bring machines back.
 
 The release ships the node image as an **OCI layout**, not as a disk. The first
-`ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB, once) using
+`ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB) using
 `ferry-node`'s own unpacker — so Docker is not needed on the installing Mac.
+It unpacks again whenever the layout changes, which means on every upgrade to a
+release with a different node image, and after any `ferry node-image` — so the
+~400 MB is paid once per node image rather than once per Mac. Machines that
+already exist keep the disk they were given; delete and re-apply a `Machine` to
+move it onto a new image.
 Docker is only needed to *create* the layout, which happens on the machine
 cutting the release:
 
