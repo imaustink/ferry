@@ -220,6 +220,16 @@ func machineConfiguration(
     port.attachment = console.attachment
     config.serialPorts = [port]
 
+    // Without this the guest has no entropy source at all -- rng_available is
+    // empty -- so the kernel seeds its CRNG from interrupt timing alone and
+    // reports `random: crng init done` about ten seconds in. Until that moment
+    // every getrandom(2) blocks, which in practice means every Go binary that
+    // wants randomness: the kubelet's TLS bootstrap, and `ctr`, which was
+    // measured taking seventeen seconds to answer `version` against a
+    // containerd that had booted in forty-five milliseconds. It is one line and
+    // it moves the whole early boot.
+    config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
     try config.validate()
     return config
 }
