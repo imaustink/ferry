@@ -70,14 +70,23 @@ data:
         reload
     }
 ---
+# A DaemonSet, not a Deployment, and the reason is consolidation rather than
+# latency. Karpenter decides a machine is empty by looking at what is on it and
+# ignoring DaemonSet pods; a Deployment pinned to machines is a real workload,
+# so the first machine provisioned would hold cluster DNS forever and could
+# never be reclaimed. Provisioning would be a one-way ratchet -- the exact thing
+# consolidation exists to prevent -- and it took watching a machine refuse to go
+# away to notice.
+#
+# Being per-machine is the right shape anyway: DNS is then local to the node
+# asking, and no machine depends on another to resolve a name.
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: coredns-machines
   namespace: kube-system
   labels: {k8s-app: kube-dns-machines}
 spec:
-  replicas: 1
   selector:
     matchLabels: {k8s-app: kube-dns-machines}
   template:

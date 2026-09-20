@@ -458,10 +458,23 @@ succeeds "and is derived from the Mac rather than guessed" \
 contains "the provisioner is stopped before the machines it manages" \
   "$(sed -n '/^stop_machines/,/^}/p' "$repo/ferry")" "running ferry-karpenter"
 
-for f in karpenter.sh_nodepools.yaml karpenter.sh_nodeclaims.yaml ferrynodeclass.yaml default-nodepool.yaml; do
-  succeeds "  manifests/machines/karpenter/$f is shipped" \
-    test -f "$repo/manifests/machines/karpenter/$f"
+# The CRDs sit in crds/ rather than beside the NodePool, and that is load
+# bearing: `kubectl apply -f <dir>` applies in alphabetical order, so a NodePool
+# sent from the same directory goes before the CRD defining its kind.
+for f in karpenter.sh_nodepools.yaml karpenter.sh_nodeclaims.yaml ferrynodeclass.yaml; do
+  succeeds "  manifests/machines/karpenter/crds/$f is shipped" \
+    test -f "$repo/manifests/machines/karpenter/crds/$f"
 done
+succeeds "  the default NodePool is shipped, outside crds/" \
+  test -f "$repo/manifests/machines/karpenter/default-nodepool.yaml"
+succeeds "and the CRDs are applied, and waited for, before it" \
+  ruby -e '
+    b = File.read(ARGV[0])[/^start_provisioner\(\).*?\n}/m].to_s
+    crds = b.index(%q{kube apply -f "$dir/crds"})
+    est  = b.index(%q{kube wait --for condition=established})
+    pool = b.index(%q{kube apply -f "$dir/default-nodepool.yaml"})
+    exit(crds && est && pool && crds < est && est < pool ? 0 : 1)
+  ' "$repo/ferry"
 
 # --- choosing a mode ------------------------------------------------------
 #
@@ -528,12 +541,26 @@ if command -v ruby >/dev/null 2>&1; then
       bad << o.dig("metadata","name") unless sel && sel["ferry.dev/mode"] == "shared"
     end
     svc = objs.find{|o| o["kind"]=="Service"}
-    dep = objs.find{|o| o["kind"]=="Deployment"}
-    bad << "service-selector" unless svc && svc.dig("spec","selector") == dep.dig("spec","template","metadata","labels")
+    dns = objs.find{|o| o.dig("metadata","name")=="coredns-machines" && %w[Deployment DaemonSet].include?(o["kind"])}
+    bad << "service-selector" unless svc && dns && svc.dig("spec","selector") == dns.dig("spec","template","metadata","labels")
     bad << "selects-mode-1-coredns" if svc && svc.dig("spec","selector","k8s-app") == "kube-dns"
     print bad.empty? ? "ok" : bad.join(",")
   ' 2>/dev/null)"
   is "every machine workload is pinned to ferry.dev/mode=shared" "$pinning" "ok"
+
+  # As a Deployment this both provisioned a machine on its own -- its pod is
+  # unschedulable until one exists -- and then held it against consolidation
+  # forever, because Karpenter discounts DaemonSet pods when deciding a node is
+  # empty and counts everything else. Provisioning became a one-way ratchet.
+  is "machine CoreDNS is a DaemonSet, so a machine can be reclaimed" \
+    "$(ruby -ryaml -e '
+      k = nil
+      YAML.load_stream(File.read("manifests/machines/coredns.yaml")){|d|
+        k = d["kind"] if d && d.dig("metadata","name") == "coredns-machines" &&
+                         %w[Deployment DaemonSet].include?(d["kind"])
+      }
+      print k.to_s
+    ' 2>/dev/null)" "DaemonSet"
 
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy

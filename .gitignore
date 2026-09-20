@@ -12,3 +12,4 @@ kernel/vmlinux-arm64
 guest/nft/
 ferry-proxy/ferry-proxy
 ferry-netpol/ferry-netpol
+ferry-machined/ferry-machined

@@ -13,10 +13,13 @@ package main
 // at it.
 
 import (
+	"fmt"
+
 	"github.com/awslabs/operatorpkg/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 )
 
 const (
@@ -29,6 +32,22 @@ var (
 
 	FerryNodeClassGVK = SchemeGroupVersion.WithKind("FerryNodeClass")
 )
+
+// Registered into client-go's global scheme, because that is the one
+// Karpenter's operator resolves objects against. Without this the operator
+// starts, prints its banner, and then panics deep inside NewControllers with
+// "no kind is registered for the type main.FerryNodeClass" -- which is a long
+// way from the missing line that caused it.
+func init() {
+	builder := runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &FerryNodeClass{}, &FerryNodeClassList{})
+		metav1.AddToGroupVersion(s, SchemeGroupVersion)
+		return nil
+	})
+	if err := builder.AddToScheme(clientgoscheme.Scheme); err != nil {
+		panic(fmt.Sprintf("registering FerryNodeClass: %v", err))
+	}
+}
 
 // +kubebuilder:object:root=true
 type FerryNodeClass struct {
@@ -113,7 +132,12 @@ func (n *FerryNodeClass) StatusConditions(opts ...status.ForOption) status.Condi
 
 // --- runtime.Object ------------------------------------------------------
 
-func (n *FerryNodeClass) DeepCopyObject() runtime.Object {
+// DeepCopy has to be declared on this type rather than inherited. Without it
+// `nc.DeepCopy()` resolves to the embedded ObjectMeta's method and returns an
+// *ObjectMeta, which compiles everywhere it is assigned to an interface and
+// fails only where a client.Object is wanted -- and would silently copy none of
+// the spec if it did not.
+func (n *FerryNodeClass) DeepCopy() *FerryNodeClass {
 	if n == nil {
 		return nil
 	}
@@ -126,6 +150,13 @@ func (n *FerryNodeClass) DeepCopyObject() runtime.Object {
 		copy(out.Status.Conditions, n.Status.Conditions)
 	}
 	return out
+}
+
+func (n *FerryNodeClass) DeepCopyObject() runtime.Object {
+	if n == nil {
+		return nil
+	}
+	return n.DeepCopy()
 }
 
 // +kubebuilder:object:root=true

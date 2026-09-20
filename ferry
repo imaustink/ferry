@@ -1262,17 +1262,44 @@ start_provisioner() {
   # Karpenter's own CRDs, and the NodePool that points at ferry. Applied on
   # every start for the same reason the Machine CRD is: 'ferry down --purge'
   # takes them with the cluster while the enabled marker survives.
+  # The CRDs before the objects that use them, and waited for.
+  #
+  # `kubectl apply -f <dir>` applies in alphabetical order, so a NodePool named
+  # default-nodepool.yaml is sent before the CRD that defines its kind and the
+  # whole apply fails. It then succeeds on the next attempt -- the CRDs from the
+  # failed run are there by now -- which is the worst version of the bug,
+  # because "run it twice" hides it.
   local dir="$here/manifests/machines/karpenter"
-  if [ -d "$dir" ]; then
-    kube apply -f "$dir" >/dev/null 2>&1 \
+  if [ -d "$dir/crds" ]; then
+    kube apply -f "$dir/crds" >/dev/null 2>&1 \
       || { warn "could not install Karpenter's CRDs; machines must be declared by hand"; return 0; }
+    # Established, not merely created: the API server needs a moment before it
+    # will accept an object of a kind it has just learned.
+    kube wait --for condition=established --timeout=60s \
+      crd/nodepools.karpenter.sh crd/nodeclaims.karpenter.sh \
+      crd/ferrynodeclasses.ferry.dev >/dev/null 2>&1 \
+      || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
+    kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
+      || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
   fi
 
+  # Settings through the environment, the command line left to Karpenter.
+  #
+  # Its operator parses os.Args with its own flag set and exits on an argument
+  # it does not recognise, so `--kubeconfig` of ferry's own does not collide --
+  # it stops the process starting at all. KUBECONFIG is how controller-runtime
+  # finds a cluster from outside one, which is what this is.
+  #
+  # Leader election off: it is one process on one Mac, and the lease it would
+  # take is a cluster object ferry would then have to clean up.
+  KUBECONFIG="$FERRY_HOME/admin.conf" \
+  FERRY_MACHINE_LIMIT_CPUS="$MACHINE_LIMIT_CPUS" \
+  FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_NODE_DISK="$NODE_DISK" \
   "$here/bin/ferry-karpenter" \
-    --kubeconfig "$FERRY_HOME/admin.conf" \
-    --limit-cpus "$MACHINE_LIMIT_CPUS" \
-    --limit-memory-gi "$MACHINE_LIMIT_MEMORY_GI" \
-    --max-pods 110 \
+    --disable-leader-election \
+    --metrics-port 0 \
     >"$FERRY_RUN/logs/ferry-karpenter.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-karpenter.pid"
   sleep 2

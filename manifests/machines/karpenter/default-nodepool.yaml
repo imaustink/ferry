@@ -7,18 +7,21 @@
 # node size before knowing the workload, and that is the bargain ferry exists to
 # avoid.
 #
-# `limits` here is deliberately absent. The ceiling that matters is the Mac's,
-# and it belongs to the FerryNodeClass where it applies to every NodePool rather
-# than to this one.
+# `limits` on the NodePool is deliberately absent. The ceiling that matters is
+# the Mac's, and it is not a policy about one workload.
+#
+# The FerryNodeClass below is deliberately empty for a related reason. Machine
+# shapes and the host budget come from ferry's environment -- it measured this
+# Mac and started ferry-karpenter with the answers (FERRY_MACHINE_* in
+# docs/INSTALL.md) -- so this object exists to give the NodePool's nodeClassRef
+# something to resolve, and to carry its Ready condition. Spelling the numbers
+# out here would be a second place for them to live, disagreeing with the real
+# ones on any Mac that is not the size these defaults assume, and editing them
+# would change nothing.
 apiVersion: ferry.dev/v1alpha1
 kind: FerryNodeClass
 metadata:
   name: default
-spec:
-  cpus: {min: 2, max: 8}
-  memoryGi: {min: 2, max: 16}
-  limits: {cpus: 8, memoryGi: 16}
-  maxPods: 110
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
