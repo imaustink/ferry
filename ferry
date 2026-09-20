@@ -1240,18 +1240,38 @@ machines_ready() {
       echo "    Build it: ferry node-image   (slow, needs docker)"
     fi
     return 1; }
-  # Unpacked once, from the layout the release carries. Doing it here rather
-  # than at install time keeps the cost off every Mac that never uses mode 2.
-  if [ ! -f "$NODE_DISK" ]; then
-    echo "  unpacking the node image (once, ~400MB)"
+  # Unpacked from the layout the release carries, and re-unpacked when that
+  # layout changes. Doing it here rather than at install time keeps the cost off
+  # every Mac that never uses mode 2.
+  #
+  # The stamp is what makes `ferry node-image` mean anything on a Mac that has
+  # already run mode 2 once. This used to unpack only when $NODE_DISK was
+  # missing, so rebuilding the node image left the old disk in place and the
+  # next machine booted the image the user thought they had just replaced --
+  # silently, because everything still works, just not with their changes in it.
+  local stamp="$NODE_DISK.layout"
+  local want; want="$(node_layout_id)"
+  if [ ! -f "$NODE_DISK" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
+    if [ -f "$NODE_DISK" ]; then
+      echo "  the node image changed; unpacking it again (~400MB)"
+    else
+      echo "  unpacking the node image (once, ~400MB)"
+    fi
     "$here/bin/ferry-node" build --layout "$NODE_IMAGE_LAYOUT" --out "$NODE_DISK" \
       >"$FERRY_RUN/logs/ferry-node-build.log" 2>&1 || {
         bad "could not unpack the node image"
         tail -5 "$FERRY_RUN/logs/ferry-node-build.log" 2>/dev/null | sed 's/^/    /'
-        rm -f "$NODE_DISK"
+        rm -f "$NODE_DISK" "$stamp"
         return 1; }
+    printf '%s' "$want" > "$stamp"
     ok "node disk at $NODE_DISK"
   fi
+}
+
+# Identifies the OCI layout the node disk was unpacked from. index.json carries
+# the manifest digest, so it changes whenever the image does and not otherwise.
+node_layout_id() {
+  shasum -a 256 "$NODE_IMAGE_LAYOUT/index.json" 2>/dev/null | awk '{print $1}'
 }
 
 start_storage() {
