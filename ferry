@@ -279,7 +279,15 @@ NODE_DISK="${FERRY_NODE_DISK:-$FERRY_HOME/node.ext4}"
 # networking ordinary routing rather than mode 1's flooded switch. Profiles get
 # their own, because a vmnet network is claimed for the whole Mac and a second
 # cluster asking for the same one gets none.
-MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
+# The subnet that last came up is remembered, because the preferred one is not
+# always available: vmnet holds a subnet after the process using it stops, so
+# `ferry machines enable` is sometimes run with FERRY_MACHINE_SUBNET pointing
+# somewhere else. Without remembering it, the next `ferry up` went back to the
+# default, failed to claim it, and brought the cluster up with mode 2 silently
+# missing -- having been told, once, to use a different one.
+MACHINE_SUBNET_FILE="$FERRY_HOME/machine-subnet"
+MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-$(cat "$MACHINE_SUBNET_FILE" 2>/dev/null)}"
+MACHINE_SUBNET="${MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
 # Cluster DNS for pods inside machines, as a ClusterIP.
 #
 # Mode 1's CoreDNS cannot serve them: it is a ferry-cri pod on the Mac's vmnet
@@ -1202,7 +1210,11 @@ start_machines() {
     fi
     return 1
   fi
+  # What ferry-node actually claimed, which is not always what it was asked for.
+  actual_subnet=$(grep -a 'network' "$FERRY_RUN/logs/ferry-node.log" | head -1 | sed 's/.*network *//' | awk -F, '{print $1}' | tr -d ' ')
   ok "machine network $(grep -a 'network' "$FERRY_RUN/logs/ferry-node.log" | head -1 | sed 's/.*network //')"
+  # Remembered so the next start asks for the one that worked, not the default.
+  [ -n "$actual_subnet" ] && printf '%s' "$actual_subnet" > "$MACHINE_SUBNET_FILE"
 
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
