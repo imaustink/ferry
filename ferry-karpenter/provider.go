@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -207,6 +208,9 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 		"spec": map[string]any{
 			"cpus":   s.cpus,
 			"memory": fmt.Sprintf("%dGi", s.memoryGi),
+			"node": map[string]any{
+				"taints": registrationTaints(claim),
+			},
 		},
 	}}
 	if img := p.nodeClass.Spec.Image; img != "" {
@@ -371,3 +375,43 @@ func isNotFound(err error) bool {
 // Checked at compile time rather than discovered at startup: an interface this
 // large is easy to implement almost correctly.
 var _ cloudprovider.CloudProvider = (*Provider)(nil)
+
+// registrationTaints is what the machine's kubelet registers its Node with.
+//
+// The first is Karpenter's own, and it is the point of this function.
+// Registration expects a node it asked for to arrive already carrying
+// karpenter.sh/unregistered:NoExecute, and removes it once it has synced the
+// NodePool's labels on. Without it Karpenter logs "missing taint prevents
+// registration-related race conditions" and carries on, so machines work -- but
+// the window it names is real: between the kubelet registering and the sync
+// finishing, a pod with no nodeSelector can land on a node Karpenter has not
+// finished describing.
+//
+// A taint cannot be patched on afterwards and mean anything, because by then
+// the node is already schedulable. It has to come from the kubelet, so it
+// travels the whole way down: NodeClaim to Machine.spec.node.taints to
+// ferry-node to the kernel command line to --register-with-taints.
+//
+// Only machines the provisioner creates get it. A Machine written by hand has
+// no NodeClaim behind it and nothing that would ever take the taint off, and a
+// node nothing can schedule to is a worse failure than the race.
+//
+// The NodePool's own taints ride along for the same reason. Karpenter would
+// sync those onto the node too, and just as late.
+func registrationTaints(claim *karpv1.NodeClaim) []string {
+	out := []string{taintString(karpv1.UnregisteredNoExecuteTaint)}
+	for _, t := range append(slices.Clone(claim.Spec.Taints), claim.Spec.StartupTaints...) {
+		out = append(out, taintString(t))
+	}
+	return out
+}
+
+// taintString writes a taint the way the kubelet's --register-with-taints reads
+// it. The value is omitted when empty rather than written as `key=:Effect`:
+// both parse, and the shorter one is what `kubectl taint` prints back.
+func taintString(t corev1.Taint) string {
+	if t.Value == "" {
+		return fmt.Sprintf("%s:%s", t.Key, t.Effect)
+	}
+	return fmt.Sprintf("%s=%s:%s", t.Key, t.Value, t.Effect)
+}

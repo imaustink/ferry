@@ -50,6 +50,9 @@ GATEWAY=$(param ferry.gateway)
 POD_CIDR=$(param ferry.podcidr)
 DNS=$(param ferry.dns)
 DNS_SERVICE=$(param ferry.dnssvc)
+# Absent on a machine nobody tainted, and on any machine booted by a ferry-node
+# older than the parameter -- in both cases the flag is simply not passed.
+TAINTS=$(param ferry.taints)
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -138,7 +141,23 @@ evictionHard:
   nodefs.inodesFree: "5%"
 EOF
 
+# Taints belong on the kubelet rather than on a patch afterwards, and the
+# reason is the window between the two. A node registers, becomes schedulable,
+# and only then would a controller taint it; anything the scheduler placed in
+# between is already running somewhere it was meant to be kept off. The
+# provisioner's karpenter.sh/unregistered taint exists precisely to hold that
+# window shut until it has finished syncing the node, so applying it late would
+# be the same as not applying it.
+#
+# Built as a list so an empty TAINTS contributes no argument at all:
+# --register-with-taints="" is rejected, and a kubelet that will not start is a
+# worse failure than an untainted node.
+set --
+[ -n "$TAINTS" ] && set -- --register-with-taints="$TAINTS"
+log "taints: ${TAINTS:-none}"
+
 /usr/local/bin/kubelet \
+  "$@" \
   --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
   --kubeconfig=/etc/kubernetes/kubelet.conf \
   --config=/var/lib/kubelet/config.yaml \

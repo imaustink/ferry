@@ -30,6 +30,10 @@ struct MachineSpec: Codable {
     /// The slice of the cluster's pod network this machine owns. Each machine
     /// gets its own, so routes between them are unambiguous.
     let podCIDR: String
+    /// Taints the kubelet registers with, in its own --register-with-taints
+    /// spelling. Optional, because a machine written by hand has none and an
+    /// older ferry-machined does not send the field at all.
+    let taints: [String]?
 }
 
 /// What this reports back about a machine it is running.
@@ -143,7 +147,7 @@ func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
         nodeName: spec.name, disk: spec.disk, configDisk: configDisk, kernelPath: kernelPath,
         cpus: spec.cpus, memoryMiB: spec.memoryMiB, apiServer: apiServer, token: spec.token,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
-        interface: interface, console: console)
+        taints: spec.taints ?? [], interface: interface, console: console)
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)

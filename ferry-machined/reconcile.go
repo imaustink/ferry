@@ -56,6 +56,10 @@ type machineSpec struct {
 	MemoryMiB int64  `json:"memoryMiB"`
 	Token     string `json:"token"`
 	PodCIDR   string `json:"podCIDR"`
+	// Taints the kubelet registers the Node with, rather than ones patched on
+	// once it is already schedulable -- see ensureProviderID for why the same
+	// argument did not win for the mode label.
+	Taints []string `json:"taints,omitempty"`
 }
 
 // machineStatus is what it writes back.
@@ -169,9 +173,10 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	// Asking the server rather than starting a process: one vmnet network
 	// belongs to the process that made it (experiment 19), so every machine has
 	// to be hosted by the same one or they land on networks vmnet keeps apart.
+	taints, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "node", "taints")
 	spec := machineSpec{
 		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
-		Token: token,
+		Token: token, Taints: taints,
 	}
 	body, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {

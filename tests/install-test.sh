@@ -562,6 +562,44 @@ if command -v ruby >/dev/null 2>&1; then
       print k.to_s
     ' 2>/dev/null)" "DaemonSet"
 
+
+# --- taints arrive with the node, not after it ----------------------------
+#
+# Karpenter's karpenter.sh/unregistered taint only does its job if the kubelet
+# registers with it: patched on afterwards, the node has already been
+# schedulable for the length of the race the taint exists to close. So the
+# assertion is on the whole path rather than on any one end of it -- provider to
+# Machine spec to ferry-node to the kernel command line to the kubelet flag.
+succeeds "the provisioner asks for Karpenter's unregistered taint" \
+  grep -q 'UnregisteredNoExecuteTaint' "$repo/ferry-karpenter/provider.go"
+succeeds "  and the NodePool's own taints travel the same way" \
+  grep -q 'claim.Spec.Taints' "$repo/ferry-karpenter/provider.go"
+succeeds "the Machine CRD carries spec.node.taints" \
+  ruby -ryaml -e '
+    d = YAML.load_file(ARGV[0])
+    t = d.dig("spec","versions",0,"schema","openAPIV3Schema",
+              "properties","spec","properties","node","properties","taints")
+    exit(t && t["type"] == "array" ? 0 : 1)
+  ' "$repo/ferry-machined/crd.yaml"
+succeeds "  and refuses one with a space, which would truncate the command line" \
+  ruby -ryaml -e '
+    d = YAML.load_file(ARGV[0])
+    p_ = d.dig("spec","versions",0,"schema","openAPIV3Schema","properties","spec",
+               "properties","node","properties","taints","items","pattern").to_s
+    exit(p_.include?("[^ ,]") ? 0 : 1)
+  ' "$repo/ferry-machined/crd.yaml"
+succeeds "ferry-machined reads them off the Machine" \
+  grep -q '"spec", "node", "taints"' "$repo/ferry-machined/reconcile.go"
+succeeds "  and passes them to ferry-node" \
+  grep -q 'Taints \[\]string' "$repo/ferry-machined/reconcile.go"
+succeeds "ferry-node puts them on the kernel command line" \
+  grep -q 'ferry.taints=' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  and the guest hands them to --register-with-taints" \
+  grep -q 'register-with-taints' "$repo/experiments/18-node-image/init.sh"
+# An empty one is not "no taints", it is a kubelet that will not start.
+succeeds "  only when there are some" \
+  grep -q 'if !taints.isEmpty' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy
   # pinned to nodes mode 1 does not have.

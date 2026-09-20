@@ -292,32 +292,52 @@ do not hold a node against consolidation. Being per-machine is also the better
 shape — DNS is local to the node asking, and no machine depends on another to
 resolve a name.
 
-### Machines register without Karpenter's unregistered taint
+### Machines register with their taints, not patched afterwards
 
-Karpenter expects a node it asked for to arrive carrying
-`karpenter.sh/unregistered:NoExecute`, which it removes once it has synced the
-NodePool's labels onto the node. Ferry's machines do not carry it, and the
-provisioner log says so on every machine:
+Karpenter expects a node it asked for to arrive already carrying
+`karpenter.sh/unregistered:NoExecute`, and removes it once it has synced the
+NodePool's labels onto the node. The window that taint holds shut is the one
+between a kubelet registering and Karpenter finishing with it: a node is
+schedulable the moment it registers, so anything the scheduler places in that
+gap is already running somewhere Karpenter had not finished describing.
+
+The first version of this machinery did not carry it, and Karpenter said so on
+every machine:
 
 ```
 node claim registration error … taint: karpenter.sh/unregistered
   "missing taint prevents registration-related race conditions"
 ```
 
-Karpenter logs this and proceeds — registration completes — so it is a warning
-rather than a failure, and the machine is usable. What stays open is the race it
-names: between the kubelet registering the node and ferry-machined labelling it,
-a pod with no `nodeSelector` can land on a machine that Karpenter has not
-finished syncing.
+It logs that and proceeds, so machines worked and the race was invisible until
+something lost it.
 
-It is not fixed here because the fix is not a patch. A taint has to be present
-*before* the node is schedulable, so it has to come from the kubelet's
-`--register-with-taints`, which for a machine means the guest's boot arguments
-and a rebuilt node image — the same cost the mode label declines to pay. It also
-has to be conditional: a machine created by hand, with no NodeClaim behind it,
-would get a taint that nothing ever removes, and a node nothing can schedule on
-is worse than the race. Both are milestone 4/5 follow-up work, recorded here so
-the log line is a known gap rather than a mystery.
+A taint cannot be patched on after the fact and still mean anything, which is
+the whole difference between this and the mode label below. By the time a
+controller could apply it the node is already schedulable. So it comes from the
+kubelet, and travels the whole way down: the provisioner writes
+`spec.node.taints` on the `Machine` it creates, `ferry-machined` passes it to
+`ferry-node`, `ferry-node` puts it on the kernel command line, and the guest's
+init hands it to `--register-with-taints`. The string is the kubelet's own
+spelling from end to end, so nothing re-parses it in between.
+
+Two things keep it honest. Only machines the provisioner creates are tainted --
+a `Machine` written by hand has no NodeClaim behind it and nothing that would
+ever take the taint off, and a node nothing can schedule to is a worse failure
+than the race. And the taints travel comma-separated because a space would end
+the kernel parameter they ride on, which is why the CRD refuses a taint
+containing one rather than producing a machine that boots with a truncated
+command line.
+
+The NodePool's own taints ride the same path, for the same reason: Karpenter
+would otherwise sync those onto the node just as late.
+
+Measured before and after on one cluster: a machine booted by the old code logs
+`taints: none` and produces two registration errors; one booted by this code
+logs `taints: karpenter.sh/unregistered:NoExecute` and produces none. Catching
+the taint *on* the node from outside is not practical -- Karpenter takes it off
+within milliseconds of registration -- so the absence of that error is the
+assertion, and it is the same thing Karpenter itself is checking.
 
 ## Which mode is the default, and what has to be true first
 
