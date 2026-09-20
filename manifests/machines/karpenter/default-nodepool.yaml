@@ -1,0 +1,58 @@
+# The default NodePool: what ferry will provision when pods do not fit.
+#
+# A pod lands here by asking for a shared kernel --
+# `nodeSelector: {ferry.dev/mode: shared}` -- and Karpenter makes a machine
+# shaped to hold it. Nothing is declared in advance and nothing is sized by
+# hand, which is the whole point: mode 2 without a provisioner means choosing a
+# node size before knowing the workload, and that is the bargain ferry exists to
+# avoid.
+#
+# `limits` on the NodePool is deliberately absent. The ceiling that matters is
+# the Mac's, and it is not a policy about one workload.
+#
+# The FerryNodeClass below is deliberately empty for a related reason. Machine
+# shapes and the host budget come from ferry's environment -- it measured this
+# Mac and started ferry-karpenter with the answers (FERRY_MACHINE_* in
+# docs/INSTALL.md) -- so this object exists to give the NodePool's nodeClassRef
+# something to resolve, and to carry its Ready condition. Spelling the numbers
+# out here would be a second place for them to live, disagreeing with the real
+# ones on any Mac that is not the size these defaults assume, and editing them
+# would change nothing.
+apiVersion: ferry.dev/v1alpha1
+kind: FerryNodeClass
+metadata:
+  name: default
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    metadata:
+      labels:
+        ferry.dev/mode: shared
+    spec:
+      nodeClassRef:
+        group: ferry.dev
+        kind: FerryNodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: [arm64]
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      # A machine is cattle, and on a laptop it is cattle with a short life:
+      # nothing here is worth keeping across a working day, and memory returned
+      # is memory the Mac can use for something else.
+      expireAfter: 24h
+  disruption:
+    # The half without which provisioning is a one-way ratchet, which on a
+    # laptop is a memory leak with a controller in front of it.
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 60s

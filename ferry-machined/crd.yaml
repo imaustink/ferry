@@ -75,6 +75,28 @@ spec:
                   type: string
                   enum: [worker, controlPlane]
                   default: worker
+                node:
+                  type: object
+                  description: >-
+                    What the kubelet inside this machine registers its Node
+                    with. Applied at registration rather than patched on
+                    afterwards, which is the difference between a guarantee and
+                    a race: a taint that arrives after the node is schedulable
+                    has already let a pod through.
+                  properties:
+                    taints:
+                      type: array
+                      description: >-
+                        Taints in the kubelet's own --register-with-taints
+                        spelling, `key=value:Effect` or `key:Effect`. Set by the
+                        provisioner on machines it creates, and rarely by hand:
+                        a taint nothing removes is a machine nothing schedules
+                        to. A space would end the kernel parameter these travel
+                        on, so one is refused here rather than producing a
+                        machine that boots with a truncated command line.
+                      items:
+                        type: string
+                        pattern: '^[^ ,]+:(NoSchedule|PreferNoSchedule|NoExecute)$'
             status:
               type: object
               properties:

@@ -57,9 +57,10 @@ None of that changes if you want density instead. A `Machine` is a Linux node VM
 whose pods are ordinary containers sharing its kernel — ~45ms to start one
 against ~300ms for a pod VM — and a pod picks with
 `nodeSelector: {ferry.dev/mode: shared}` or `vm-per-pod`. It is still nothing to
-size up front: a machine is sized when you declare one and gone when you delete
-it. Off until `ferry machines enable`; [docs/MACHINES.md](docs/MACHINES.md) is
-the case for it and what it costs.
+size up front, and not because sizing is easy here — because you never do it. A
+pod that fits nowhere causes a machine shaped to fit it, and an idle machine
+gives its memory back to the Mac. Off until `ferry machines enable`;
+[docs/MACHINES.md](docs/MACHINES.md) is the case for it and what it costs.
 
 ## Status
 
@@ -148,9 +149,16 @@ cost time.
   machines reach each other, each node routing to the others' pod CIDR slices.
   A pod chooses between the modes with
   `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}`, which is node selection
-  rather than a new concept. Off until `ferry machines enable`. Built through
-  milestone 3: provisioning on demand, consolidation and cross-mode pod routing
-  are not. See [docs/MACHINES.md](docs/MACHINES.md).
+  rather than a new concept.
+
+  Nobody declares that `Machine` in the ordinary case. A pending pod that fits
+  no existing node creates one sized to fit it, and an empty machine is
+  reclaimed a minute later — Karpenter, with ferry as its cloud provider,
+  running natively beside the control plane rather than as a pod in the cluster
+  it provisions for. Pods reach each other across both modes at their real
+  addresses, so one `Deployment` can span the Mac node and a machine. Off until
+  `ferry machines enable`. Built through milestone 6; GPU into machines is not.
+  See [docs/MACHINES.md](docs/MACHINES.md).
 - ✅ **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
   sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
   on the PATH, registers a login agent and starts a cluster — Apple silicon and
@@ -203,6 +211,7 @@ experiments/18-node-image/           the node image, and ferry-node that boots i
 experiments/19-machine-crd/          a node made by applying a resource
 experiments/20-pod-network/          pods on two machines reaching each other
 experiments/21-density-vs-kind-minikube/  against kind and minikube, on one Mac
+experiments/22-vmnet-lifecycle/      why a vmnet subnet stays reserved
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
 node-image/ (built)                  mode 2's node image, as an OCI layout

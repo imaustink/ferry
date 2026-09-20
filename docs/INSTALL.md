@@ -282,7 +282,7 @@ not in the installer.
 | `FERRY_CLUSTER_DOMAIN` | `cluster.local` | the cluster's DNS domain |
 | `FERRY_COREDNS_IMAGE` | `docker.io/coredns/coredns:1.11.3` | the CoreDNS mode 1 runs, and mode 2's machines run |
 | `FERRY_NODE_INDEX` | `0` | which `/24` of the cluster CIDR this node owns |
-| `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs |
+| `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs. The base of a range, not one port: node N added with `ferry node add` uses this plus N, up to 200 |
 | `FERRY_PEERS` | read from `$FERRY_HOME/peers` | the other Macs' relay endpoints |
 | `FERRY_ALLOW_OFF_SLICE` | — | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
 | `FERRY_HOST_CLUSTER_IPS` | `false` | `1` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |
@@ -299,8 +299,26 @@ not in the installer.
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
+| `FERRY_MACHINE_LIMIT_CPUS` | half the Mac's cores | total cpus the provisioner may commit to machines |
+| `FERRY_MACHINE_LIMIT_MEMORY_GI` | a quarter of the Mac's memory | total memory it may commit. Past this, a pod stays `Pending` with a reason rather than the Mac swapping |
+| `FERRY_MACHINE_MIN_CPUS` / `FERRY_MACHINE_MAX_CPUS` | `2` / `8` | how small and how large one provisioned machine may be |
+| `FERRY_MACHINE_MIN_MEMORY_GI` / `FERRY_MACHINE_MAX_MEMORY_GI` | `2` / the total memory limit | the same for memory. The max is held to the total by default, since one machine cannot exceed what every machine may be |
+| `FERRY_MACHINE_RELAY_PORT` | `8700` + profile shift | where machines join ferry's pod network. `ferry-node` holds this end of the switch and `ferry-cri` the other, both on loopback, so machines and mode 1 pods land on one segment. Clear of `FERRY_RELAY_PORT`, which is a range rather than a port: node N's switch is `FERRY_RELAY_PORT` + N |
+| `FERRY_MACHINE_MAX_PODS` | `110` | pods a provisioned machine advertises. Kubernetes' own default, not mode 1's memory-derived number: pods in a machine share its kernel |
+| `FERRY_MACHINE_IMAGE` | — | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
 | `FERRY_NODE_VERBOSE` | — | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
 | `FERRY_NODE_NO_CONFIG` | — | set to boot a machine without its generated config disk. For debugging the image itself |
+
+The two `MIN`/`MAX` pairs bound one machine; the two `LIMIT`s bound all of them
+together. They are separate numbers on purpose — collapsing them gives either a
+single machine that can eat the whole budget, or a budget that silently caps how
+large any one machine can be. Between them they decide the shapes the
+provisioner offers: powers of two within the cpu range, each with memory at 1×,
+2× and 4× its cores, clipped to the memory range.
+
+The machine range is also the only sizing decision left. Nothing declares a
+machine in the ordinary case: a pod that fits no existing node produces one, and
+an empty machine is reclaimed about a minute later.
 
 ### GPU
 

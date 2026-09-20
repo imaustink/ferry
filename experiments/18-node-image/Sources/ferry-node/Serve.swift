@@ -30,6 +30,10 @@ struct MachineSpec: Codable {
     /// The slice of the cluster's pod network this machine owns. Each machine
     /// gets its own, so routes between them are unambiguous.
     let podCIDR: String
+    /// Taints the kubelet registers with, in its own --register-with-taints
+    /// spelling. Optional, because a machine written by hand has none and an
+    /// older ferry-machined does not send the field at all.
+    let taints: [String]?
 }
 
 /// What this reports back about a machine it is running.
@@ -51,29 +55,76 @@ func serve() throws {
     let clusterDNS = option("--cluster-dns", "10.96.0.10")
     let requestedSubnet = option("--subnet", "")
     let poll = Double(option("--poll", "0.5")) ?? 0.5
+    // Ferry's pod network, joined as one more switch rather than as a node.
+    // Absent means machines keep to their own vmnet network and mode 1 stays
+    // out of reach -- which is what every version before this did, and is still
+    // what happens when mode 1 is not running.
+    let switchPort = UInt16(option("--switch-port", "0")) ?? 0
+    let switchPeer = option("--switch-peer", "")
+    let clusterCIDR = option("--cluster-cidr", "")
 
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
     // The one network every machine joins. Created once, here, which is the
     // whole point of this mode.
-    let network = Box(try VmnetNetwork(
-        subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet)))
+    let network = try MachineNetwork(
+        subnet: requestedSubnet.isEmpty ? nil : try CIDRv4(requestedSubnet))
+    let podNetwork = MachineSwitch(relayPort: switchPort, peer: switchPeer)
+
     print("==> ferry-node serve")
     print("    dir      \(dir)")
-    print("    network  \(network.value.subnet), gateway \(network.value.ipv4Gateway)")
+    print("    network  \(network.subnet), gateway \(network.ipv4Gateway)")
+    if podNetwork != nil {
+        print("    switch   udp/\(switchPort), ferry-cri at \(switchPeer)")
+    } else {
+        print("    switch   off; machines cannot reach mode 1 pods")
+    }
 
     // Held so the machines stay alive: a VZVirtualMachine that goes out of
     // scope takes its guest with it.
-    var running: [String: RunningMachine] = [:]
+    let live = Live()
+
+    // Every name this process has tried to boot, running or not.
+    //
+    // `live` is not that set: a machine whose boot threw never enters it, and
+    // cleaning up from `live` alone leaves the failed one's vmnet address
+    // assigned for as long as the process lives. Which used to be a slow leak
+    // and now is not: the provisioner makes a machine per pending pod under a
+    // fresh name and takes it away again a minute after it empties.
+    var known: Set<String> = []
+
+    // Stop the machines and give the subnet back, rather than being killed with
+    // both still held.
+    //
+    // A machine whose host process is killed loses whatever it had not flushed,
+    // and a node VM runs containerd over a real filesystem; and the network
+    // stays reserved, so the next `ferry machines enable` waits for a subnet
+    // this process abandoned. Asking again is the one thing that makes that
+    // worse (experiment 22).
+    let signals = onShutdownSignal {
+        announce("\n==> stopping machines and releasing the machine network")
+        for (name, machine) in live.take() {
+            podNetwork?.detach(name: name)
+            machine.stop()
+            try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
+        }
+        network.release()
+        announce("==> stopped")
+        exit(0)
+    }
+    _ = signals
 
     while true {
         let wanted = readSpecs(in: dir)
 
+        let running = live.all()
         for (name, spec) in wanted where running[name] == nil {
+            known.insert(name)
             do {
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
-                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS)
-                running[name] = machine
+                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
+                                       clusterCIDR: clusterCIDR, podNetwork: podNetwork)
+                live.add(name, machine)
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,
                     podCIDR: spec.podCIDR, phase: "Running", message: nil), in: dir)
@@ -86,10 +137,20 @@ func serve() throws {
             }
         }
 
-        for (name, machine) in running where wanted[name] == nil {
-            print("==> \(name) stopping")
-            machine.stop()
-            running.removeValue(forKey: name)
+        // Over `known` rather than over `running`, so a machine that failed to
+        // boot gives its address back too.
+        for name in known where wanted[name] == nil {
+            if let machine = running[name] {
+                print("==> \(name) stopping")
+                podNetwork?.detach(name: name)
+                machine.stop()
+                live.remove(name)
+            }
+            // After stop(), which waits for the guest: an address handed out
+            // again while the VM holding it is still shutting down is two
+            // machines on one address for as long as that takes.
+            network.releaseInterface(name)
+            known.remove(name)
             try? FileManager.default.removeItem(atPath: statusFile(name: name, in: dir))
         }
 
@@ -125,11 +186,12 @@ final class RunningMachine {
 }
 
 @available(macOS 26.0, *)
-func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
-          caPath: String, apiServer: String, clusterDNS: String) throws -> RunningMachine {
+func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
+          caPath: String, apiServer: String, clusterDNS: String,
+          clusterCIDR: String = "", podNetwork: MachineSwitch? = nil) throws -> RunningMachine {
     // An interface on the shared network, so every machine is on one segment
     // and a route between two of them is an ordinary route.
-    guard let interface = try network.value.createInterface(spec.name) as? VmnetNetwork.Interface else {
+    guard let interface = try network.createInterface(spec.name) else {
         throw Failure.message("vmnet gave no interface for \(spec.name)")
     }
     let address = "\(interface.ipv4Address)"
@@ -138,12 +200,39 @@ func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
     let configDisk = spec.disk + ".config.ext4"
     try makeConfigDisk(caPath: caPath, out: configDisk)
 
+    // eth1, if mode 1 is around to talk to. Made before the machine so the
+    // switch has the port the moment the guest starts sending: a machine whose
+    // first ARP is dropped waits out a retransmit for no reason.
+    //
+    // Made before the machine also means made before anything that can throw,
+    // and everything below here can: machineConfiguration ends in
+    // VZVirtualMachineConfiguration.validate, which rejects a cpu count or a
+    // memory size the host will not take, and the start can time out. The port
+    // is registered with a live read source over both ends of a socketpair, so
+    // leaving on a throw leaks two descriptors and a source -- and the serve
+    // loop retries the same spec every poll, attaching again over the entry it
+    // left behind, twice a second, until the process runs out of descriptors.
+    let podNIC: MachineNIC? = podNetwork == nil ? nil : try MachineNIC()
+    if let podNIC, let podNetwork {
+        podNetwork.attach(name: spec.name, fd: podNIC.hostFD)
+    }
+    var booted = false
+    defer {
+        if !booted {
+            // detach cancels the source and closes ferry's end; the guest's end
+            // was never handed to a running VM, so it is ours to close.
+            podNetwork?.detach(name: spec.name)
+            podNIC?.closeGuestSide()
+        }
+    }
+
     let console = Console()
     let config = try machineConfiguration(
         nodeName: spec.name, disk: spec.disk, configDisk: configDisk, kernelPath: kernelPath,
         cpus: spec.cpus, memoryMiB: spec.memoryMiB, apiServer: apiServer, token: spec.token,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
-        interface: interface, console: console)
+        clusterCIDR: clusterCIDR, taints: spec.taints ?? [],
+        interface: interface, console: console, podNIC: podNIC)
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)
@@ -172,6 +261,7 @@ func boot(spec: MachineSpec, network: Box<VmnetNetwork>, kernelPath: String,
         }
     }
 
+    booted = true
     return RunningMachine(vm: vm, queue: queue, console: console, address: address, gateway: gateway)
 }
 

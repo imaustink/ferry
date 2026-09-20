@@ -78,6 +78,7 @@ func run() throws {
     let cpus = Int(option("--cpus", "2")) ?? 2
     let memoryMiB = UInt64(option("--memory-mib", "2048")) ?? 2048
     let podCIDR = option("--pod-cidr", "10.88.0.0/16")
+    let taintsOption = option("--taints", "").split(separator: ",").map(String.init)
     // The kubelet has to know where cluster DNS lives before any pod starts, and
     // it cannot be discovered -- the address is a ClusterIP chosen by the
     // cluster, so the machine is simply told.
@@ -129,7 +130,7 @@ func run() throws {
         nodeName: nodeName, disk: disk, configDisk: configDisk, kernelPath: kernelPath,
         cpus: cpus, memoryMiB: memoryMiB, apiServer: apiServer, token: token,
         address: address, gateway: gateway, podCIDR: podCIDR, clusterDNS: clusterDNS,
-        interface: interface, console: console)
+        taints: taintsOption, interface: interface, console: console)
 
     let queue = DispatchQueue(label: "ferry.node")
     let vm = VZVirtualMachine(configuration: config, queue: queue)
@@ -183,7 +184,10 @@ func machineConfiguration(
     nodeName: String, disk: String, configDisk: String, kernelPath: String,
     cpus: Int, memoryMiB: UInt64, apiServer: String, token: String,
     address: String, gateway: String, podCIDR: String, clusterDNS: String,
-    interface: VmnetNetwork.Interface, console: Console
+    clusterCIDR: String = "",
+    taints: [String] = [],
+    interface: VmnetNetwork.Interface, console: Console,
+    podNIC: MachineNIC? = nil
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
@@ -192,7 +196,7 @@ func machineConfiguration(
     let boot = VZLinuxBootLoader(kernelURL: URL(filePath: kernelPath))
     // Everything the node needs to join, on the command line: there is no other
     // channel at first boot that does not mean building a second device.
-    boot.commandLine = [
+    var arguments = [
         "console=hvc0", "root=/dev/vda", "rw", "init=/sbin/ferry-init",
         "ferry.node=\(nodeName)",
         "ferry.api=\(apiServer)",
@@ -201,7 +205,24 @@ func machineConfiguration(
         "ferry.gateway=\(gateway)",
         "ferry.podcidr=\(podCIDR)",
         "ferry.dnssvc=\(clusterDNS)",
-    ].joined(separator: " ")
+        // The prefix mode 1's pods treat as on-link. A machine's own slice is a
+        // /24 it learns from the API, but the segment it shares with those pods
+        // is the whole cluster CIDR, and nothing in the guest can derive one
+        // from the other.
+        "ferry.clustercidr=\(clusterCIDR)",
+    ]
+    // Only when there are some. An empty `ferry.taints=` reaches the guest as a
+    // parameter that is set but blank, and `--register-with-taints=""` is an
+    // error rather than a no-op -- a kubelet that will not start at all.
+    //
+    // Comma-separated because a space would end this parameter and begin a
+    // kernel argument. That is also the kubelet's own spelling, so the string
+    // travels from the Machine spec to the flag without being re-parsed
+    // anywhere in between.
+    if !taints.isEmpty {
+        arguments.append("ferry.taints=\(taints.joined(separator: ","))")
+    }
+    boot.commandLine = arguments.joined(separator: " ")
     config.bootLoader = boot
 
     // vda is the node, vdb is its configuration.
@@ -212,9 +233,21 @@ func machineConfiguration(
             url: URL(filePath: configDisk), readOnly: true)
         config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: configAttachment))
     }
-    // eth0 is vmnet, and it is the only NIC: the internet, the Mac, the API
-    // server, and pod traffic to every other machine on this network.
+    // eth0 is vmnet: the internet, the Mac, the API server, and pod traffic to
+    // every other machine on this network.
+    //
+    // eth1, when there is one, is ferry's pod network -- the flat segment mode
+    // 1's pods live on. It is a plain datagram socket rather than a vmnet
+    // interface, because vmnet is exactly what cannot carry this: it will not
+    // route between its own networks, so a machine and a pod VM on two of them
+    // have no path however the Mac is configured.
+    //
+    // The order is load bearing. The guest names these eth0 and eth1 in the
+    // order they are attached, and its init configures them by those names.
     config.networkDevices = [try interface.device()]
+    if let podNIC {
+        config.networkDevices.append(podNIC.device())
+    }
 
     let port = VZVirtioConsoleDeviceSerialPortConfiguration()
     port.attachment = console.attachment

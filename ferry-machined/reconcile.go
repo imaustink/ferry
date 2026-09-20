@@ -56,6 +56,10 @@ type machineSpec struct {
 	MemoryMiB int64  `json:"memoryMiB"`
 	Token     string `json:"token"`
 	PodCIDR   string `json:"podCIDR"`
+	// Taints the kubelet registers the Node with, rather than ones patched on
+	// once it is already schedulable -- see ensureProviderID for why the same
+	// argument did not win for the mode label.
+	Taints []string `json:"taints,omitempty"`
 }
 
 // machineStatus is what it writes back.
@@ -169,9 +173,10 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	// Asking the server rather than starting a process: one vmnet network
 	// belongs to the process that made it (experiment 19), so every machine has
 	// to be hosted by the same one or they land on networks vmnet keeps apart.
+	taints, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "node", "taints")
 	spec := machineSpec{
 		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
-		Token: token,
+		Token: token, Taints: taints,
 	}
 	body, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
@@ -312,6 +317,7 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 		status["nodeRef"] = map[string]any{"name": node.Name}
 		status["phase"] = "Running"
 		c.ensureModeLabel(ctx, node)
+		c.ensureProviderID(ctx, node)
 		if node.Spec.PodCIDR != "" {
 			m.podCIDR = node.Spec.PodCIDR
 			status["podCIDR"] = node.Spec.PodCIDR
@@ -356,6 +362,34 @@ func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node) {
 		// a selector yet. Logged because a node that never gets the label is a
 		// pod that never schedules, and that is hard to diagnose from outside.
 		log.Printf("machine %s: could not label node %s: %v", node.Name, modeLabel, err)
+	}
+}
+
+// providerIDPrefix is how a provisioner refers to a machine it asked for.
+// ferry-karpenter builds the same string from the machine's name.
+const providerIDPrefix = "ferry://"
+
+// ensureProviderID gives the Node the identifier a provisioner finds it by.
+//
+// Karpenter creates a NodeClaim, ferry makes a machine, and the two are
+// reconciled by matching spec.providerID -- so a Node without one is a claim
+// that never registers. Karpenter waits, decides the machine failed to join,
+// deletes it and asks for another, forever, while the node it is deleting sits
+// there Ready with pods on it.
+//
+// The canonical place to set this is the kubelet's --provider-id, which for a
+// machine means the guest's boot arguments and therefore a rebuilt node image.
+// Doing it here instead is the same value by a cheaper route, and it is safe
+// because the field is settable exactly once: Kubernetes rejects a change to a
+// providerID that is already set, so this cannot fight anything.
+func (c *controller) ensureProviderID(ctx context.Context, node *corev1.Node) {
+	if node.Spec.ProviderID != "" {
+		return
+	}
+	patch := fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerIDPrefix+node.Name)
+	if _, err := c.kube.CoreV1().Nodes().Patch(ctx, node.Name,
+		types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		log.Printf("machine %s: could not set providerID: %v", node.Name, err)
 	}
 }
 

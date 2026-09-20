@@ -62,10 +62,39 @@ So the two cases are treated differently:
 
 - **No other nodes:** fall back at once, and say the pods are off the pod network
   and another Mac cannot join until this one starts on its slice.
-- **Other nodes:** wait 90 seconds for the slice, then refuse to start. A node
-  that cannot hold its slice has nothing to offer a cluster it cannot talk to.
-  `FERRY_ALLOW_OFF_SLICE=1` overrides this and starts anyway, with a warning,
-  because vmnet can stay exhausted longer than its documentation suggests.
+- **Other nodes:** wait for the slice, then refuse to start. A node that cannot
+  hold its slice has nothing to offer a cluster it cannot talk to.
+  `FERRY_ALLOW_OFF_SLICE=1` overrides this and starts anyway, with a warning.
+
+### Waiting means not asking
+
+The wait asks twice, ninety-five seconds apart, and that spacing is the whole
+reason it works.
+
+A refused `vmnet_network_create` **renews the reservation it was refused by**
+([experiment 22](../experiments/22-vmnet-lifecycle/FINDINGS.md)). The earlier
+version of this wait asked every three seconds, which meant a node whose slice
+was reserved could never get it: each attempt pushed the expiry out again, and
+the ninety-second deadline always expired first. Measured on one subnet with
+ferry fully down, six hundred and one asks over ten minutes never got it, and a
+single ask after ninety seconds of silence did.
+
+This is also why a reboot looked like the only cure. A reboot is not a longer
+wait; it is a wait during which nothing asks.
+
+Most of the time there is now nothing to wait for. `ferry down` releases the
+subnet, so the next start takes it back at once -- measured at zero seconds,
+against ten minutes of refusals before. That needed ferry to create the network
+itself (`PodNetwork`), because Containerization is a pinned dependency that
+keeps the reference in a struct with no `deinit` and no accessor; pod VMs are
+still configured with its own `VmnetNetwork.Interface`, whose
+`init(reference:)` is public.
+
+It also needed the shutdown handler to run at all, which it never had: a closure
+written in top-level code is `@MainActor`-isolated, a dispatch signal source
+calls it off the main queue, and Swift traps on the isolation check about a
+second after SIGTERM. So pods were not being stopped either. The wait above is
+what remains for the case where another process genuinely holds the subnet.
 
 Whether this node has peers is read from `$FERRY_HOME/peers`, which is why that
 file lives with the cluster's state rather than in the run directory -- the

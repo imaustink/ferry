@@ -1,11 +1,13 @@
 # Machines — the second mode
 
-**Status: built through milestone 3, and shipped off by default.** A `Machine`
-becomes a Ready node, `kubectl delete` takes it away again, and pods on two
-machines reach each other — [milestones](#milestones) 1, 1b, 2 and 3 below.
-Provisioning on demand (4), consolidation (5), mixed-cluster scheduling (6) and
-GPU (7) are not built. An installed ferry carries all of it; `ferry machines
-enable` turns it on. See [INSTALL.md](INSTALL.md).
+**Status: built through milestone 6, and shipped off by default.** A `Machine`
+becomes a Ready node, `kubectl delete` takes it away again, a pod that does not
+fit causes a machine that fits it and gives the memory back when it is done, and
+pods reach each other across both modes at the addresses Kubernetes knows them
+by — [milestones](#milestones) 1, 1b, 2, 3, 4, 5 and 6 below. GPU into machines
+(7) is not built. An
+installed ferry carries all of it; `ferry machines enable` turns it on. See
+[INSTALL.md](INSTALL.md).
 
 This document was written before any of it existed and is kept as the design it
 argued for, with each milestone marked as it landed and corrected where
@@ -259,11 +261,17 @@ Machines resolve through their own CoreDNS, behind a `kube-dns` ClusterIP that
 kube-proxy answers on each machine — the ordinary Kubernetes arrangement, which
 works here because a node VM has a kernel to program.
 
-Mode 1's CoreDNS cannot serve them, and the reason is the same vmnet isolation
-that shaped the rest of this section: it is a `ferry-cri` pod on the Mac's vmnet
-network, machines are on a vmnet network of their own, and a pod inside a
-machine has no route to it. Two CoreDNS deployments is the honest arrangement
-until cross-mode pod routing exists, which is milestone 6.
+Mode 1's CoreDNS could not serve them, and the reason was the same vmnet
+isolation that shaped the rest of this section: it is a `ferry-cri` pod on the
+Mac's vmnet network, machines were on a vmnet network of their own, and a pod
+inside a machine had no route to it.
+
+Milestone 6 removes that obstacle -- a machine's pods are on the same segment as
+mode 1's now, and could resolve through mode 1's CoreDNS. The split stays
+anyway, because the reason for it is no longer the only reason to want it: DNS
+on every machine is node-local, answers without crossing to another node, and
+keeps a machine's pods resolving when nothing else is up. What changes is that
+this is a choice rather than a workaround.
 
 They are named apart on purpose. Mode 1 already owns `Deployment/coredns` and
 `ConfigMap/coredns` in `kube-system` and labels its pods `k8s-app: kube-dns`;
@@ -271,6 +279,113 @@ reusing those names replaces mode 1's DNS with a copy pinned to nodes it does
 not have, and reusing that label makes the `kube-dns` Service load-balance
 across pods half the cluster cannot reach — DNS that works intermittently,
 which is worse than DNS that does not work.
+
+Machine CoreDNS is a `DaemonSet`, and the reason is the provisioner rather than
+latency. A `Deployment` pinned to machines with `nodeSelector` interacts badly
+with milestone 5 in two ways, both found by watching it happen:
+
+- It provisions a machine by itself. Its pod is unschedulable while no machine
+  exists, so turning mode 2 on is enough to make Karpenter build one — `found
+  provisionable pod(s): kube-system/coredns-machines-…` with no user workload
+  anywhere in the cluster.
+- The machine it provisions can never be reclaimed. Consolidation decides a node
+  is empty by discounting DaemonSet pods; a Deployment pod is a real workload,
+  so the node is never empty and `consolidateAfter` never fires. Provisioning
+  becomes a one-way ratchet, which is the exact failure milestone 5 exists to
+  prevent.
+
+As a DaemonSet it is neither: DaemonSet pods do not drive provisioning, and they
+do not hold a node against consolidation. Being per-machine is also the better
+shape — DNS is local to the node asking, and no machine depends on another to
+resolve a name.
+
+### Machines register with their taints, not patched afterwards
+
+Karpenter expects a node it asked for to arrive already carrying
+`karpenter.sh/unregistered:NoExecute`, and removes it once it has synced the
+NodePool's labels onto the node. The window that taint holds shut is the one
+between a kubelet registering and Karpenter finishing with it: a node is
+schedulable the moment it registers, so anything the scheduler places in that
+gap is already running somewhere Karpenter had not finished describing.
+
+The first version of this machinery did not carry it, and Karpenter said so on
+every machine:
+
+```
+node claim registration error … taint: karpenter.sh/unregistered
+  "missing taint prevents registration-related race conditions"
+```
+
+It logs that and proceeds, so machines worked and the race was invisible until
+something lost it.
+
+A taint cannot be patched on after the fact and still mean anything, which is
+the whole difference between this and the mode label below. By the time a
+controller could apply it the node is already schedulable. So it comes from the
+kubelet, and travels the whole way down: the provisioner writes
+`spec.node.taints` on the `Machine` it creates, `ferry-machined` passes it to
+`ferry-node`, `ferry-node` puts it on the kernel command line, and the guest's
+init hands it to `--register-with-taints`. The string is the kubelet's own
+spelling from end to end, so nothing re-parses it in between.
+
+Two things keep it honest. Only machines the provisioner creates are tainted --
+a `Machine` written by hand has no NodeClaim behind it and nothing that would
+ever take the taint off, and a node nothing can schedule to is a worse failure
+than the race. And the taints travel comma-separated because a space would end
+the kernel parameter they ride on, which is why the CRD refuses a taint
+containing one rather than producing a machine that boots with a truncated
+command line.
+
+The NodePool's own taints ride the same path, for the same reason: Karpenter
+would otherwise sync those onto the node just as late.
+
+Measured before and after on one cluster: a machine booted by the old code logs
+`taints: none` and produces two registration errors; one booted by this code
+logs `taints: karpenter.sh/unregistered:NoExecute` and produces none. Catching
+the taint *on* the node from outside is not practical -- Karpenter takes it off
+within milliseconds of registration -- so the absence of that error is the
+assertion, and it is the same thing Karpenter itself is checking.
+
+## Which mode is the default, and what has to be true first
+
+Mode 1 is the default today, and the reason was provisioning rather than
+confidence — which, as of milestone 5, no longer applies. The rest of this
+section is the argument as it stood; what it asked for now exists.
+
+The case for making mode 2 the default is real and gets stronger the smaller
+the Mac. A pod VM costs 226 MiB idle whatever it runs, so `maxPods` is derived
+from memory and a 16 GiB Mac advertises around 36 pods; mode 2's marginal
+container is ~17 MiB and eight containers of one image cost what one costs.
+Most people have less memory than the machine this was developed on, and for
+them mode 2 is the difference between running their stack and not.
+
+What blocks it is not that mode 2 is newer. It is that **a `Machine` has to be
+declared, with a size**, and "nothing to size up front" is the thing ferry is
+for. Defaulting to mode 2 as it stands would mean `ferry up` inventing a node
+shape before knowing the workload, which is Docker Desktop's bargain with extra
+steps — and it would do it on the mode whose whole argument is density, where
+guessing too small is a cluster that cannot schedule and guessing too large is
+the memory you were trying to save.
+
+Provisioning removes the guess rather than relocating it. A pending pod that
+fits nothing creates the machine it needs, sized to fit; consolidation gives the
+memory back when it does not. At that point nothing is sized in advance in
+either mode, the claim at the top of the README holds for both, and mode 2
+becoming the default is a change of which node a pod lands on by default rather
+than a change in what ferry asks of you.
+
+So: **milestones 4 and 5 are the precondition, not a nice-to-have afterwards.**
+Until they exist, a small Mac is better served by mode 1 advertising a low
+`maxPods` honestly than by mode 2 asking for a number nobody has.
+
+They exist now, and the precondition is met: nothing is sized in advance in
+either mode. Mode 1 remains the default for the moment because the switch is a
+separate change with its own blast radius — every existing cluster's pods would
+start landing somewhere else — and because milestone 6, the mixed cluster, is
+what makes that landing predictable rather than a surprise.
+
+Worth saying because it is easy to lose: mode 1 does not go away when mode 2 is
+the default. The Mac node is where the provisioner runs.
 
 ## How a pod chooses
 
@@ -361,13 +476,89 @@ which is milestone 4's job to make deliberate.
    not do: it had neither the UDP relay nor the peer list that mode 1's
    `PodSwitch` carries.
 
-4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
-   creation, and the host budget. A Deployment scaled beyond what exists
-   creates the node it needs.
-5. **Consolidation.** Cordon, drain honouring PDBs, delete — and the memory
-   returns to the Mac. Without this half, provisioning is a one-way ratchet.
-6. **Mixed cluster.** The Mac node and machines in one cluster, `nodeSelector`
-   choosing between them, both modes running the same Deployment.
+4. ~~**Provisioning on demand.**~~ **Done** —
+   `ferry-karpenter`, Karpenter with ferry as its cloud provider. `Create`
+   writes a `Machine` and `ferry-machined` makes it a node; `Delete` removes it.
+   Instance types are synthesised from a shape range rather than read from a
+   catalogue, and the host budget is enforced by refusing with Karpenter's
+   insufficient-capacity error — the one part of a cloud provider a cloud never
+   has to write, because a region does not run out when you ask for one more
+   node. Started by `ferry machines enable` beside `ferry-machined`.
+
+   This is what has to exist before mode 2 can sensibly be the default, because
+   until a machine is created for you, choosing mode 2 means choosing a node
+   size in advance.
+
+   Verified end to end: an unschedulable pod produces `NodeClaim` `default-f9499`
+   of type `ferry-2cpu-2gi`, a `Machine`, and a Ready node carrying
+   `providerID: ferry://default-f9499`, which the pod then runs on.
+
+   Six things had to be fixed before any of that happened, and five were the
+   same shape — a provisioner that starts cleanly, logs nothing wrong, and
+   provisions nothing. Karpenter will not build for a `NodePool` whose NodeClass
+   is not Ready, and nothing sets that condition for you, so a provider needs its
+   own status controller; its operator parses `os.Args` itself and exits on a
+   flag it does not know, so ferry's settings come through the environment; its
+   scheme is client-go's global one, so a type not registered there panics deep
+   inside `NewControllers`; `DeepCopy` on a type embedding `ObjectMeta` resolves
+   to the embedded method and silently returns the wrong thing; and a `Node` with
+   no `providerID` is a claim that never registers, so `ferry-machined` sets one.
+   The sixth was ordering: the CRDs have to be established before the `NodePool`
+   that references them is applied.
+5. ~~**Consolidation.**~~ **Done** — cordon, drain honouring PDBs, delete, and
+   the memory returns to the Mac. Without this half, provisioning is a one-way
+   ratchet, and on a laptop a one-way ratchet is just a memory leak with a
+   controller.
+
+   Verified against the same cluster: with the pod deleted, the disruption
+   controller decides `Empty … delete … pod-count: 0`, taints the node
+   `karpenter.sh/disrupted`, and the `Machine`, `NodeClaim` and `Node` are all
+   gone — back to the Mac node alone.
+
+   Getting there found the one design flaw this pair had: machine CoreDNS was a
+   `Deployment` pinned to machines, which both provisioned a machine on its own
+   and then held it against consolidation forever. It is a `DaemonSet` now, for
+   the reasons in [Cluster DNS is per mode](#cluster-dns-is-per-mode-for-now).
+6. ~~**Mixed cluster.**~~ **Done** — a pod on the Mac node and a pod inside a
+   machine reach each other at their real addresses, both directions, TCP and
+   ICMP, at about 0.9ms.
+
+   The obstacle was never scheduling; it was that the two modes had no path
+   between them. vmnet will not route between its own networks, and the Mac
+   being on both does not help because the drop happens inside vmnet rather
+   than in a routing table. So machines join ferry's own pod network -- the flat
+   layer-2 segment mode 1's pods already sit on -- as a **second switch rather
+   than a second network**. `ferry-node` holds the machines' end and speaks the
+   relay protocol `ferry-cri` already uses between Macs, so the learning, the
+   flooding and the fan-out to other Macs are not reimplemented; the only thing
+   that lives on the machines' side is which machine a frame belongs to.
+
+   Inside a machine, `eth1` takes the machine's own pod address with the
+   *cluster* prefix rather than its slice's -- the arrangement mode 1's pods
+   already use -- and `proxy_arp` puts that machine's pods on the segment
+   without giving each of them a port on it. A mode 1 pod treats the whole
+   cluster CIDR as on-link and ARPs for what it wants; the machine answers for
+   the addresses it routes to `cni0` and forwards what arrives. **Nothing on the
+   mode 1 side needs a route**, which is what makes this work at all: those pods
+   are VMs nobody can reconfigure once they are running.
+
+   Two things had to be corrected, and both were found by measurement rather
+   than reasoning.
+
+   The route agent was installing a route to the Mac node's pods via the Mac's
+   LAN address. That address *is* reachable from a machine -- through vmnet's
+   NAT, as the host -- so the route looked reasonable and silently blackholed.
+   It now only routes to nodes on its own segment, and leaves the rest to the
+   switch.
+
+   And `ferry-cri` was discarding `--peers` wholesale on the first read of the
+   peers file. That was invisible for as long as the file was the only source,
+   and became a one-directional failure the moment a fixed peer existed: frames
+   *from* a machine still arrived, because that direction only needs the address
+   the datagram came from, while frames *to* a machine needed the peer set --
+   so every ARP, which is how a conversation starts, was flooded to nobody. The
+   symptom was a machine that could reach mode 1 while mode 1 could not reach
+   it, which reads like a routing problem and is not one.
 7. **GPU into machines.** A device plugin inside the node VM proxying to
    `ferry-gpud` over vsock — which is *more* standard than what mode 1 does
    today, since a real device plugin API exists inside a Linux node.
@@ -419,6 +610,40 @@ which is milestone 4's job to make deliberate.
   from a catalogue rather than arbitrary shapes. Worth a serious look before
   milestone 4 — the shape of `NodePool` above is deliberately close to
   Karpenter's so that either answer stays open.
+
+  **Decided: Karpenter**, built as `ferry-karpenter`. Both objections turned
+  out to be smaller than they read, and one of them was simply wrong.
+
+  *Running inside the cluster it provisions for* turned out not to happen at
+  all, and this document was wrong to assume it. Karpenter v1 is a library with
+  no webhooks, and ferry already runs its controllers as native macOS
+  processes -- so `ferry-karpenter` is one more of them, talking to the cluster
+  over a kubeconfig from outside it. There is no bootstrap problem, because
+  nothing that makes nodes needs a node to run on, and no Linux image to build
+  and publish for a controller.
+
+  *A catalogue rather than arbitrary shapes* is a synthesis away. `GetInstanceTypes`
+  can enumerate shapes from the `machine.cpus` and `machine.memory` ranges above
+  — powers of two within the range is enough — and Karpenter will bin-pack
+  against them. A hypervisor does not care that the shapes came from a list.
+
+  The real adaptation is neither of those. **Karpenter assumes capacity is
+  elastic** and a Mac's is not: `spec.limits` is a hard ceiling, and past it
+  `Create` has to fail with an insufficient-capacity error so Karpenter marks
+  the shape unavailable and backs off, rather than retrying into a machine that
+  cannot be made. Getting that wrong is a hot loop against the hypervisor, and
+  it is the part with no upstream precedent to copy.
+
+  The argument against, which is not nothing: Karpenter is a large dependency
+  for a laptop. Its sophistication — multi-zone, spot, instance-type arbitrage —
+  is mostly inapplicable to one Mac with a handful of machines, while its
+  operational surface is fully applicable: CRDs, a controller to keep running,
+  and version skew with the Kubernetes it provisions for. A provisioner that
+  said "pods are pending and do not fit, so make one machine big enough,
+  respecting the budget; delete machines that have been empty for a minute"
+  would be a few hundred lines. What argues against *that* is the second half:
+  drain honouring PodDisruptionBudgets is where the bodies are buried, and
+  Karpenter has already buried them.
 
 ## What this costs
 

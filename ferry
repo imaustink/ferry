@@ -206,6 +206,19 @@ else
 fi
 NODE_INDEX="${FERRY_NODE_INDEX:-0}"
 RELAY_PORT="${FERRY_RELAY_PORT:-$(( 8472 + PORT_SHIFT ))}"
+# Where machines join ferry's pod network. A second switch rather than a second
+# network: ferry-cri owns the segment and the learning, and ferry-node holds the
+# machines' end of it, the two speaking the same relay protocol ferry-cri
+# already uses between Macs. Both ports are on loopback, so this is a hop
+# between two processes rather than a hop onto a wire.
+#
+# Clear of RELAY_PORT rather than next to it. 'ferry node add' gives node N the
+# switch port RELAY_PORT + N and allows N up to 200, so 8472..8672 is a range
+# and not a port: the neighbouring 8473 is the *first* added node's switch, and
+# whichever of the two bound second lost. That failure reads as "switch off;
+# machines cannot reach mode 1 pods" or as an added node with no pod switch,
+# depending on start order, neither of which points at a port collision.
+MACHINE_RELAY_PORT="${FERRY_MACHINE_RELAY_PORT:-$(( 8700 + PORT_SHIFT ))}"
 PEERS="${FERRY_PEERS:-}"
 # Kept in FERRY_HOME rather than FERRY_RUN because it has to outlive a restart.
 # ferry-cri reads it before the API server exists, to find out whether this
@@ -289,6 +302,15 @@ MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}
 # arrangement, which works there because a node VM has a kernel to program.
 # Cross-mode resolution is MACHINES.md milestone 6.
 MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
+# What the Mac will commit to machines in total.
+#
+# A quarter of memory and half the cores by default. The provisioner will spend
+# up to this and then tell Karpenter there is no capacity, which is a pod that
+# stays Pending with a reason rather than a Mac that swaps -- the same answer a
+# cloud gives when a zone is full, and the thing a cloud provider never has to
+# implement because a region does not run out when you ask for one more node.
+MACHINE_LIMIT_CPUS="${FERRY_MACHINE_LIMIT_CPUS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
+MACHINE_LIMIT_MEMORY_GI="${FERRY_MACHINE_LIMIT_MEMORY_GI:-$(( $(sysctl -n hw.memsize) / 1073741824 / 4 ))}"
 MACHINE_KUBE_PROXY_IMAGE="${FERRY_KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
 
 STOPPED_MARKER="$FERRY_HOME/stopped"
@@ -366,7 +388,8 @@ Environment:
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
-  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472
+  FERRY_RELAY_PORT       udp port the pod switch uses, default 8472. The base of
+                         a range: an added node uses this plus its index
   FERRY_ALLOW_OFF_SLICE  1 to start even when vmnet will not give this node its
                          slice of the pod network. Other nodes will not reach
                          these pods; without it ferry refuses rather than
@@ -690,6 +713,14 @@ cmd_build() {
   ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
   echo "==> $here/bin/ferry-machined"
   echo
+  # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
+  # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
+  # demand rather than failing, so this does not raise ferry's own toolchain
+  # floor.
+  echo "==> ferry-karpenter"
+  ( cd "$here/ferry-karpenter" && go build -o "$here/bin/ferry-karpenter" . ) || return 1
+  echo "==> $here/bin/ferry-karpenter"
+  echo
   echo "==> ferry-node"
   OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" || return 1
   echo
@@ -864,15 +895,27 @@ cmd_up() {
     ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$NODE_INDEX" \
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
+    --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
-  local ready=
-  for _ in $(seq 1 90); do
+  # Ninety seconds, unless ferry-cri says it is waiting for its slice -- then
+  # longer, because that wait is deliberately slow.
+  #
+  # A refused vmnet create renews the reservation it was refused by
+  # (experiment 22), so the only way to outlast one is to ask rarely: two or
+  # three asks, ninety-five seconds apart. That is longer than a startup wait
+  # should normally be, and giving every failure the same budget would mean
+  # four minutes of silence for a ferry-cri that was never going to start. So
+  # the budget grows only once ferry-cri has said what it is doing.
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     if [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then ready=1; break; fi
     running ferry-cri || break
+    if grep -q "waiting for .*slice" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then limit=260; fi
     sleep 1
+    waited=$(( waited + 1 ))
   done
   # Show the whole failure, not the last five lines of it. ferry-cri explains
   # some of these at length -- a refused pod subnet takes a paragraph to say
@@ -1174,6 +1217,8 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --subnet "$MACHINE_SUBNET" \
     --cluster-dns "$MACHINE_DNS_IP" \
+    --cluster-cidr "$CLUSTER_CIDR" \
+    --switch-port "$MACHINE_RELAY_PORT" --switch-peer "127.0.0.1:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-node.pid"
   local _
@@ -1219,6 +1264,79 @@ start_machines() {
     bad "ferry-machined did not start"
     tail -5 "$FERRY_RUN/logs/ferry-machined.log" 2>/dev/null | sed 's/^/    /'
     return 1
+  fi
+
+  start_provisioner
+}
+
+# Karpenter, with ferry as its cloud provider: machines made for pods that have
+# nowhere to run, and taken away when they are empty.
+#
+# This is what lets mode 2 stop asking anybody to size a node. Without it, using
+# mode 2 means declaring a Machine and choosing its shape before knowing the
+# workload -- which is the bargain ferry exists to avoid, and the reason mode 1
+# is still the default.
+#
+# It runs here, natively, rather than as a pod in the cluster it provisions for.
+# docs/MACHINES.md listed "Karpenter runs as a pod" as an argument against using
+# it; Karpenter v1 is a library with no webhooks, and ferry already runs its
+# controllers as macOS processes. Out of cluster there is no chicken and egg
+# where the thing that makes nodes needs a node, and no Linux image to publish.
+start_provisioner() {
+  [ -x "$here/bin/ferry-karpenter" ] || {
+    warn "ferry-karpenter not built; machines must be declared by hand"
+    return 0; }
+
+  # Karpenter's own CRDs, and the NodePool that points at ferry. Applied on
+  # every start for the same reason the Machine CRD is: 'ferry down --purge'
+  # takes them with the cluster while the enabled marker survives.
+  # The CRDs before the objects that use them, and waited for.
+  #
+  # `kubectl apply -f <dir>` applies in alphabetical order, so a NodePool named
+  # default-nodepool.yaml is sent before the CRD that defines its kind and the
+  # whole apply fails. It then succeeds on the next attempt -- the CRDs from the
+  # failed run are there by now -- which is the worst version of the bug,
+  # because "run it twice" hides it.
+  local dir="$here/manifests/machines/karpenter"
+  if [ -d "$dir/crds" ]; then
+    kube apply -f "$dir/crds" >/dev/null 2>&1 \
+      || { warn "could not install Karpenter's CRDs; machines must be declared by hand"; return 0; }
+    # Established, not merely created: the API server needs a moment before it
+    # will accept an object of a kind it has just learned.
+    kube wait --for condition=established --timeout=60s \
+      crd/nodepools.karpenter.sh crd/nodeclaims.karpenter.sh \
+      crd/ferrynodeclasses.ferry.dev >/dev/null 2>&1 \
+      || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
+    kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
+      || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
+  fi
+
+  # Settings through the environment, the command line left to Karpenter.
+  #
+  # Its operator parses os.Args with its own flag set and exits on an argument
+  # it does not recognise, so `--kubeconfig` of ferry's own does not collide --
+  # it stops the process starting at all. KUBECONFIG is how controller-runtime
+  # finds a cluster from outside one, which is what this is.
+  #
+  # Leader election off: it is one process on one Mac, and the lease it would
+  # take is a cluster object ferry would then have to clean up.
+  KUBECONFIG="$FERRY_HOME/admin.conf" \
+  FERRY_MACHINE_LIMIT_CPUS="$MACHINE_LIMIT_CPUS" \
+  FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_NODE_DISK="$NODE_DISK" \
+  "$here/bin/ferry-karpenter" \
+    --disable-leader-election \
+    --metrics-port 0 \
+    >"$FERRY_RUN/logs/ferry-karpenter.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-karpenter.pid"
+  sleep 2
+  if running ferry-karpenter; then
+    ok "provisioning on demand, up to $MACHINE_LIMIT_CPUS cpus and ${MACHINE_LIMIT_MEMORY_GI}Gi of machines"
+    echo "      a pod with nodeSelector ferry.dev/mode=shared makes the node it needs"
+  else
+    warn "ferry-karpenter did not start; machines must be declared by hand"
+    tail -3 "$FERRY_RUN/logs/ferry-karpenter.log" 2>/dev/null | sed 's/^/      /'
   fi
 }
 
@@ -1489,6 +1607,15 @@ cmd_node_add() {
   mkdir -p "$run"/{kubelet,pki,podlogs,containerlogs,volume-plugins,cri}
   rm -f "$sock" "$exec_sock" "$streamer_sock"
 
+  # No --machine-switch here, deliberately. An extra node on this Mac shares the
+  # one 'ferry-node serve', and that process relays to a single switch -- this
+  # Mac's first one. Pointing this node at it would carry frames one way only:
+  # its pods could reach a machine, and the machine's reply would arrive at the
+  # first node's switch and stop there, because a switch does not re-flood what
+  # a peer sent it. One direction is worse than none, since it looks like packet
+  # loss rather than a missing feature. So pods on an added node do not reach
+  # machines; pods on the first node do. Fixing it means the machines' switch
+  # holding a peer per node on the Mac rather than one.
   "$here/bin/ferry-cri" \
     --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
@@ -1504,10 +1631,12 @@ cmd_node_add() {
     --relay-endpoint "$LAN_IP:$relay" \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
-  local ready=
-  for _ in $(seq 1 90); do
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     [ -S "$sock" ] && grep -q "serving" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && { ready=1; break; }
+    grep -q "waiting for .*slice" "$FERRY_RUN/logs/node-$index-cri.log" 2>/dev/null && limit=260
     sleep 1
+    waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
   ok "runtime on 10.244.$index.0/24, switch udp/$relay"
@@ -1940,13 +2069,19 @@ start_worker() {
     ${FERRY_CNI_CONFLIST:+--cni-conflist "$FERRY_CNI_CONFLIST"} \
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
+    --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
-  local ready=
-  for _ in $(seq 1 90); do
+  # Same budget rule as cmd_up, and it matters more here: a Mac joining a
+  # cluster always has peers, so it always waits for its slice rather than
+  # falling back to another subnet.
+  local ready= waited=0 limit=90
+  while [ "$waited" -lt "$limit" ]; do
     [ -S "$FERRY_SOCK" ] && grep -q "serving" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null && { ready=1; break; }
+    grep -q "waiting for .*slice" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null && limit=260
     sleep 1
+    waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
   ok "runtime on 10.244.$index.0/24, switch udp/$RELAY_PORT"
@@ -3149,12 +3284,21 @@ stop_machines() {
   # ferry-machined already uses rather than hunting for VM processes. The
   # Machine objects stay in etcd, so the next start brings them back.
   #
-  # It does not make the next 'ferry up' any quicker: vmnet holds the machine
-  # subnet for about a minute after the network goes either way, so an
-  # immediate restart still fails to create it (status 1001) and mode 2 reports
-  # that rather than coming back.
+  # It also makes the next start quicker, which it did not used to. ferry-node
+  # releases the machine network on the way out now, so an immediate restart
+  # takes the same subnet straight back -- measured at five seconds, against a
+  # minute or more of status 1001 before. See experiment 22 for why asking
+  # again was the worst possible response to that.
   if running ferry-node && [ -d "$FERRY_RUN/machines" ]; then
     # ferry-machined first, or it writes the spec files straight back.
+    # The provisioner first of all: it exists to replace machines that go
+    # away, so stopping the machines while it watches is asking it to make
+    # them again.
+    if running ferry-karpenter; then
+      kill -TERM "$(cat "$FERRY_RUN/ferry-karpenter.pid")" 2>/dev/null
+      for _ in $(seq 1 20); do running ferry-karpenter || break; sleep 0.5; done
+      rm -f "$FERRY_RUN/ferry-karpenter.pid"
+    fi
     if running ferry-machined; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-machined.pid")" 2>/dev/null
       for _ in $(seq 1 20); do running ferry-machined || break; sleep 0.5; done
@@ -3171,7 +3315,7 @@ stop_machines() {
     fi
   fi
 
-  for component in ferry-machined ferry-node; do
+  for component in ferry-karpenter ferry-machined ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"; rm -f "$pidfile"
@@ -3662,7 +3806,7 @@ cmd_status() {
     then ok "$component"; else bad "$component"; fi
   done
   if machines_enabled; then
-    for component in ferry-node ferry-machined; do
+    for component in ferry-node ferry-machined ferry-karpenter; do
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
@@ -3677,10 +3821,10 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node>"; return 1 ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter>"; return 1 ;;
   esac
 }
 

@@ -50,6 +50,10 @@ GATEWAY=$(param ferry.gateway)
 POD_CIDR=$(param ferry.podcidr)
 DNS=$(param ferry.dns)
 DNS_SERVICE=$(param ferry.dnssvc)
+# Absent on a machine nobody tainted, and on any machine booted by a ferry-node
+# older than the parameter -- in both cases the flag is simply not passed.
+TAINTS=$(param ferry.taints)
+CLUSTER_CIDR=$(param ferry.clustercidr)
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -158,7 +162,23 @@ evictionHard:
   nodefs.inodesFree: "5%"
 EOF
 
+# Taints belong on the kubelet rather than on a patch afterwards, and the
+# reason is the window between the two. A node registers, becomes schedulable,
+# and only then would a controller taint it; anything the scheduler placed in
+# between is already running somewhere it was meant to be kept off. The
+# provisioner's karpenter.sh/unregistered taint exists precisely to hold that
+# window shut until it has finished syncing the node, so applying it late would
+# be the same as not applying it.
+#
+# Built as a list so an empty TAINTS contributes no argument at all:
+# --register-with-taints="" is rejected, and a kubelet that will not start is a
+# worse failure than an untainted node.
+set --
+[ -n "$TAINTS" ] && set -- --register-with-taints="$TAINTS"
+log "taints: ${TAINTS:-none}"
+
 /usr/local/bin/kubelet \
+  "$@" \
   --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
   --kubeconfig=/etc/kubernetes/kubelet.conf \
   --config=/var/lib/kubelet/config.yaml \
@@ -217,6 +237,15 @@ route_agent() {
         [ -z "$cidr" ] && continue
         [ "$cidr" = "$POD_CIDR" ] && continue
         [ "$via" = "${ADDRESS%%/*}" ] && continue
+        # Only nodes on this machine's own segment. The Mac node advertises its
+        # LAN address, which is routable from here -- through vmnet's NAT, as
+        # the host -- so a route to its pods via that address looks reasonable
+        # and silently blackholes: vmnet will not carry pod traffic between its
+        # networks, which is the whole reason eth1 exists. Anything not on-link
+        # here belongs to the switch, and the /16 on eth1 already covers it.
+        case "$(ip -o route get "$via" 2>/dev/null)" in
+          *" via "*) continue ;;
+        esac
         case "$(ip route show "$cidr" 2>/dev/null)" in
           *"via $via"*) ;;
           *) ip route replace "$cidr" via "$via" 2>/dev/null && log "route $cidr via $via" ;;
@@ -247,6 +276,36 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 log "pod cidr $POD_CIDR"
+
+# eth1: ferry's pod network, the flat segment mode 1's pods are on.
+#
+# It cannot be configured at boot because the address depends on the slice
+# kube-controller-manager hands this Node, and that is not known until after it
+# registers. So it happens here, with the slice in hand.
+#
+# The same address as the bridge gateway, with the cluster prefix rather than
+# the slice's -- the arrangement mode 1's own pods use (docs/POD-NETWORK.md,
+# "Two interfaces, one address"). Longest match then does the routing for free:
+# this machine's own pods are on the narrower /24 via cni0, and the rest of the
+# cluster leaves by eth1.
+#
+# proxy_arp is what puts this machine's pods on that segment without giving each
+# of them a port on it. A mode 1 pod treats the whole cluster CIDR as on-link
+# and ARPs for whatever it wants to reach; with proxy_arp the machine answers
+# for the addresses it routes to cni0, and forwards what arrives. Nothing on the
+# mode 1 side needs a route, which matters because those pods are VMs nobody can
+# reconfigure once they are running.
+if [ -n "$POD_CIDR" ] && [ -n "$CLUSTER_CIDR" ] && ip link show eth1 >/dev/null 2>&1; then
+  prefix=${CLUSTER_CIDR#*/}
+  gw=$(echo "${POD_CIDR%/*}" | awk -F. '{print $1"."$2"."$3"."($4 + 1)}')
+  ip link set eth1 up
+  ip addr add "$gw/$prefix" dev eth1 2>/dev/null
+  sysctl -w net.ipv4.conf.eth1.proxy_arp=1 >/dev/null 2>&1
+  sysctl -w net.ipv4.conf.eth1.forwarding=1 >/dev/null 2>&1
+  log "pod network: eth1 $gw/$prefix, proxy arp for $POD_CIDR"
+else
+  log "pod network: eth1 absent; mode 1 pods are unreachable from here"
+fi
 
 mkdir -p /etc/cni/net.d
 cat > /etc/cni/net.d/10-ferry-node.conflist <<CNI

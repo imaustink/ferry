@@ -1,0 +1,92 @@
+# What a machine Karpenter provisions is made of.
+#
+# Karpenter separates "how many nodes and of what shape" -- its own NodePool --
+# from "what a node actually is", which belongs to the provider. For ferry that
+# is the node image, the shapes a machine may take, and what the Mac will
+# commit in total.
+#
+# The limits live here rather than on the NodePool deliberately. A NodePool
+# limit is a policy about a workload; this is a fact about the Mac, and it holds
+# however many NodePools point at it.
+#
+# ferry-karpenter takes these from its own flags rather than reading this
+# object, because they describe the installation and ferry already knows them.
+# The CRD exists because Karpenter requires a NodeClass to reference.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ferrynodeclasses.ferry.dev
+spec:
+  group: ferry.dev
+  names:
+    kind: FerryNodeClass
+    listKind: FerryNodeClassList
+    plural: ferrynodeclasses
+    singular: ferrynodeclass
+    shortNames: [fnc]
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: CPUs, type: string, jsonPath: .spec.cpus.max}
+        - {name: MemoryGi, type: string, jsonPath: .spec.memoryGi.max}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                image:
+                  type: string
+                  description: >-
+                    Node disk image machines are cloned from. Empty means
+                    whatever ferry-machined was started with, which is the
+                    ordinary case.
+                cpus:
+                  type: object
+                  description: Bounds on the cores a machine may have.
+                  properties:
+                    min: {type: integer, minimum: 1}
+                    max: {type: integer, minimum: 1}
+                memoryGi:
+                  type: object
+                  description: Bounds on a machine's memory ceiling, in GiB.
+                  properties:
+                    min: {type: integer, minimum: 1}
+                    max: {type: integer, minimum: 1}
+                limits:
+                  type: object
+                  description: >-
+                    What this Mac will commit to machines in total. Reaching it
+                    is not an error; it is the point at which Karpenter is told
+                    there is no capacity, the same answer a cloud gives when a
+                    zone is full.
+                  properties:
+                    cpus: {type: integer, minimum: 1}
+                    memoryGi: {type: integer, minimum: 1}
+                maxPods:
+                  type: integer
+                  description: >-
+                    Pods a machine advertises. A node VM shares one kernel
+                    between its pods, so this is Kubernetes' own default rather
+                    than mode 1's memory-derived number.
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: {type: string}
+                      status: {type: string}
+                      reason: {type: string}
+                      message: {type: string}
+                      lastTransitionTime: {type: string}
+                      observedGeneration: {type: integer}

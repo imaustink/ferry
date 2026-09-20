@@ -47,6 +47,17 @@ struct RuntimeConfig: Sendable {
     var peersFile: String?
     /// This node's own endpoint, so it can be skipped in that list.
     var relayEndpoint: String?
+    /// The machines' switch on this Mac, if mode 2 is on: `ferry-node` holds
+    /// the other end of ferry's pod network for the machines it runs.
+    ///
+    /// Deliberately not one of `peers`, though frames are flooded to it exactly
+    /// as they are to one. `peers` answers a second question -- are there other
+    /// nodes whose routes point at this node's slice -- and that question
+    /// decides whether a node that cannot get its slice falls back or refuses.
+    /// Counted as a peer, turning mode 2 on would quietly turn a single-Mac
+    /// cluster from one that starts anyway into one that refuses to, for a
+    /// process on loopback that is not a node and routes to nothing.
+    var machineSwitch: String?
     /// ferry-cni, the CNI runtime. Absent leaves ferry allocating addresses
     /// itself, which is what it did before it had one.
     var cniBinary: String?
@@ -157,7 +168,7 @@ actor PodRuntime {
     private let store: ImageStore
     private let kernel: Kernel
     private var initfs: Containerization.Mount!
-    private var network: VmnetNetwork!
+    private var network: PodNetwork!
 
     /// An address held back for cluster DNS. CoreDNS has to live at an address
     /// the kubelet can be configured with before CoreDNS exists, so one is
@@ -236,7 +247,7 @@ actor PodRuntime {
         // by a cluster that starts than by one that cannot.
         let allowOffSlice = ProcessInfo.processInfo.environment["FERRY_ALLOW_OFF_SLICE"] == "1"
         let peers = allowOffSlice ? [] : Self.otherPeers(config: config)
-        var chosen: VmnetNetwork?
+        var chosen: PodNetwork?
         var lastError: Error?
 
         if !peers.isEmpty {
@@ -244,7 +255,7 @@ actor PodRuntime {
             var announced = false
             while true {
                 do {
-                    chosen = try VmnetNetwork(subnet: try CIDRv4(preferredSubnet))
+                    chosen = try PodNetwork(subnet: try CIDRv4(preferredSubnet))
                     lastError = nil
                     break
                 } catch {
@@ -258,7 +269,15 @@ actor PodRuntime {
                         : "\(peers.count) other nodes route to it"
                     print("    waiting for \(preferredSubnet); it is this node's slice and \(others)")
                 }
-                try? await Task.sleep(for: .seconds(3))
+                // Far apart on purpose, and this is the whole reason the wait
+                // ever worked or did not. A refused create renews the
+                // reservation it was refused by (experiment 22), so asking
+                // every three seconds guaranteed the subnet stayed taken for
+                // as long as ferry kept wanting it -- the wait could not
+                // succeed, however long it ran. Measured: 601 asks over ten
+                // minutes never got the subnet, and one ask after ninety
+                // seconds of silence did.
+                try? await Task.sleep(for: .seconds(Self.sliceRetrySeconds))
             }
             guard let held = chosen else {
                 // Built by concatenation rather than as one multiline literal:
@@ -287,7 +306,7 @@ actor PodRuntime {
         } else {
             for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
                 do {
-                    chosen = try VmnetNetwork(subnet: try CIDRv4(candidate))
+                    chosen = try PodNetwork(subnet: try CIDRv4(candidate))
                     if candidate != preferredSubnet {
                         print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
                         if config.clusterCIDR != nil {
@@ -350,9 +369,11 @@ actor PodRuntime {
         // local /24 leaves by eth0 on the kernel's own datapath, the rest of the
         // /16 leaves by eth1, and the source address is the same either way.
         if let cidr = config.clusterCIDR, let slice = Self.nodeSlice(of: cidr, node: config.nodeIndex) {
-            self.podSwitch = PodSwitch(relayPort: config.relayPort, peers: config.peers,
-                                       peersFile: config.peersFile,
-                                       self: config.relayEndpoint)
+            self.podSwitch = PodSwitch(
+                relayPort: config.relayPort,
+                peers: config.peers + (config.machineSwitch.map { [$0] } ?? []),
+                peersFile: config.peersFile,
+                self: config.relayEndpoint)
             self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
             self.cni = try makeCNI()
             print("    pod network \(cidr), this node is \(slice)")
@@ -406,10 +427,19 @@ actor PodRuntime {
     var subnet: String { "\(network.subnet)" }
 
     /// How long to wait for this node's slice before giving up on it, when there
-    /// are peers that would be cut off by starting anywhere else. vmnet holds a
-    /// subnet for about a minute after the process using it stops, so this is
-    /// that plus enough margin to cover a slow release.
-    static let sliceWaitSeconds: TimeInterval = 90
+    /// are peers that would be cut off by starting anywhere else.
+    ///
+    /// Long enough for two attempts a full expiry window apart. It is not "a
+    /// minute plus margin" any more, because the thing being waited out is not
+    /// a fixed timer: asking restarts it.
+    static let sliceWaitSeconds: TimeInterval = 200
+
+    /// The gap between asking for the slice and asking again.
+    ///
+    /// Longer than the reservation's own expiry, because each refused ask
+    /// renews it (experiment 22). Anything shorter than an expiry window turns
+    /// waiting into holding.
+    static let sliceRetrySeconds: TimeInterval = 95
 
     /// The other Macs in this cluster, as relay endpoints.
     ///
@@ -709,7 +739,7 @@ actor PodRuntime {
         if sandboxes[id]?.usesReservedAddress == true {
             dnsInterfaceInUse = false
         } else {
-            try? network.releaseInterface(id)
+            network.releaseInterface(id)
         }
         sandboxes.removeValue(forKey: id)
     }
@@ -1580,10 +1610,15 @@ actor PodRuntime {
     func shutdown() async {
         for record in sandboxes.values {
             try? await record.pod.stop()
-            try? network.releaseInterface(record.id)
+            network.releaseInterface(record.id)
         }
         sandboxes.removeAll()
         containers.removeAll()
+        // The pods are stopped, so nothing is using the network: end the
+        // reservation now rather than leaving it to expire. This is what makes
+        // `ferry down` followed by `ferry up` work at once instead of waiting
+        // out a timer that asking would only have extended.
+        network?.release()
     }
 
     func dnsAddress() -> String? {
