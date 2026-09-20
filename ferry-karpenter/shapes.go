@@ -1,0 +1,117 @@
+package main
+
+// The shapes a machine may take, and what the Mac will commit to them.
+//
+// Karpenter provisions by picking an instance type, so ferry has to offer a
+// catalogue. It does not have one: a machine can be any shape the hypervisor
+// will boot. So the catalogue is synthesised from a range -- powers of two
+// between a floor and a ceiling -- which gives Karpenter something to bin-pack
+// against without pretending a Mac has instance types.
+//
+// Powers of two rather than a fine-grained ladder for a reason. Karpenter's
+// scheduling cost is per instance type considered, and a laptop gains nothing
+// from choosing between a 5 and a 6 cpu node. Doubling keeps the catalogue to a
+// handful of entries that differ enough to matter.
+
+import (
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+// shape is one synthesised instance type: a cpu count and a memory ceiling.
+type shape struct {
+	cpus     int64
+	memoryGi int64
+}
+
+func (s shape) name() string { return fmt.Sprintf("ferry-%dcpu-%dgi", s.cpus, s.memoryGi) }
+
+func (s shape) capacity(maxPods int64) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU:    *resource.NewQuantity(s.cpus, resource.DecimalSI),
+		corev1.ResourceMemory: *resource.NewQuantity(s.memoryGi*gibibyte, resource.BinarySI),
+		corev1.ResourcePods:   *resource.NewQuantity(maxPods, resource.DecimalSI),
+	}
+}
+
+const gibibyte = 1024 * 1024 * 1024
+
+// bounds is what a NodeClass allows a machine to be, and what the Mac will
+// spend in total.
+type bounds struct {
+	minCPUs, maxCPUs         int64
+	minMemoryGi, maxMemoryGi int64
+	limitCPUs, limitMemoryGi int64
+}
+
+// shapes enumerates the catalogue: every power-of-two cpu count and memory size
+// inside the bounds, paired.
+//
+// Pairs rather than a cross product of all cpus against all memory. A 2 cpu
+// node with 32 GiB and an 8 cpu node with 2 GiB are both shapes a hypervisor
+// would happily boot and neither is a shape anybody wants, and every one of
+// them is another instance type for Karpenter to consider on every scheduling
+// pass. The ladder walks both together and then widens memory only, which
+// covers the case the guest actually hits -- a workload that wants memory more
+// than it wants cores.
+func (b bounds) shapes() []shape {
+	var out []shape
+	seen := map[string]bool{}
+	add := func(c, m int64) {
+		if c < b.minCPUs || c > b.maxCPUs || m < b.minMemoryGi || m > b.maxMemoryGi {
+			return
+		}
+		s := shape{cpus: c, memoryGi: m}
+		if seen[s.name()] {
+			return
+		}
+		seen[s.name()] = true
+		out = append(out, s)
+	}
+	for c := roundUpPow2(b.minCPUs); c <= b.maxCPUs; c *= 2 {
+		// The balanced rung, then twice and four times the memory. Untouched
+		// guest memory is nearly free (experiment 14), so a generous ceiling
+		// costs little and lets a memory-hungry workload land without taking
+		// cores it will not use.
+		for _, mult := range []int64{1, 2, 4} {
+			add(c, c*mult)
+		}
+	}
+	// A floor entry, so a NodeClass whose minimum is not a power of two still
+	// has something to offer.
+	add(b.minCPUs, b.minMemoryGi)
+	return out
+}
+
+func roundUpPow2(n int64) int64 {
+	if n < 1 {
+		return 1
+	}
+	p := int64(1)
+	for p < n {
+		p *= 2
+	}
+	return p
+}
+
+// fits reports whether committing this shape would stay inside what the Mac has
+// agreed to spend, given what is already committed.
+//
+// This is the part of a Karpenter provider that has no cloud equivalent. A
+// cloud region does not run out because you asked for one more node; a Mac
+// does, and it does so at a number the operator chose rather than at a number
+// the provider can discover. Past the limit `Create` has to refuse in a way
+// that makes Karpenter stop asking -- see the insufficient-capacity error in
+// provider.go -- rather than refuse in a way that makes it ask again
+// immediately, which is a hot loop against the hypervisor.
+func (b bounds) fits(committed shape, next shape) bool {
+	if b.limitCPUs > 0 && committed.cpus+next.cpus > b.limitCPUs {
+		return false
+	}
+	if b.limitMemoryGi > 0 && committed.memoryGi+next.memoryGi > b.limitMemoryGi {
+		return false
+	}
+	return true
+}

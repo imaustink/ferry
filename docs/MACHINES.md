@@ -395,13 +395,20 @@ which is milestone 4's job to make deliberate.
    not do: it had neither the UDP relay nor the peer list that mode 1's
    `PodSwitch` carries.
 
-4. **Provisioning on demand.** `NodePool`, pending-pod bin-packing, machine
-   creation, and the host budget. A Deployment scaled beyond what exists
-   creates the node it needs. Likely by implementing Karpenter's cloud-provider
-   interface rather than writing the bin-packer — see
-   [the open decision](#open-decisions). This is also what has to exist before
-   mode 2 can sensibly be the default, because until a machine is created for
-   you, choosing mode 2 means choosing a node size in advance.
+4. **Provisioning on demand.** **Built, and not yet run against a cluster** —
+   `ferry-karpenter`, Karpenter with ferry as its cloud provider. `Create`
+   writes a `Machine` and `ferry-machined` makes it a node; `Delete` removes it.
+   Instance types are synthesised from a shape range rather than read from a
+   catalogue, and the host budget is enforced by refusing with Karpenter's
+   insufficient-capacity error — the one part of a cloud provider a cloud never
+   has to write, because a region does not run out when you ask for one more
+   node. Started by `ferry machines enable` beside `ferry-machined`.
+
+   This is what has to exist before mode 2 can sensibly be the default, because
+   until a machine is created for you, choosing mode 2 means choosing a node
+   size in advance. What is not yet proven is any of it running: the provider
+   compiles against the interface and its arithmetic is tested, and no pod has
+   yet caused a machine.
 5. **Consolidation.** Cordon, drain honouring PDBs, delete — and the memory
    returns to the Mac. Without this half, provisioning is a one-way ratchet, and
    on a laptop a one-way ratchet is just a memory leak with a controller.
@@ -459,15 +466,16 @@ which is milestone 4's job to make deliberate.
   milestone 4 — the shape of `NodePool` above is deliberately close to
   Karpenter's so that either answer stays open.
 
-  **Leaning Karpenter**, and the two objections above turn out to be smaller
-  than they read.
+  **Decided: Karpenter**, built as `ferry-karpenter`. Both objections turned
+  out to be smaller than they read, and one of them was simply wrong.
 
-  *Running inside the cluster it provisions for* is the good case here rather
-  than the awkward one. The Mac node always exists and always runs mode 1, so
-  there is somewhere for the controller to live before a single machine does.
-  That removes the bootstrap problem a cloud provider has to solve with a
-  management cluster, and it means the two modes are not alternatives: mode 1 is
-  what makes mode 2 self-starting.
+  *Running inside the cluster it provisions for* turned out not to happen at
+  all, and this document was wrong to assume it. Karpenter v1 is a library with
+  no webhooks, and ferry already runs its controllers as native macOS
+  processes -- so `ferry-karpenter` is one more of them, talking to the cluster
+  over a kubeconfig from outside it. There is no bootstrap problem, because
+  nothing that makes nodes needs a node to run on, and no Linux image to build
+  and publish for a controller.
 
   *A catalogue rather than arbitrary shapes* is a synthesis away. `GetInstanceTypes`
   can enumerate shapes from the `machine.cpus` and `machine.memory` ranges above

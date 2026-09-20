@@ -348,6 +348,7 @@ not_shipped="
   ferry-proxy                                   go sources
   ferry-storage                                 go sources
   ferry-streamer                                go sources
+  ferry-karpenter                               go sources
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
@@ -434,6 +435,33 @@ contains "'ferry up' starts them for a cluster that asked" \
 # a missing directory.
 contains "a missing node image explains itself on a release" \
   "$(sed -n '/^machines_ready/,/^}/p' "$repo/ferry")" "packaged without one"
+
+# --- provisioning on demand ------------------------------------------------
+#
+# What makes mode 2 usable without asking anybody to size a node: a pod that
+# does not fit causes a machine shaped to hold it. Without this, using mode 2
+# means declaring a Machine and choosing its shape in advance, which is the
+# bargain ferry exists to avoid.
+prov_src="$(sed -n '/^start_provisioner/,/^}/p' "$repo/ferry")"
+contains "machines start a provisioner" \
+  "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" "start_provisioner"
+contains "which installs Karpenter's CRDs and the NodePool" "$prov_src" "manifests/machines/karpenter"
+contains "and degrades to hand-declared machines rather than failing" \
+  "$prov_src" "declared by hand"
+# The ceiling is the thing a cloud provider never implements, because a region
+# does not run out when you ask for one more node.
+contains "the host budget is passed to it" "$prov_src" "MACHINE_LIMIT_CPUS"
+succeeds "and is derived from the Mac rather than guessed" \
+  grep -q "FERRY_MACHINE_LIMIT_CPUS:-\$(( \$(sysctl -n hw.ncpu)" "$repo/ferry"
+
+# A provisioner that outlives the machines it manages will make them again.
+contains "the provisioner is stopped before the machines it manages" \
+  "$(sed -n '/^stop_machines/,/^}/p' "$repo/ferry")" "running ferry-karpenter"
+
+for f in karpenter.sh_nodepools.yaml karpenter.sh_nodeclaims.yaml ferrynodeclass.yaml default-nodepool.yaml; do
+  succeeds "  manifests/machines/karpenter/$f is shipped" \
+    test -f "$repo/manifests/machines/karpenter/$f"
+done
 
 # --- choosing a mode ------------------------------------------------------
 #

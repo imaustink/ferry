@@ -289,6 +289,15 @@ MACHINE_SUBNET="${FERRY_MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}
 # arrangement, which works there because a node VM has a kernel to program.
 # Cross-mode resolution is MACHINES.md milestone 6.
 MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
+# What the Mac will commit to machines in total.
+#
+# A quarter of memory and half the cores by default. The provisioner will spend
+# up to this and then tell Karpenter there is no capacity, which is a pod that
+# stays Pending with a reason rather than a Mac that swaps -- the same answer a
+# cloud gives when a zone is full, and the thing a cloud provider never has to
+# implement because a region does not run out when you ask for one more node.
+MACHINE_LIMIT_CPUS="${FERRY_MACHINE_LIMIT_CPUS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
+MACHINE_LIMIT_MEMORY_GI="${FERRY_MACHINE_LIMIT_MEMORY_GI:-$(( $(sysctl -n hw.memsize) / 1073741824 / 4 ))}"
 MACHINE_KUBE_PROXY_IMAGE="${FERRY_KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
 
 STOPPED_MARKER="$FERRY_HOME/stopped"
@@ -689,6 +698,14 @@ cmd_build() {
   echo "==> ferry-machined"
   ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
   echo "==> $here/bin/ferry-machined"
+  echo
+  # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
+  # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
+  # demand rather than failing, so this does not raise ferry's own toolchain
+  # floor.
+  echo "==> ferry-karpenter"
+  ( cd "$here/ferry-karpenter" && go build -o "$here/bin/ferry-karpenter" . ) || return 1
+  echo "==> $here/bin/ferry-karpenter"
   echo
   echo "==> ferry-node"
   OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" || return 1
@@ -1219,6 +1236,52 @@ start_machines() {
     bad "ferry-machined did not start"
     tail -5 "$FERRY_RUN/logs/ferry-machined.log" 2>/dev/null | sed 's/^/    /'
     return 1
+  fi
+
+  start_provisioner
+}
+
+# Karpenter, with ferry as its cloud provider: machines made for pods that have
+# nowhere to run, and taken away when they are empty.
+#
+# This is what lets mode 2 stop asking anybody to size a node. Without it, using
+# mode 2 means declaring a Machine and choosing its shape before knowing the
+# workload -- which is the bargain ferry exists to avoid, and the reason mode 1
+# is still the default.
+#
+# It runs here, natively, rather than as a pod in the cluster it provisions for.
+# docs/MACHINES.md listed "Karpenter runs as a pod" as an argument against using
+# it; Karpenter v1 is a library with no webhooks, and ferry already runs its
+# controllers as macOS processes. Out of cluster there is no chicken and egg
+# where the thing that makes nodes needs a node, and no Linux image to publish.
+start_provisioner() {
+  [ -x "$here/bin/ferry-karpenter" ] || {
+    warn "ferry-karpenter not built; machines must be declared by hand"
+    return 0; }
+
+  # Karpenter's own CRDs, and the NodePool that points at ferry. Applied on
+  # every start for the same reason the Machine CRD is: 'ferry down --purge'
+  # takes them with the cluster while the enabled marker survives.
+  local dir="$here/manifests/machines/karpenter"
+  if [ -d "$dir" ]; then
+    kube apply -f "$dir" >/dev/null 2>&1 \
+      || { warn "could not install Karpenter's CRDs; machines must be declared by hand"; return 0; }
+  fi
+
+  "$here/bin/ferry-karpenter" \
+    --kubeconfig "$FERRY_HOME/admin.conf" \
+    --limit-cpus "$MACHINE_LIMIT_CPUS" \
+    --limit-memory-gi "$MACHINE_LIMIT_MEMORY_GI" \
+    --max-pods 110 \
+    >"$FERRY_RUN/logs/ferry-karpenter.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-karpenter.pid"
+  sleep 2
+  if running ferry-karpenter; then
+    ok "provisioning on demand, up to $MACHINE_LIMIT_CPUS cpus and ${MACHINE_LIMIT_MEMORY_GI}Gi of machines"
+    echo "      a pod with nodeSelector ferry.dev/mode=shared makes the node it needs"
+  else
+    warn "ferry-karpenter did not start; machines must be declared by hand"
+    tail -3 "$FERRY_RUN/logs/ferry-karpenter.log" 2>/dev/null | sed 's/^/      /'
   fi
 }
 
@@ -3098,6 +3161,14 @@ stop_machines() {
   # that rather than coming back.
   if running ferry-node && [ -d "$FERRY_RUN/machines" ]; then
     # ferry-machined first, or it writes the spec files straight back.
+    # The provisioner first of all: it exists to replace machines that go
+    # away, so stopping the machines while it watches is asking it to make
+    # them again.
+    if running ferry-karpenter; then
+      kill -TERM "$(cat "$FERRY_RUN/ferry-karpenter.pid")" 2>/dev/null
+      for _ in $(seq 1 20); do running ferry-karpenter || break; sleep 0.5; done
+      rm -f "$FERRY_RUN/ferry-karpenter.pid"
+    fi
     if running ferry-machined; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-machined.pid")" 2>/dev/null
       for _ in $(seq 1 20); do running ferry-machined || break; sleep 0.5; done
@@ -3114,7 +3185,7 @@ stop_machines() {
     fi
   fi
 
-  for component in ferry-machined ferry-node; do
+  for component in ferry-karpenter ferry-machined ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"; rm -f "$pidfile"
@@ -3605,7 +3676,7 @@ cmd_status() {
     then ok "$component"; else bad "$component"; fi
   done
   if machines_enabled; then
-    for component in ferry-node ferry-machined; do
+    for component in ferry-node ferry-machined ferry-karpenter; do
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
@@ -3620,10 +3691,10 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node>"; return 1 ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter>"; return 1 ;;
   esac
 }
 
