@@ -114,6 +114,18 @@ Known limits, which are not bugs:
   See [INSTALL.md](INSTALL.md).
 - **A minor bump is a different problem** -- porting `patches/` -- and this
   machinery does not claim to solve it.
+- **More of `helpers_unsupported.go` leaks into Linux-guest decisions.** The CFS
+  conversions are handled -- `lib/overlay.sh` redirects them to `cm.Ferry*` and
+  asserts that it did -- but that file also declares
+  `CPUSharesEqualAfterV2RoundTrip` (returns `false`),
+  `CPURequestsFromConfig`, `CPULimitsFromConfig` and `ResourceConfigForPod`
+  (return `nil`), and those are reached from `pkg/kubelet/kubelet_pods.go`,
+  which has no build tag and so compiles on darwin as written. The consequences
+  are in the pod-level-resources and in-place-resize paths rather than in
+  ordinary pod startup, which is why they are recorded here rather than fixed
+  alongside the conversions. The overlay check will not catch them either: it
+  reads the derived `_darwin.go` files, and these call sites are in a file that
+  is not derived.
 
 ## Known, and deliberate
 

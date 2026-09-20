@@ -15,7 +15,24 @@
 # Copying with a handful of substitutions keeps the result tracking upstream
 # instead of freezing a fork of it.
 
-# The substitutions, and what each is for.
+# The rules. One per line: the name that must not survive in a derived file,
+# a space, and the sed expression that rewrites it.
+#
+# Both halves of this file read this one table, because they were two lists
+# before and two lists drift. A rewrite added without its assertion is a seam
+# nobody is watching, which is the exact failure the assertions exist to catch.
+#
+# A guard of `-` is a rewrite with nothing to assert on. The build tags are not
+# a seam: a file that failed to be retagged is not compiled at all rather than
+# compiled wrong, so the compiler already says so.
+#
+# Several rules share the libcontainercgroups guard on purpose. The assertion is
+# on the package rather than on any one call, which is what makes it survive
+# upstream moving between forms, as it did in v1.35: v1.34 calls
+# IsCgroup2UnifiedMode(), v1.35 and v1.36 assign the function itself. Repeated
+# guards are collapsed.
+#
+# What each rule is for:
 #
 # The host-cgroup queries -- HugePageSizes, IsCgroup2UnifiedMode,
 # ParseCgroupFile -- describe macOS, which has no cgroups, so they are answered
@@ -26,21 +43,49 @@
 # land in a Linux kernel inside the pod's VM, but on darwin package cm compiles
 # helpers_unsupported.go, where every CFS constant is 0 and both conversions
 # return 0. Left alone, every container reached the runtime with CpuShares and
-# CpuQuota of 0 and its CPU limit never sized the VM. cm.Ferry* in
-# ferry_cpu_conversions_darwin.go does the real arithmetic.
+# CpuQuota of 0. cm.Ferry* in ferry_cpu_conversions_darwin.go does the real
+# arithmetic.
+ferry_overlay_rules=(
+  '- s|^//go:build linux$|//go:build darwin|'
+  '- s|^// +build linux$|// +build darwin|'
+  'libcontainercgroups. /libcontainercgroups "github.com\/opencontainers\/cgroups"/d'
+  'libcontainercgroups. s|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g'
+  'libcontainercgroups. s|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g'
+  'libcontainercgroups. s|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|'
+  'libcontainercgroups. s|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g'
+  'cm.ApplyPodLevelMemoryHigh( s|cm\.ApplyPodLevelMemoryHigh(|ferryApplyPodLevelMemoryHigh(|g'
+  'cm.MilliCPUToShares( s|cm\.MilliCPUToShares(|cm.FerryMilliCPUToShares(|g'
+  'cm.MilliCPUToQuota( s|cm\.MilliCPUToQuota(|cm.FerryMilliCPUToQuota(|g'
+  'cm.QuotaPeriod s|cm\.QuotaPeriod|cm.FerryQuotaPeriod|g'
+)
+
+# The names no derived file may still contain, one per line, in table order and
+# without repeats. Read by ferry_check_derived_darwin, and by the test, which
+# reintroduces each one in turn to prove the check would notice.
+ferry_overlay_guards() {
+  local rule guard seen existing
+  local -a guards=()
+  for rule in "${ferry_overlay_rules[@]}"; do
+    guard="${rule%% *}"
+    if [ "$guard" = "-" ]; then continue; fi
+    seen=0
+    for existing in ${guards[@]+"${guards[@]}"}; do
+      if [ "$existing" = "$guard" ]; then seen=1; break; fi
+    done
+    if [ "$seen" -eq 0 ]; then
+      guards+=("$guard")
+      echo "$guard"
+    fi
+  done
+}
+
 ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
-  sed -e 's|^//go:build linux$|//go:build darwin|' \
-      -e 's|^// +build linux$|// +build darwin|' \
-      -e '/libcontainercgroups "github.com\/opencontainers\/cgroups"/d' \
-      -e 's|libcontainercgroups\.HugePageSizes()|ferryHugePageSizes()|g' \
-      -e 's|libcontainercgroups\.IsCgroup2UnifiedMode()|false|g' \
-      -e 's|= libcontainercgroups\.IsCgroup2UnifiedMode$|= func() bool { return false }|' \
-      -e 's|libcontainercgroups\.ParseCgroupFile("/proc/self/cgroup")|ferryParseCgroupFile()|g' \
-      -e 's|cm\.ApplyPodLevelMemoryHigh(|ferryApplyPodLevelMemoryHigh(|g' \
-      -e 's|cm\.MilliCPUToShares(|cm.FerryMilliCPUToShares(|g' \
-      -e 's|cm\.MilliCPUToQuota(|cm.FerryMilliCPUToQuota(|g' \
-      -e 's|cm\.QuotaPeriod|cm.FerryQuotaPeriod|g' \
-      "$1" > "$2"
+  local rule
+  local -a args=()
+  for rule in "${ferry_overlay_rules[@]}"; do
+    args+=(-e "${rule#* }")
+  done
+  sed "${args[@]}" "$1" > "$2"
 }
 
 # Nothing upstream may still be named in a derived file.
@@ -51,9 +96,6 @@ ferry_derive_darwin_from_linux() { # source-linux-file destination-darwin-file
 # libcontainercgroups: the import is deleted unconditionally, so every use of it
 # has to have been rewritten -- one survivor is an `undefined:
 # libcontainercgroups` at build time with nothing naming the seam that missed.
-# Asserting on the package rather than on one substitution is also what makes
-# this survive upstream moving between the two forms, as it did in v1.35: v1.34
-# calls IsCgroup2UnifiedMode(), v1.35 and v1.36 assign the function itself.
 #
 # The CFS conversions: a survivor here compiles perfectly well, because
 # cm.MilliCPUToShares does exist on darwin. It just returns 0, and the kubelet
@@ -66,18 +108,13 @@ ferry_check_derived_darwin() { # darwin-file
   # regex reads as the start of a group. None is a prefix of its own
   # replacement -- cm.MilliCPUToShares( does not occur inside
   # cm.FerryMilliCPUToShares( -- so a substring search is exact here.
-  local file="$1" found=0 name
-  for name in \
-    'libcontainercgroups.' \
-    'cm.MilliCPUToShares(' \
-    'cm.MilliCPUToQuota(' \
-    'cm.QuotaPeriod' \
-    'cm.ApplyPodLevelMemoryHigh('; do
-    if grep -qF "$name" "$file"; then
-      echo "$(basename "$file"): still names $name"
-      grep -nF "$name" "$file"
+  local file="$1" found=0 guard
+  while IFS= read -r guard; do
+    if grep -qF "$guard" "$file"; then
+      echo "$(basename "$file"): still names $guard"
+      grep -nF "$guard" "$file"
       found=1
     fi
-  done
+  done < <(ferry_overlay_guards)
   return "$found"
 }

@@ -24,11 +24,16 @@ limitations under the License.
 // darwin copy builds LinuxContainerResources from cm.MilliCPUToShares and
 // cm.MilliCPUToQuota, which on this platform are helpers_unsupported.go's and
 // return 0. Every container therefore reached the runtime asking for
-// CpuShares: 0, CpuQuota: 0, and ferry-cri sizes a machine with
+// CpuShares: 0, CpuQuota: 0 -- a CRI message that says the container has no
+// CPU limit at all, whatever its pod spec said.
 //
-//	if cpuQuota > 0 && cpuPeriod > 0 { c.cpus = max(1, Int(cpuQuota / cpuPeriod)) }
+// What that cost is a cgroup inside the pod's VM, not the size of the VM: the
+// machine is sized once at sandbox creation, from the pod spec, which ferry-cri
+// reads through ferry-streamer precisely because CRI carries resources per
+// container and never for the pod. So the pod was the right size and the
+// containers inside it were unbounded, each free to take the whole machine
+// regardless of the limit Kubernetes had granted it.
 //
-// so that branch was never taken and a pod's CPU limit never reached its VM.
 // The Ferry-prefixed pair below does the real arithmetic; build-kubelet.sh
 // rewrites the call sites, because the unsupported file is still compiled here
 // and owns the unprefixed names.

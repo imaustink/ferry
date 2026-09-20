@@ -226,23 +226,41 @@ carry: cadvisor folded `info/v1` and `info/v2` into one `lib/model` package, and
 an import path cannot be overridden from a second file, so that minor overlays
 whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
 
-### Rebuilding changes how pods are sized
+### Rebuilding starts enforcing container CPU limits
 
 Not a version upgrade, but it arrives with one, so it belongs here.
 
 On darwin, package `cm` compiles upstream's `helpers_unsupported.go`, where
 every CFS constant is `0` and both milli-CPU conversions return `0`. The kubelet
 was therefore telling the runtime that every container wanted `CpuShares: 0,
-CpuQuota: 0`, and `ferry-cri` sizes a machine from its quota — so a pod's CPU
-limit never reached its VM and every pod got one vCPU. `lib/overlay.sh` now
-redirects those conversions to `cm.Ferry*`, which does the real arithmetic, and
-`ferry-cri` falls back to the request when there is no limit.
+CpuQuota: 0` — a CRI message that says no CPU limit at all, whatever the pod
+spec said. `lib/overlay.sh` now redirects those conversions to `cm.Ferry*`,
+which does upstream's real arithmetic.
 
-This is not gated by version: the bug was never version-specific, and a kubelet
-rebuilt from this overlay at **any** version will start sizing VMs from CPU
-limits and requests. A pod asking for `cpu: 4` that has been quietly running on
-one vCPU will get four the next time its sandbox is created. That is the fix
-working, but it changes how much of the Mac a busy namespace takes, so roll it
+**This does not change how big a pod's VM is.** That is decided once, at sandbox
+creation, from the pod spec: CRI carries resources per container and never for
+the pod, so `ferry-cri` asks `ferry-streamer` for the pod and sizes the machine
+from the aggregate of its containers' limits. A pod asking for `cpu: 4` has
+always got four vCPUs.
+
+What changes is the cgroup *inside* that machine. With no quota in the CRI
+config, `ferry-cri` left the container's `resources.cpu` unset, so every
+container in a pod could use the whole VM whatever its own limit said — two
+containers limited to `cpu: 2` each shared a 4-vCPU machine with neither bounded
+to its half. After a rebuild each is held to its limit. A container that has
+been quietly borrowing a sibling's headroom will stop, and if it was relying on
+that to keep up, it will now be throttled at the number its spec actually asks
+for. Containers with no CPU limit stay unbounded within their pod's machine,
+which is what Kubernetes means by Burstable and BestEffort — a request is a
+weight, not a ceiling, and is deliberately not turned into one here.
+
+Limits are rounded **up** to whole CPUs, because a cgroup inside the guest is
+the only lever and it takes whole CPUs. A container limited to `1500m` gets two
+CPUs of quota rather than one; the VM is sized with the same rounding, so this
+can never ask for more than the machine has. A limit below `1` CPU lands on one.
+
+This is not gated by version: the bug was never version-specific, so a kubelet
+rebuilt from this overlay at **any** version starts sending real limits. Roll it
 out when you can watch it rather than alongside an unrelated upgrade.
 
 ## Tests
@@ -262,10 +280,10 @@ out when you can watch it rather than alongside an unrelated upgrade.
   from the store, on ports of its own. Skipped until something has been built.
 - `tests/overlay-test.sh` — the rewrites in `lib/overlay.sh`, against a fixture
   holding the lines upstream actually writes. It checks both that each rule
-  fires and that `ferry_check_derived_darwin` notices when one stops firing.
-  That matters most for the CFS conversions: a missed rewrite there still
-  compiles, because `cm.MilliCPUToShares` exists on darwin, and simply goes back
-  to sending zero.
+  fires and that `ferry_check_derived_darwin` notices when one stops firing, the
+  second for every guard in the table rather than a chosen few. That matters
+  most for the CFS conversions: a missed rewrite there still compiles, because
+  `cm.MilliCPUToShares` exists on darwin, and simply goes back to sending zero.
 
 ### What the tests do not cover, and what was run instead
 

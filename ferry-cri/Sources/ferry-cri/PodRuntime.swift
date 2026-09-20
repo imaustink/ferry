@@ -1054,9 +1054,36 @@ actor PodRuntime {
 
     static let gpuResource = "ferry.dev/gpu"
 
-    /// CFS weight for one whole CPU. The kubelet converts a container's CPU
-    /// request to cpu.shares at this scale, so dividing gets the request back.
-    static let cpuSharesPerCPU: Int64 = 1024
+    /// How many whole CPUs a container may use inside its pod's machine.
+    ///
+    /// This is not the size of the machine. The VM's vCPU count is decided once,
+    /// in runPodSandbox, from the aggregate of the pod spec's limits -- CRI
+    /// sends resources per container and never for the pod, so that total comes
+    /// from ferry-streamer rather than from here. What this number becomes is
+    /// the container's own cgroup inside the guest: Containerization turns
+    /// ContainerConfiguration.cpus into cpu.max, quota over a 100ms period.
+    ///
+    /// Only a limit produces a number. A request is a weight and not a ceiling
+    /// -- Kubernetes lets a Burstable container use idle CPU beyond what it
+    /// asked for -- and a quota is the only thing this field can express, so a
+    /// container with no limit is left unthrottled within the machine its pod
+    /// was sized for. Passing its cpu.shares through here would quietly turn
+    /// every request into a limit, and would cap a BestEffort container at one
+    /// CPU: the kubelet floors shares at 2 for unset, so there is no value that
+    /// means "no request".
+    ///
+    /// Rounds up, because whole CPUs are the only lever. A container granted
+    /// 1500m and floored to one CPU is a third slower than Kubernetes said it
+    /// could be, so the rounding errs towards the limit rather than under it.
+    /// The machine is already sized the same way -- the pod's total comes from
+    /// limits.Cpu().Value(), which rounds up too -- so this cannot ask for more
+    /// than the VM has. A limit below one CPU still lands on one: the guest
+    /// cannot be given a fraction of a vCPU, and over-granting a 100m sidecar
+    /// is the safer direction.
+    static func containerCPUs(quota: Int64, period: Int64) -> Int? {
+        guard quota > 0, period > 0 else { return nil }
+        return Int((quota + period - 1) / period)
+    }
 
     // MARK: - Containers
 
@@ -1156,7 +1183,6 @@ actor PodRuntime {
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
-        let cpuShares = cfg.linux.resources.cpuShares
 
         // The kubelet assembles volume contents on the host -- projected
         // ServiceAccount tokens, ConfigMaps, Secrets, emptyDir -- and passes
@@ -1237,16 +1263,10 @@ actor PodRuntime {
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
-            // A CPU limit sizes the machine: quota over period is the number of
-            // whole CPUs the container is allowed. Failing that, fall back to
-            // the request, which arrives as cpu.shares at 1024 per CPU -- a pod
-            // with a request and no limit was getting one vCPU regardless of
-            // how many it asked for. Both truncate, so anything under a whole
-            // CPU lands on the floor of one.
-            if cpuQuota > 0 && cpuPeriod > 0 {
-                c.cpus = max(1, Int(cpuQuota / cpuPeriod))
-            } else if cpuShares > 0 {
-                c.cpus = max(1, Int(cpuShares / Self.cpuSharesPerCPU))
+            // A CPU limit bounds the container within the pod's machine; see
+            // containerCPUs for why a request deliberately does not.
+            if let cpus = Self.containerCPUs(quota: cpuQuota, period: cpuPeriod) {
+                c.cpus = cpus
             }
             // Append rather than replace: the defaults carry /proc, /sys and
             // the rest of the standard container filesystem.

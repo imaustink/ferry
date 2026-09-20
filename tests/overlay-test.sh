@@ -42,9 +42,11 @@ trap 'rm -rf "$work"' EXIT
 . "$repo/lib/overlay.sh"
 
 # A stand-in for kuberuntime_container_linux.go, holding the lines the rules
-# have to match. Every one of these is copied from upstream v1.37.0 rather than
-# invented, so if upstream changes the shape, this fixture is what gets updated
-# alongside the rule.
+# have to match. Each call is written the way upstream v1.37.0 writes it rather
+# than invented, so if upstream changes the shape, this fixture is what gets
+# updated alongside the rule. The surrounding declarations are the fixture's
+# own, so that it is a Go file a reader can reason about rather than a scrap of
+# text -- the rules only ever see the call sites.
 cat > "$work/sample_linux.go" <<'FIXTURE'
 //go:build linux
 // +build linux
@@ -52,20 +54,22 @@ cat > "$work/sample_linux.go" <<'FIXTURE'
 package kuberuntime
 
 import (
+	v1 "k8s.io/api/core/v1"
 	libcontainercgroups "github.com/opencontainers/cgroups"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 )
 
 var isCgroup2UnifiedMode = libcontainercgroups.IsCgroup2UnifiedMode
 
-func example() {
+func example(pod *v1.Pod, rc *cm.ResourceConfig, cpuLimit resource.Quantity, factor float64) {
 	pageSizes := libcontainercgroups.HugePageSizes()
 	unified := libcontainercgroups.IsCgroup2UnifiedMode()
 	cgroups, err := libcontainercgroups.ParseCgroupFile("/proc/self/cgroup")
-	cpuShares = int64(cm.MilliCPUToShares(cpuLimit.MilliValue()))
+	cpuShares := int64(cm.MilliCPUToShares(cpuLimit.MilliValue()))
 	cpuPeriod := int64(cm.QuotaPeriod)
 	cpuQuota := cm.MilliCPUToQuota(cpuLimit.MilliValue(), cpuPeriod)
-	cm.ApplyPodLevelMemoryHigh(pod, rc, *m.memoryThrottlingFactor)
+	cm.ApplyPodLevelMemoryHigh(pod, rc, factor)
+	_, _, _, _, _, _ = pageSizes, unified, cgroups, err, cpuShares, cpuQuota
 }
 FIXTURE
 
@@ -102,6 +106,19 @@ refuses "so is a leftover cgroups call" ferry_check_derived_darwin "$work/cgroup
 
 sed 's|ferryApplyPodLevelMemoryHigh(|cm.ApplyPodLevelMemoryHigh(|' "$out" > "$work/memhigh_darwin.go"
 refuses "and a missed memory.high call"  ferry_check_derived_darwin "$work/memhigh_darwin.go"
+
+# Every guard in the table, not the three spelled out above. The rules and the
+# assertions are one list now, so a rule added later arrives here on its own --
+# which is the point, since the rule most worth guarding is the one whose author
+# did not think to add a test for it.
+printf '\033[1m%s\033[0m\n' "every guard in the table is enforced"
+guards=0
+while IFS= read -r guard; do
+  guards=$((guards + 1))
+  printf 'package kuberuntime\n\nfunc rot() { %s }\n' "$guard" > "$work/guard_darwin.go"
+  refuses "$guard" ferry_check_derived_darwin "$work/guard_darwin.go"
+done < <(ferry_overlay_guards)
+if [ "$guards" -gt 0 ]; then ok "the table has guards to enforce"; else bad "the table yielded no guards"; fi
 
 echo
 if [ "$fail" -eq 0 ]; then
