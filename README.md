@@ -2,22 +2,64 @@
 
 # ferry
 
-Kubernetes on a Mac where **the pod is the virtual machine** and there is no
-Linux host anywhere in the system.
+Kubernetes on a Mac with **nothing to size and nothing to wait for**.
 
-The control plane runs as native Mach-O processes on macOS. Each pod is a
-lightweight VM on `Virtualization.framework` with its own kernel. There is no
-node VM to size, nothing nested, and no shared kernel between pods.
+There is no Linux VM to allocate memory to before you start, no machine to keep
+running between sessions, and no boot to sit through. A pod is a virtual machine
+that starts in **a third of a second**, and the control plane is native Mach-O
+processes on macOS — so `ferry up` is a few processes starting, not a VM coming
+up.
 
-|  | isolation | overhead |
+|  | what you size up front | what it costs idle |
 |---|---|---|
-| Docker Desktop / colima / kind | one Linux VM, pods share a kernel | a VM you size up front |
-| kiac / Orchard | VM per **node**, pods share the node's kernel | 2–4 GB per node, idle or not |
-| **ferry** | VM per **pod** — every pod its own kernel | pods only |
+| Docker Desktop / colima / kind | a Linux VM: memory and CPUs, before the first pod | the whole VM, used or not |
+| kiac / Orchard | a node VM, per node | 2–4 GB per node, idle or not |
+| **ferry** | nothing | nothing — pods pay for what they touch |
+
+The last column is measured, not aspirational. 128 pod VMs configured with
+512 MiB each — 64 GiB asked for — consumed **1.6 GiB** of host memory, because
+guests are lazily backed and pay for the pages they actually touch. Sizing is a
+guess you make before you know the answer, and this removes the guess: ask for
+what the workload says it wants, and the Mac spends what the workload uses.
+
+**Startup, measured:** the hypervisor starts a VM in 0.06–0.09s and the guest
+reaches userspace in ~0.12s, so a real Alpine pod is up in **0.33s** and answers
+ping from the Mac in 0.34ms. The 128th VM starts as fast as the first. Nothing
+is nested, and there is no node VM in the path.
+
+### Against kind and minikube, on one Mac
+
+| | up | first pod | memory |
+|---|---|---|---|
+| kind | 13.8 s | 10.3 s | 2354 MiB *of a VM you sized* |
+| minikube | 21.4 s | 1.0 s | 2200 MiB *of a VM you sized* |
+| **ferry** | **12.6 s** | **1.0 s** | **1047 MiB of the Mac** |
+
+Those two memory columns cannot be the same number, and the reason is the point.
+Docker Desktop on that Mac holds **15.6 GiB and 16 cpus before the first pod
+exists**, so a pod on kind costs the Mac nothing extra — it costs a slice of a
+VM already taken, and when the slice is gone, pods stop fitting. ferry reserves
+nothing, and a pod costs 237 MiB of real memory. An idle single-node cluster
+costs kind and minikube 2.2–2.4 GiB of their VM before any workload runs.
+
+Measured with [experiment 21](experiments/21-density-vs-kind-minikube/FINDINGS.md),
+which is also honest about what it could not measure: one run per stack, kind's
+first-pod time probably includes an image pull, and mode 2 did not complete.
+The 237 MiB per pod independently reproduces
+[experiment 13](experiments/13-shared-kernel-cost/FINDINGS.md)'s 226 MiB by a
+different method.
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause
 container, no network namespace plumbing.
+
+None of that changes if you want density instead. A `Machine` is a Linux node VM
+whose pods are ordinary containers sharing its kernel — ~45ms to start one
+against ~300ms for a pod VM — and a pod picks with
+`nodeSelector: {ferry.dev/mode: shared}` or `vm-per-pod`. It is still nothing to
+size up front: a machine is sized when you declare one and gone when you delete
+it. Off until `ferry machines enable`; [docs/MACHINES.md](docs/MACHINES.md) is
+the case for it and what it costs.
 
 ## Status
 
@@ -99,6 +141,22 @@ cost time.
   kubelet, the control plane and etcd together, which it did not before — asking
   for a newer one used to produce a kubelet newer than the API server, silently.
   See [docs/UPGRADES.md](docs/UPGRADES.md).
+- ✅ **A second mode, where the node is the VM.** `kubectl apply` a `Machine`
+  and a Linux node VM joins the cluster **Ready in 16 seconds**, running
+  containerd and a stock kubelet; `kubectl delete` takes it away in 3, VM
+  stopped, `Node` removed, disk cleaned up behind a finalizer. Pods on two
+  machines reach each other, each node routing to the others' pod CIDR slices.
+  A pod chooses between the modes with
+  `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}`, which is node selection
+  rather than a new concept. Off until `ferry machines enable`. Built through
+  milestone 3: provisioning on demand, consolidation and cross-mode pod routing
+  are not. See [docs/MACHINES.md](docs/MACHINES.md).
+- ✅ **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
+  sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
+  on the PATH, registers a login agent and starts a cluster — Apple silicon and
+  macOS 26 the only requirement, no Swift, no Go, no Kubernetes source tree and
+  no `sudo`. Another Mac joins with one line carrying a token, so nothing copies
+  binaries by hand any more. See [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Why this can work
 
@@ -120,14 +178,17 @@ CNAME                                the domain, copied into the published site
 .github/workflows/pages.yml          publishes install.sh to that domain from main
 release/build.sh                     package a built checkout into a release tarball
 release/publish.sh                   put one on GitHub Releases
-ferry                                the CLI: doctor, build, up, down, status, logs, upgrade
+ferry                                the CLI: doctor, build, up, down, status, logs,
+                                     upgrade, machines, service, uninstall
 lib/versions.sh                      the version store, and what may follow what
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
+manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines
 tests/                               what can be checked without a cluster
-docs/                                HANDOFF.md (the full picture), INSTALL.md, SERVICES.md
+docs/                                HANDOFF.md (the full picture), INSTALL.md,
+                                     MACHINES.md (mode 2), SERVICES.md
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
@@ -137,7 +198,14 @@ experiments/06-kube-proxy-on-macos/  kube-proxy's rule generation, rendered on d
 experiments/07-vmnet-leak/           what a refused vmnet subnet actually means
 experiments/08-vsock-socket-relay/   a host socket, inside a pod, over vsock
 experiments/12-gpu-contention/       what shares this Mac's silicon and what does not
+experiments/17-node-vm/              a Linux node VM joining, in six and a half seconds
+experiments/18-node-image/           the node image, and ferry-node that boots it
+experiments/19-machine-crd/          a node made by applying a resource
+experiments/20-pod-network/          pods on two machines reaching each other
+experiments/21-density-vs-kind-minikube/  against kind and minikube, on one Mac
 ferry-cri/                           the CRI runtime: one VM per pod
+ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
+node-image/ (built)                  mode 2's node image, as an OCI layout
 ferry-streamer/                      SPDY streaming for exec, attach and port-forward
 ferry-proxyd/ (in patches/)          kube-proxy's rule generation, built for darwin
 guest/                               nft, bundled with its loader for pods
