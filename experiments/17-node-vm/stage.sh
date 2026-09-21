@@ -6,13 +6,17 @@
 # node that boots twenty times does not download twenty times.
 #
 # The kubelet's version is not a free choice -- it has to match the control
-# plane it joins, which ferry builds at v1.34.x.
+# plane it joins. ferry passes that version in; the fallback below is for
+# running this script on its own, and comes from the same version store ferry
+# uses rather than a second pin that has to be remembered separately.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 STAGE="${STAGE:-$here/stage}"
 mkdir -p "$STAGE"
 
-KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.34.11}"
+# shellcheck source=../../lib/versions.sh
+source "$here/../../lib/versions.sh"
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-$(ferry_control_plane_version "$FERRY_DEFAULT_K8S_VERSION")}"
 CONTAINERD_VERSION="${CONTAINERD_VERSION:-2.3.5}"
 RUNC_VERSION="${RUNC_VERSION:-1.5.1}"
 # Not a free choice either. The configuration the node image ships with
@@ -33,8 +37,16 @@ get() { # url dest
   curl -sSL -o "$2" "$1"
 }
 
+# Same reasoning as the containerd tarball below: get() keeps whatever is
+# already staged, and a kubelet staged at another version is indistinguishable
+# from this one by its name. Without this the node is built with the kubelet of
+# whichever version happened to be staged first, while everything that reports
+# the node's version -- `ferry node-image` included -- says this one.
+[ "$(cat "$STAGE/kubelet.version" 2>/dev/null)" = "$KUBERNETES_VERSION" ] \
+  || rm -f "$STAGE/kubelet"
 get "https://dl.k8s.io/release/$KUBERNETES_VERSION/bin/linux/arm64/kubelet" "$STAGE/kubelet"
 chmod +x "$STAGE/kubelet"
+printf '%s\n' "$KUBERNETES_VERSION" > "$STAGE/kubelet.version"
 
 # The version is recorded next to the tarball because its name does not survive
 # the copy into the node image build, which checks it before baking the 2.x-only
