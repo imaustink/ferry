@@ -122,6 +122,20 @@ K8S_CONTROL_PLANE_VERSION=v1.35.2 ferry upgrade apply v1.35.0
 
 etcd is paired the same way, and `ETCD_VERSION` overrides it.
 
+### What a fresh checkout builds
+
+`FERRY_DEFAULT_K8S_VERSION` in `lib/versions.sh` is the version a checkout
+builds when nothing says otherwise -- v1.37.0. It lives there, and not in each
+script, because ferry, `build-kubelet.sh` and both control-plane scripts each
+used to carry the literal separately; a default bumped in three of the four is
+the split-version bug the store was built to end.
+
+It only decides where a *new* checkout starts. ferry reads
+`ferry_active_version` first, so a checkout that has built something stays on it
+until asked to move, and raising the default cannot upgrade a running cluster
+behind its back -- `ferry upgrade` still refuses to cross more than one minor at
+a time, so a v1.34 cluster reaches v1.37 in three steps or not at all.
+
 ## Snapshots
 
 Every switch that could touch the cluster's state takes an etcd snapshot first,

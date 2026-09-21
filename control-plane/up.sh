@@ -16,7 +16,7 @@ export FERRY_ROOT
 # and everything below runs out of that version's directory rather than out of
 # bin/. Running the version by name is what makes an upgrade a restart: the
 # binaries that come up are the ones asked for, not whatever bin/ points at.
-K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+K8S_VERSION="${K8S_VERSION:-$FERRY_DEFAULT_K8S_VERSION}"
 bin="$(ferry_version_dir "$K8S_VERSION")"
 STATE="${STATE:-/tmp/ferry}"
 PKI_DIR="${PKI_DIR:-$STATE/pki}"

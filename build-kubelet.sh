@@ -13,7 +13,7 @@ export FERRY_ROOT
 # shellcheck source=lib/overlay.sh
 . "$here/lib/overlay.sh"
 
-K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+K8S_VERSION="${K8S_VERSION:-$FERRY_DEFAULT_K8S_VERSION}"
 ferry_version_valid "$K8S_VERSION" \
   || { echo "K8S_VERSION=$K8S_VERSION is not a version like v1.34.0" >&2; exit 1; }
 # A few shims differ by minor -- upstream changes a constructor's signature and
