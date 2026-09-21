@@ -219,6 +219,50 @@ has moved — so a drifted tree fails during the build, which happens before
 anything is switched. `plan` warns when the target is a new minor for exactly
 this reason. That is the honest position, not a claim that any minor works.
 
+Shims whose signatures move between minors live in `patches/kubelet-vX.Y/`,
+chosen by exact minor, and the build refuses before it clones if the minor being
+built has no directory. v1.37 needs more than the two constructors the others
+carry: cadvisor folded `info/v1` and `info/v2` into one `lib/model` package, and
+an import path cannot be overridden from a second file, so that minor overlays
+whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
+
+### Rebuilding starts enforcing container CPU limits
+
+Not a version upgrade, but it arrives with one, so it belongs here.
+
+On darwin, package `cm` compiles upstream's `helpers_unsupported.go`, where
+every CFS constant is `0` and both milli-CPU conversions return `0`. The kubelet
+was therefore telling the runtime that every container wanted `CpuShares: 0,
+CpuQuota: 0` — a CRI message that says no CPU limit at all, whatever the pod
+spec said. `lib/overlay.sh` now redirects those conversions to `cm.Ferry*`,
+which does upstream's real arithmetic.
+
+**This does not change how big a pod's VM is.** That is decided once, at sandbox
+creation, from the pod spec: CRI carries resources per container and never for
+the pod, so `ferry-cri` asks `ferry-streamer` for the pod and sizes the machine
+from the aggregate of its containers' limits. A pod asking for `cpu: 4` has
+always got four vCPUs.
+
+What changes is the cgroup *inside* that machine. With no quota in the CRI
+config, `ferry-cri` left the container's `resources.cpu` unset, so every
+container in a pod could use the whole VM whatever its own limit said — two
+containers limited to `cpu: 2` each shared a 4-vCPU machine with neither bounded
+to its half. After a rebuild each is held to its limit. A container that has
+been quietly borrowing a sibling's headroom will stop, and if it was relying on
+that to keep up, it will now be throttled at the number its spec actually asks
+for. Containers with no CPU limit stay unbounded within their pod's machine,
+which is what Kubernetes means by Burstable and BestEffort — a request is a
+weight, not a ceiling, and is deliberately not turned into one here.
+
+Limits are rounded **up** to whole CPUs, because a cgroup inside the guest is
+the only lever and it takes whole CPUs. A container limited to `1500m` gets two
+CPUs of quota rather than one; the VM is sized with the same rounding, so this
+can never ask for more than the machine has. A limit below `1` CPU lands on one.
+
+This is not gated by version: the bug was never version-specific, so a kubelet
+rebuilt from this overlay at **any** version starts sending real limits. Roll it
+out when you can watch it rather than alongside an unrelated upgrade.
+
 ## Tests
 
 ```
@@ -234,6 +278,15 @@ this reason. That is the honest position, not a claim that any minor works.
   checkout with stub binaries and no cluster.
 - `tests/etcd-snapshot-test.sh` — a real save and restore with the real etcd
   from the store, on ports of its own. Skipped until something has been built.
+- `tests/overlay-test.sh` — the rewrites in `lib/overlay.sh`, against a fixture
+  holding the lines upstream actually writes. It checks both that each rule
+  fires and that `ferry_check_derived_darwin` notices when one stops firing, the
+  second for every guard in the table rather than a chosen few. That matters
+  most for the CFS conversions: a missed rewrite there still compiles, because
+  `cm.MilliCPUToShares` exists on darwin, and simply goes back to sending zero.
+  It covers the in-place rewrite too, which is how `kubelet_pods.go` -- the one
+  file that reads those constants without carrying a build tag -- gets the same
+  rules and the same assertion as the derived ones.
 
 ### What the tests do not cover, and what was run instead
 
@@ -262,6 +315,18 @@ ferry upgrade nodes
 Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`
 — which started the cluster at its own recorded version and said so, rather
 than letting the build become an upgrade.
+
+The CPU change above was run the same way, on v1.36.4, against four builds — the
+one before it, the kubelet half alone, the first attempt at the runtime half,
+and what shipped — reading each container's `cpu.max` from inside its own VM and
+then loading it past its limit to see whether the quota bit. Before, every
+container read `max`: no limit at all, whatever its spec said. After, a 100m
+container is throttled in every one of the fifty 100ms periods in five seconds
+and delivers exactly the one CPU it is allowed, while a BestEffort container is
+throttled in none and takes its whole machine. It also found that the kubelet
+was logging two `not implemented` errors per pod per sync from a pod cgroup that
+does not exist here. Reproducer and numbers in
+[experiments/23-pod-cpu-limits](../experiments/23-pod-cpu-limits/FINDINGS.md).
 
 Running it found three things the tests could not, all since fixed. The node
 upgrade read the kubelet's version the moment the node went Ready, but a node

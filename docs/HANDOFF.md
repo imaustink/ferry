@@ -118,6 +118,7 @@ guest. This is what fixes the API server's advertise address.
 ```
 build-kubelet.sh                     clone upstream + apply overlay + build
 patches/kubelet/                     darwin implementations, mirroring upstream paths
+patches/kubelet-vX.Y/                the shims whose signatures move between minors
 control-plane/
   pki.sh                             CA, serving, client, front-proxy, SA certs
   fetch-binaries.sh                  darwin/arm64 control plane + etcd

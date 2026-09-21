@@ -70,7 +70,7 @@ ferry_version_mm() { echo "v$(ferry_version_major "$1").$(ferry_version_minor "$
 # which is well inside the supported skew -- rather than silently 404ing at
 # download time.
 #
-# v1.34, v1.35 and v1.36 have been built. The rest are the shape this takes when
+# v1.34 through v1.37 have been built. The rest are the shape this takes when
 # another minor is added, not a claim that they work.
 #
 # The pins have to be an unbroken ladder, because ferry_skew_reason below refuses
@@ -80,14 +80,20 @@ ferry_version_mm() { echo "v$(ferry_version_major "$1").$(ferry_version_minor "$
 # by v1.35 NewContainerManager has taken a context but cadvisor.New has not yet
 # taken a logger, so neither neighbour's shims compile against it.
 #
-# v1.37 is absent because it cannot be built at all -- upstream removed the
-# vendored cadvisor packages ferry's darwin shim imports.
+# v1.37 was thought to be unbuildable, on the grounds that upstream had removed
+# the vendored cadvisor packages the darwin shim imports. They were not removed:
+# cadvisor folded info/v1 and info/v2 into a single lib/model package, which
+# k8s.io/kubernetes v1.37.0 vendors, and kubelet's own cadvisor.Interface is
+# declared in terms of it. So the shim could not have kept its own copy of the
+# old packages either -- it has to speak the types the Interface names. It is a
+# rename, and patches/kubelet-v1.37/ carries it.
 ferry_control_plane_version() { # k8s-version
   [ -n "${K8S_CONTROL_PLANE_VERSION:-}" ] && { echo "$K8S_CONTROL_PLANE_VERSION"; return; }
   case "$(ferry_version_mm "$1")" in
     v1.34) echo "v1.34.11" ;;
     v1.35) echo "v1.35.8" ;;
     v1.36) echo "v1.36.4" ;;
+    v1.37) echo "v1.37.0" ;;
     # No pin for this minor: ask for the exact version and let the download say
     # so if kwok-ci has not built it. The error names the override.
     *)     echo "$1" ;;

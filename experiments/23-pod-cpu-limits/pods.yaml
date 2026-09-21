@@ -1,0 +1,94 @@
+---
+# limits.cpu: 2 -- the plain case. The container's cgroup should read
+# "200000 100000" and the VM should have 2 vCPUs.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-limit-2
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "2", memory: 128Mi}
+---
+# No requests and no limits: BestEffort. Kubernetes says unlimited, so the
+# cgroup should read "max 100000". This is the case the cpu.shares fallback
+# capped at one CPU.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-besteffort
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+---
+# A request and no limit: Burstable. Also unlimited -- a request is a weight,
+# not a ceiling. The fallback would have pinned this at one CPU as well.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-request-only
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: "1", memory: 128Mi}
+---
+# 1500m: the rounding case. Up to "200000 100000", not down to "100000 100000",
+# which would throttle it a third below what Kubernetes granted.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-fractional
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "1500m", memory: 128Mi}
+---
+# Two containers, 1 CPU each, in a 2-vCPU machine. Each should be held to its
+# own "100000 100000" rather than either being free to take both.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-two-containers
+spec:
+  restartPolicy: Never
+  containers:
+    - name: a
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "1", memory: 128Mi}
+    - name: b
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "1", memory: 128Mi}
+---
+# 100m: below one whole CPU, so it lands on the floor of one -- "100000 100000".
+# Over-granting, and written down as such.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-sub-one
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: busybox
+      command: ["sleep", "3600"]
+      resources:
+        limits: {cpu: "100m", memory: 128Mi}

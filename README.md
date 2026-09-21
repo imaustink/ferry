@@ -191,6 +191,7 @@ ferry                                the CLI: doctor, build, up, down, status, l
 lib/versions.sh                      the version store, and what may follow what
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
+patches/kubelet-vX.Y/                per-minor shims, laid over the shared tree
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
 manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines

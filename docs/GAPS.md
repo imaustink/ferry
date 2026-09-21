@@ -88,9 +88,13 @@ Three bugs were found by running it, which is the argument for running it:
 
 What is still only reasoned about is a **minor** bump *on a running cluster*.
 Everything above is within v1.34, which drives every path except patch drift.
-Building across minors is no longer reasoned about: v1.34, v1.35 and v1.36
-kubelets all build, from one shared overlay plus a per-minor
+Building across minors is no longer reasoned about: v1.34, v1.35, v1.36 and
+v1.37 kubelets all build, from one shared overlay plus a per-minor
 `patches/kubelet-vX.Y/` carrying the two constructors whose signatures move.
+v1.37 also carries whole copies of `cadvisor_darwin.go` and
+`container_manager_darwin.go`: cadvisor merged `info/v1` and `info/v2` into one
+`lib/model` package, and an import path is not something a second file can
+override.
 What has not been done is draining a node and flipping a control plane across
 that boundary, and `build-kubelet.sh` failing loudly on a moved seam -- during
 the build, before anything is switched -- remains the best that can be said for
@@ -110,6 +114,27 @@ Known limits, which are not bugs:
   See [INSTALL.md](INSTALL.md).
 - **A minor bump is a different problem** -- porting `patches/` -- and this
   machinery does not claim to solve it.
+- ~~**More of `helpers_unsupported.go` leaks into Linux-guest decisions.**~~
+  **Closed**, and smaller than it looked. `kubelet_pods.go` carries no build
+  tag, so it compiles on darwin as written and reads `cm.MinShares` and
+  `cm.MinMilliCPULimit` -- Linux floors that file declares as `0` -- to decide
+  what a container's status reports, plus `cm.MilliCPUToShares` from v1.37.
+  `lib/overlay.sh` now rewrites it in place from the same rule table as the
+  derived files, so the same assertion covers it. Separately, the pod container
+  manager's `GetPodCgroupConfig` reported `not implemented`, which
+  `convertToAPIPodLevelResourcesStatus` logged as an error twice per pod per
+  sync; darwin answers *no configuration, no error* instead, which is the truth
+  here and what every caller already handles. Measured in
+  [experiments/23-pod-cpu-limits](../experiments/23-pod-cpu-limits/FINDINGS.md).
+
+  What is left of it is not a leak. `ResourceConfigForPod` returns `nil` on
+  darwin and upstream expects that on any platform without pod cgroups: it makes
+  in-place pod resize fail with a message naming the reason, which is the right
+  answer for a machine that cannot be resized after it boots, and it makes an
+  `emptyDir` memory volume fall back to node allocatable. `CPURequestsFromConfig`,
+  `CPULimitsFromConfig`, `MemoryLimitsFromConfig` and v1.37's
+  `CPUSharesEqualAfterV2RoundTrip` are only ever reached with the config that
+  `GetPodCgroupConfig` returns, so on darwin they are dead rather than wrong.
 
 ## Known, and deliberate
 
