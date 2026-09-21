@@ -643,6 +643,22 @@ succeeds "a ferry-built guest kubelet is marked as one" \
 succeeds "  and stage.sh keeps it instead of downloading" \
   grep -q 'kubelet.ferry-built' "$repo/experiments/17-node-vm/stage.sh"
 
+# The two durability barriers, both opt-in. Measured: ferry's etcd averages
+# 4.85ms per WAL fsync on APFS against kind's 0.88ms inside Docker's VM, and
+# a host fsync stalls the guest's disk too.
+succeeds "etcd's fsync can be turned off for a local cluster" \
+  grep -q 'unsafe-no-fsync' "$repo/control-plane/up.sh"
+succeeds "  behind an environment variable, not by default" \
+  grep -q 'FERRY_ETCD_NO_FSYNC' "$repo/control-plane/up.sh"
+succeeds "the node disk's barrier is a knob" \
+  grep -q 'FERRY_NODE_DISK_SYNC' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  still .fsync unless asked otherwise" \
+  grep -q 'default:     sync = .fsync' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+# "${a[@]}" with set -u on bash 3.2 -- which is the bash macOS ships -- is an
+# unbound variable, so the control plane would not start with the flag off.
+succeeds "  and an empty flag list does not break bash 3.2" \
+  grep -q 'etcd_fsync_args\[@\]+' "$repo/control-plane/up.sh"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

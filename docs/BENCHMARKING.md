@@ -238,6 +238,50 @@ Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s
 sandbox creation 0.063 vs 0.065s, container start 0.034 vs 0.045s. The remaining
 gap is not in any of them.
 
+### The port you curl may belong to someone else's cluster
+
+`curl 127.0.0.1:2379/metrics` returned etcd metrics, and they were not this
+cluster's. ferry shifts every port by the profile's index, so the profile
+under test had its etcd on 11379; 2379 was a different ferry entirely, left
+running by another worktree. The numbers looked entirely reasonable -- 5.13ms
+per WAL fsync, against the 4.85ms the right process turned out to be -- and
+the conclusion drawn from them happened to survive being re-measured, which
+is luck and not method.
+
+A localhost port is not an identifier. Find the process, confirm its
+`--data-dir` is the state directory under test, and read the port off that:
+
+```sh
+ps -Ao pid=,command= | grep "[b]in/versions/.*/etcd --data-dir=$FERRY_HOME"
+lsof -nP -iTCP -sTCP:LISTEN -a -p <pid>
+```
+
+The same applies to anything else this harness reaches by a fixed port on
+127.0.0.1. On a machine that runs more than one ferry -- which is every
+machine with more than one worktree -- the default port is the one *least*
+likely to be the cluster you mean.
+
+### Docker Desktop's VM has a cheaper fsync than macOS does
+
+Worth knowing before attributing anything to the runtime. ferry's etcd runs
+natively and averages 4.85ms per WAL fsync and 11.12ms per backend commit.
+kind's runs inside Docker Desktop's VM and averages 0.88ms and 1.78ms, on
+the same Mac and the same physical disk.
+
+kind's etcd is not better tuned. A guest fsync there reaches a virtual disk
+whose host-side durability Docker has already relaxed; ferry's reaches APFS
+and pays a real barrier. So the inner-platform layering that ought to cost
+kind something is buying it a cheap fsync, and any comparison of write-heavy
+paths between a native process and one inside Docker's VM is partly a
+comparison of how honest the two are being about durability.
+
+The corollary, which cost an afternoon to notice: an `F_FULLFSYNC` flushes
+the device cache, so it stalls whatever else is queued on that volume.
+`CreateContainer` runs inside the guest and got 4x faster when *etcd on the
+host* stopped fsyncing, with nothing in the guest changed. Processes that
+share a disk are not independent, and a profile taken of one of them will
+not show the other one causing its stalls.
+
 ### A tie is not the same as nothing to win
 
 Both bullets above are still true and the second conclusion drawn from the
