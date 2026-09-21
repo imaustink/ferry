@@ -479,10 +479,17 @@ check_binaries_run() {
 # available -- so ask softwareupdate what it has rather than guessing. The
 # removal is first because `softwareupdate --install` and `xcode-select
 # --install` both lay a version down beside whatever is already there.
+#
+# What --install matches is the Label, and the Label is not the Title:
+# softwareupdate lists `Label: Command Line Tools for Xcode 27.0-27.0` beside
+# `Title: Command Line Tools for Xcode 27.0`. The title is the readable one and
+# the one a person copies, and it fails with "No such update" -- so the line
+# below prints labels only, and says to pass one through verbatim rather than
+# retyping it.
 swift_install_hint() {
   echo "      sudo rm -rf /Library/Developer/CommandLineTools"
-  echo "      softwareupdate --list | grep 'Command Line Tools'   # pick one"
-  echo "      sudo softwareupdate --install \"Command Line Tools for Xcode <version>\""
+  echo "      softwareupdate --list | sed -n 's/^\* Label: \(.*Command Line Tools.*\)/\1/p'"
+  echo "      sudo softwareupdate --install \"<that label, copied exactly>\""
   echo "      ferry is built with Swift $SWIFT_RECOMMENDED; use the same one on every Mac."
 }
 
