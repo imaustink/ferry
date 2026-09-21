@@ -8,12 +8,25 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 KC_DIR="$BENCH_HOME/kubeconfigs"; mkdir -p "$KC_DIR"
 CLUSTER=bench
 
-# Docker Desktop's VM, recorded before any ferry VM exists so the two can be
-# told apart afterwards. Its parent is launchd, not Docker, so parentage is no
-# help -- it is simply the VM that was already there.
+# Docker Desktop's VM. Its parent is launchd, not Docker, so parentage is no
+# help; it is identified by the disk image it has open.
+#
+# It used to be "the first VM in the process table", on the reasoning that it
+# was the only one there before ferry started. That is true on an idle laptop
+# and false on this one -- a Claude sandbox VM and three orphaned ferry pod
+# VMs from other profiles were all ahead of it -- and picking the wrong one
+# puts an unrelated VM's memory in kind's column and leaves Docker's out.
 DOCKER_VM_PID_FILE="$BENCH_HOME/.docker-vm-pid"
 docker_vm_pid() { cat "$DOCKER_VM_PID_FILE" 2>/dev/null; }
-pin_docker_vm() { vm_pids | head -1 > "$DOCKER_VM_PID_FILE"; }
+pin_docker_vm() {
+  local pid
+  : > "$DOCKER_VM_PID_FILE"
+  for pid in $(vm_pids); do
+    if lsof -p "$pid" 2>/dev/null | grep -qF "com.docker.docker/Data/vms"; then
+      echo "$pid" > "$DOCKER_VM_PID_FILE"; return
+    fi
+  done
+}
 
 # Mode 2's node is sized to mirror Docker Desktop's VM, which is what kind and
 # minikube get to put their node in. Guest memory is lazily backed, so a ceiling
@@ -25,7 +38,22 @@ pin_docker_vm() { vm_pids | head -1 > "$DOCKER_VM_PID_FILE"; }
 # fixing it, for the record: ferry's 20-pod burst comes out the same at 10 and
 # at 16, so this was never the concurrency gap -- but a comparison that claims
 # to be matched should be matched.)
-MACHINE_CPUS="${MACHINE_CPUS:-$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 10)}"
+# Asked of Docker when it is running, and of the Mac when it is not -- the
+# ferry runs stop Docker Desktop on purpose, and Docker Desktop takes every
+# core by default, so the host's count is the same answer from the other side.
+#
+# Not `docker info ... || echo N`: with the daemon down, docker prints "0" on
+# *stdout* and exits 1, so the substitution captured "0\n10" and the Machine
+# manifest became `cpus: 0` followed by a bare `10` on its own line. Validated
+# rather than trusted, for that reason.
+machine_cpus_default() {
+  local v
+  v="$(docker info --format '{{.NCPU}}' 2>/dev/null | head -1)"
+  case "$v" in ''|*[!0-9]*|0) ;; *) echo "$v"; return ;; esac
+  v="$(sysctl -n hw.ncpu 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*|0) echo 10 ;; *) echo "$v" ;; esac
+}
+MACHINE_CPUS="${MACHINE_CPUS:-$(machine_cpus_default)}"
 MACHINE_MEM="${MACHINE_MEM:-15Gi}"
 
 # The Kubernetes the other stacks run, pinned to the one ferry is built at.

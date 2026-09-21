@@ -29,25 +29,82 @@ is nested, and there is no node VM in the path.
 
 ### Against kind and minikube, on one Mac
 
-| | up | first pod | memory |
-|---|---|---|---|
-| kind | 13.8 s | 10.3 s | 2354 MiB *of a VM you sized* |
-| minikube | 21.4 s | 1.0 s | 2200 MiB *of a VM you sized* |
-| **ferry** | **12.6 s** | **1.0 s** | **1047 MiB of the Mac** |
+Every stack on **Kubernetes v1.37.0**, one after another, each from a machine
+with the others shut down — and with Docker Desktop stopped for ferry's runs,
+because ferry does not use it and leaving 15.6 GiB of idle VM on the machine
+is not the baseline ferry actually has.
 
-Those two memory columns cannot be the same number, and the reason is the point.
-Docker Desktop on that Mac holds **15.6 GiB and 16 cpus before the first pod
+| | ferry | ferry, mode 2 | kind | minikube |
+|:--|--:|--:|--:|--:|
+| a pod is | its own VM | a container | a container | a container |
+| needs Docker Desktop | **no** | **no** | yes | yes |
+| create a cluster | **12.6 s** | 32.3 s | 25.4 s | 30.3 s |
+| delete it | 3.0 s | 8.3 s | **0.5 s** | 12.5 s |
+| start one pod | 0.48 s | **0.25 s** | 0.61 s | 0.60 s |
+| start 10 | 1.41 s | 0.76 s | **0.70 s** | 1.08 s |
+| start 20 | 3.51 s | 1.07 s | **0.93 s** | 2.18 s |
+| idle memory | **432 MiB of the Mac** | 1,490 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
+| idle CPU | **3.1%** | 13.1% | 24.4% | 29.0% |
+| per pod | 240 MiB | 9 MiB | 6 MiB | 16 MiB |
+
+CPU is percent of one core over a 60-second window with the cluster up and
+nothing scheduled. This Mac has sixteen.
+
+**The two memory columns cannot be the same number, and the reason is the
+point.** Docker Desktop holds **15.6 GiB and 16 CPUs before the first pod
 exists**, so a pod on kind costs the Mac nothing extra — it costs a slice of a
-VM already taken, and when the slice is gone, pods stop fitting. ferry reserves
-nothing, and a pod costs 237 MiB of real memory. An idle single-node cluster
-costs kind and minikube 2.2–2.4 GiB of their VM before any workload runs.
+VM already taken, and when the slice is gone, pods stop fitting. Before any
+cluster at all, Docker Desktop was already charging this Mac 1.7 GiB and 7% of
+a core. ferry reserves nothing: an idle mode 1 cluster is 432 MiB of real
+memory and 3.1% of one core, and there is no VM to size.
 
-Measured with [experiment 21](experiments/21-density-vs-kind-minikube/FINDINGS.md),
-which is also honest about what it could not measure: one run per stack, kind's
-first-pod time probably includes an image pull, and mode 2 did not complete.
-The 237 MiB per pod independently reproduces
-[experiment 13](experiments/13-shared-kernel-cost/FINDINGS.md)'s 226 MiB by a
-different method.
+Mode 1 trades memory for isolation and does not hide it — a pod is a VM with
+its own kernel, and 240 MiB each is what that costs. Mode 2 is the other end:
+9 MiB a pod, on kind's own basis (read inside the guest, the way kind is
+read), and still no Docker.
+
+**Where ferry is slower, it is slower.** kind creates 20 pods faster than
+ferry mode 2 out of the box, deletes a cluster in half a second against
+ferry's three, and costs less per pod. Mode 2 also takes 32 s to create,
+because it is a mode 1 control plane with a Linux node booted on top of it.
+
+That 20-pod row is the one number here that moves a lot on a flag:
+
+| ferry mode 2 | default | `FERRY_ETCD_NO_FSYNC=1 FERRY_NODE_DISK_SYNC=none` |
+|:--|--:|--:|
+| start one pod | 0.25 s | **0.26 s** |
+| start 10 | 0.76 s | **0.29 s** |
+| start 20 | 1.07 s | **0.40 s** |
+
+Both default to off, because they relax durability and that is the cluster's
+data. On a cluster you recreate on demand they are close to free, and they
+take the 20-pod burst from behind kind to **2.3× ahead** of it. Most of what
+they buy back is fsync: ferry's etcd runs natively on APFS and pays a real
+barrier per write, while kind's runs inside Docker Desktop's VM, where a guest
+fsync reaches a virtual disk whose host-side durability Docker has already
+relaxed.
+
+Measured by [experiment 24](experiments/24-benchmark-harness/FINDINGS.md) on:
+
+| | |
+|:--|:--|
+| machine | MacBook Pro, Apple M4 Max, 16 cores (12P + 4E), 128 GB |
+| macOS | 26.6.2 (25G83), APFS on the internal SSD |
+| Docker Desktop | 29.2.1 — its VM sized 16 CPUs / 15.6 GiB |
+| kind / minikube | v0.32.0 / v1.38.1 |
+| Kubernetes | v1.37.0 on all four |
+
+**What it does not establish.** One run per stack, so these are the shape of
+the difference and not three significant figures. Pod-start times are polled
+rather than watched and carry roughly 40 ms of the harness's own loop —
+watched, mode 2's single pod is nearer 190 ms. Memory is read where each stack
+keeps it: on the Mac for ferry, inside Docker's VM for kind and minikube,
+which is the only way to compare them and is not the same instrument twice.
+Disk is deliberately not in the table: ferry's figure would include the node
+image it boots and kind's would not, because that image is shared with every
+other cluster kind makes. The per-pod figures for kind and mode 2 are a few
+MiB read inside a guest and are noisy at this scale — the 10-pod cell put kind
+at 0.9 MiB a pod and the 20-pod cell at 5.8.
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause

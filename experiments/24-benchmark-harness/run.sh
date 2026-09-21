@@ -19,7 +19,20 @@ QUIESCE="${QUIESCE:-45}"
 CPU_WINDOW="${CPU_WINDOW:-60}"
 # Unset means "wherever the scheduler likes", which for ferry2 is both modes at
 # once. node_selector_of pins the stacks that need it; see stacks.sh.
-NODE_SELECTOR="${NODE_SELECTOR:-$(node_selector_of "$STACK")}"
+#
+# The trailing newline is part of the value, because the template below splices
+# it in ahead of `containers:` on the next line -- which is how altbench.sh and
+# pleg.sh spell it, as $'...\n'. Command substitution strips trailing newlines,
+# so taking it from node_selector_of dropped it and produced
+#
+#   nodeSelector: {ferry.dev/mode: shared}      containers:
+#
+# on one line. Every ferry2 battery run since the selector was added died at
+# the first apply with a YAML parse error twelve lines from the cause.
+if [ -z "${NODE_SELECTOR+set}" ]; then
+  NODE_SELECTOR="$(node_selector_of "$STACK")"
+  [ -n "$NODE_SELECTOR" ] && NODE_SELECTOR="$NODE_SELECTOR"$'\n'
+fi
 
 kc=""; ctx=""
 say() { printf '\n== %s: %s\n' "$STACK" "$*"; }

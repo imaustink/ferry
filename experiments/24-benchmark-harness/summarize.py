@@ -134,5 +134,11 @@ if len(STACKS) > 1 and "ferry" in STACKS:
         ob, os_ = mem_added(s), per_pod(s, counts[-1])
         if None in (fb, fs, ob, os_) or fs == os_: continue
         x = (ob - fb) / (fs - os_)
-        print(f"- ferry costs less than **{s}** below **{x:.1f} pods**, more above "
-              f"(before counting Docker Desktop itself, which only {s} needs).")
+        # Only the Docker-based stacks pay for Docker Desktop. ferry2 is a
+        # ferry mode and needs it no more than ferry does; saying otherwise
+        # was a formatting string that never checked which stack it was on.
+        extra = ("" if s.startswith("ferry") else
+                 ", before counting Docker Desktop itself, which only "
+                 f"{s} needs")
+        print(f"- ferry costs less than **{s}** below **{x:.1f} pods**, "
+              f"more above{extra}.")
