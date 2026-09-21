@@ -3185,6 +3185,15 @@ cmd_down() {
   # than insisting on what used to be here.
   if [ -n "$purge" ]; then
     rm -f "$FERRY_HOME/version" "$FERRY_HOME/version.previous"
+    # A Machine's disk is removed by ferry-machined's finalizer, which runs when
+    # the object is deleted through the API. --purge does not delete objects, it
+    # deletes etcd -- so every Machine vanishes without its finalizer ever
+    # running, and the disk it owned is left behind with nothing that references
+    # it and no command that removes it. They are ~550 MiB each and they
+    # accumulate: a checkout used for a few dozen machines had 19 GiB of them.
+    # Purging the cluster has to take them, because nothing else ever will.
+    [ -n "${FERRY_HOME:-}" ] && [ "$FERRY_HOME" != "/" ] && [ "$FERRY_HOME" != "$HOME" ] \
+      && rm -rf "${FERRY_HOME:?}/machined"
     ok "cluster data purged"
   fi
   # The peers file is deliberately not removed: it is what tells the next
