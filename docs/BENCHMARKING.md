@@ -238,6 +238,30 @@ Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s
 sandbox creation 0.063 vs 0.065s, container start 0.034 vs 0.045s. The remaining
 gap is not in any of them.
 
+### A very regular number is a rate limiter, and small ones are not logged
+
+The last thing standing between ferry and kind on a 20-pod burst was the pod
+statuses landing 39.6ms apart -- min 2.7ms, max 41.7ms. That regularity is
+the finding. Real work is variable; a token bucket is not.
+
+It was `kubeAPIQPS`, which defaults to 50: one token per 20ms, two spent per
+pod, so 40ms a pod with every container already running. Three things made it
+hard to see, and all three generalise:
+
+- **client-go only logs a throttle wait over 50ms.** At 20ms a token nothing
+  appears in the log at any verbosity, so "grep for throttling, found none"
+  is not evidence that there is none.
+- **`rest_client_rate_limiter_duration_seconds` is cumulative across every
+  goroutine**, so both stacks showed seconds of it and the comparison said
+  nothing. It does not tell you whether the wait was on the critical path.
+- **Per-operation latency was identical on both stacks.** A sequential PATCH
+  is 2.07ms from inside ferry's node and 2.02ms from inside kind's. Measuring
+  the operation harder would never have found this; what found it was
+  measuring the *gap between* operations.
+
+So when a sequence is slower than the sum of its parts, stop timing the parts
+and time the spacing.
+
 ### The port you curl may belong to someone else's cluster
 
 `curl 127.0.0.1:2379/metrics` returned etcd metrics, and they were not this
