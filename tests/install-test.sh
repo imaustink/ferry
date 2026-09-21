@@ -719,6 +719,26 @@ succeeds "the guest's startup diagnostics do not block its readiness" \
 succeeds "karpenter's health probe port is shifted like the rest" \
   grep -q 'health-probe-port' "$repo/ferry"
 
+# Durability, as a flag rather than two environment variables nobody finds.
+# Full is the default because it is the guarantee kind and minikube cannot
+# offer at all; relaxed is worth 3x on a pod start and is the caller's call.
+succeeds "durability is a flag on ferry up" \
+  grep -q 'durability relaxed to trade crash-safety for speed' "$repo/ferry"
+succeeds "  validated rather than trusted" \
+  grep -q "expected 'full' or 'relaxed'" "$repo/ferry"
+succeeds "  remembered for the cluster, the way machines is" \
+  grep -q 'DURABILITY_MARKER=' "$repo/ferry"
+succeeds "  and it reaches etcd" \
+  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed' "$repo/ferry"
+succeeds "  and the machine disks, so mode 2 does not disagree with mode 1" \
+  grep -q 'FERRY_NODE_DISK_SYNC="$(durability_is_relaxed' "$repo/ferry"
+# A relaxed cluster that looks like a full one is the failure mode worth
+# preventing: it is only ever discovered after something is lost.
+succeeds "  a relaxed cluster says so every time it starts" \
+  grep -q 'writes are acknowledged before they reach the disk' "$repo/ferry"
+succeeds "  and ferry status says which one you are on" \
+  test "$(grep -c 'durability_is_relaxed' "$repo/ferry")" -ge 4
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

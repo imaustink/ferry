@@ -18,7 +18,15 @@ for line in raw.read_text().splitlines():
     if len(p) == 3:
         d[p[0]][p[1]] = p[2]
 
-STACKS = [s for s in ("ferry", "ferry2", "kind", "minikube") if s in d]
+# The order columns appear in, and the only names this knows about. The
+# relaxed variants are the same stacks with `--durability relaxed`, recorded
+# under their own tag by the runner; without them here they sat in raw.tsv
+# and never reached a table, which is a quiet way to lose half a comparison.
+STACK_ORDER = ("ferry", "ferryrelaxed", "ferry2", "ferry2relaxed",
+               "kind", "minikube")
+LABELS = {"ferryrelaxed": "ferry, relaxed", "ferry2": "ferry, mode 2",
+          "ferry2relaxed": "ferry, mode 2, relaxed"}
+STACKS = [s for s in STACK_ORDER if s in d]
 
 def n(s, k):
     try:    return float(d[s][k])
@@ -32,7 +40,7 @@ def row(label, fn):
 
 def table(title, rows, note=None):
     print(f"\n### {title}\n")
-    print("| | " + " | ".join(STACKS) + " |")
+    print("| | " + " | ".join(LABELS.get(s, s) for s in STACKS) + " |")
     print("|:--" + "|--:" * len(STACKS) + "|")
     for r in rows: print(r)
     if note: print(f"\n{note}")
@@ -64,9 +72,15 @@ table("What each stack actually is", [
         "native macOS processes" if s.startswith("ferry") else "static pods in a container"),
     row("API server platform", lambda s: d[s].get("platform", "—")),
     row("a pod is", lambda s:
-        "its own VM, own kernel" if s == "ferry" else "a container on a shared kernel"),
+        "its own VM, own kernel" if s in ("ferry", "ferryrelaxed")
+        else "a container on a shared kernel"),
     row("pods at rest", lambda s: d[s].get("idle_syspods", "—")),
     row("needs Docker Desktop", lambda s: "no" if s.startswith("ferry") else "yes"),
+    # The row kind and minikube have no answer to. etcd inside Docker's VM
+    # acknowledges a commit before it is on the drive; ferry at full
+    # durability does not.
+    row("writes survive power loss", lambda s:
+        "no" if (s.endswith("relaxed") or not s.startswith("ferry")) else "yes"),
 ])
 
 table("Cluster lifecycle", [

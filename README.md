@@ -34,18 +34,31 @@ with the others shut down — and with Docker Desktop stopped for ferry's runs,
 because ferry does not use it and leaving 15.6 GiB of idle VM on the machine
 is not the baseline ferry actually has.
 
-| | ferry | ferry, mode 2 | kind | minikube |
-|:--|--:|--:|--:|--:|
-| a pod is | its own VM | a container | a container | a container |
-| needs Docker Desktop | **no** | **no** | yes | yes |
-| create a cluster | **12.8 s** | 26.4 s | 25.4 s | 30.3 s |
-| delete it | 0.85 s | 0.65 s | **0.47 s** | 12.5 s |
-| start one pod | 0.47 s | **0.34 s** | 0.61 s | 0.60 s |
-| start 10 | 1.21 s | **0.61 s** | 0.70 s | 1.08 s |
-| start 20 | 3.51 s | 1.16 s | **0.93 s** | 2.18 s |
-| idle memory | **430 MiB of the Mac** | 1,481 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
-| idle CPU | **3.6%** | 12.8% | 24.4% | 29.0% |
-| per pod | 240 MiB | 9 MiB | 6 MiB | 16 MiB |
+| | ferry | ferry `relaxed` | mode 2 | mode 2 `relaxed` | kind | minikube |
+|:--|--:|--:|--:|--:|--:|--:|
+| a pod is | its own VM | its own VM | a container | a container | a container | a container |
+| needs Docker Desktop | **no** | **no** | **no** | **no** | yes | yes |
+| writes survive power loss | **yes** | no | **yes** | no | no | no |
+| create a cluster | 12.8 s | **10.9 s** | 26.4 s | 24.7 s | 25.4 s | 30.3 s |
+| delete it | 0.85 s | 0.54 s | 0.65 s | 0.70 s | **0.47 s** | 12.5 s |
+| start one pod | 0.47 s | 0.44 s | 0.34 s | **0.20 s** | 0.61 s | 0.60 s |
+| start 10 | 1.21 s | 1.21 s | 0.61 s | **0.29 s** | 0.70 s | 1.08 s |
+| start 20 | 3.51 s | 3.30 s | 1.16 s | **0.39 s** | 0.93 s | 2.18 s |
+| idle memory | **430 MiB** | **430 MiB** | 1,481 MiB | 1,537 MiB | 695 MiB | 667 MiB |
+| ↳ taken from | the Mac | the Mac | the Mac | the Mac | a VM you sized | a VM you sized |
+| idle CPU | 3.6% | **2.3%** | 12.8% | 12.2% | 24.4% | 29.0% |
+| per pod | 240 MiB | 241 MiB | 9 MiB | 9 MiB | **6 MiB** | 16 MiB |
+
+`relaxed` is `ferry up --durability relaxed`, explained below. The four ferry
+columns are two choices, not four products: a pod is either its own VM or a
+container on a shared one, and writes either reach the disk before they are
+acknowledged or they do not.
+
+**Relaxed buys mode 2 a great deal and mode 1 almost nothing** — 0.34 s to
+0.20 s a pod against 0.47 s to 0.44 s. That is the honest shape of it: mode
+1's pod start is a virtual machine booting, and no disk barrier was ever the
+thing holding it up. If you want the fast numbers you want mode 2, and if you
+want one kernel per pod you are paying for the kernel, not for `fsync`.
 
 CPU is percent of one core over a 60-second window with the cluster up and
 nothing scheduled. This Mac has sixteen.
@@ -109,24 +122,46 @@ work:
 cluster is meant to come back, the ticks are 50 ms, the diagnostics run in the
 background, and karpenter's port is shifted with the rest.
 
-That 20-pod row is the one number here that moves a lot on a flag:
+### Durability is a choice, and it is yours
 
-| ferry mode 2 | default | `FERRY_ETCD_NO_FSYNC=1 FERRY_NODE_DISK_SYNC=none` |
-|:--|--:|--:|
-| start one pod | 0.34 s | **0.20 s** |
-| start 10 | 0.61 s | **0.29 s** |
-| start 20 | 1.16 s | **0.39 s** |
+The row that says **writes survive power loss** is the one to read first,
+because it is the only row where kind and minikube have no answer.
 
-Both default to off, because they relax durability and that is the cluster's
-data. On a cluster you recreate on demand they are close to free, and they
-take the 20-pod burst from behind kind to **2.4× ahead** of it.
+`ferry up` defaults to **full** durability: every etcd commit reaches the SSD
+before it is acknowledged. Nothing else in this table does that. kind and
+minikube run etcd inside Docker Desktop's Linux VM, where the same call
+reaches a disk image on the host — acknowledged, not yet durable. Pull the
+power mid-write and they can lose commits the API server already confirmed.
 
-What they buy back is one syscall, and it is worth understanding, because it
-is most of what is left between ferry and kind. macOS has two durability
-calls: `fsync(2)` hands the data to the OS, and `fcntl(F_FULLFSYNC)` flushes
-the drive's own write cache. Go's `os.File.Sync()` is `F_FULLFSYNC` on
-darwin and `fsync(2)` on linux — and etcd is Go. Measured on this Mac, same
-SSD:
+That guarantee is not free, and it is not always wanted:
+
+```sh
+ferry up                        # full durability, the default
+ferry up --durability relaxed   # speed instead, remembered for this cluster
+```
+
+| | mode 2 `full` | mode 2 `relaxed` | mode 1 `full` | mode 1 `relaxed` |
+|:--|--:|--:|--:|--:|
+| start one pod | 0.34 s | **0.20 s** | 0.47 s | 0.44 s |
+| start 20 | 1.16 s | **0.39 s** | 3.51 s | 3.30 s |
+| an etcd commit | 9.7 ms | **0.14 ms** | 9.7 ms | 0.14 ms |
+| survives power loss | **yes** | no | **yes** | no |
+
+In mode 2 that is 2.4× kind on a 20-pod burst and 3× on a single pod — the
+fastest thing in the table. In mode 1 it is nearly free of effect, because a
+pod there is a virtual machine booting and `fsync` was never what it was
+waiting for. The flag is worth reaching for on mode 2 and worth skipping on
+mode 1.
+
+It is the right setting for a cluster you recreate from a script, and the
+wrong one for a cluster holding something you would have to rebuild by hand.
+`ferry status` says which one you are on, and `ferry up` warns every time it
+starts a relaxed cluster, so it cannot become a thing you forgot.
+
+**Why the gap exists at all.** macOS has two durability calls: `fsync(2)`
+hands the data to the OS, and `fcntl(F_FULLFSYNC)` flushes the drive's own
+write cache. Go's `os.File.Sync()` is `F_FULLFSYNC` on darwin and `fsync(2)`
+on linux — and etcd is Go. Measured on this Mac, same SSD:
 
 | | |
 |:--|--:|
@@ -134,12 +169,11 @@ SSD:
 | **`F_FULLFSYNC`, natively on macOS** | **3.961 ms** |
 | `fsync(2)`, inside Docker Desktop's VM | 0.042 ms |
 
-So ferry's etcd asks the SSD to flush on every commit and waits ~4 ms for it;
-kind's etcd, on Linux inside Docker's VM, makes the same Go call and it
-compiles to the cheap one — then lands in a disk image on the host rather
-than on the drive. The same line of code, 128× apart, decided by which
-kernel it was built for. kind is not skipping a step ferry takes; it is
-running where that step is not offered.
+So ferry's etcd, running natively, asks the SSD to flush on every commit and
+waits ~4 ms for it. kind's etcd makes the identical Go call on Linux, where
+it compiles to the cheap one. The same source line, 128× apart, decided by
+which kernel it was built for. kind is not skipping a step ferry takes — it
+is running where that step is not offered, and it cannot opt back in.
 
 Measured by [experiment 24](experiments/24-benchmark-harness/FINDINGS.md) on:
 
