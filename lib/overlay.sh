@@ -139,3 +139,58 @@ ferry_check_derived_darwin() { # darwin-or-rewritten-file
   done < <(ferry_overlay_guards)
   return "$found"
 }
+
+# --- pacing that is upstream's default and not ferry's ---------------------
+
+# Shorten the volume manager's poll intervals, in place.
+#
+# A pod whose only volume is its projected serviceaccount token waits 301ms
+# between "Waiting for volumes to attach and mount" and "All volumes are
+# attached and mounted", and 10ms of that is the mount. The rest is three
+# sleeps: the populator's loop notices the volume, the reconciler's next tick
+# verifies it, the tick after that mounts it. Measured with the kubelet's own
+# --v=4 log in experiments/24-benchmark-harness (syncphases.py); kind measures
+# 301ms too, so this is upstream's pacing rather than anything ferry does.
+#
+# Upstream's numbers suit a node reconciling hundreds of pods with
+# network-attached volumes, where a tighter loop is real work against an API
+# server and a cloud provider. A ferry node is one developer's machine with
+# local volumes, and the same loop is three sleeps on the critical path of
+# every pod start -- worth 279ms of a 710ms pod on the measurement that
+# prompted this.
+#
+# Here rather than in build-kubelet.sh because the guest kubelet mode 2 boots
+# wants exactly the same rewrite and none of the darwin overlay around it.
+ferry_shorten_volume_polls() { # kubernetes-source-dir
+  local f="$1/pkg/kubelet/volumemanager/volume_manager.go"
+  [ -f "$f" ] || { echo "no $f" >&2; return 1; }
+
+  # Each is "name = <n> * time.Millisecond" on one line, tab-indented inside a
+  # const block. Anchored on the name so a duration elsewhere cannot be caught
+  # by accident, and [[:space:]] rather than \t because BSD sed does not read
+  # \t as a tab in a pattern -- it matches nothing and leaves the build quietly
+  # at upstream's pacing. Indentation comes back through the capture group.
+  #
+  # [0-9]* on the left makes this idempotent: the source tree is reused between
+  # builds, so this runs again over numbers it already wrote.
+  sed -i '' \
+    -e "s/^\([[:space:]]*reconcilerLoopSleepPeriod *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_RECONCILE_MS:-10} * time.Millisecond/" \
+    -e "s/^\([[:space:]]*desiredStateOfWorldPopulatorLoopSleepPeriod *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_POPULATE_MS:-10} * time.Millisecond/" \
+    -e "s/^\([[:space:]]*podAttachAndMountRetryInterval *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_RETRY_MS:-20} * time.Millisecond/" \
+    "$f"
+
+  # Verified rather than assumed. A constant upstream renames, moves, or
+  # respells as `time.Duration(100) * time.Millisecond` leaves the sed matching
+  # nothing and the build silently back at upstream's pacing -- a regression
+  # with nothing anywhere pointing at it.
+  local want
+  for want in \
+    "reconcilerLoopSleepPeriod = ${FERRY_VOLUME_RECONCILE_MS:-10} \* time.Millisecond" \
+    "desiredStateOfWorldPopulatorLoopSleepPeriod = ${FERRY_VOLUME_POPULATE_MS:-10} \* time.Millisecond" \
+    "podAttachAndMountRetryInterval = ${FERRY_VOLUME_RETRY_MS:-20} \* time.Millisecond"; do
+    grep -qE "$want" "$f" || {
+      echo "could not set: $want" >&2
+      echo "upstream moved or respelled it; see ferry_shorten_volume_polls" >&2
+      return 1; }
+  done
+}

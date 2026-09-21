@@ -422,19 +422,76 @@ both other stacks measured before.
 This is the default path. `ferry up` is mode 1; mode 2 is opt-in behind
 `ferry machines enable`.
 
-### What is left
+### Mode 2 as well
 
-Mode 2 still pays the 300ms, and mode 2 is the configuration that competes
-with kind on bursts. Building a linux/arm64 kubelet from the same source with
-the same rewrite would put it near 230ms, but it cannot simply reuse this
-build: `build-kubelet.sh` overlays that source tree for darwin, adding
-`_darwin.go` files and rewriting `kubelet_pods.go` in place, so a linux build
-needs its own clean extraction rather than a second `GOOS` over the same
-tree.
+`build-kubelet-linux.sh` builds the guest kubelet from the same source with
+the same rewrite and nothing else, into `experiments/17-node-vm/stage/`, where
+`stage.sh` would otherwise download upstream's. It is deliberately not
+`build-kubelet.sh` with a different `GOOS`: that script exists to make a
+kubelet run on macOS at all, and none of its darwin shims belong in a Linux
+build. It leaves a `kubelet.ferry-built` marker, because the two binaries are
+otherwise indistinguishable and a stale one would read as a regression
+somewhere else.
 
-And the concurrency gap this PR started on is untouched by any of it. The
-300ms was a flat tax on every pod; the staircase is `create` to `sandbox
-created` stretching under load, and that is still open.
+Single pod, `timeline.py`, n=7, everything v1.37.0, one machine one session:
+
+| single pod, apply to Running | before | after |
+|:--|--:|--:|
+| ferry mode 2 | 501ms | **229ms** |
+| ferry mode 1 | 710ms | **406ms** |
+| kind | 500ms | 500ms |
+
+**Mode 2 starts a pod in under half the time kind does.** The guest kubelet's
+own log agrees: the volume wait there is 41ms, of which 16ms is the mount,
+against 301ms/10ms before.
+
+## What this did not fix: the burst
+
+Three alternating rounds of 20 pods, after the patch:
+
+| 20-pod burst | ferry mode 2 | kind |
+|:--|--:|--:|
+| first pod | 743ms | **627ms** |
+| last pod | 1080ms | **877ms** |
+
+Against ferry's own pre-patch runs in the same session (last pod 1183ms and
+1186ms), the tail moved about 100ms. **kind still wins the 20-pod burst, and
+the single-pod win does not carry over to it.**
+
+What did change is the shape. Inside syncPod the staircase is gone:
+
+| mode 2, 20-pod burst | before | after |
+|:--|--:|--:|
+| TOTAL admit to SyncPod exit, early pods | 655ms | 655ms |
+| TOTAL admit to SyncPod exit, late pods | 892ms | 677ms |
+| the stretch | +245 | **+22** |
+| `create` to `sandbox created`, early | 95ms | 258ms |
+| `create` to `sandbox created`, late | 356ms | 262ms |
+
+Before, the volume loops released pods into the runtime a few at a time over
+~400ms, and each wave found containerd freer than the last, so the early pods
+looked fast and the late ones slow. Now all twenty arrive together and every
+one of them takes the same 260ms. The work did not get cheaper; it stopped
+being staggered, which is why the tail improves and the first pod does not.
+
+### The lead that replaces the old one
+
+With the volume wait out of the way, the two segments where ferry is behind
+kind in a burst are both after the sandbox is asked for:
+
+| mode 2, 20-pod burst, median | ferry | kind |
+|:--|--:|--:|
+| `create` to `sandbox created` | 260ms | 155ms |
+| `sandbox created` to `SyncPod exit` | 344ms | 157ms |
+
+The second is the larger and is container create plus start, which no
+instrument here has priced on its own -- `criconc.sh` measured RunPodSandbox
+and `ctrconc.sh` measured `ctr` with no kubelet in the way. That is the thing
+to measure next, and it is a different question from the one this PR opened
+with.
+
+Single rounds behind the phase tables; the alternating three are the burst
+row. Direction, not magnitudes.
 
 ## Running it
 

@@ -617,6 +617,32 @@ succeeds "  and the guest hands it to --v" \
 succeeds "  defaulting to 2 when nothing asks" \
   grep -q 'KUBELET_V:-2' "$repo/experiments/18-node-image/init.sh"
 
+# The volume manager's poll intervals. Three unexported constants upstream
+# exposes through no flag, worth ~270ms on every pod start, and the reason
+# ferry compiling its own kubelet is worth anything at all here.
+succeeds "the volume manager's poll intervals are shortened in one place" \
+  grep -q 'ferry_shorten_volume_polls()' "$repo/lib/overlay.sh"
+succeeds "  the mac kubelet gets it" \
+  grep -q 'ferry_shorten_volume_polls' "$repo/build-kubelet.sh"
+succeeds "  and so does the guest's" \
+  grep -q 'ferry_shorten_volume_polls' "$repo/build-kubelet-linux.sh"
+# A constant upstream renames leaves the sed matching nothing and the build
+# silently back at 100ms, which is a regression with nothing pointing at it.
+succeeds "  and the build fails if a constant moved" \
+  grep -q 'could not set' "$repo/lib/overlay.sh"
+# BSD sed does not read \t as a tab in a pattern; the version that spelled it
+# that way matched nothing and looked like it had worked.
+succeeds "  matching indentation without relying on \\t" \
+  grep -q 'reconcilerLoopSleepPeriod' "$repo/lib/overlay.sh"
+succeeds "the guest kubelet is stamped with its version" \
+  grep -q 'gitVersion=\$GUEST_VERSION' "$repo/build-kubelet-linux.sh"
+# Upstream's download and ferry's build are the same version and the same
+# name; without the marker there is no way to tell which one got baked in.
+succeeds "a ferry-built guest kubelet is marked as one" \
+  grep -q 'kubelet.ferry-built' "$repo/build-kubelet-linux.sh"
+succeeds "  and stage.sh keeps it instead of downloading" \
+  grep -q 'kubelet.ferry-built' "$repo/experiments/17-node-vm/stage.sh"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

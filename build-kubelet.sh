@@ -258,57 +258,12 @@ if [ -f "$pods_file" ]; then
   echo "    ~ pkg/kubelet/kubelet_pods.go"
 fi
 
-# The volume manager's poll intervals.
-#
-# Measured with the kubelet's own --v=4 log (experiments/24-benchmark-harness,
-# syncphases.py): a pod with nothing but its projected serviceaccount token
-# waits 301ms between "Waiting for volumes to attach and mount" and "All
-# volumes are attached and mounted", and 10ms of that is the mount. The rest
-# is three sleeps -- the populator's loop notices the volume, the reconciler's
-# next tick verifies it, the tick after that mounts it. kind measures 301ms
-# too, because this is upstream's pacing and not anything either stack does.
-#
-# Upstream picks 100ms for a kubelet that may be reconciling hundreds of pods
-# with network-attached volumes, where a tighter loop is real work against an
-# API server and a cloud provider. A ferry node is one developer's machine
-# with local volumes, and the same loop is three sleeps on the critical path
-# of every pod start. ~250ms, on every pod, single or burst.
-#
-# Rewritten where they lie rather than overlaid: they are three unexported
-# constants in a file ferry otherwise has no opinion about, and carrying a
-# whole copy of volume_manager.go per minor to change three numbers would be
-# a much larger thing to keep in step with upstream.
+# The volume manager's poll intervals, which are upstream's pacing rather than
+# anything ferry chose. See ferry_shorten_volume_polls in lib/overlay.sh for
+# the measurement and the reasoning; the guest kubelet mode 2 boots gets the
+# same rewrite, which is why it lives there and not here.
 echo "==> shortening the volume manager's poll intervals"
-vm_file="$src/pkg/kubelet/volumemanager/volume_manager.go"
-[ -f "$vm_file" ] || { echo "    !! no $vm_file" >&2; exit 1; }
-# Each is "name = <n> * time.Millisecond" on one line, tab-indented inside a
-# const block. Anchored on the name so a duration elsewhere in the file cannot
-# be caught by accident, and [[:space:]] rather than \t because BSD sed does
-# not read \t as a tab in a pattern -- it would match nothing here and leave
-# the build quietly at upstream's pacing. The indentation comes back through
-# the capture group rather than being respelled.
-#
-# [0-9]* on the left makes this idempotent: build-kubelet.sh reuses an
-# extracted source tree between builds, so this runs again over numbers it
-# already wrote, and a changed override still takes.
-sed -i '' \
-  -e "s/^\([[:space:]]*reconcilerLoopSleepPeriod *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_RECONCILE_MS:-10} * time.Millisecond/" \
-  -e "s/^\([[:space:]]*desiredStateOfWorldPopulatorLoopSleepPeriod *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_POPULATE_MS:-10} * time.Millisecond/" \
-  -e "s/^\([[:space:]]*podAttachAndMountRetryInterval *= *\)[0-9]* \* time.Millisecond/\1${FERRY_VOLUME_RETRY_MS:-20} * time.Millisecond/" \
-  "$vm_file"
-# Verified rather than assumed. A constant upstream renames, moves to another
-# file, or respells as `time.Duration(100) * time.Millisecond` leaves the sed
-# matching nothing and the build silently back at upstream's pacing -- which
-# would show up as a performance regression nobody could find, months later.
-for want in \
-  "reconcilerLoopSleepPeriod = ${FERRY_VOLUME_RECONCILE_MS:-10} \* time.Millisecond" \
-  "desiredStateOfWorldPopulatorLoopSleepPeriod = ${FERRY_VOLUME_POPULATE_MS:-10} \* time.Millisecond" \
-  "podAttachAndMountRetryInterval = ${FERRY_VOLUME_RETRY_MS:-20} \* time.Millisecond"; do
-  grep -qE "$want" "$vm_file" || {
-    echo "    !! could not set: $want" >&2
-    echo "    upstream moved or respelled it; see the note above this block" >&2
-    exit 1; }
-done
+ferry_shorten_volume_polls "$src" || exit 1
 echo "    ~ pkg/kubelet/volumemanager/volume_manager.go"
 
 echo "==> building darwin/arm64 kubelet ($K8S_VERSION)"
