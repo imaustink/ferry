@@ -633,6 +633,54 @@ sandbox and container work, which is now flat across the burst rather than a
 staircase -- there is no queue left to find. The next real gain would have to
 come from making the runtime itself faster, not from removing a wait.
 
+## Teardown
+
+`ferry down --purge` was 3.9s in mode 1 and 8.1s in mode 2, against kind's
+0.47s. Timed per printed step, almost none of it was work:
+
+| mode 1, 3.9s | |
+|:--|--:|
+| fixed `sleep 1` after the service proxy | ~1000 ms |
+| ferry-cri releasing its vmnet network | ~500 ms |
+| **the control plane** | **~2200 ms** |
+| six other components, 11-29ms each | ~90 ms |
+| purge | ~20 ms |
+
+Inside the control plane, kube-scheduler and kube-controller-manager exit in
+**0ms**. All of it is kube-apiserver draining its watches -- 2.2s in mode 1,
+and in mode 2 it does not finish inside the 5s grace and is killed anyway,
+which is where that stack's extra four seconds went.
+
+Three causes, all of them waiting rather than working:
+
+- **The drain runs even when the data is about to be deleted.** `--purge`
+  removes `$STATE/etcd` a few milliseconds later, so the API server was
+  settling state on its way to the bin. `--purge` now stops it without the
+  drain; a plain `ferry down` keeps it, because that cluster is meant to come
+  back. Checked by writing a configmap, running `ferry down`, bringing it up
+  and reading the configmap.
+- **Every teardown loop polled at 0.5s** for processes that exit in tens of
+  milliseconds. `ferry_await_exit` and `ferry_await_gone` poll at 50ms with
+  the same ten seconds of patience.
+- **A fixed `sleep 1`** for ferry-proxy. Replacing it with an ordinary wait
+  made teardown *four times worse* (3.9s to 12.9s): ferry-proxy does not exit
+  on SIGTERM at all, and the `sudo pkill` further down is what has always
+  ended it. It gets 250ms and then the kill that was always coming.
+
+| purge teardown | before | after |
+|:--|--:|--:|
+| mode 1 | 3940 ms | **1160 ms** |
+| mode 2 | 8100 ms | **1530 ms** |
+| kind, for scale | 470 ms | 470 ms |
+
+What is left is real: ~70ms a component to stop and be seen to stop, 137ms
+for ferry-node to give back its vmnet network, 149ms for the control plane.
+
+The general shape is the one from the rate limiter: a very regular number is
+a policy, not a cost. Half-second ticks and a one-second sleep are both
+somebody's round number, and neither had been measured against what it was
+waiting for.
+
 ## Running it
 
 ```sh
