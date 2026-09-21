@@ -3233,10 +3233,11 @@ cmd_down() {
     # wait sat out its full timeout every time. The point of the pause is that
     # the listener has released its ports before the next `ferry up`, which a
     # kill achieves and patience does not.
-    # A quarter of a second of courtesy, then the kill that was always going
-    # to happen. ferry_await_exit's floor is one second, which is more than
-    # this is worth when the answer is nearly always "still there".
-    for _ in 1 2 3 4 5; do kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05; done
+    # A tenth of a second of courtesy, then the kill that was always going to
+    # happen -- ferry-proxy has never once exited on SIGTERM, so this is a
+    # gesture towards a version that might. It was a quarter second and that
+    # was 42% of what a teardown had left.
+    for _ in 1 2; do kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05; done
     sudo kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
@@ -3259,16 +3260,30 @@ cmd_down() {
   # the control plane it reports to does.
   stop_machines
 
+  # Signalled in order, then waited for together.
+  #
+  # The order the signals go out in matters -- the kubelet should hear about it
+  # before the runtime it is talking to -- but the waits do not have to be
+  # serial, and they were. Seven components at about 70ms each is half a
+  # second of watching processes that had already been told to go, and it was
+  # the largest thing left between ferry's teardown and kind's `docker rm -f`.
+  #
+  # ferry-cri must still finish releasing its vmnet network before another run
+  # can claim the same subnet, so it is waited for -- just not on its own.
+  local stopping=() stopnames=() component pidfile pid
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
-    local pidfile="$FERRY_RUN/$component.pid"
+    pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
-    local pid; pid="$(cat "$pidfile")"
+    pid="$(cat "$pidfile")"
     rm -f "$pidfile"
     kill -TERM "$pid" 2>/dev/null || continue
-    # ferry-cri must finish releasing its vmnet network before another run can
-    # claim the same subnet, so this is a real wait and not a formality.
-    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
-    ok "$component stopped"
+    stopping+=("$pid"); stopnames+=("$component")
+  done
+  local i=0
+  while [ "$i" -lt "${#stopping[@]}" ]; do
+    ferry_await_exit "${stopping[$i]}" || kill -KILL "${stopping[$i]}" 2>/dev/null
+    ok "${stopnames[$i]} stopped"
+    i=$((i + 1))
   done
   # A listener that outlives its pid file holds the node port against the next
   # run, and the symptom -- "address already in use" buried in a log -- is a poor

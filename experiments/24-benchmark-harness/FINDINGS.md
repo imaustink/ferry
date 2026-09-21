@@ -532,11 +532,23 @@ macOS:
 | WAL fsync | 4.85ms | none | 0.88ms |
 | backend commit | 11.12ms | **0.12ms** | 1.78ms |
 
-**kind's etcd is not better tuned. It is inside Docker Desktop's VM, where a
-guest fsync reaches a virtual disk whose host-side durability Docker has
-already relaxed.** ferry's pays a real APFS barrier per write. The
-inner-platform layering that ought to cost kind something is buying it a
-cheap fsync instead.
+**kind's etcd is not better tuned. It is compiled for a different kernel.**
+
+macOS has two durability calls -- `fsync(2)`, which hands the data to the OS,
+and `fcntl(F_FULLFSYNC)`, which flushes the drive's write cache -- and Go's
+`os.File.Sync()` is the second on darwin and the first on linux. etcd is Go.
+
+| same Mac, same SSD | |
+|:--|--:|
+| `fsync(2)` natively | 0.031 ms |
+| `fcntl(F_FULLFSYNC)` natively | **3.961 ms** |
+| `fsync(2)` in Docker's VM | 0.042 ms |
+
+3.961 ms is the 4.85 ms etcd reports, less etcd's own work. The first version
+of this finding said Docker had relaxed the host-side durability, which is
+true of the disk image but is not the mechanism: plain fsync costs the same
+on both sides. The probe written to confirm it disproved it, which is the
+only reason the right answer turned up.
 
 `FERRY_ETCD_NO_FSYNC=1` opts in. Off by default: this is the cluster's data,
 and a Mac that loses power mid-write can leave it needing a restore.

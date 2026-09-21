@@ -38,14 +38,14 @@ is not the baseline ferry actually has.
 |:--|--:|--:|--:|--:|
 | a pod is | its own VM | a container | a container | a container |
 | needs Docker Desktop | **no** | **no** | yes | yes |
-| create a cluster | **12.3 s** | 25.9 s | 25.4 s | 30.3 s |
-| delete it | 1.2 s | 1.4 s | **0.5 s** | 12.5 s |
-| start one pod | 0.50 s | **0.25 s** | 0.61 s | 0.60 s |
-| start 10 | 0.99 s | **0.64 s** | 0.70 s | 1.08 s |
-| start 20 | 3.56 s | 1.17 s | **0.93 s** | 2.18 s |
-| idle memory | **431 MiB of the Mac** | 1,491 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
-| idle CPU | **2.8%** | 14.4% | 24.4% | 29.0% |
-| per pod | 239 MiB | 9 MiB | 6 MiB | 16 MiB |
+| create a cluster | **12.8 s** | 26.4 s | 25.4 s | 30.3 s |
+| delete it | 0.85 s | 0.65 s | **0.47 s** | 12.5 s |
+| start one pod | 0.47 s | **0.34 s** | 0.61 s | 0.60 s |
+| start 10 | 1.21 s | **0.61 s** | 0.70 s | 1.08 s |
+| start 20 | 3.51 s | 1.16 s | **0.93 s** | 2.18 s |
+| idle memory | **430 MiB of the Mac** | 1,481 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
+| idle CPU | **3.6%** | 12.8% | 24.4% | 29.0% |
+| per pod | 240 MiB | 9 MiB | 6 MiB | 16 MiB |
 
 CPU is percent of one core over a 60-second window with the cluster up and
 nothing scheduled. This Mac has sixteen.
@@ -113,17 +113,33 @@ That 20-pod row is the one number here that moves a lot on a flag:
 
 | ferry mode 2 | default | `FERRY_ETCD_NO_FSYNC=1 FERRY_NODE_DISK_SYNC=none` |
 |:--|--:|--:|
-| start one pod | 0.25 s | **0.21 s** |
-| start 10 | 0.64 s | **0.26 s** |
-| start 20 | 1.17 s | **0.41 s** |
+| start one pod | 0.34 s | **0.20 s** |
+| start 10 | 0.61 s | **0.29 s** |
+| start 20 | 1.16 s | **0.39 s** |
 
 Both default to off, because they relax durability and that is the cluster's
 data. On a cluster you recreate on demand they are close to free, and they
-take the 20-pod burst from behind kind to **2.3× ahead** of it. Most of what
-they buy back is fsync: ferry's etcd runs natively on APFS and pays a real
-barrier per write, while kind's runs inside Docker Desktop's VM, where a guest
-fsync reaches a virtual disk whose host-side durability Docker has already
-relaxed.
+take the 20-pod burst from behind kind to **2.4× ahead** of it.
+
+What they buy back is one syscall, and it is worth understanding, because it
+is most of what is left between ferry and kind. macOS has two durability
+calls: `fsync(2)` hands the data to the OS, and `fcntl(F_FULLFSYNC)` flushes
+the drive's own write cache. Go's `os.File.Sync()` is `F_FULLFSYNC` on
+darwin and `fsync(2)` on linux — and etcd is Go. Measured on this Mac, same
+SSD:
+
+| | |
+|:--|--:|
+| `fsync(2)`, natively on macOS | 0.031 ms |
+| **`F_FULLFSYNC`, natively on macOS** | **3.961 ms** |
+| `fsync(2)`, inside Docker Desktop's VM | 0.042 ms |
+
+So ferry's etcd asks the SSD to flush on every commit and waits ~4 ms for it;
+kind's etcd, on Linux inside Docker's VM, makes the same Go call and it
+compiles to the cheap one — then lands in a disk image on the host rather
+than on the drive. The same line of code, 128× apart, decided by which
+kernel it was built for. kind is not skipping a step ferry takes; it is
+running where that step is not offered.
 
 Measured by [experiment 24](experiments/24-benchmark-harness/FINDINGS.md) on:
 

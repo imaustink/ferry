@@ -317,12 +317,30 @@ natively and averages 4.85ms per WAL fsync and 11.12ms per backend commit.
 kind's runs inside Docker Desktop's VM and averages 0.88ms and 1.78ms, on
 the same Mac and the same physical disk.
 
-kind's etcd is not better tuned. A guest fsync there reaches a virtual disk
-whose host-side durability Docker has already relaxed; ferry's reaches APFS
-and pays a real barrier. So the inner-platform layering that ought to cost
-kind something is buying it a cheap fsync, and any comparison of write-heavy
-paths between a native process and one inside Docker's VM is partly a
-comparison of how honest the two are being about durability.
+kind's etcd is not better tuned, and the reason is more specific than
+"Docker relaxed it" -- which is what this section said first, on a
+measurement that did not support it. Plain `fsync(2)` is 0.031 ms natively on
+macOS and 0.042 ms inside Docker's VM: no difference worth having.
+
+The difference is which call gets made. macOS has two, and Go picks between
+them by GOOS:
+
+| same Mac, same SSD | |
+|:--|--:|
+| `fsync(2)` natively | 0.031 ms |
+| `fcntl(F_FULLFSYNC)` natively | **3.961 ms** |
+| `fsync(2)` in Docker's VM | 0.042 ms |
+
+`os.File.Sync()` is `F_FULLFSYNC` on darwin and `fsync(2)` on linux. etcd is
+Go. So the same source line flushes the drive's write cache when etcd runs
+natively and does not when it runs on Linux in a VM -- 128x, decided at
+compile time and invisible in the code.
+
+The lesson generalises past fsync: when the same program is fast on one
+platform and slow on another, check whether its runtime is quietly calling
+something different, before concluding anything about the platform. The
+measurement that finds this is the *syscall*, not the program -- timing etcd
+would only ever have told you etcd was slower.
 
 The corollary, which cost an afternoon to notice: an `F_FULLFSYNC` flushes
 the device cache, so it stalls whatever else is queued on that volume.
