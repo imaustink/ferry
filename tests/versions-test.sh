@@ -108,6 +108,27 @@ for mm in $(sort -t. -k2 -n <<<"$pinned_minors"); do
   previous="$mm"
 done
 
+# The default is the third half of the same agreement. lib/versions.sh says
+# FERRY_DEFAULT_K8S_VERSION has to name a minor ferry_control_plane_version
+# pins, because a fresh checkout builds it before anyone has asked for a
+# version -- and an unpinned minor sends that first build to kwok-ci for a
+# control plane nobody published. Said in a comment, it stays true until
+# someone bumps the constant; said here, a bump to an unpinned minor fails
+# before a clone does.
+#
+# Matched whole rather than as a substring: v1.3 is in v1.34 and means nothing.
+default_mm="$(ferry_version_mm "$FERRY_DEFAULT_K8S_VERSION")"
+default_pinned=false
+for mm in $pinned_minors; do
+  [ "$mm" = "$default_mm" ] && default_pinned=true
+done
+if [ "$default_pinned" = true ]; then
+  ok "the default ($FERRY_DEFAULT_K8S_VERSION) builds a pinned minor"
+else
+  bad "the default is $FERRY_DEFAULT_K8S_VERSION, but $default_mm has no pin in ferry_control_plane_version"
+fi
+succeeds "and is a version" ferry_version_valid "$FERRY_DEFAULT_K8S_VERSION"
+
 printf '\033[1m%s\033[0m\n' "control plane skew"
 empty "a patch bump is allowed"       "$(ferry_skew_reason v1.34.0 v1.34.11)"
 empty "one minor forward is allowed"  "$(ferry_skew_reason v1.33.4 v1.34.0)"
