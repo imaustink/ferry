@@ -197,7 +197,8 @@ manifests/                           CoreDNS, rendered at 'ferry up'
 manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines
 tests/                               what can be checked without a cluster
 docs/                                HANDOFF.md (the full picture), INSTALL.md,
-                                     MACHINES.md (mode 2), SERVICES.md
+                                     MACHINES.md (mode 2), SERVICES.md,
+                                     BENCHMARKING.md (how to measure this honestly)
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
 experiments/03-vm-ceiling/           how many VMs macOS runs, and how fast
@@ -213,6 +214,7 @@ experiments/19-machine-crd/          a node made by applying a resource
 experiments/20-pod-network/          pods on two machines reaching each other
 experiments/21-density-vs-kind-minikube/  against kind and minikube, on one Mac
 experiments/22-vmnet-lifecycle/      why a vmnet subnet stays reserved
+experiments/24-benchmark-harness/    the repeatable battery, and what it found
 ferry-cri/                           the CRI runtime: one VM per pod
 ferry-machined/                      mode 2: Machine objects into node VMs, and the CRD
 node-image/ (built)                  mode 2's node image, as an OCI layout
