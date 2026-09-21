@@ -54,6 +54,24 @@ stack_host_pids() {
   esac
 }
 
+# Which node the battery's pods have to land on.
+#
+# With mode 2 enabled the cluster has two nodes and they are not the same
+# architecture: the Mac node runs a VM per pod, the machine node runs
+# containers sharing one kernel. An unpinned Deployment is scheduled across
+# both -- measured at an even 5/5 split of ten replicas -- so every ferry2
+# latency and memory row becomes a mixture of the two modes rather than a
+# measurement of either, and the mixture changes from run to run with whatever
+# the scheduler scores.
+#
+# Mode 1 needs no selector: `ferry machines disable` leaves one node.
+node_selector_of() {
+  case "$1" in
+    ferry2) printf '      nodeSelector: {ferry.dev/mode: shared}\n' ;;
+    *)      : ;;
+  esac
+}
+
 # --- lifecycle -----------------------------------------------------------
 
 stack_up() {

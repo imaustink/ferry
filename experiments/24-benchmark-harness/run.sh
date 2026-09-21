@@ -16,6 +16,9 @@ POD_IMAGE="${POD_IMAGE:-alpine:3.20}"
 LAT_REPS="${LAT_REPS:-5}"
 SCALES="${SCALES:-10 20}"
 QUIESCE="${QUIESCE:-45}"
+# Unset means "wherever the scheduler likes", which for ferry2 is both modes at
+# once. node_selector_of pins the stacks that need it; see stacks.sh.
+NODE_SELECTOR="${NODE_SELECTOR:-$(node_selector_of "$STACK")}"
 
 kc=""; ctx=""
 say() { printf '\n== %s: %s\n' "$STACK" "$*"; }

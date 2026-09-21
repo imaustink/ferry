@@ -18,6 +18,11 @@ Ferry's two modes and kind all ran **v1.37.0** — the first run where ferry and
 kind were on the same minor. minikube's own default is still **v1.30.0**, so that
 column is not version-matched.
 
+> **The mode 2 latency rows below are wrong** — the battery scheduled half of
+> their pods onto the Mac node as mode-1 VMs. Corrected numbers are in
+> [Correction](#correction-the-latency-rows-above-were-measuring-two-architectures-at-once).
+> Lifecycle and memory rows are unaffected except as noted there.
+
 | | mode 1 | mode 2 | kind | minikube |
 |:--|--:|--:|--:|--:|
 | create, cached | **14.43s** | 34.73s | 26.27s | 29.83s |
@@ -54,8 +59,10 @@ largest margin in the battery — and wins memory on a common basis, where mode 
 406 + 8.1n never crosses kind's 712 + 13.1n. Kind wins every latency number
 involving a pod: 0.62s against 0.82s for one, 1.07s against 2.72s for twenty.
 
-The burst gap has narrowed from ~0.6s to ~0.26s and the distributions now
-overlap, but kind still holds the median.
+**That last sentence does not survive the correction below.** Pinned and
+watched, the single pod is a tie and ferry's *first* pod of a burst is faster;
+what kind wins is concurrency, at 11.3ms per additional pod against ferry's
+35.0ms.
 
 ## What moved between runs
 
@@ -89,6 +96,72 @@ Kubernetes-level:
   burst has repetition behind it, via `altbench.sh`. No confidence intervals are
   claimed.
 
+## Correction: the latency rows above were measuring two architectures at once
+
+**Every ferry2 latency figure in the table above is wrong**, and the cause is
+in this harness rather than in ferry.
+
+`run.sh` interpolates `${NODE_SELECTOR}` into its Deployment and `stacks.sh`
+never set it for `ferry2`. With mode 2 enabled the cluster has two nodes of
+different architectures, so the pods were scheduled across both -- an even 5/5
+split of ten replicas, measured with the battery's own manifest by
+`whereland.sh`. Half of every "mode 2" burst was mode 1, booting a VM per pod.
+
+Re-measured with the pods pinned and the API watched rather than polled
+(`timeline.py`, `burst.py`), on an all-v1.37.0 cluster:
+
+| single pod, apply → Running | mode 2 | kind |
+|:--|--:|--:|
+| from a bare Pod | 534ms | 568ms |
+| from a Deployment | 541ms | 544ms |
+
+A tie, where the battery reported 0.82s against 0.62s.
+
+The 20-pod burst is where the two still differ, and not in the way the battery
+suggested:
+
+| 20-pod burst | mode 2 | kind |
+|:--|--:|--:|
+| all created by | 142ms | 117ms |
+| all scheduled by | 152ms | 122ms |
+| **first** pod Running | **705ms** | 745ms |
+| last pod Running | 1370ms | **959ms** |
+| scheduled → first Running | **553ms** | 623ms |
+| marginal cost per extra pod | 35.0ms | **11.3ms** |
+
+**Ferry's single-pod path is faster than kind's. Its concurrency is 3.1×
+worse**, and that is the whole of the remaining gap. The kubelet's own
+`podStartSLOduration` shows the same shape from inside the node -- ferry's
+fastest pod beats kind's (898ms against 970ms) and its slowest is far behind
+(1559ms against 1233ms).
+
+The ten-pod cell that the run above flags as an anomaly -- 3.63s against a
+twenty-pod 2.72s -- is this bug, not a warm-up effect. The mixture differed
+between the two cells.
+
+The memory rows are probably affected too. Ten mode-1 pod VMs at ~220 MiB is
+2,200 MiB against the 2,814 MiB observed at twenty pods, where a pinned mode-2
+burst costs ~8 MiB a pod. That fits the mixture better than the guest-page-cache
+explanation given in BENCHMARKING.md, but no dedicated run has confirmed it.
+
+### What the gap is not
+
+Each of these was measured, not reasoned about:
+
+| | |
+|:--|:--|
+| the control plane or scheduler | all 20 pods scheduled by 152ms |
+| API round trips across the host/guest boundary | 1.15ms from inside ferry's node vs kind's 0.84ms (`rtt.sh`) |
+| the durability barrier | fsync 0.085ms vs kind's 0.098ms (`fsynccost.sh`) |
+| CNI | `hostNetwork`, which skips it entirely, moves the last pod 3ms per pod |
+| containerd | 20 containers in 165ms, 6× speedup from concurrency, no kubelet (`ctrconc.sh`) |
+| kubelet configuration | neither sets kubeAPIQPS/Burst; ferry uses cgroupfs, kind the slower systemd (`knobs.sh`) |
+| the harness's poll loop | costs 40.7ms against ferry, 48.5ms against kind (`pollcost.sh`) |
+
+What remains is the CRI path as the kubelet drives it under concurrency --
+sandbox, CNI, container, status -- which `ctr run` does not exercise. That is
+where to look next.
+
 ## The scripts
 
 The battery:
@@ -118,6 +191,20 @@ Diagnostics, each answering one question:
 | `m2-breakdown.sh` | where mode 2's idle memory goes |
 | `m2-phases.sh` | where mode 2's bring-up time goes |
 | `pleg.sh` | pod start with and without `EventedPLEG` (it is worse — see BENCHMARKING.md) |
+
+Added while chasing the gap above:
+
+| | |
+|:--|:--|
+| `timeline.py` | apply → object → scheduled → Running, watched, one clock |
+| `burst.py` | the same split for N pods, with the node histogram and a `HOSTNET=1` mode |
+| `whereland.sh` | where the battery's unpinned pods actually land |
+| `pollcost.sh` | what one iteration of the battery's poll loop costs, per stack |
+| `rtt.sh` | API round-trip latency from inside the node |
+| `fsynccost.sh` | what a durability barrier costs inside the node |
+| `ctrconc.sh` | containerd's own concurrency, serial vs parallel, no kubelet |
+| `slodur.sh` | `podStartSLOduration`, the kubelet measuring itself |
+| `knobs.sh` | the two kubelets' concurrency-bounding configuration, side by side |
 
 ## Running it
 
