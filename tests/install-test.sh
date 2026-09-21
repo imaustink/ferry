@@ -675,6 +675,31 @@ succeeds "  and reaching the guest over the kernel command line" \
 succeeds "  in both of ferry's kubelet configs" \
   test "$(grep -c 'kubeAPIQPS:' "$repo/ferry")" = 2
 
+# Teardown. Measured: a mode 1 purge was 3.9s and a mode 2 one 8.1s, almost
+# all of it waiting -- 0.5s poll ticks, a fixed `sleep 1`, and the API server
+# draining watches on its way to a data directory about to be deleted.
+succeeds "teardown polls finely rather than in half seconds" \
+  grep -q 'ferry_await_exit()' "$repo/ferry"
+# Only the teardown loops: `ferry up` waits on sockets appearing with the same
+# spelling, and those are a different thing left alone.
+succeeds "  and no teardown loop still sleeps half a second" \
+  test "$(grep -c 'kill -0 "$pid" 2>/dev/null || break; sleep 0.5' "$repo/ferry")" = 0
+succeeds "  including the ones that stop machines" \
+  test "$(grep -c 'running ferry-machined || break; sleep 0.5' "$repo/ferry")" = 0
+succeeds "  nor does the control plane's" \
+  test "$(grep -c 'sleep 0.5' "$repo/control-plane/down.sh")" = 0
+# --purge deletes etcd's data directory a few lines later, so draining it
+# first is time spent settling state that is about to be removed.
+succeeds "--purge stops the control plane without a graceful drain" \
+  grep -q 'purging' "$repo/control-plane/down.sh"
+# ...but a plain `ferry down` is meant to come back, so that path keeps it.
+succeeds "  and a plain down still drains" \
+  grep -q 'kill -TERM "$pid" 2>/dev/null || continue' "$repo/control-plane/down.sh"
+# ferry-proxy never exits on SIGTERM; waiting for it politely made teardown
+# four times worse than the `sleep 1` it replaced.
+succeeds "  and the service proxy is forced rather than waited out" \
+  grep -q 'sudo kill -KILL "$proxy_pid"' "$repo/ferry"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

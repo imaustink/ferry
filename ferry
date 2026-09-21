@@ -3142,6 +3142,43 @@ cmd_profile() {
   echo "  Set FERRY_PROFILE to override."
 }
 
+# Wait for a pid to go, polling finely.
+#
+# Every teardown loop here used `sleep 0.5`, so a process that exits in 15ms
+# still cost half a second to notice, and seven of them made a teardown that
+# was mostly rounding. 50ms keeps the same overall patience -- the timeout is
+# still ten seconds -- and stops charging for it.
+# Wait until a command stops succeeding, polling finely. The sibling of
+# ferry_await_exit for the teardown conditions that are not a pid -- a helper
+# that reports whether something is running, or a status file that a server
+# removes when its machine has gone.
+#
+#   ferry_await_gone [timeout_s] command...
+#
+# The timeout is optional and leads; anything else is the command.
+ferry_await_gone() {
+  local limit=10
+  case "${1:-}" in ''|*[!0-9]*) ;; *) limit="$1"; shift ;; esac
+  local i=0 ticks; ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    "$@" >/dev/null 2>&1 || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+ferry_await_exit() { # pid [timeout_s]
+  local pid="$1" limit="${2:-10}" i=0 ticks
+  ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 cmd_down() {
   local purge=""
   case "${1:-}" in
@@ -3155,10 +3192,23 @@ cmd_down() {
   mark_stopped
   # ferry-proxy runs as root, so stopping it does too.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
-    sudo kill -TERM "$(cat "$FERRY_RUN/ferry-proxy.pid")" 2>/dev/null \
+    local proxy_pid; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
+    sudo kill -TERM "$proxy_pid" 2>/dev/null \
       && ok "Service proxy stopped"
     rm -f "$FERRY_RUN/ferry-proxy.pid"
-    sleep 1
+    # Waited for rather than slept through, but briefly and then forced.
+    #
+    # This was `sleep 1`. Replacing it with an ordinary wait made teardown
+    # four times *worse*: ferry-proxy does not exit on SIGTERM at all -- the
+    # `sudo pkill` further down is what has always actually ended it -- so the
+    # wait sat out its full timeout every time. The point of the pause is that
+    # the listener has released its ports before the next `ferry up`, which a
+    # kill achieves and patience does not.
+    # A quarter of a second of courtesy, then the kill that was always going
+    # to happen. ferry_await_exit's floor is one second, which is more than
+    # this is worth when the answer is nearly always "still there".
+    for _ in 1 2 3 4 5; do kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05; done
+    sudo kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
   local index
@@ -3169,8 +3219,7 @@ cmd_down() {
       [ -f "$pidfile" ] || continue
       local pid; pid="$(cat "$pidfile")"; rm -f "$pidfile"
       kill -TERM "$pid" 2>/dev/null || continue
-      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-      kill -KILL "$pid" 2>/dev/null
+      ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     done
     rm -f "/tmp/ferry-cri$SUFFIX-$index.sock" "/tmp/ferry-exec$SUFFIX-$index.sock" \
           "/tmp/ferry-str$SUFFIX-$index.sock"
@@ -3188,9 +3237,8 @@ cmd_down() {
     rm -f "$pidfile"
     kill -TERM "$pid" 2>/dev/null || continue
     # ferry-cri must finish releasing its vmnet network before another run can
-    # claim the same subnet.
-    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -KILL "$pid" 2>/dev/null
+    # claim the same subnet, so this is a real wait and not a formality.
+    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     ok "$component stopped"
   done
   # A listener that outlives its pid file holds the node port against the next
@@ -3203,6 +3251,10 @@ cmd_down() {
   # the control plane, which has to be up to accept the patch.
   withdraw_gpu
 
+  # --purge reaches down.sh, which then stops the API server and etcd without
+  # a graceful drain: their data directory is deleted a few milliseconds
+  # later, so draining it is two to five seconds spent flushing state that is
+  # about to be removed. See control-plane/down.sh.
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" ${purge:+--purge} >/dev/null 2>&1 \
     && ok "control plane stopped"
   # --purge drops etcd's data, which is the cluster. The recorded version goes
@@ -3355,21 +3407,18 @@ stop_machines() {
     # them again.
     if running ferry-karpenter; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-karpenter.pid")" 2>/dev/null
-      for _ in $(seq 1 20); do running ferry-karpenter || break; sleep 0.5; done
+      ferry_await_gone running ferry-karpenter
       rm -f "$FERRY_RUN/ferry-karpenter.pid"
     fi
     if running ferry-machined; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-machined.pid")" 2>/dev/null
-      for _ in $(seq 1 20); do running ferry-machined || break; sleep 0.5; done
+      ferry_await_gone running ferry-machined
     fi
     if ls "$FERRY_RUN/machines"/*.json >/dev/null 2>&1; then
       rm -f "$FERRY_RUN/machines"/*.json
       # Long enough for a guest to shut down and vmnet to be given back; a
       # machine that has not gone by then is stopped with its server anyway.
-      for _ in $(seq 1 60); do
-        ls "$FERRY_RUN/machines"/*.status.json >/dev/null 2>&1 || break
-        sleep 0.5
-      done
+      ferry_await_gone 30 ls "$FERRY_RUN/machines"/*.status.json
       ok "machines stopped"
     fi
   fi
@@ -3381,8 +3430,7 @@ stop_machines() {
     kill -TERM "$pid" 2>/dev/null || continue
     # ferry-node has to release its vmnet network before another run can claim
     # the same subnet, exactly as ferry-cri does.
-    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -KILL "$pid" 2>/dev/null
+    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     ok "$component stopped"
   done
 }
