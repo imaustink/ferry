@@ -758,6 +758,17 @@ enables. That is a behaviour change with a long tail -- a controller nobody
 thought about not running is a feature that silently does not work -- so it is
 written down here rather than done.
 
+And it is not where ferry loses, because ferry does not lose here. kind's
+controller-manager takes **8.89s** from starting to running its deployment
+controller against ferry's **7.46s**, on the same machine and the same
+Kubernetes. Both pay it; ferry pays slightly less.
+
+What differs is when each tool stops talking to you. `kind create cluster`
+returns after 7.7s with the cluster unusable for another 18.9s; `ferry up`
+returns after 12.7s and is done 0.3s later. To a cluster that works it is
+12.9s against 26.6s. The 7.5s above is real and is spent inside both numbers
+-- kind's is simply after the prompt has come back.
+
 ## Running it
 
 ```sh

@@ -50,6 +50,26 @@ is not the baseline ferry actually has.
 CPU is percent of one core over a 60-second window with the cluster up and
 nothing scheduled. This Mac has sixteen.
 
+**"Create a cluster" means a cluster you can use** — every node Ready and
+every `kube-system` pod Running — not the moment the command returns. Those
+are not the same for every tool, and the gap is where most of this row lives:
+
+| | the command returns | usable | still settling |
+|:--|--:|--:|--:|
+| `kind create cluster` | **7.7 s** | 26.6 s | 18.9 s |
+| `ferry up` | 12.7 s | **12.9 s** | 0.3 s |
+
+kind hands the prompt back after 7.7 s and finishes bringing the cluster up
+behind you; `ferry up` waits for CoreDNS before it says it is up, and is then
+done. Timing "when the command returned" would make kind look 1.6× faster
+here and it is 2× slower to a cluster that works — so the table times the
+second column for both.
+
+Both stacks pay about the same for the part neither controls: kube-controller-
+manager takes 7.5 s on ferry and 8.9 s on kind to get from starting up to
+running its deployment controller, and CoreDNS is a Deployment, so its pod
+cannot exist until that happens.
+
 **The two memory columns cannot be the same number, and the reason is the
 point.** Docker Desktop holds **15.6 GiB and 16 CPUs before the first pod
 exists**, so a pod on kind costs the Mac nothing extra — it costs a slice of a

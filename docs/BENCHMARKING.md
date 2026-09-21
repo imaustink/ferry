@@ -238,6 +238,31 @@ Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s
 sandbox creation 0.063 vs 0.065s, container start 0.034 vs 0.045s. The remaining
 gap is not in any of them.
 
+### Time the readiness bar, not the prompt coming back
+
+`kind create cluster` returns in 7.7s. The cluster is not usable for another
+18.9s -- kind hands the prompt back and finishes behind you. `ferry up`
+returns in 12.7s and is done 0.3s later, because it waits for CoreDNS before
+it says it is up.
+
+Timing "when the command returned" makes kind 1.6x faster at cluster
+creation. Timing "every node Ready and every kube-system pod Running" makes
+it 2x slower. Both numbers are real and only the second one is a comparison,
+because it is the only one that means the same thing for both tools -- and
+which one a stack reports is a UX choice its authors made, not a property of
+how fast it is.
+
+So define the bar first and apply it to everything, including the stack whose
+own command already blocks. run.sh does this by timing `stack_up` *plus*
+`wait_ready`, which is why its kind figure is 25s against the 8s a person
+sees at their prompt. Expect to have to explain that to anyone who has run
+kind themselves.
+
+The same trap sits behind any "ready" that a tool defines for itself: a node
+that is `Ready` before its CNI is configured, a Deployment that is
+`Available` at zero replicas, a `ferry up` that returned before CoreDNS.
+Decide what working means, measure that.
+
 ### A very regular number is a rate limiter, and small ones are not logged
 
 The last thing standing between ferry and kind on a 20-pod burst was the pod
