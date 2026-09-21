@@ -2,16 +2,37 @@ import re, sys, datetime, collections, statistics
 # Per pod: admit -> volumes mounted -> sandbox decision -> Running.
 # Both kubelets log all of these at v=2, so kind and mode 2 are comparable
 # without changing either one's verbosity.
+#
+# Which pods, as a regex on <namespace>/<name>. The default is the battery's
+# own Deployment, which is what this was written against; burst.py names each
+# round after a fresh uuid so that it cannot collide with the round before it,
+# and those pods matched nothing at all here -- the script printed "no
+# complete pod traces" and looked like a kubelet that had not logged rather
+# than a filter that had not matched.
+PODS = re.compile(sys.argv[1] if len(sys.argv) > 1 else r"bench-[\w-]+")
+
+# klog's own header, wherever it starts on the line.
+#
+# Anchored at the start this worked for ferry, whose kubelet writes klog
+# straight to a file, and silently matched nothing for kind, whose kubelet is
+# under systemd: journalctl puts "Sep 21 13:20:00 node kubelet[123]: " in
+# front of every line, so the klog stamp is mid-line and every kind log
+# parsed as zero timestamped lines. The output for that is "no complete pod
+# traces", which reads like a kubelet that did not log what was wanted rather
+# than a parser that could not see it.
+KLOG = re.compile(r"[IWE](\d{4}) (\d\d:\d\d:\d\d\.\d+)")
+
 def ts(l):
-    m = re.match(r"[IWE]\d{4} (\d\d:\d\d:\d\d\.\d+)", l)
-    return datetime.datetime.strptime(m.group(1), "%H:%M:%S.%f") if m else None
+    m = KLOG.search(l)
+    return datetime.datetime.strptime(m.group(2), "%H:%M:%S.%f") if m else None
 
 pods = collections.defaultdict(dict)
 for l in sys.stdin:
     t = ts(l)
     if not t: continue
-    m = re.search(r'pod="?([\w.-]+/bench-[\w-]+)"?', l) or re.search(r'pods=\["([\w.-]+/bench-[\w-]+)"\]', l)
+    m = re.search(r'pod="?([\w.-]+/[\w.-]+)"?', l) or re.search(r'pods=\["([\w.-]+/[\w.-]+)"\]', l)
     if not m: continue
+    if not PODS.search(m.group(1)): continue
     k = m.group(1)
     if "SyncLoop ADD" in l:                      pods[k].setdefault("admit", t)
     elif "MountVolume.SetUp succeeded" in l:     pods[k]["vol"] = t

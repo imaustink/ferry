@@ -36,6 +36,19 @@ K8S_VERSION="${K8S_VERSION:-$(
     "$BENCH_HOME/../../lib/versions.sh")}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:$K8S_VERSION}"
 
+# The kubelet's log level, for whichever stack is being brought up.
+#
+# One knob rather than two, because the comparison is worthless asymmetric:
+# the volume manager and the pod workers only narrate themselves above v=3,
+# so a ferry at v=4 against a kind at its default v=2 produces a detailed
+# account of one stack and "no complete pod traces" for the other, which
+# reads like a difference between them and is a difference in the logging.
+#
+# ferry reads it from the environment (ferry-node puts it on the guest's
+# kernel command line); kind takes it through a kubeadm patch, which is why
+# stack_up has to write a config file for it rather than pass a flag.
+KUBELET_V="${KUBELET_V:-}"
+
 kubeconfig_of() {
   case "$1" in
     ferry|ferry2) "$FERRY" kubeconfig 2>/dev/null ;;
@@ -112,6 +125,8 @@ stack_up() {
       n=$(( $(cat "$seq_file" 2>/dev/null || echo 29) + 1 ))
       echo "$n" > "$seq_file"
       export FERRY_MACHINE_SUBNET="192.168.$n.0/24"
+      # Read by ferry-node when it builds the machine's kernel command line.
+      [ -n "$KUBELET_V" ] && export FERRY_KUBELET_V="$KUBELET_V"
       "$FERRY" up >"$RESULTS/$s-up.log" 2>&1
       # vmnet holds a subnet after the process using it stops -- documented as
       # about a minute, observed far longer -- so an enable that follows a
@@ -141,8 +156,30 @@ YAML
         KUBECONFIG="$kc" kubectl get node worker-0 >/dev/null 2>&1 && break
         sleep 1
       done ;;
-    kind)     kind create cluster --name "$CLUSTER" --kubeconfig "$kc" \
-                --image "$KIND_NODE_IMAGE" \
+    kind)
+      # kubeadm v1beta4 spells kubeletExtraArgs as a list of name/value pairs;
+      # the map form that every older example shows is rejected outright by
+      # v1.37's kubeadm, and kind reports it as a cluster that failed to come
+      # up rather than as a bad patch.
+      local cfg=() kindcfg="$BENCH_HOME/.kind-config.yaml"
+      if [ -n "$KUBELET_V" ]; then
+        cat > "$kindcfg" <<YAML
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+      - name: v
+        value: "$KUBELET_V"
+YAML
+        cfg=(--config "$kindcfg")
+      fi
+      kind create cluster --name "$CLUSTER" --kubeconfig "$kc" \
+                --image "$KIND_NODE_IMAGE" "${cfg[@]}" \
                 >"$RESULTS/$s-up.log" 2>&1 ;;
     minikube) KUBECONFIG="$kc" minikube start -p "$CLUSTER" --driver=docker \
                 --interactive=false >"$RESULTS/$s-up.log" 2>&1 ;;

@@ -304,6 +304,96 @@ Added while chasing the concurrency gap:
 | `stall.py` | what containerd logged inside the biggest gap between requests |
 | `syncbatch.sh` | how many batches the kubelet learns about a burst in |
 
+Added while asking the kubelet directly:
+
+| | |
+|:--|:--|
+| `podphases.sh` | runs a burst and reads the kubelet's own account of it, either stack |
+| `syncphases.py` | inside syncPod at `--v=4`: which part is work and which is waiting for a turn |
+
+## Inside syncPod, both stacks at --v=4
+
+The kubelet's log level is a runtime knob now (`KUBELET_V=4` for the harness,
+`FERRY_KUBELET_V=4` for ferry on its own, a kubeadm patch for kind), so the
+question the last round stopped in front of — which phase stretches — can be
+put to both kubelets directly. `podphases.sh ferry|kind` runs the burst and
+reads the answer back.
+
+20 pods, one round each, both nodes v1.37.0:
+
+| median, ms | ferry | kind |
+|:--|--:|--:|
+| admit → SyncPod enter | 5 | 2 |
+| wait → populator noticed | 43 | 13 |
+| populator → verify attached | 101 | 105 |
+| verify → mount started | 103 | 106 |
+| **mount → mounted (the actual work)** | **10** | **10** |
+| mounted → all mounted | 64 | 68 |
+| all mounted → create sandbox | 1 | 3 |
+| create → sandbox created | 204 | 155 |
+| sandbox created → SyncPod exit | 231 | 157 |
+| TOTAL admit → SyncPod exit | 779 | 630 |
+
+### The projected serviceaccount volume is not where ferry loses
+
+**The volume wait is 301ms on ferry and 301ms on kind, and 10ms of it is the
+mount.** The other ~290ms is three sleeps: the populator's loop notices the
+volume, the reconciler's next tick verifies it, the tick after that mounts it.
+Writing the token and renaming it into place is 3% of the wait on both stacks.
+
+That reframes the previous round's lead. `NOSA=1` really does halve ferry's
+spread, and the reason is not that ferry's volumes are expensive — they are
+exactly as expensive as kind's. Both stacks are paying the same fixed toll,
+and the earlier "about half of it is the serviceaccount volume, and ferry has
+twice as much to lose" reads the shared part as ferry's. Those four columns
+were flagged provisional for being taken minutes apart; this is the other
+reason to be careful with them.
+
+### Where it actually goes is sandbox creation, under concurrency
+
+Splitting the burst by admit order, `create → sandbox created`:
+
+| | first half | second half | stretch |
+|:--|--:|--:|--:|
+| ferry | 95ms | 356ms | **+261** |
+| kind | 121ms | 187ms | +65 |
+
+Ferry's first pod gets a sandbox *faster* than kind's and its last takes
+nearly twice as long — the same shape the wall-clock numbers have, now
+located. Everything upstream of it is flat: `mount`, `mounted` and
+`allmounted` are reached within ~110ms of each other across all twenty pods.
+
+`HOSTNET=1`, which skips CNI entirely, moves that stretch from +261 to +180.
+So CNI is part of it and not most of it, which agrees with the earlier finding
+from the other direction.
+
+Single rounds, not alternated — read the direction, not the magnitudes, and
+re-run with `ab.sh`-style alternation before quoting them. The 301ms/10ms
+volume figure is the exception: five separate runs across both stacks put it
+between 300 and 301ms every time.
+
+### The part worth acting on
+
+Those three sleeps are `reconcilerLoopSleepPeriod` (100ms),
+`desiredStateOfWorldPopulatorLoopSleepPeriod` (100ms) and
+`podAttachAndMountRetryInterval` (300ms) in
+`pkg/kubelet/volumemanager/volume_manager.go`. All three are unexported
+package constants. No flag reaches them, no KubeletConfiguration field
+reaches them, and every cluster in the world pays them — including kind,
+which runs the stock binary.
+
+ferry does not have to. It already compiles its own kubelet from a whole-file
+overlay in `patches/kubelet-vX.Y/`, which is the same mechanism this would
+use. ~250ms is on the critical path of *every* pod start, burst or single —
+ferry's single pod is 541ms — and it is a toll a one-node developer cluster
+has no reason to pay.
+
+The catch is that this only reaches mode 1 today. Mode 2's guest kubelet is
+the upstream linux binary that `experiments/17-node-vm/stage.sh` downloads,
+not one ferry builds, so collecting it there means building a linux/arm64
+kubelet from the same tree — which is not hard, and is a larger change than
+this round should make on its own.
+
 ## Running it
 
 ```sh
@@ -315,6 +405,11 @@ python3 summarize.py results/raw.tsv
 
 ./m2mem.sh
 ./altbench.sh 4
+
+# The kubelet's own account of a burst. Both stacks have to be at --v=4:
+# KUBELET_V=4 stack_up, or FERRY_KUBELET_V=4 ferry up for ferry alone.
+./podphases.sh ferry
+./podphases.sh kind
 ```
 
 One stack at a time. `run.sh` appends to `results/raw.tsv`, so archive or clear

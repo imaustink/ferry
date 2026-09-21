@@ -1,0 +1,11 @@
+# What a run leaves behind. results/raw.tsv is the exception -- it is the
+# battery's accumulated output and is checked in, so it is unignored below.
+results/
+!results/raw.tsv
+kubeconfigs/
+# Per-run scratch: the subnet counter that survives create/delete cycles, the
+# kind config written only when KUBELET_V asks for one, and the pinned pid of
+# Docker Desktop's VM.
+.machine-subnet-seq
+.kind-config.yaml
+.docker-vm-pid
