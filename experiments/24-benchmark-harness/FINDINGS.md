@@ -390,9 +390,51 @@ has no reason to pay.
 
 The catch is that this only reaches mode 1 today. Mode 2's guest kubelet is
 the upstream linux binary that `experiments/17-node-vm/stage.sh` downloads,
-not one ferry builds, so collecting it there means building a linux/arm64
-kubelet from the same tree — which is not hard, and is a larger change than
-this round should make on its own.
+not one ferry builds.
+
+## Taking the 300ms out, and what it was worth
+
+Done, in `build-kubelet.sh`: the three constants are rewritten where they lie
+(10ms, 10ms, 20ms), with the build failing if any of the three does not take.
+A constant upstream renames would otherwise put the build silently back at
+upstream's pacing and surface as a regression nobody could find.
+`FERRY_VOLUME_RECONCILE_MS`, `FERRY_VOLUME_POPULATE_MS` and
+`FERRY_VOLUME_RETRY_MS` override them.
+
+Single pod, `timeline.py`, all v1.37.0, before and after on one machine in
+one session:
+
+| single pod, apply to Running | before | after |
+|:--|--:|--:|
+| ferry mode 1 (the patched kubelet) | 710ms | **431ms** |
+| ferry mode 2 (guest kubelet, *not* patched) | 501ms | 497ms |
+| kind (stock kubelet) | | 500ms |
+
+**279ms off mode 1, and mode 1 now starts a pod faster than kind does.**
+
+Mode 2 is the control and the reason to believe it. Its kubelet is the
+upstream binary the node image downloads, nothing about it changed, and it
+did not move, so the 279ms is the patch and not the machine having a quieter
+afternoon. The kubelet's own log agrees from the inside: the volume wait on
+mode 1 is **30ms, of which 3ms is the mount**, against the 301ms/10ms it and
+both other stacks measured before.
+
+This is the default path. `ferry up` is mode 1; mode 2 is opt-in behind
+`ferry machines enable`.
+
+### What is left
+
+Mode 2 still pays the 300ms, and mode 2 is the configuration that competes
+with kind on bursts. Building a linux/arm64 kubelet from the same source with
+the same rewrite would put it near 230ms, but it cannot simply reuse this
+build: `build-kubelet.sh` overlays that source tree for darwin, adding
+`_darwin.go` files and rewriting `kubelet_pods.go` in place, so a linux build
+needs its own clean extraction rather than a second `GOOS` over the same
+tree.
+
+And the concurrency gap this PR started on is untouched by any of it. The
+300ms was a flat tax on every pod; the staircase is `create` to `sandbox
+created` stretching under load, and that is still open.
 
 ## Running it
 

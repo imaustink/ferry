@@ -2384,7 +2384,7 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
     --kubeconfig="$kubeconfig" \
     --node-labels="ferry.dev/mode=vm-per-pod${index:+,ferry.dev/node-index=$index}" \
     --hostname-override="$name" --root-dir="$run/kubelet" \
-    --cert-dir="$run/pki" --v=2 >"$logfile" 2>&1 &
+    --cert-dir="$run/pki" --v="${FERRY_KUBELET_V:-2}" >"$logfile" 2>&1 &
   echo $! > "$pidfile"
   echo "$name" > "$run/node-name"
 }
