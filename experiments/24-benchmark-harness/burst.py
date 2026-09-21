@@ -28,6 +28,11 @@ NS    = "burst"
 # hostNetwork skips CNI ADD entirely. If the staircase is CNI being serialized,
 # it collapses here; if it does not move, CNI is not the serializer.
 HOSTNET = os.environ.get("HOSTNET") == "1"
+# syncPod waits on WaitForAttachAndMount before it will create a sandbox, and
+# every pod gets a projected serviceaccount token volume unless told not to.
+# NOSA=1 removes the only volume these pods have, so the volume manager has
+# nothing to reconcile and cannot pace the burst.
+NOSA = os.environ.get("NOSA") == "1"
 
 def kubectl(*a):
     return subprocess.run(["kubectl", "--kubeconfig", KC, *a],
@@ -91,7 +96,7 @@ spec:
     metadata: {{labels: {{app: {name}}}}}
     spec:
       terminationGracePeriodSeconds: 0
-{hn}{sel}      containers:
+{sa}{hn}{sel}      containers:
       - name: c
         image: alpine:3.20
         command: ["sleep","3600"]
@@ -105,7 +110,8 @@ def one():
     name = f"b{uuid.uuid4().hex[:8]}"
     sel = "" if SEL == "-" else "      nodeSelector: {%s: %s}\n" % tuple(SEL.split("=", 1))
     hn = "      hostNetwork: true\n" if HOSTNET else ""
-    y = MANIFEST.format(name=name, ns=NS, n=N, sel=sel, hn=hn)
+    sa = "      automountServiceAccountToken: false\n" if NOSA else ""
+    y = MANIFEST.format(name=name, ns=NS, n=N, sel=sel, hn=hn, sa=sa)
 
     w = Watcher(name, list_rv()); w.start()
     time.sleep(0.25)
@@ -145,7 +151,7 @@ try:
     if not rows:
         print("  no successful rounds"); sys.exit(1)
 
-    print(f"  {N} pods, {len(rows)} rounds{' , hostNetwork (no CNI)' if HOSTNET else ''}   ms")
+    print(f"  {N} pods, {len(rows)} rounds{' , hostNetwork' if HOSTNET else ''}{' , no SA token' if NOSA else ''}   ms")
     for k in ["created_first", "created_last", "sched_first", "sched_last",
               "first", "median", "last"]:
         v = sorted(r[k] for r in rows)

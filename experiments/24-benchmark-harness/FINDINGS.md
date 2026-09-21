@@ -162,6 +162,94 @@ What remains is the CRI path as the kubelet drives it under concurrency --
 sandbox, CNI, container, status -- which `ctr run` does not exercise. That is
 where to look next.
 
+## Where the concurrency gap is, and where it is not
+
+The correction above leaves one real difference: ferry's first pod of a burst
+beats kind's and its last loses badly. Three alternating rounds, 20 pods,
+teardown between, free memory logged (`ab.sh` — taken after two runs minutes
+apart disagreed by 187ms on a figure that had strictly *less* work to do):
+
+| 20-pod burst, 3 alternating rounds | ferry | kind |
+|:--|--:|--:|
+| first pod (median) | **742ms** | 786ms |
+| last pod (median) | 1400ms | **975ms** |
+| marginal cost per additional pod | 34.6ms | **9.9ms** |
+
+Ferry's first pod wins all three rounds; its last loses all three.
+
+### The runtime is not the problem — it is the faster of the two
+
+`crictl`, same version and same request on both nodes, with `network: NODE` so
+CNI is out of it (`criconc.sh`):
+
+| RunPodSandbox ×12 | ferry | kind |
+|:--|--:|--:|
+| issued serially | **38.2ms** each | 55.2ms each |
+| issued at once | **6.5ms** each | 16.6ms each |
+| speedup from concurrency | **5.87×** | 3.33× |
+
+**Ferry's CRI is ~1.4× faster serially, ~2.6× faster concurrently, and
+parallelises better.** Tuning containerd is the wrong target.
+
+The first attempt at this measured 0 of 12 sandboxes on kind and reported
+timings anyway — kind uses the systemd cgroup driver, and runc rejects a
+`cgroup_parent` that is not a slice. The script now counts what it created and
+says so. Same class of error as the `ctr` namespace mistake below.
+
+### Nor is the kubelet starved of work
+
+- It learns about all 20 pods within **102ms** (`syncbatch.sh`), so watch
+  delivery across the host/guest boundary is not pacing it.
+- The control plane has all 20 scheduled by 152ms.
+- Plain `ctr` creates 20 containers in 165ms with a 6× concurrency speedup
+  (`ctrconc.sh`).
+
+### It is the kubelet, feeding the runtime in waves
+
+From containerd's own log, when each `RunPodSandbox` *arrived* (`criseq.sh`):
+
+| | ferry | kind |
+|:--|--:|--:|
+| all 20 requests issued within | 427ms | **64ms** |
+| largest gap between requests | 297ms | 7.5ms |
+
+Kind's kubelet fires all twenty almost at once. Ferry's spreads them over
+427ms — and containerd is not idle during the gaps: `stall.py` shows it busy
+with `CreateContainer`/`StartContainer` for *earlier* pods. Ferry's kubelet
+works a wave of pods through to completion before starting the next.
+
+### Half of the excess is the projected serviceaccount volume
+
+`syncPod` will not create a sandbox until `WaitForAttachAndMount` returns, and
+every pod gets a projected serviceaccount token unless told otherwise. With
+`automountServiceAccountToken: false` (`NOSA=1 burst.py`):
+
+| 20-pod burst | ferry | ferry, no SA | kind | kind, no SA |
+|:--|--:|--:|--:|--:|
+| last pod | 1370ms | 1246ms | 959ms | 719ms |
+| spread (first → last) | 665ms | **354ms** | 214ms | 150ms |
+| marginal per pod | 35.0ms | **18.6ms** | 11.3ms | 7.9ms |
+
+Removing it halves ferry's staircase. Both stacks improve, so this is not
+ferry-specific — but ferry has roughly twice as much of it to lose, and is
+still 2.4× behind afterwards. The volume manager's reconciler runs on a 100ms
+loop, and 427ms is about four of those.
+
+These two rows were taken minutes apart rather than alternating, and ferry's
+"first pod" moved the wrong way between them (705ms → 892ms with *less* work).
+Treat the direction as real and the magnitudes as provisional.
+
+### What to look at next
+
+Not containerd, and not the control plane. The remaining question is why
+ferry's kubelet completes a wave before starting the next when kind's does
+not, given the same binary, the same default configuration (`knobs.sh`
+confirms neither sets `kubeAPIQPS`/`kubeAPIBurst`, and ferry uses the *faster*
+cgroupfs driver where kind uses systemd), and a faster runtime underneath.
+Raising the kubelet past `--v=2` would show the per-pod phase boundaries
+directly; it currently needs a node-image rebuild to do that, which is worth
+making a runtime flag.
+
 ## The scripts
 
 The battery:
@@ -205,6 +293,16 @@ Added while chasing the gap above:
 | `ctrconc.sh` | containerd's own concurrency, serial vs parallel, no kubelet |
 | `slodur.sh` | `podStartSLOduration`, the kubelet measuring itself |
 | `knobs.sh` | the two kubelets' concurrency-bounding configuration, side by side |
+
+Added while chasing the concurrency gap:
+
+| | |
+|:--|:--|
+| `ab.sh` | alternating burst A/B with free memory logged, for when runs minutes apart disagree |
+| `criconc.sh` | RunPodSandbox serial vs concurrent, via crictl, no kubelet |
+| `criseq.sh` | when the kubelet *issued* each CRI call, from containerd's log |
+| `stall.py` | what containerd logged inside the biggest gap between requests |
+| `syncbatch.sh` | how many batches the kubelet learns about a burst in |
 
 ## Running it
 
