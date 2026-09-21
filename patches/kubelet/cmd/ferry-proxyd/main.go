@@ -27,14 +27,12 @@ import (
 	"syscall"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy/config"
 	"k8s.io/kubernetes/pkg/proxy/nftables"
-	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
 
 // How long a client waiting for a new ruleset is left hanging before being sent
@@ -75,21 +73,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Traffic policies distinguish local from remote endpoints by node. Every
-	// pod here is its own machine, so nothing is "local" in that sense and the
-	// no-op detector is the honest answer.
-	proxier, err := nftables.NewProxier(ctx,
-		v1.IPv4Protocol,
-		*syncPeriod,
-		time.Second,
-		false, // masqueradeAll: only hairpins need it, which kube-proxy marks itself
-		14,    // masqueradeBit, kube-proxy's default
-		proxyutil.NewNoOpLocalDetector(),
-		*nodeName,
-		nodeIP,
-		nil, nil, nil,
-		false,
-	)
+	// NewProxier's signature moves between minors, so the call itself lives in
+	// patches/kubelet-vX.Y/cmd/ferry-proxyd/. What the proxier is told is the
+	// same either way; only the shape of the telling changes.
+	proxier, err := ferryNewProxier(ctx, *nodeName, nodeIP, *syncPeriod)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create proxier: %v\n", err)
 		os.Exit(1)

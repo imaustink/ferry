@@ -13,7 +13,7 @@ export FERRY_ROOT
 # shellcheck source=lib/overlay.sh
 . "$here/lib/overlay.sh"
 
-K8S_VERSION="${K8S_VERSION:-v1.34.0}"
+K8S_VERSION="${K8S_VERSION:-$FERRY_DEFAULT_K8S_VERSION}"
 ferry_version_valid "$K8S_VERSION" \
   || { echo "K8S_VERSION=$K8S_VERSION is not a version like v1.34.0" >&2; exit 1; }
 # A few shims differ by minor -- upstream changes a constructor's signature and
@@ -124,6 +124,28 @@ if [ -f "$proxier" ]; then
   echo "    ~ pkg/proxy/nftables/proxier.go"
   grep -q 'ferryNFTablesInterface(ipFamily)' "$proxier" \
     || { echo "    !! the nftables seam did not apply; ferry-proxyd will not work" >&2; exit 1; }
+fi
+
+# knftables' netlink backend is not portable, and from v1.37 it is not tagged.
+#
+# Vendored knftables v0.0.22 -- first pulled in by v1.37 -- added netlink.go
+# with no build tag. It reaches the kernel through github.com/google/nftables,
+# whose xt package reads unix.NFPROTO_IPV4 and friends, constants darwin's
+# x/sys/unix does not declare. So the package stopped compiling on darwin and
+# took ferry-proxyd with it, which is to say Services, on a failure whose
+# message names neither.
+#
+# Narrowing the file to linux is the fix; patches/kubelet-v1.37/ supplies the
+# darwin stand-in for the two names nftables.go still refers to. Conditional
+# because the minors before v1.37 vendor a knftables that has no such file.
+netlink="$src/vendor/sigs.k8s.io/knftables/netlink.go"
+if [ -f "$netlink" ] && ! head -1 "$netlink" | grep -q '^//go:build linux$'; then
+  echo "==> narrowing knftables' netlink backend to linux"
+  printf '//go:build linux\n\n' | cat - "$netlink" > "$netlink.ferry"
+  mv "$netlink.ferry" "$netlink"
+  echo "    ~ vendor/sigs.k8s.io/knftables/netlink.go"
+  head -1 "$netlink" | grep -q '^//go:build linux$' \
+    || { echo "    !! knftables netlink.go was not narrowed; ferry-proxyd will not build" >&2; exit 1; }
 fi
 
 # Tell the cluster that this node runs Linux containers.

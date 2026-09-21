@@ -36,6 +36,25 @@ FERRY_VERSIONED_BINARIES="kubelet ferry-proxyd kube-apiserver kube-controller-ma
 # shellcheck disable=SC2034 # read by ferry, which sources this file
 FERRY_CONTROL_PLANE_BINARIES="kube-apiserver kube-controller-manager kube-scheduler etcd etcdctl etcdutl"
 
+# The Kubernetes a checkout builds when nothing says otherwise.
+#
+# Held here rather than in each caller because ferry, build-kubelet.sh,
+# control-plane/fetch-binaries.sh and control-plane/up.sh all used to spell the
+# same literal separately. That is the disagreement this file exists to end: a
+# default bumped in three of those four places is the split-version bug in the
+# header above, arrived at from the other direction.
+#
+# It has to be a minor ferry_control_plane_version pins, or a fresh checkout's
+# first build asks kwok-ci for a control plane nobody published.
+#
+# Note this is only where a *new* checkout starts. ferry prefers
+# ferry_active_version, so a checkout that has already built something stays
+# where it is until someone asks it to move -- bumping this never upgrades an
+# existing cluster behind its back, and could not: ferry_skew_reason still
+# refuses to cross more than one minor at a time.
+# shellcheck disable=SC2034 # read by the four scripts that source this file
+FERRY_DEFAULT_K8S_VERSION="v1.37.0"
+
 # --- version arithmetic ---------------------------------------------------
 
 ferry_version_valid() { # vX.Y.Z

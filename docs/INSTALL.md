@@ -331,7 +331,7 @@ an empty machine is reclaimed about a minute later.
 
 | | default | |
 |---|---|---|
-| `K8S_VERSION` | what is built, else `v1.34.0` | the Kubernetes to build |
+| `K8S_VERSION` | what is built, else `v1.37.0` | the Kubernetes to build |
 | `K8S_CONTROL_PLANE_VERSION` | pinned per minor | the darwin control plane build, when ferry's pin is not published |
 | `ETCD_VERSION` | paired with the Kubernetes | the etcd to fetch |
 | `K8S_SRC` | under `$TMPDIR` | where the Kubernetes source tree is checked out |

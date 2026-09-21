@@ -90,7 +90,13 @@ What is still only reasoned about is a **minor** bump *on a running cluster*.
 Everything above is within v1.34, which drives every path except patch drift.
 Building across minors is no longer reasoned about: v1.34, v1.35, v1.36 and
 v1.37 kubelets all build, from one shared overlay plus a per-minor
-`patches/kubelet-vX.Y/` carrying the two constructors whose signatures move.
+`patches/kubelet-vX.Y/` carrying the constructors whose signatures move --
+cadvisor's, the container manager's, and `nftables.NewProxier`, which v1.37
+changed from positional arguments to a `KubeProxyConfiguration`. v1.37 has been
+run on a cluster as well as built: node Ready, pods scheduled and networked,
+CoreDNS resolving, `ferry-proxyd` rendering Service rules, pods reaching a
+ClusterIP by address and by name across both endpoints with no host proxy and
+no root, and the twelve assertions in `experiments/23-pod-cpu-limits` passing.
 v1.37 also carries whole copies of `cadvisor_darwin.go` and
 `container_manager_darwin.go`: cadvisor merged `info/v1` and `info/v2` into one
 `lib/model` package, and an import path is not something a second file can
