@@ -240,6 +240,22 @@ carry: cadvisor folded `info/v1` and `info/v2` into one `lib/model` package, and
 an import path cannot be overridden from a second file, so that minor overlays
 whole copies of `cadvisor_darwin.go` and `container_manager_darwin.go`.
 
+`ferry-proxyd` is shimmed the same way. `nftables.NewProxier` took every knob
+positionally through v1.36 and takes a `KubeProxyConfiguration` from v1.37, so
+the call lives in `patches/kubelet-vX.Y/cmd/ferry-proxyd/ferry_new_proxier.go`
+and `main.go` only calls `ferryNewProxier`. The values passed are the same on
+both sides of that change; a minor added without its shim fails to compile on
+the one function rather than anywhere else.
+
+v1.37 is also the first minor to vendor knftables v0.0.22, which added
+`netlink.go` with no build tag. That file reaches the kernel through
+`github.com/google/nftables`, whose `xt` package reads `unix.NFPROTO_*` --
+constants darwin does not declare -- so the whole package stopped compiling and
+took `ferry-proxyd`, and therefore Services, with it. `build-kubelet.sh` narrows
+the file to linux and the v1.37 overlay supplies a darwin stand-in for the two
+names `nftables.go` still refers to. Nothing is lost: `newNetlinkAdapter` is
+only reached behind the `UseNetlink` opt-in, which the proxier never sets.
+
 ### Rebuilding starts enforcing container CPU limits
 
 Not a version upgrade, but it arrives with one, so it belongs here.
