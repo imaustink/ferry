@@ -78,7 +78,8 @@ context_of() {
 stack_vm_pids() {
   local d; d=$(docker_vm_pid)
   case "$1" in
-    ferry|ferry2) vm_pids | grep -v "^${d}$" ;;
+    # By what they have open, not by "not Docker's" -- see ferry_vm_pids.
+    ferry|ferry2) ferry_vm_pids ;;
     *)     echo "$d" ;;
   esac
 }
@@ -192,6 +193,7 @@ YAML
                 --image "$KIND_NODE_IMAGE" ${cfg[@]+"${cfg[@]}"} \
                 >"$RESULTS/$s-up.log" 2>&1 ;;
     minikube) KUBECONFIG="$kc" minikube start -p "$CLUSTER" --driver=docker \
+                --kubernetes-version="$K8S_VERSION" \
                 --interactive=false >"$RESULTS/$s-up.log" 2>&1 ;;
   esac
 }
@@ -211,8 +213,22 @@ stack_down() {
 # minikube keep theirs in a Docker volume inside the VM.
 stack_disk_mib() {
   case "$1" in
-    ferry|ferry2) du -sm "$HOME/.ferry" 2>/dev/null | awk '{print $1}' ;;
-    *)     docker system df -v 2>/dev/null \
-             | awk -v n="$CLUSTER" '$1 ~ n {print $0}' | head -3 ;;
+    # FERRY_HOME, not ~/.ferry: under a profile the state lives in
+    # ~/.ferry-<profile>, and the hardcoded path measured whichever unrelated
+    # cluster happened to own the default directory -- or nothing at all.
+    ferry|ferry2)
+      # Derived from the kubeconfig ferry reports, which is
+      # $FERRY_HOME/admin.conf -- there is no `ferry home`, and re-deriving
+      # the profile suffix here would be a second place to get it wrong.
+      local home; home="$(dirname "$("$FERRY" kubeconfig 2>/dev/null)")"
+      [ -d "$home" ] || home="${FERRY_HOME:-$HOME/.ferry}"
+      du -sm "$home" 2>/dev/null | awk '{print $1}' ;;
+    # The node's writable layer plus its volumes, as a number rather than
+    # three lines of `docker system df -v` for a human to read.
+    *)
+      docker ps -a --filter "name=$CLUSTER" --format '{{.Size}}' 2>/dev/null \
+        | awk '{ v=$1; u=toupper(v); sub(/[A-Za-z]+$/,"",v)
+                 if (u ~ /GB$/) v*=1024; else if (u ~ /KB$/) v/=1024
+                 t+=v } END { printf "%.0f", t+0 }' ;;
   esac
 }

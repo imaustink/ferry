@@ -30,6 +30,30 @@ vm_pids() {
   ps -Ao pid=,comm= | awk '/Virtualization.VirtualMachine/ {print $1}'
 }
 
+# The VMs belonging to the ferry under test, identified by what they have open.
+#
+# "every VM that is not Docker's" was the old rule, and it is wrong on any
+# machine running more than one ferry -- which is every machine with more than
+# one worktree. Measured while writing this: three pod VMs from the default
+# profile, one from another worktree's, and a Claude sandbox VM, all of which
+# the old rule charged to the cluster under test. That is 3.5 GiB of somebody
+# else's memory in ferry's column, on its way into a README.
+#
+# A ferry pod VM keeps its disks under FERRY_RUN/cri; a machine node's are
+# under FERRY_RUN or FERRY_HOME. A VM with none of those open is not ours,
+# whoever it belongs to.
+ferry_vm_pids() {
+  local run home pid
+  run="${FERRY_RUN:-/tmp/ferry-run${FERRY_PROFILE:+-$FERRY_PROFILE}}"
+  home="$(dirname "$("$FERRY" kubeconfig 2>/dev/null)")"
+  [ -d "$home" ] || home="${FERRY_HOME:-$HOME/.ferry}"
+  for pid in $(vm_pids); do
+    if lsof -p "$pid" 2>/dev/null | grep -qF -e "$run/" -e "$home/"; then
+      echo "$pid"
+    fi
+  done
+}
+
 # phys_footprint -- what macOS charges a process, resident minus the shared
 # pages every VM process maps its own copy of. Slow (~1-3s per VM process),
 # so it is taken at rest rather than sampled.
@@ -47,6 +71,31 @@ footprint_mib() {
   echo "$total"
 }
 
+# Cumulative CPU seconds a pid set has consumed, from ps cputime.
+#
+# The honest basis for "what does this cost when nothing is happening".
+# `ps %cpu` below is a decaying average over a window the kernel chooses and
+# does not publish, so it cannot be compared between a stack that has just
+# finished a burst and one that has been resting -- which is exactly the
+# comparison the idle rows make. Two readings of this, over the wall time
+# between them, is an average over a window we picked.
+#
+# macOS prints cputime as [[dd-]hh:]mm:ss.ss.
+cpu_seconds_of() {
+  local args=() pid
+  for pid in "$@"; do [ -n "$pid" ] && args+=(-p "$pid"); done
+  [ ${#args[@]} -eq 0 ] && { echo 0; return; }
+  ps -o cputime= "${args[@]}" 2>/dev/null | awk '
+    { gsub(/^ +/, ""); gsub(/-/, ":")
+      n = split($1, a, ":"); s = 0
+      if      (n == 4) s = a[1]*86400 + a[2]*3600 + a[3]*60 + a[4]
+      else if (n == 3) s = a[1]*3600 + a[2]*60 + a[3]
+      else if (n == 2) s = a[1]*60 + a[2]
+      else             s = a[1]
+      t += s }
+    END { printf "%.2f", t+0 }'
+}
+
 # Sum of %CPU across a pid set.
 cpu_of() {
   local args=() pid
@@ -55,9 +104,17 @@ cpu_of() {
   ps -o %cpu= "${args[@]}" 2>/dev/null | awk '{t+=$1} END {printf "%.1f", t+0}'
 }
 
-# ferry's native control plane and runtime, by executable name.
+# ferry's native control plane and runtime, for the checkout under test.
+#
+# Anchored on this checkout's bin directory. Matching 'bin/etcd' alone also
+# matches another worktree's etcd, an installed release's, and anything else
+# on the machine that keeps a binary by that name under a bin -- the same
+# mistake ferry_vm_pids documents, arrived at from the process table instead
+# of the VM list. FERRY is this harness's ferry, so its bin is the only one
+# these numbers should include.
 ferry_host_pids() {
-  pgrep -f 'bin/(etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kubelet|ferry-cri|ferry-streamer|ferry-proxyd|ferry-netpol|ferry-storage|ferry-gpud|ferry-proxy|ferry-machined|ferry-node)' 2>/dev/null
+  local bin; bin="$(cd "$(dirname "$FERRY")" && pwd)/bin"
+  pgrep -f "^$bin/(etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kubelet|ferry-cri|ferry-streamer|ferry-proxyd|ferry-netpol|ferry-storage|ferry-gpud|ferry-proxy|ferry-machined|ferry-node)" 2>/dev/null
 }
 
 # Docker Desktop's own processes on the host side (its VM is found separately).

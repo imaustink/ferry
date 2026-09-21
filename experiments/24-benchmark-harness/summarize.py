@@ -74,7 +74,13 @@ table("Cluster lifecycle", [
     row("create, artifacts cached", lambda s: fmt(n(s, "create_warm_s"), "s")),
     row("delete", lambda s: fmt(n(s, "delete_s"), "s")),
     row("disk once created", lambda s: fmt(n(s, "disk_mib"), " MiB", 0)),
-])
+],
+"**The disk row is not a comparison.** ferry's is everything under FERRY_HOME,\n"
+"including the node image it boots. kind's and minikube's is the node\n"
+"container's writable layer only -- the ~1.3 GiB node image underneath it is a\n"
+"Docker image shared with every other cluster that tool makes, and counting it\n"
+"once per cluster would be as wrong as counting it zero times. Read each\n"
+"column on its own.")
 
 table("Idle — cluster up, nothing scheduled", [
     row("memory the cluster adds", lambda s: fmt(mem_added(s), " MiB", 0)),
@@ -82,9 +88,11 @@ table("Idle — cluster up, nothing scheduled", [
         "VM + host footprint" if s.startswith("ferry") else "used in Docker's VM"),
     row("Docker Desktop host processes", lambda s:
         "n/a" if s.startswith("ferry") else fmt(n(s, "idle.host_footprint"), " MiB", 0)),
-    row("CPU, cluster down", lambda s: fmt(n(s, "baseline.cpu_pct"), "%")),
-    row("CPU, cluster up and empty", lambda s: fmt(n(s, "idle.cpu_pct"), "%")),
-], "CPU is cumulative CPU-time over a 60s window, not `ps %cpu`.")
+    row("CPU, cluster down", lambda s: fmt(n(s, "baseline.cpu_core_pct"), "%", 1)),
+    row("CPU, cluster up and empty", lambda s: fmt(n(s, "idle.cpu_core_pct"), "%", 1)),
+], "CPU is percent of one core, from cumulative CPU-time over a 60s window with\n"
+   "the cluster left alone -- not `ps %cpu`, which is a decaying average over a\n"
+   "window the kernel picks. This machine has 16 cores, so 100% is one of them.")
 
 def lat(s):
     v = [n(s, f"pod_start_s.{i}") for i in range(1, 9)]
