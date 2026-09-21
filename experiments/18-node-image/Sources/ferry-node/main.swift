@@ -236,6 +236,18 @@ func machineConfiguration(
        !level.isEmpty, Int(level) != nil {
         arguments.append("ferry.kubeletv=\(level)")
     }
+    // How fast the kubelet may talk to the API server. Upstream's 50 QPS
+    // paces a 20-pod burst at 40ms a pod and leaves the statuses trailing the
+    // containers by half a second; see ferry.apiqps in init.sh. Same shape as
+    // the level above -- an environment variable, only appended when set, so
+    // an unset one leaves the guest on upstream's defaults.
+    for (env, param) in [("FERRY_KUBE_API_QPS", "ferry.apiqps"),
+                         ("FERRY_KUBE_API_BURST", "ferry.apiburst")] {
+        if let v = ProcessInfo.processInfo.environment[env],
+           !v.isEmpty, Int(v) != nil {
+            arguments.append("\(param)=\(v)")
+        }
+    }
     boot.commandLine = arguments.joined(separator: " ")
     config.bootLoader = boot
 

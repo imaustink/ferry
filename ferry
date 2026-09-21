@@ -136,6 +136,21 @@ PORT_SHIFT=$(( PROFILE_INDEX * 1000 ))
 
 # Cluster state that should survive a restart: certificates and etcd.
 FERRY_HOME="${FERRY_HOME:-$HOME/.ferry$SUFFIX}"
+
+# How fast a kubelet may talk to the API server.
+#
+# Upstream defaults to 50 QPS with a burst of 100, sized for a node that is
+# one of hundreds and where a kubelet flooding the API server is a real
+# hazard. A ferry cluster is one or two nodes and an API server on the same
+# Mac, and at those defaults a 20-pod burst is paced at a very regular 40ms a
+# pod -- two requests each, one token per 20ms. The containers are all started
+# within 55ms and the last pod's status is not stored for another 580ms, so
+# the whole burst is waiting on a rate limiter rather than on any work.
+#
+# Measured, 20-pod burst, last pod Running: 875ms at the defaults, 347ms at
+# these. See experiments/24-benchmark-harness/FINDINGS.md.
+FERRY_KUBE_API_QPS="${FERRY_KUBE_API_QPS:-500}"
+FERRY_KUBE_API_BURST="${FERRY_KUBE_API_BURST:-1000}"
 # Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
 # ~104 bytes and the kubelet builds its podresources socket beneath --root-dir,
 # so a long home directory would break it.
@@ -987,6 +1002,8 @@ podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
+kubeAPIQPS: $FERRY_KUBE_API_QPS
+kubeAPIBurst: $FERRY_KUBE_API_BURST
 # The upstream hard-eviction defaults are sized for small cloud nodes; on a
 # laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
 # node taints itself NoSchedule.
@@ -2125,6 +2142,8 @@ podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
+kubeAPIQPS: $FERRY_KUBE_API_QPS
+kubeAPIBurst: $FERRY_KUBE_API_BURST
 evictionHard:
   memory.available: "$EVICT_MEMORY"
   nodefs.available: "$EVICT_DISK"

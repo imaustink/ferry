@@ -311,6 +311,7 @@ Added while asking the kubelet directly:
 | `podphases.sh` | runs a burst and reads the kubelet's own account of it, either stack |
 | `syncphases.py` | inside syncPod at `--v=4`: which part is work and which is waiting for a turn |
 | `statuslat.py` | phase=Running to the status stored in the API -- the part after syncPod |
+| `apiwrite.py` / `apiwrite.sh` | what one sequential API write costs from inside a node |
 
 ## Inside syncPod, both stacks at --v=4
 
@@ -564,14 +565,73 @@ Against where this PR opened -- 742ms first, 1400ms last, against kind's
 786ms and 975ms -- the last pod has gone from 1.44x behind to slightly
 ahead, and everything before it is not close.
 
-### Still open
+## The last of it: the kubelet was rate-limiting itself
 
-The status write is still the largest thing ferry does that kind does not:
-149ms median even with etcd's fsync gone, and all twenty stored within 584ms
-while the kubelet had them all Running within 55ms. That is no longer etcd
-(0.12ms a commit), so it is the kubelet-to-API-server path across vmnet,
-twenty times, serially. It is what keeps the last pod near kind's rather than
-well past it.
+What was left after both fsync barriers was not in the kubelet and not in the
+runtime. The kubelet had all twenty containers started within 55ms and the
+last pod's status was not stored for another 580ms.
+
+Everything plausible was measured and was not it:
+
+| hypothesis | result | how |
+|:--|:--|:--|
+| the write crosses vmnet to the Mac | **No.** A sequential PATCH from inside ferry's node is 2.07ms; from inside kind's node, 2.02ms. Identical. | `apiwrite.sh` |
+| the guest is told the wrong address | No. The vmnet gateway is no faster than the Mac's LAN address (2.21 vs 2.07ms) | `apiwrite.sh` |
+| etcd again | No. 0.12ms a commit with the barrier off | etcd metrics |
+| client-side throttling, visibly | No. Neither kubelet logs a single wait -- client-go only logs one over 50ms | grep |
+| ferry does more status writes | No. Three per pod on both | `statuslat.py` |
+
+So the writes were the same speed and there were the same number of them.
+What differed was the spacing:
+
+| the one status write per pod that carries Running | ferry | kind |
+|:--|--:|--:|
+| gap between consecutive pods | **39.6ms** (min 2.7, max 41.7) | 4.2ms |
+| span for twenty | 580ms | 198ms |
+
+Nothing is that regular by accident. `kubeAPIQPS` defaults to 50, which is one
+token per 20ms, and the status manager spends two per pod -- so a burst is
+paced at 40ms a pod by a rate limiter, with the containers long since
+running.
+
+Upstream's defaults are right for a node that is one of hundreds, where a
+kubelet flooding the API server is a real hazard. A ferry cluster is one or
+two nodes and an API server on the same Mac. Raised to 500/1000, on both the
+Mac's kubelet and the guest's, overridable with `FERRY_KUBE_API_QPS` and
+`FERRY_KUBE_API_BURST`:
+
+| 20-pod burst | before | after |
+|:--|--:|--:|
+| gap between status writes | 39.6ms | **2.2ms** |
+| all twenty statuses stored within | 584ms | **75ms** |
+| last pod Running | 875ms | **347ms** |
+
+## Where it ends up
+
+Three alternating rounds, 20 pods, everything v1.37.0, CPUs matched:
+
+| 20-pod burst | ferry mode 2 | kind |
+|:--|--:|--:|
+| first pod | **293ms** | 632ms |
+| median pod | **325ms** | 700ms |
+| last pod | **347ms** | 886ms |
+| spread across the burst | **55ms** | 254ms |
+
+| single pod, apply to Running | ferry mode 2 | ferry mode 1 | kind |
+|:--|--:|--:|--:|
+| | **~190ms** | ~405ms | 500ms |
+
+This PR opened with ferry's first pod at 742ms and its last at 1400ms,
+against kind's 786ms and 975ms, and the last pod losing 1.44x. The last pod
+is now 2.6x ahead, and the twenty of them finish within 55ms of each other.
+
+### What is actually left
+
+Nothing in this chain is the top cost any more. The remaining ~290ms before
+the first pod is object creation and scheduling (~90ms of it) plus the
+sandbox and container work, which is now flat across the burst rather than a
+staircase -- there is no queue left to find. The next real gain would have to
+come from making the runtime itself faster, not from removing a wait.
 
 ## Running it
 

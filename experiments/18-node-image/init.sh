@@ -59,6 +59,21 @@ CLUSTER_CIDR=$(param ferry.clustercidr)
 # this image to find out which phase stretched. Absent on a node booted by an
 # older ferry-node, and the default is the 2 that was hardcoded here.
 KUBELET_V=$(param ferry.kubeletv)
+# How fast the kubelet is allowed to talk to the API server.
+#
+# Upstream defaults to 50 QPS with a burst of 100, which paces a 20-pod burst
+# at a very regular 40ms a pod -- two requests each, one token per 20ms -- and
+# the pods are Running long before their statuses say so. Measured: the
+# kubelet had all twenty containers started within 55ms and the last status
+# was not stored for another 580ms, against kind's 198ms.
+#
+# Those defaults are sized for a node in a cluster with hundreds of others,
+# where a kubelet that floods the API server is a real hazard. A ferry node is
+# one of one or two, talking to an API server on the same Mac.
+# Defaulted here as well as on the host, so a guest booted by a ferry-node
+# that does not pass the parameter still gets them.
+KUBE_API_QPS=$(param ferry.apiqps); KUBE_API_QPS=${KUBE_API_QPS:-500}
+KUBE_API_BURST=$(param ferry.apiburst); KUBE_API_BURST=${KUBE_API_BURST:-1000}
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -157,6 +172,8 @@ ${DNS_SERVICE:+clusterDNS: ["$DNS_SERVICE"]}
 cgroupDriver: cgroupfs
 failSwapOn: false
 readOnlyPort: 0
+${KUBE_API_QPS:+kubeAPIQPS: $KUBE_API_QPS}
+${KUBE_API_BURST:+kubeAPIBurst: $KUBE_API_BURST}
 # Sized to this machine's disk rather than to a Mac's. Asking for gigabytes
 # free on a node whose root filesystem is a few gigabytes means DiskPressure
 # from the first heartbeat, and everything scheduled here is evicted.

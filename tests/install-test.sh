@@ -659,6 +659,22 @@ succeeds "  still .fsync unless asked otherwise" \
 succeeds "  and an empty flag list does not break bash 3.2" \
   grep -q 'etcd_fsync_args\[@\]+' "$repo/control-plane/up.sh"
 
+# kubeAPIQPS. Upstream's 50 paces a 20-pod burst at 40ms a pod -- two
+# requests each, one token per 20ms -- with every container already running.
+# Both kubelets get the raised value or neither comparison means anything.
+succeeds "the mac kubelet is not rate-limited to upstream's 50 QPS" \
+  grep -q 'kubeAPIQPS: \$FERRY_KUBE_API_QPS' "$repo/ferry"
+succeeds "  and neither is the guest's" \
+  grep -q 'kubeAPIQPS: \$KUBE_API_QPS' "$repo/experiments/18-node-image/init.sh"
+succeeds "  overridable from the environment" \
+  grep -q 'FERRY_KUBE_API_QPS:-' "$repo/ferry"
+succeeds "  and reaching the guest over the kernel command line" \
+  grep -q 'ferry.apiqps' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+# Both heredocs in ferry write a kubelet.yaml; one of them having it is a
+# cluster where the first node is fast and a node added later is not.
+succeeds "  in both of ferry's kubelet configs" \
+  test "$(grep -c 'kubeAPIQPS:' "$repo/ferry")" = 2
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod
