@@ -238,6 +238,38 @@ Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s
 sandbox creation 0.063 vs 0.065s, container start 0.034 vs 0.045s. The remaining
 gap is not in any of them.
 
+### A tie is not the same as nothing to win
+
+Both bullets above are still true and the second conclusion drawn from the
+first was wrong. "The mount is 3ms, the rest is the kubelet's own 100ms
+populator and reconciler periods, which both stacks pay identically" is a
+correct measurement, and it got filed as a phase ferry does not lose in, so
+not worth returning to. Which is right if the question is *why is ferry
+slower than kind*, and wrong if the question is *how does ferry get faster*.
+
+It was ~290ms of sleeping on the critical path of every pod start, doing
+nothing, on both stacks. Three unexported constants in
+`pkg/kubelet/volumemanager/volume_manager.go` that no flag and no
+KubeletConfiguration field reaches. kind runs the stock binary and cannot
+turn them down; ferry compiles its own and can. Doing it took mode 2's
+single-pod start from 501ms to 229ms against kind's 500ms, and mode 1's from
+710ms to 406ms.
+
+So when a phase comes out a tie, it is worth asking a second question before
+moving on: *is this a floor, and can we alone move it?* A cost both stacks
+pay identically is invisible to any A/B between them, which makes a
+comparative harness exactly the wrong instrument for finding it. The thing
+that found it was the absolute breakdown -- 301ms of wait against 10ms of
+work, with the ratio printed rather than left to be noticed.
+
+The corollary is the trap: this only pays where ferry controls the binary. It
+reached mode 1 immediately and mode 2 only after `build-kubelet-linux.sh`,
+because mode 2's guest kubelet was upstream's download. Before claiming a
+patch like this, check which of ferry's own configurations actually run the
+thing that was patched -- and keep an unpatched one in the run as a control.
+Mode 2 sitting at 497ms while mode 1 moved 710 to 431 is the only reason the
+279ms is attributable to the patch rather than to the afternoon.
+
 ### A burst's wall time is the last pod, not the typical one
 
 Twenty pods reaching Running in 2.72s says nothing about whether they went
@@ -267,7 +299,9 @@ half mode 2**, and the ratio moved from run to run with whatever the scheduler
 scored. That single bug produced:
 
 - *"mode 2 starts a pod in 0.82s against kind's 0.62s."* Watched rather than
-  polled, and pinned, it is **541ms against kind's 544ms** -- a tie.
+  polled, and pinned, it is **541ms against kind's 544ms** -- a tie. (A tie
+  only until the volume manager's poll intervals came down; it is now 229ms
+  against 500ms. See "A tie is not the same as nothing to win" above.)
 - *"mode 2's ten-pod time (3.63s) is slower than its twenty-pod time (2.72s),
   which should not happen."* It does not happen. That was the mixture changing
   between the two cells.
