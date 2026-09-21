@@ -94,8 +94,9 @@ v1.37 kubelets all build, from one shared overlay plus a per-minor
 cadvisor's, the container manager's, and `nftables.NewProxier`, which v1.37
 changed from positional arguments to a `KubeProxyConfiguration`. v1.37 has been
 run on a cluster as well as built: node Ready, pods scheduled and networked,
-CoreDNS resolving, `ferry-proxyd` rendering Service rules, and the twelve
-assertions in `experiments/23-pod-cpu-limits` passing.
+CoreDNS resolving, `ferry-proxyd` rendering Service rules, pods reaching a
+ClusterIP by address and by name across both endpoints with no host proxy and
+no root, and the twelve assertions in `experiments/23-pod-cpu-limits` passing.
 v1.37 also carries whole copies of `cadvisor_darwin.go` and
 `container_manager_darwin.go`: cadvisor merged `info/v1` and `info/v2` into one
 `lib/model` package, and an import path is not something a second file can
