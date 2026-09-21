@@ -130,9 +130,13 @@ start etcd "$bin/etcd" \
   --initial-advertise-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
   --initial-cluster=default=http://127.0.0.1:$ETCD_PEER_PORT
 
-for i in $(seq 1 30); do
+# 0.1s, not 1s, and the same thirty seconds of patience. etcd answers in about
+# a fifth of a second; at one-second granularity that cost a whole one, and
+# the same was true of both API server checks below. Three rounded-up waits
+# were most of the 4.6s this script contributed to `ferry up`.
+for i in $(seq 1 300); do
   "$bin/etcdctl" --endpoints=127.0.0.1:$ETCD_CLIENT_PORT endpoint health >/dev/null 2>&1 && break
-  sleep 1
+  sleep 0.1
 done
 
 start kube-apiserver "$bin/kube-apiserver" \
@@ -168,10 +172,10 @@ start kube-apiserver "$bin/kube-apiserver" \
   --service-node-port-range="${SERVICE_NODE_PORT_RANGE:-30000-32767}"
 
 echo "    . waiting for /livez"
-for i in $(seq 1 60); do
+for i in $(seq 1 600); do
   curl -sk --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
     https://127.0.0.1:$API_PORT/livez 2>/dev/null | grep -q ok && break
-  sleep 1
+  sleep 0.1
 done
 
 start kube-controller-manager "$bin/kube-controller-manager" \
@@ -201,9 +205,9 @@ export KUBECONFIG="$STATE/admin.conf"
 # bootstrap hooks run after that, and applying manifests before they finish
 # fails, so wait on /healthz which covers them.
 echo "    . waiting for /healthz"
-for i in $(seq 1 60); do
+for i in $(seq 1 600); do
   [ "$(kubectl get --raw /healthz 2>/dev/null)" = "ok" ] && break
-  sleep 1
+  sleep 0.1
 done
 
 # The Node authorizer covers a kubelet's access to objects tied to its own

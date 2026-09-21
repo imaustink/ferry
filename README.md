@@ -38,14 +38,14 @@ is not the baseline ferry actually has.
 |:--|--:|--:|--:|--:|
 | a pod is | its own VM | a container | a container | a container |
 | needs Docker Desktop | **no** | **no** | yes | yes |
-| create a cluster | **12.3 s** | 32.6 s | 25.4 s | 30.3 s |
-| delete it | 1.2 s | 1.5 s | **0.5 s** | 12.5 s |
-| start one pod | 0.48 s | **0.32 s** | 0.61 s | 0.60 s |
-| start 10 | 1.21 s | **0.59 s** | 0.70 s | 1.08 s |
-| start 20 | 3.36 s | 1.19 s | **0.93 s** | 2.18 s |
-| idle memory | **431 MiB of the Mac** | 1,486 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
-| idle CPU | **3.0%** | 14.2% | 24.4% | 29.0% |
-| per pod | 241 MiB | 9 MiB | 6 MiB | 16 MiB |
+| create a cluster | **12.3 s** | 25.9 s | 25.4 s | 30.3 s |
+| delete it | 1.2 s | 1.4 s | **0.5 s** | 12.5 s |
+| start one pod | 0.50 s | **0.25 s** | 0.61 s | 0.60 s |
+| start 10 | 0.99 s | **0.64 s** | 0.70 s | 1.08 s |
+| start 20 | 3.56 s | 1.17 s | **0.93 s** | 2.18 s |
+| idle memory | **431 MiB of the Mac** | 1,491 MiB of the Mac | 695 MiB of a VM you sized | 667 MiB of a VM you sized |
+| idle CPU | **2.8%** | 14.4% | 24.4% | 29.0% |
+| per pod | 239 MiB | 9 MiB | 6 MiB | 16 MiB |
 
 CPU is percent of one core over a 60-second window with the cluster up and
 nothing scheduled. This Mac has sixteen.
@@ -65,26 +65,37 @@ read), and still no Docker.
 
 **Where ferry is slower, it is slower.** kind creates 20 pods faster than
 ferry mode 2 out of the box, deletes a cluster in half a second against
-ferry's one and a bit, and costs less per pod. Mode 2 also takes 32 s to
-create, because it is a mode 1 control plane with a Linux node booted on top
-of it.
+ferry's one and a bit, and costs less per pod. Mode 2 takes twice as long as
+mode 1 to create, because it is a mode 1 control plane with a Linux node
+booted on top of it.
 
-Deleting used to be worse — 3.9 s in mode 1 and 8.1 s in mode 2 — and almost
-none of it was work. `kube-apiserver` spent two seconds draining its watches,
-and on `--purge` it was draining them into a data directory deleted a few
-milliseconds later; every teardown loop polled at half-second ticks for
-processes that exit in tens of milliseconds; and a fixed `sleep 1` waited on
-a service proxy that does not exit on SIGTERM at all. `--purge` now skips the
-drain, plain `ferry down` keeps it because that cluster is meant to come
-back, and the ticks are 50 ms.
+Both of those numbers used to be worse, and almost none of the difference was
+work:
+
+- **Teardown** was 3.9 s in mode 1 and 8.1 s in mode 2. `kube-apiserver` spent
+  two seconds draining its watches — and on `--purge`, draining them into a
+  data directory deleted milliseconds later. Every teardown loop polled at
+  half-second ticks for processes that exit in tens of milliseconds. A fixed
+  `sleep 1` waited on a service proxy that does not exit on SIGTERM at all.
+- **Mode 2 creation** was 32.6 s. Seven of those seconds were the node not
+  being Ready, because the kubelet cannot report `NetworkReady` until its CNI
+  configuration exists and that was written after an eight-second sleep whose
+  only job was logging diagnostics. Another 4.6 s went on `ferry-karpenter`
+  failing to start: it binds port 8081 for its health probe, which — unlike
+  every other port ferry uses — was not shifted per profile, so a second
+  ferry on the same Mac panicked on it.
+
+`--purge` now skips the drain, plain `ferry down` keeps it because that
+cluster is meant to come back, the ticks are 50 ms, the diagnostics run in the
+background, and karpenter's port is shifted with the rest.
 
 That 20-pod row is the one number here that moves a lot on a flag:
 
 | ferry mode 2 | default | `FERRY_ETCD_NO_FSYNC=1 FERRY_NODE_DISK_SYNC=none` |
 |:--|--:|--:|
-| start one pod | 0.32 s | **0.21 s** |
-| start 10 | 0.59 s | **0.34 s** |
-| start 20 | 1.19 s | **0.40 s** |
+| start one pod | 0.25 s | **0.21 s** |
+| start 10 | 0.64 s | **0.26 s** |
+| start 20 | 1.17 s | **0.41 s** |
 
 Both default to off, because they relax durability and that is the cluster's
 data. On a cluster you recreate on demand they are close to free, and they

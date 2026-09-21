@@ -221,19 +221,29 @@ kubelet_pid=$!
 # Report early rather than after three minutes of silence: a node that cannot
 # reach its cluster says so in the first seconds, and waiting out the timeout
 # to find out is how an afternoon goes missing.
-sleep 8
-log "route: $(ip route show default 2>&1 | head -1)"
-# Whether this is a network problem or an authentication one, said plainly.
-# A kubelet blocked in TLS bootstrap logs nothing at all while it waits.
-log "api /healthz: $(curl -sk -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 8 "$API_SERVER/healthz" 2>&1)"
-# klog marks errors with a leading E and warnings with W; the flag dump at
-# startup contains the word "fail" and is not what is wanted here.
-log "kubelet alive: $(kill -0 $kubelet_pid 2>/dev/null && echo yes || echo NO), log lines $(wc -l < /var/log/kubelet.log 2>/dev/null)"
-# Everything except the flag dump, which is two hundred lines of noise that
-# swallowed every attempt to sample this log.
-log "--- kubelet, first lines that are not flags ---"
-grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
-log "--- end ---"
+#
+# In the background, because this is diagnosis and the node's readiness is
+# not waiting for it. It used to be `sleep 8` inline, and everything that
+# makes this node Ready is downstream of it -- the kubelet cannot report
+# NetworkReady until the CNI configuration exists, and that is written at the
+# bottom of this script. So eight seconds of logging sat on the critical path
+# of every mode 2 cluster creation, which measured 7.09s from the Machine
+# running to the node going Ready.
+(
+  sleep 8
+  log "route: $(ip route show default 2>&1 | head -1)"
+  # Whether this is a network problem or an authentication one, said plainly.
+  # A kubelet blocked in TLS bootstrap logs nothing at all while it waits.
+  log "api /healthz: $(curl -sk -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 8 "$API_SERVER/healthz" 2>&1)"
+  # klog marks errors with a leading E and warnings with W; the flag dump at
+  # startup contains the word "fail" and is not what is wanted here.
+  log "kubelet alive: $(kill -0 $kubelet_pid 2>/dev/null && echo yes || echo NO), log lines $(wc -l < /var/log/kubelet.log 2>/dev/null)"
+  # Everything except the flag dump, which is two hundred lines of noise that
+  # swallowed every attempt to sample this log.
+  log "--- kubelet, first lines that are not flags ---"
+  grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
+  log "--- end ---"
+) &
 
 # Routes to the other nodes' pods.
 #
@@ -291,11 +301,16 @@ log "registered ($(elapsed)ms)"
 # addresses nobody else can reach, which is exactly what happened the first
 # time this ran.
 cert=/var/lib/kubelet/pki/kubelet-client-current.pem
-for _ in $(seq 1 120); do
+# 0.2s, not 1s, and the same two minutes of patience. The CIDR is allocated by
+# kube-controller-manager's node-ipam controller, which on a cold control
+# plane takes a few seconds to get to; asking in whole seconds rounded that
+# wait up, and the CNI configuration below -- and so the node going Ready --
+# is waiting on the answer.
+for _ in $(seq 1 600); do
   POD_CIDR=$(curl -s --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
     "$API_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null | jq -r '.spec.podCIDR // empty')
   [ -n "$POD_CIDR" ] && break
-  sleep 1
+  sleep 0.2
 done
 log "pod cidr $POD_CIDR"
 

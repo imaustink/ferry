@@ -114,7 +114,7 @@ cpu_of() {
 # these numbers should include.
 ferry_host_pids() {
   local bin; bin="$(cd "$(dirname "$FERRY")" && pwd)/bin"
-  pgrep -f "^$bin/(etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kubelet|ferry-cri|ferry-streamer|ferry-proxyd|ferry-netpol|ferry-storage|ferry-gpud|ferry-proxy|ferry-machined|ferry-node)" 2>/dev/null
+  pgrep -f "^$bin/(etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kubelet|ferry-cri|ferry-streamer|ferry-proxyd|ferry-netpol|ferry-storage|ferry-gpud|ferry-proxy|ferry-machined|ferry-node|ferry-karpenter)" 2>/dev/null
 }
 
 # Docker Desktop's own processes on the host side (its VM is found separately).

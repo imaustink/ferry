@@ -700,6 +700,25 @@ succeeds "  and a plain down still drains" \
 succeeds "  and the service proxy is forced rather than waited out" \
   grep -q 'sudo kill -KILL "$proxy_pid"' "$repo/ferry"
 
+# Startup. The same tick problem as teardown: five steps of `ferry up` landed
+# within 43ms of each other at half a second, and the control plane polled
+# etcd and the API server in whole seconds.
+succeeds "startup waits on a condition rather than a tick" \
+  grep -q 'ferry_await()' "$repo/ferry"
+succeeds "  and no socket wait still polls at half a second" \
+  test "$(grep -c 'break; sleep 0.5; done' "$repo/ferry")" = 0
+succeeds "  nor does the control plane poll in whole seconds" \
+  test "$(grep -cE '^  sleep 1$' "$repo/control-plane/up.sh")" = 0
+# The kubelet cannot report NetworkReady until its CNI configuration exists,
+# and that is written after this block -- so eight seconds of logging sat on
+# the critical path of every mode 2 cluster creation.
+succeeds "the guest's startup diagnostics do not block its readiness" \
+  grep -q '^) &' "$repo/experiments/18-node-image/init.sh"
+# Every other port ferry uses is shifted by the profile index. This one was
+# not, so a second ferry on the same Mac panicked on it.
+succeeds "karpenter's health probe port is shifted like the rest" \
+  grep -q 'health-probe-port' "$repo/ferry"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

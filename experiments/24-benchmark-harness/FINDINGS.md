@@ -681,6 +681,83 @@ a policy, not a cost. Half-second ticks and a one-second sleep are both
 somebody's round number, and neither had been measured against what it was
 waiting for.
 
+## Cluster creation
+
+Mode 2 was 32.6s. Timed per printed step, three things, none of them work.
+
+### `ferry up` had teardown's problem
+
+Five steps of `ferry up` landed within 43ms of each other at roughly half a
+second -- the GPU offer, the streaming server, kube-proxy, NetworkPolicies,
+storage. That is a poll interval, not a cost. The control plane had three
+more in `control-plane/up.sh`, at whole seconds: etcd's health check, the API
+server's `/livez`, and its `/healthz`.
+
+| | before | after |
+|:--|--:|--:|
+| GPU offered | 526 ms | 67 ms |
+| streaming server | 512 ms | 58 ms |
+| kube-proxy | 549 ms | 94 ms |
+| NetworkPolicies | 533 ms | 56 ms |
+| control plane | 4608 ms | 3561 ms |
+
+### Eight seconds of diagnostics on the critical path
+
+The kubelet cannot report `NetworkReady` until a CNI configuration exists, and
+in the guest that file is written near the bottom of `init.sh` -- after a
+`sleep 8` whose only job is to log the default route, the API server's
+`/healthz` and whether the kubelet is still alive, so that a node which cannot
+join says so early instead of after a three-minute timeout.
+
+Useful, and not something the node's readiness should be waiting for. It runs
+in the background now, and the podCIDR fetch below it polls at 0.2s rather
+than 1s because the answer comes from kube-controller-manager's node-ipam
+controller on a cold control plane.
+
+| mode 2 | before | after |
+|:--|--:|--:|
+| Machine running to node Ready | 7.09 s | **0.07 s** |
+
+### A port that was never shifted
+
+`ferry-karpenter` binds 8081 for its health probe. Every other port ferry uses
+is shifted by the profile's index; this one was not, so a second ferry on the
+same Mac panics with `bind: address already in use`, which surfaces as
+"ferry-karpenter did not start; machines must be declared by hand" 4.6s into
+`machines enable` -- with mode 2 then falling back to hand-declared machines.
+
+Found because a stray karpenter from an earlier run in this session was
+holding the port, which had been quietly inflating mode 2's creation time in
+every measurement taken here. The same shape as the default-profile etcd in
+docs/BENCHMARKING.md: a fixed port on a machine that runs more than one
+ferry.
+
+### Where it ends up
+
+| create a cluster | before | after |
+|:--|--:|--:|
+| mode 1 | 12.3 s | 12.3 s |
+| mode 2 | 32.6 s | **25.9 s** |
+
+Mode 1 does not move: its polling savings are real but small against the two
+items below, which it also pays.
+
+### What is left, and why it was left
+
+`ferry up` is now about 12s, and the largest piece of it is not ferry's. From
+kube-controller-manager's own log, it starts at 21.920 and its **deployment
+controller starts at 29.384** -- 7.46s spent initialising some forty
+controllers serially, worst single gap 1.6s, with no one cause. CoreDNS is a
+Deployment, so its pod cannot be created until that controller is running,
+which is why "cluster DNS" reads about five seconds even though the pod itself
+goes from Pending to Ready in 848ms and the image pulls in 586ms. On a warm
+cluster the same rollout is 598ms end to end.
+
+Shortening it means `--controllers=<list>`, running fewer than upstream
+enables. That is a behaviour change with a long tail -- a controller nobody
+thought about not running is a feature that silently does not work -- so it is
+written down here rather than done.
+
 ## Running it
 
 ```sh

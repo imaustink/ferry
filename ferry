@@ -986,7 +986,7 @@ cmd_up() {
       --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_STREAMER_SOCK"
     [ -S "$FERRY_STREAMER_SOCK" ] && ok "streaming server on $FERRY_STREAM_ADDR" \
       || warn "streaming server did not start; kubectl exec will not work"
   else
@@ -1049,7 +1049,7 @@ EOF
       --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
       >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
     [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
       || warn "ferry-proxyd did not start; Services will not route"
   fi
@@ -1089,7 +1089,7 @@ start_netpol() {
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_NETPOL_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
   [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
     || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
 }
@@ -1115,7 +1115,7 @@ start_gpud() {
     --time-slice "$GPU_SLICE" \
     >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-gpud.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_GPUD_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_GPUD_SOCK"
   if [ -S "$FERRY_GPUD_SOCK" ]; then
     ok "GPU offered to pods: $(sed -n 's/.*device  *//p' "$FERRY_RUN/logs/ferry-gpud.log" | head -1)"
   else
@@ -1363,9 +1363,18 @@ start_provisioner() {
   FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_NODE_DISK="$NODE_DISK" \
+  # The health probe port is shifted with every other port this profile uses.
+  # Karpenter defaults it to 8081, which is not shifted, so a second ferry on
+  # the same Mac finds it taken and the process panics on startup --
+  # "bind: address already in use", reported as "ferry-karpenter did not
+  # start; machines must be declared by hand", 4.6s into `machines enable`.
+  # Found with a stray karpenter from an earlier run holding the port, which
+  # is the same shape as the default-profile etcd that docs/BENCHMARKING.md
+  # warns about.
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
+    --health-probe-port "$(( 8081 + PORT_SHIFT ))" \
     >"$FERRY_RUN/logs/ferry-karpenter.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-karpenter.pid"
   sleep 2
@@ -1695,7 +1704,7 @@ cmd_node_add() {
     --peers-file "$PEERS_FILE" \
     >"$FERRY_RUN/logs/node-$index-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index-streamer.pid"
-  for _ in $(seq 1 30); do [ -S "$streamer_sock" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$streamer_sock"
 
   # The kubelet's config differs from node 0's only in where things live and
   # which ports it holds; everything that makes a kubelet work on darwin is the
@@ -2187,7 +2196,7 @@ EOF
     --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
     >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_STREAMER_SOCK"
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
 
   # The node object exists now, so its GPU capacity can go on it.
@@ -2204,7 +2213,7 @@ EOF
       --node-name "$name" --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
       >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
     [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
       || warn "ferry-proxyd did not start; Services will not route on this node"
   else
@@ -3148,6 +3157,26 @@ cmd_profile() {
 # still cost half a second to notice, and seven of them made a teardown that
 # was mostly rounding. 50ms keeps the same overall patience -- the timeout is
 # still ten seconds -- and stops charging for it.
+# Wait until a command succeeds, polling finely.
+#
+#   ferry_await [timeout_s] command...
+#
+# The startup half of ferry_await_gone. Every socket this script waits for
+# during `ferry up` appears in tens of milliseconds and was polled for at
+# half-second ticks, so five of them turned about 150ms of real waiting into
+# roughly 2.6 seconds of startup. The timeout is optional and leads.
+ferry_await() {
+  local limit=15
+  case "${1:-}" in ''|*[!0-9]*) ;; *) limit="$1"; shift ;; esac
+  local i=0 ticks; ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 # Wait until a command stops succeeding, polling finely. The sibling of
 # ferry_await_exit for the teardown conditions that are not a pid -- a helper
 # that reports whether something is running, or a status file that a server
