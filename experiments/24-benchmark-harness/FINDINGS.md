@@ -681,9 +681,25 @@ Three causes, all of them waiting rather than working:
 
 | purge teardown | before | after |
 |:--|--:|--:|
-| mode 1 | 3940 ms | **1160 ms** |
-| mode 2 | 8100 ms | **1530 ms** |
+| mode 1 | 3940 ms | **350 ms** |
+| mode 2 | 8100 ms | **540 ms** |
 | kind, for scale | 470 ms | 470 ms |
+
+It took three rounds. The first two are above; the third is that the
+components were stopped one at a time -- seven of them at ~70ms each -- and
+the control plane after all of them, though on `--purge` nothing between the
+two needs an API server. Signals now go out in the order they have to and the
+waits overlap, and the control plane goes down alongside the components
+rather than behind them. `withdraw_gpu` is skipped on `--purge` for the same
+reason: it patches a node that is about to stop existing, and it would race
+the API server on its way down.
+
+Worth recording that the number being chased was wrong. raw.tsv had mode 1's
+delete at 0.85s and three clean runs of the same measurement put it at
+0.46-0.49s, already level with kind, before any of the third round was
+written. One run per stack is what this battery does and that cell was an
+outlier; the work was still worth doing, but "we are losing by 0.4s" was
+never true.
 
 What is left is real: ~70ms a component to stop and be seen to stop, 137ms
 for ferry-node to give back its vmnet network, 149ms for the control plane.

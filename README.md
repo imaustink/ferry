@@ -39,15 +39,15 @@ is not the baseline ferry actually has.
 | a pod is | its own VM | its own VM | a container | a container | a container | a container |
 | needs Docker Desktop | **no** | **no** | **no** | **no** | yes | yes |
 | writes survive power loss | **yes** | no | **yes** | no | no | no |
-| create a cluster | 12.8 s | **10.9 s** | 26.4 s | 24.7 s | 25.4 s | 30.3 s |
-| delete it | 0.85 s | 0.54 s | 0.65 s | 0.70 s | **0.47 s** | 12.5 s |
-| start one pod | 0.47 s | 0.44 s | 0.34 s | **0.20 s** | 0.61 s | 0.60 s |
-| start 10 | 1.21 s | 1.21 s | 0.61 s | **0.29 s** | 0.70 s | 1.08 s |
-| start 20 | 3.51 s | 3.30 s | 1.16 s | **0.39 s** | 0.93 s | 2.18 s |
-| idle memory | **430 MiB** | **430 MiB** | 1,481 MiB | 1,537 MiB | 695 MiB | 667 MiB |
+| create a cluster | 11.9 s | **10.7 s** | 26.1 s | 24.6 s | 25.4 s | 30.3 s |
+| delete it | **0.35 s** | 0.36 s | 0.54 s | 0.48 s | 0.47 s | 12.5 s |
+| start one pod | 0.48 s | 0.45 s | 0.32 s | **0.27 s** | 0.61 s | 0.60 s |
+| start 10 | 1.19 s | 0.79 s | 0.71 s | **0.31 s** | 0.70 s | 1.08 s |
+| start 20 | 3.61 s | 3.41 s | 1.11 s | **0.50 s** | 0.93 s | 2.18 s |
+| idle memory | 432 MiB | **430 MiB** | 1,485 MiB | 1,539 MiB | 695 MiB | 667 MiB |
 | ↳ taken from | the Mac | the Mac | the Mac | the Mac | a VM you sized | a VM you sized |
-| idle CPU | 3.6% | **2.3%** | 12.8% | 12.2% | 24.4% | 29.0% |
-| per pod | 240 MiB | 241 MiB | 9 MiB | 9 MiB | **6 MiB** | 16 MiB |
+| idle CPU | 2.5% | **2.1%** | 8.1% | 8.7% | 24.4% | 29.0% |
+| per pod | 239 MiB | 240 MiB | 9 MiB | 9 MiB | **6 MiB** | 16 MiB |
 
 `relaxed` is `ferry up --durability relaxed`, explained below. The four ferry
 columns are two choices, not four products: a pod is either its own VM or a
@@ -96,20 +96,23 @@ its own kernel, and 240 MiB each is what that costs. Mode 2 is the other end:
 9 MiB a pod, on kind's own basis (read inside the guest, the way kind is
 read), and still no Docker.
 
-**Where ferry is slower, it is slower.** kind creates 20 pods faster than
-ferry mode 2 out of the box, deletes a cluster in half a second against
-ferry's one and a bit, and costs less per pod. Mode 2 takes twice as long as
-mode 1 to create, because it is a mode 1 control plane with a Linux node
-booted on top of it.
+**Where ferry is slower, it is slower.** kind starts 20 pods faster than
+ferry mode 2 at full durability (0.93 s against 1.11 s), costs a third as
+much per pod, and deletes a cluster faster than mode 2 does. Mode 2 takes
+twice as long as mode 1 to create, because it is a mode 1 control plane with
+a Linux node booted on top of it.
 
-Both of those numbers used to be worse, and almost none of the difference was
-work:
+Deleting used to be on that list and is not any more, which took three
+rounds. Both it and mode 2's creation were mostly waiting rather than work:
 
 - **Teardown** was 3.9 s in mode 1 and 8.1 s in mode 2. `kube-apiserver` spent
   two seconds draining its watches — and on `--purge`, draining them into a
   data directory deleted milliseconds later. Every teardown loop polled at
   half-second ticks for processes that exit in tens of milliseconds. A fixed
   `sleep 1` waited on a service proxy that does not exit on SIGTERM at all.
+  The components were then stopped one at a time, and the control plane after
+  all of them, though on `--purge` nothing between the two needs an API
+  server. Signals now go out in order and the waits overlap.
 - **Mode 2 creation** was 32.6 s. Seven of those seconds were the node not
   being Ready, because the kubelet cannot report `NetworkReady` until its CNI
   configuration exists and that was written after an eight-second sleep whose
@@ -142,16 +145,17 @@ ferry up --durability relaxed   # speed instead, remembered for this cluster
 
 | | mode 2 `full` | mode 2 `relaxed` | mode 1 `full` | mode 1 `relaxed` |
 |:--|--:|--:|--:|--:|
-| start one pod | 0.34 s | **0.20 s** | 0.47 s | 0.44 s |
-| start 20 | 1.16 s | **0.39 s** | 3.51 s | 3.30 s |
+| start one pod | 0.32 s | **0.27 s** | 0.48 s | 0.45 s |
+| start 10 | 0.71 s | **0.31 s** | 1.19 s | 0.79 s |
+| start 20 | 1.11 s | **0.50 s** | 3.61 s | 3.41 s |
 | an etcd commit | 9.7 ms | **0.14 ms** | 9.7 ms | 0.14 ms |
 | survives power loss | **yes** | no | **yes** | no |
 
-In mode 2 that is 2.4× kind on a 20-pod burst and 3× on a single pod — the
-fastest thing in the table. In mode 1 it is nearly free of effect, because a
-pod there is a virtual machine booting and `fsync` was never what it was
-waiting for. The flag is worth reaching for on mode 2 and worth skipping on
-mode 1.
+In mode 2 that is 1.9× kind on a 20-pod burst and 2.3× on a single pod — the
+fastest thing in the table. In mode 1 it barely registers on a single pod,
+because a pod there is a virtual machine booting and `fsync` was never what
+it was waiting for. The flag is worth reaching for on mode 2 and close to
+pointless on mode 1.
 
 It is the right setting for a cluster you recreate from a script, and the
 wrong one for a cluster holding something you would have to rebuild by hand.

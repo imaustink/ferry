@@ -3300,7 +3300,10 @@ cmd_down() {
     # happen -- ferry-proxy has never once exited on SIGTERM, so this is a
     # gesture towards a version that might. It was a quarter second and that
     # was 42% of what a teardown had left.
-    for _ in 1 2; do kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05; done
+    # No courtesy on --purge: nothing it could flush is being kept.
+    [ -n "$purge" ] || for _ in 1 2; do
+      kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05
+    done
     sudo kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
@@ -3342,6 +3345,16 @@ cmd_down() {
     kill -TERM "$pid" 2>/dev/null || continue
     stopping+=("$pid"); stopnames+=("$component")
   done
+  # On --purge the control plane is killed outright and its data directory
+  # removed, and nothing between here and there needs an API server. So it
+  # goes down alongside the components rather than after them, which takes its
+  # ~100ms off the total instead of adding it.
+  local cp_job=""
+  if [ -n "$purge" ]; then
+    STATE="$FERRY_HOME" "$here/control-plane/down.sh" --purge >/dev/null 2>&1 &
+    cp_job=$!
+  fi
+
   local i=0
   while [ "$i" -lt "${#stopping[@]}" ]; do
     ferry_await_exit "${stopping[$i]}" || kill -KILL "${stopping[$i]}" 2>/dev/null
@@ -3356,14 +3369,26 @@ cmd_down() {
 
   # After the streamer, which would otherwise put it straight back, and before
   # the control plane, which has to be up to accept the patch.
-  withdraw_gpu
+  #
+  # Not on --purge: the node object goes with etcd a moment later, so the
+  # patch is a write to something being deleted -- and the API server may
+  # already be on its way down, above.
+  [ -n "$purge" ] || withdraw_gpu
 
   # --purge reaches down.sh, which then stops the API server and etcd without
   # a graceful drain: their data directory is deleted a few milliseconds
   # later, so draining it is two to five seconds spent flushing state that is
   # about to be removed. See control-plane/down.sh.
-  STATE="$FERRY_HOME" "$here/control-plane/down.sh" ${purge:+--purge} >/dev/null 2>&1 \
-    && ok "control plane stopped"
+  #
+  # On --purge that was started above and has been running while the
+  # components were reaped; here it is only collected.
+  if [ -n "$cp_job" ]; then
+    wait "$cp_job" 2>/dev/null
+    ok "control plane stopped"
+  else
+    STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 \
+      && ok "control plane stopped"
+  fi
   # --purge drops etcd's data, which is the cluster. The recorded version goes
   # with it: what is left is not a cluster at an older version, it is no
   # cluster, and the next 'ferry up' should start at whatever is built rather

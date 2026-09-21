@@ -739,6 +739,20 @@ succeeds "  a relaxed cluster says so every time it starts" \
 succeeds "  and ferry status says which one you are on" \
   test "$(grep -c 'durability_is_relaxed' "$repo/ferry")" -ge 4
 
+# --purge destroys the cluster, so the control plane does not have to wait
+# its turn behind the components -- nothing between them needs an API server.
+succeeds "--purge stops the control plane alongside the components" \
+  grep -q 'cp_job=\$!' "$repo/ferry"
+succeeds "  and collects it where the serial stop used to be" \
+  grep -q 'wait "\$cp_job"' "$repo/ferry"
+# withdraw_gpu patches the node's status, which on --purge is a write to an
+# object about to be deleted -- and would race the API server going down.
+succeeds "  and does not patch a node that is being deleted" \
+  grep -q '\[ -n "\$purge" \] || withdraw_gpu' "$repo/ferry"
+# A plain `ferry down` keeps the old order: that cluster is coming back.
+succeeds "  while a plain down still stops it in order" \
+  grep -q 'STATE="\$FERRY_HOME" "\$here/control-plane/down.sh" >/dev/null' "$repo/ferry"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod
