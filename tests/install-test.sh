@@ -600,6 +600,23 @@ succeeds "  and the guest hands them to --register-with-taints" \
 succeeds "  only when there are some" \
   grep -q 'if !taints.isEmpty' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
 
+# The kubelet's log level, over the same channel. At --v=4 the kubelet records
+# its own per-pod phase boundaries, which is the only direct way to see which
+# phase stretches when a burst of pods arrives at once. It was hardcoded to 2
+# inside the image, so asking that question meant a node-image rebuild --
+# minutes, Docker, and a staged kubelet -- and the investigation in
+# experiments/24 stopped at the point where it became the next step.
+succeeds "ferry-node puts the kubelet's log level on the kernel command line" \
+  grep -q 'ferry.kubeletv=' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  from the environment, so it needs no rebuild" \
+  grep -q 'FERRY_KUBELET_V' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  and the guest hands it to --v" \
+  grep -q 'v="\${KUBELET_V:-2}"' "$repo/experiments/18-node-image/init.sh"
+# Unset has to mean the 2 that was hardcoded, not an empty --v= the kubelet
+# rejects, and not a level nobody asked for on every node ferry ever boots.
+succeeds "  defaulting to 2 when nothing asks" \
+  grep -q 'KUBELET_V:-2' "$repo/experiments/18-node-image/init.sh"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

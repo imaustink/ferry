@@ -21,6 +21,21 @@ pin_docker_vm() { vm_pids | head -1 > "$DOCKER_VM_PID_FILE"; }
 MACHINE_CPUS="${MACHINE_CPUS:-10}"
 MACHINE_MEM="${MACHINE_MEM:-15Gi}"
 
+# The Kubernetes the other stacks run, pinned to the one ferry is built at.
+#
+# kind defaults to whatever node image its own release was cut against, which
+# is not ferry's default and drifts every time either side releases. Comparing
+# a pod start across two different kubelet minors measures the minors as much
+# as it measures the stacks, and nothing in the output said which it had --
+# the versions matched by luck, when they matched at all. Reading it from
+# lib/versions.sh means a ferry version bump moves kind with it, and a
+# kindest/node tag that does not exist fails at cluster creation naming the
+# tag, rather than quietly benchmarking a different minor.
+K8S_VERSION="${K8S_VERSION:-$(
+  sed -n 's/^FERRY_DEFAULT_K8S_VERSION="\(.*\)"/\1/p' \
+    "$BENCH_HOME/../../lib/versions.sh")}"
+KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:$K8S_VERSION}"
+
 kubeconfig_of() {
   case "$1" in
     ferry|ferry2) "$FERRY" kubeconfig 2>/dev/null ;;
@@ -127,6 +142,7 @@ YAML
         sleep 1
       done ;;
     kind)     kind create cluster --name "$CLUSTER" --kubeconfig "$kc" \
+                --image "$KIND_NODE_IMAGE" \
                 >"$RESULTS/$s-up.log" 2>&1 ;;
     minikube) KUBECONFIG="$kc" minikube start -p "$CLUSTER" --driver=docker \
                 --interactive=false >"$RESULTS/$s-up.log" 2>&1 ;;

@@ -222,6 +222,20 @@ func machineConfiguration(
     if !taints.isEmpty {
         arguments.append("ferry.taints=\(taints.joined(separator: ","))")
     }
+    // The kubelet's klog level, as an environment variable rather than a flag
+    // because every caller that boots a machine would otherwise have to thread
+    // it through, and nothing but an investigation ever wants it. `ferry up`
+    // execs this process, so `FERRY_KUBELET_V=4 ferry up` reaches the guest.
+    //
+    // At --v=4 the kubelet logs its own per-pod phase boundaries, which is the
+    // direct answer to which phase stretches under concurrency; it was
+    // hardcoded to 2 in the guest, so asking the question used to mean
+    // rebuilding the node image. Only appended when set, so an unset variable
+    // leaves the command line exactly as it was.
+    if let level = ProcessInfo.processInfo.environment["FERRY_KUBELET_V"],
+       !level.isEmpty, Int(level) != nil {
+        arguments.append("ferry.kubeletv=\(level)")
+    }
     boot.commandLine = arguments.joined(separator: " ")
     config.bootLoader = boot
 

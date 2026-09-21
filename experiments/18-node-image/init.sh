@@ -54,6 +54,11 @@ DNS_SERVICE=$(param ferry.dnssvc)
 # older than the parameter -- in both cases the flag is simply not passed.
 TAINTS=$(param ferry.taints)
 CLUSTER_CIDR=$(param ferry.clustercidr)
+# klog's level, so a burst can be watched at --v=4 -- where the kubelet logs
+# each pod's phase boundaries and phases.py can read them -- without rebuilding
+# this image to find out which phase stretched. Absent on a node booted by an
+# older ferry-node, and the default is the 2 that was hardcoded here.
+KUBELET_V=$(param ferry.kubeletv)
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -186,7 +191,7 @@ log "taints: ${TAINTS:-none}"
   --hostname-override="$NODE_NAME" \
   --node-ip="${ADDRESS%%/*}" \
   --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
-  --v=2 > /var/log/kubelet.log 2>&1 &
+  --v="${KUBELET_V:-2}" > /var/log/kubelet.log 2>&1 &
 kubelet_pid=$!
 
 # Stream the lines that matter to the console as they happen. Sampling the log
