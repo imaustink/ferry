@@ -51,7 +51,10 @@ MARKS = [
     ("allmounted", "All volumes are attached and mounted"),
     ("sandbox",    "Creating PodSandbox for pod"),
     ("sandboxed",  "Created PodSandbox for pod"),
+    ("mkcontainer", "Creating container in pod"),
+    ("ctrcreated", '"Added Container"'),
     ("exit",       '"SyncPod exit"'),
+    ("ctrstarted", 'reason="Started"'),
 ]
 
 # klog's own header, wherever it starts on the line.
@@ -75,7 +78,8 @@ for l in sys.stdin:
     if not t:
         continue
     m = re.search(r'pod="?([\w.-]+/[\w.-]+)"?', l) or \
-        re.search(r'pods=\["([\w.-]+/[\w.-]+)"\]', l)
+        re.search(r'pods=\["([\w.-]+/[\w.-]+)"\]', l) or \
+        re.search(r'object="([\w.-]+/[\w.-]+)"', l)
     if not m or not PODS.search(m.group(1)):
         continue
     k = m.group(1)
@@ -122,7 +126,9 @@ SEGS = [
     ("mounted -> all mounted",        "mounted",    "allmounted"),
     ("all mounted -> create sandbox", "allmounted", "sandbox"),
     ("create -> sandbox created",     "sandbox",    "sandboxed"),
-    ("sandbox created -> SyncPod exit", "sandboxed", "exit"),
+    ("sandboxed -> creating container", "sandboxed", "mkcontainer"),
+    ("CreateContainer (to cpu_manager)", "mkcontainer", "ctrcreated"),
+    ("StartContainer (to SyncPod exit)", "ctrcreated", "exit"),
     ("TOTAL admit -> SyncPod exit",   "admit",      "exit"),
 ]
 
@@ -159,6 +165,15 @@ if w and work:
 # question, and only together do they distinguish a kubelet that is slow per
 # pod from one that is fast per pod and starts them in waves -- which look
 # identical from outside, in the only number the API can see.
+# One number podphases.sh can read back, so the residual below it -- what the
+# burst costs outside anything the kubelet is doing -- is computed rather than
+# eyeballed across two tables.
+last_mark = "ctrstarted" if any("ctrstarted" in p for p in rows) else "exit"
+_t0 = min(p["admit"] for p in rows)
+_t1 = max(p[last_mark] for p in rows if last_mark in p)
+print(f"\n  KUBELET_SPAN_MS {(_t1 - _t0).total_seconds() * 1000:.0f}"
+      f"  (first admit to last {last_mark})")
+
 print("\n  when each pod reached each marker, from the first pod's admit (ms)")
 print(f"  {'':22} {'first':>6} {'median':>7} {'last':>6}  {'spread':>7}")
 t0 = rows[0]["admit"]

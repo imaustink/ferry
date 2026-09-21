@@ -310,6 +310,7 @@ Added while asking the kubelet directly:
 |:--|:--|
 | `podphases.sh` | runs a burst and reads the kubelet's own account of it, either stack |
 | `syncphases.py` | inside syncPod at `--v=4`: which part is work and which is waiting for a turn |
+| `statuslat.py` | phase=Running to the status stored in the API -- the part after syncPod |
 
 ## Inside syncPod, both stacks at --v=4
 
@@ -474,24 +475,103 @@ looked fast and the late ones slow. Now all twenty arrive together and every
 one of them takes the same 260ms. The work did not get cheaper; it stopped
 being staggered, which is why the tail improves and the first pod does not.
 
-### The lead that replaces the old one
+### The lead that replaced the old one, and where it went
 
-With the volume wait out of the way, the two segments where ferry is behind
-kind in a burst are both after the sandbox is asked for:
+Splitting the container half of syncPod (`syncphases.py` now has
+`CreateContainer` and `StartContainer` separately) put the gap in
+`CreateContainer`: 265ms on ferry against kind's 35ms. Not CNI --
+`hostNetwork`, which skips it entirely, moves `create` to `sandbox created`
+by 3ms (259 against 262). Not CPU either: the burst comes out the same with
+the machine at 10 CPUs and at 16.
 
-| mode 2, 20-pod burst, median | ferry | kind |
+`CreateContainer` is snapshot creation plus a bbolt transaction, which is to
+say fsync, and from there it stopped being about the runtime at all.
+
+## It was fsync on APFS, in two places
+
+### The node disk
+
+`FERRY_NODE_DISK_SYNC` makes the VM's disk barrier a knob. At `none`,
+`CreateContainer` went 265ms to 162ms and the kubelet's whole span 682ms to
+497ms.
+
+Which was the point at which the kubelet stopped being the problem. Two
+spans, each a duration inside one clock, so guest and Mac disagreeing about
+the time does not enter into it:
+
+| 20-pod burst | ferry | kind |
 |:--|--:|--:|
-| `create` to `sandbox created` | 260ms | 155ms |
-| `sandbox created` to `SyncPod exit` | 344ms | 157ms |
+| client span (first pod object seen to last pod Running) | 975ms | 807ms |
+| kubelet span (first admit to last container started) | **516ms** | 706ms |
+| outside syncPod | **459ms (47%)** | 101ms (13%) |
 
-The second is the larger and is container create plus start, which no
-instrument here has priced on its own -- `criconc.sh` measured RunPodSandbox
-and `ctrconc.sh` measured `ctr` with no kubelet in the way. That is the thing
-to measure next, and it is a different question from the one this PR opened
-with.
+**ferry's kubelet was already 190ms faster than kind's and still losing.**
+`podphases.sh` computes that residual now, because it is not visible in any
+table that only looks inside the kubelet.
 
-Single rounds behind the phase tables; the alternating three are the burst
-row. Direction, not magnitudes.
+### etcd, which is the bigger one
+
+What lives in the residual is the status manager: the kubelet decides
+phase=Running, and a client is waiting on that reaching the API.
+`statuslat.py` measures it.
+
+| phase=Running to status stored | ferry | kind |
+|:--|--:|--:|
+| median | 188ms | 8ms |
+| first half to last half | 85 to 294ms | 4 to 27ms |
+
+A staircase, because the status manager drains its queue from one goroutine.
+Not client-side throttling -- neither kubelet logs a single wait.
+
+Every one of those writes is an etcd write, and ferry's etcd runs natively on
+macOS:
+
+| etcd, mean | ferry | ferry `--unsafe-no-fsync` | kind |
+|:--|--:|--:|--:|
+| WAL fsync | 4.85ms | none | 0.88ms |
+| backend commit | 11.12ms | **0.12ms** | 1.78ms |
+
+**kind's etcd is not better tuned. It is inside Docker Desktop's VM, where a
+guest fsync reaches a virtual disk whose host-side durability Docker has
+already relaxed.** ferry's pays a real APFS barrier per write. The
+inner-platform layering that ought to cost kind something is buying it a
+cheap fsync instead.
+
+`FERRY_ETCD_NO_FSYNC=1` opts in. Off by default: this is the cluster's data,
+and a Mac that loses power mid-write can leave it needing a restore.
+
+And it is not only etcd's own writes that were paying. `CreateContainer`
+happens *in the guest* and dropped from 231ms to 59ms when the flag went on,
+with nothing else changed -- an F_FULLFSYNC on APFS flushes the device cache
+and stalls whatever else is queued on that volume, the VM's disk image
+included. One process's barriers were slowing another process's kernel.
+
+## Where it ends up
+
+Three alternating rounds of 20 pods, everything v1.37.0, CPUs matched:
+
+| 20-pod burst | ferry mode 2 | kind |
+|:--|--:|--:|
+| first pod | **277ms** | 665ms |
+| median pod | **494ms** | 758ms |
+| last pod | **875ms** | 906ms |
+
+| single pod | ferry mode 2 | kind |
+|:--|--:|--:|
+| apply to Running | **178ms** | 500ms |
+
+Against where this PR opened -- 742ms first, 1400ms last, against kind's
+786ms and 975ms -- the last pod has gone from 1.44x behind to slightly
+ahead, and everything before it is not close.
+
+### Still open
+
+The status write is still the largest thing ferry does that kind does not:
+149ms median even with etcd's fsync gone, and all twenty stored within 584ms
+while the kubelet had them all Running within 55ms. That is no longer etcd
+(0.12ms a commit), so it is the kubelet-to-API-server path across vmnet,
+twenty times, serially. It is what keeps the last pod near kind's rather than
+well past it.
 
 ## Running it
 
@@ -509,6 +589,9 @@ python3 summarize.py results/raw.tsv
 # KUBELET_V=4 stack_up, or FERRY_KUBELET_V=4 ferry up for ferry alone.
 ./podphases.sh ferry
 ./podphases.sh kind
+
+# Faster, at the cost of durability nobody local needs. Both off by default.
+FERRY_ETCD_NO_FSYNC=1 FERRY_NODE_DISK_SYNC=none ferry up
 ```
 
 One stack at a time. `run.sh` appends to `results/raw.tsv`, so archive or clear

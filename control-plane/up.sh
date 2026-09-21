@@ -94,8 +94,36 @@ start() { # name cmd...
 
 echo "==> starting control plane (advertise=$ADVERTISE)"
 
+# etcd's durability barrier, which on macOS is not the same bargain it is on
+# Linux.
+#
+# Measured on a 20-pod burst: ferry's etcd averages 5.13ms per WAL fsync and
+# 10.26ms per backend commit, against kind's 0.88ms and 1.78ms. kind's etcd is
+# not better tuned -- it is inside Docker Desktop's VM, where the guest's
+# fsync reaches a virtual disk whose host-side durability Docker has already
+# relaxed. ferry's runs natively and pays a real APFS barrier for every write.
+#
+# Every pod status update is an etcd write, and the kubelet's status manager
+# issues them from one goroutine, so those milliseconds are serial and land on
+# the critical path of a burst: phase=Running to status stored is 188ms median
+# on ferry against kind's 8ms.
+#
+# Off by default. This is the cluster's data, and a Mac that loses power
+# mid-write can leave it needing a restore -- not something to impose on
+# anyone who has not asked. FERRY_ETCD_NO_FSYNC=1 opts in, and for a cluster
+# that is recreated on demand it is close to free.
+# Spelled ${a[@]+"${a[@]}"} below: under `set -u` bash 3.2, which is the bash
+# macOS ships, expanding an empty array as "${a[@]}" is an unbound variable
+# and the control plane would not start at all when the flag is off.
+etcd_fsync_args=()
+if [ -n "${FERRY_ETCD_NO_FSYNC:-}" ]; then
+  etcd_fsync_args+=(--unsafe-no-fsync)
+  echo "    ! etcd --unsafe-no-fsync (FERRY_ETCD_NO_FSYNC)"
+fi
+
 start etcd "$bin/etcd" \
   --data-dir="$STATE/etcd" \
+  ${etcd_fsync_args[@]+"${etcd_fsync_args[@]}"} \
   --listen-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --advertise-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --listen-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \

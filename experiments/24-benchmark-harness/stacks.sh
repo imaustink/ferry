@@ -18,7 +18,14 @@ pin_docker_vm() { vm_pids | head -1 > "$DOCKER_VM_PID_FILE"; }
 # Mode 2's node is sized to mirror Docker Desktop's VM, which is what kind and
 # minikube get to put their node in. Guest memory is lazily backed, so a ceiling
 # it does not touch costs nothing (experiment 14).
-MACHINE_CPUS="${MACHINE_CPUS:-10}"
+#
+# It said that and did not do it: the CPU count was hardcoded to 10 while
+# Docker Desktop on this machine had all 16, so every burst gave kind 60% more
+# CPU than ferry. Asked directly rather than guessed now. (Measured before
+# fixing it, for the record: ferry's 20-pod burst comes out the same at 10 and
+# at 16, so this was never the concurrency gap -- but a comparison that claims
+# to be matched should be matched.)
+MACHINE_CPUS="${MACHINE_CPUS:-$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 10)}"
 MACHINE_MEM="${MACHINE_MEM:-15Gi}"
 
 # The Kubernetes the other stacks run, pinned to the one ferry is built at.
@@ -161,6 +168,9 @@ YAML
       # the map form that every older example shows is rejected outright by
       # v1.37's kubeadm, and kind reports it as a cluster that failed to come
       # up rather than as a bad patch.
+      # ${cfg[@]+...} below: an empty array under `set -u` on bash 3.2 is an
+      # unbound variable, and this path is the one taken whenever KUBELET_V is
+      # unset -- which is most of the time.
       local cfg=() kindcfg="$BENCH_HOME/.kind-config.yaml"
       if [ -n "$KUBELET_V" ]; then
         cat > "$kindcfg" <<YAML
@@ -179,7 +189,7 @@ YAML
         cfg=(--config "$kindcfg")
       fi
       kind create cluster --name "$CLUSTER" --kubeconfig "$kc" \
-                --image "$KIND_NODE_IMAGE" "${cfg[@]}" \
+                --image "$KIND_NODE_IMAGE" ${cfg[@]+"${cfg[@]}"} \
                 >"$RESULTS/$s-up.log" 2>&1 ;;
     minikube) KUBECONFIG="$kc" minikube start -p "$CLUSTER" --driver=docker \
                 --interactive=false >"$RESULTS/$s-up.log" 2>&1 ;;

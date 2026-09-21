@@ -247,9 +247,27 @@ func machineConfiguration(
     // waits out a barrier. Profiling a burst showed ten goroutines parked on
     // core/metadata's mutex with another inside a syscall, while the guest used
     // 48% of one core out of ten.
+    //
+    // .fsync still makes every guest fsync a host fsync. Measured with the
+    // kubelet's --v=4 log, CreateContainer in a 20-pod burst costs 265ms on a
+    // ferry node against 35ms on kind -- and CreateContainer is snapshot
+    // creation plus a bbolt transaction, which is to say fsync. So the mode is
+    // a knob rather than a constant, and FERRY_NODE_DISK_SYNC=none prices what
+    // is left of the barrier.
+    //
+    // Not the default. .none means the guest's fsync returns before the data
+    // is on the Mac's disk, so a host crash or power loss can leave the node
+    // filesystem torn -- survivable for a node that is a disposable clone,
+    // not something to impose on anyone who has not asked for it.
+    let sync: VZDiskImageSynchronizationMode
+    switch ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"] {
+    case "none": sync = .none
+    case "full": sync = .full
+    default:     sync = .fsync
+    }
     let rootAttachment = try VZDiskImageStorageDeviceAttachment(
         url: URL(filePath: disk), readOnly: false,
-        cachingMode: .automatic, synchronizationMode: .fsync)
+        cachingMode: .automatic, synchronizationMode: sync)
     config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)]
     if ProcessInfo.processInfo.environment["FERRY_NODE_NO_CONFIG"] == nil {
         let configAttachment = try VZDiskImageStorageDeviceAttachment(

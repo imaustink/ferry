@@ -91,7 +91,8 @@ start_probe
 since="$(date -u -v-1M '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S')"
 
 echo "== burst"
-python3 "$BENCH_HOME/burst.py" "$kc" "$sel" "$N" 1
+burstout="$(mktemp -t podphases-burst)"
+python3 "$BENCH_HOME/burst.py" "$kc" "$sel" "$N" 1 | tee "$burstout"
 
 # Read once and reused: on ferry this is an exec into a guest, and the log is
 # megabytes at --v=4.
@@ -108,8 +109,31 @@ python3 "$BENCH_HOME/phases.py" 'burst/b[0-9a-f]{8}-' < "$log"
 
 echo
 echo "== inside syncPod, which needs --v=4"
-python3 "$BENCH_HOME/syncphases.py" 'burst/b[0-9a-f]{8}-' < "$log"
-rm -f "$log"
+syncout="$(mktemp -t podphases-sync)"
+python3 "$BENCH_HOME/syncphases.py" 'burst/b[0-9a-f]{8}-' < "$log" | tee "$syncout"
+
+# What the burst costs outside anything the kubelet is doing.
+#
+# Two spans, each a duration inside one clock, so the guest and the Mac not
+# agreeing on the time does not enter into it:
+#
+#   client   first pod object seen -> last pod seen Running   (burst.py)
+#   kubelet  first admit -> last container started            (syncphases.py)
+#
+# The difference is the API telling the kubelet about the first pod, plus the
+# last pod's Running status getting back out to a watcher. Everything this
+# harness has measured so far lives inside the kubelet span; this is the part
+# that does not, and on ferry it is the larger share.
+awk -v s="$(grep -o 'KUBELET_SPAN_MS *[0-9]*' "$syncout" | awk '{print $2}')" '
+  /^ *created_first/ {c=$2}
+  /^ *last / {l=$2}
+  END {
+    if (c == "" || l == "" || s == "") { print "\n  (residual needs both spans)"; exit }
+    printf "\n  client span  %5d ms   (first pod object seen -> last pod Running)\n", l-c
+    printf "  kubelet span %5d ms   (first admit -> last container started)\n", s
+    printf "  OUTSIDE      %5d ms   %.0f%% of the client span\n", (l-c)-s, ((l-c)-s)*100/(l-c)
+  }' "$burstout"
+rm -f "$log" "$burstout" "$syncout"
 
 if [ "$STACK" != kind ]; then
   KUBECONFIG="$kc" kubectl delete pod "$PROBE" --ignore-not-found >/dev/null 2>&1 &
