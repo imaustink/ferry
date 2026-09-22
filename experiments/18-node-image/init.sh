@@ -142,6 +142,21 @@ else
   log "no config disk on /dev/vdb"
 fi
 
+# This Mac's PersistentVolumes, at the path they have on the Mac, so a volume's
+# hostPath means the same directory here as it does to the Mac's own kubelet.
+# Mounted before the kubelet starts: a pod scheduled here with a claim would
+# otherwise have its hostPath created as an empty directory on this disk, and
+# write its data somewhere the next machine will never see.
+VOLUMES=$(param ferry.volumes)
+if [ -n "$VOLUMES" ]; then
+  mkdir -p "$VOLUMES"
+  if mount -t virtiofs ferry-volumes "$VOLUMES" 2>/dev/null; then
+    log "volumes mounted at $VOLUMES"
+  else
+    log "could not mount the volumes share at $VOLUMES; claims will not work here"
+  fi
+fi
+
 cat > /etc/kubernetes/bootstrap-kubelet.conf <<EOF
 apiVersion: v1
 kind: Config

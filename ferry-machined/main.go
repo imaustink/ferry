@@ -40,6 +40,10 @@ var (
 	// `ferry-node serve` writes, so --cluster-dns belongs to that process.
 	interval    = flag.Duration("interval", 2*time.Second, "how often to reconcile")
 	machinesDir = flag.String("machines", "", "directory ferry-node serve watches; defaults to <state>/machines")
+	// The Mac's own node. Every machine is labelled ferry.dev/host with it, so
+	// ferry-storage can pin a volume to "anywhere on this Mac" -- the Mac and
+	// its machines share one volumes directory -- rather than to one node.
+	hostNode = flag.String("host-node", "", "the Mac's own node name, labelled on each machine as ferry.dev/host")
 )
 
 func main() {

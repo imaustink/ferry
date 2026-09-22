@@ -59,8 +59,26 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	}
 	// Late binding means the scheduler names the node. Until it has, there is
 	// nothing to do and nowhere to do it.
-	if claim.Annotations[selectedNodeAnnotation] != p.node {
+	//
+	// That node is this Mac's, or one of the machines this Mac runs. The second
+	// used to be ignored: every claim a mode 2 pod made waited for a
+	// provisioner that had decided it was someone else's, and the pod stayed
+	// Pending with no event to say why. A machine mounts this Mac's volumes
+	// directory at the same path (ferry-node shares it at boot), so a volume
+	// for one is a directory here like any other. So is a volume for a node
+	// added with `ferry node add`, which was ignored the same way: its kubelet
+	// is on this Mac, and ferry.dev/host names this Mac for it too.
+	selected := claim.Annotations[selectedNodeAnnotation]
+	if selected == "" {
 		return
+	}
+	elsewhere := false
+	if selected != p.node {
+		node, err := p.client.CoreV1().Nodes().Get(ctx, selected, metav1.GetOptions{})
+		if err != nil || node.Labels[hostLabel] != p.node {
+			return
+		}
+		elsewhere = true
 	}
 
 	name := "pvc-" + string(claim.UID)
@@ -82,7 +100,12 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 		klog.ErrorS(err, "Could not create the volume directory", "path", path)
 		return
 	}
-	if singleWriter(modes) {
+	// A disk image only for a pod on the Mac's own node, where ferry-cri
+	// attaches it to the pod's VM and the volume is pinned to that node. A
+	// machine cannot attach one after it has booted, so a volume anywhere else
+	// is the directory, shared, with the chown limit that comes with virtiofs.
+	block := singleWriter(modes) && !elsewhere
+	if block {
 		if err := makeImage(filepath.Join(path, imageName), size.Value()); err != nil {
 			klog.ErrorS(err, "Could not create the volume's disk image", "path", path)
 			return
@@ -112,19 +135,7 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 				Name:      claim.Name,
 				UID:       claim.UID,
 			},
-			// The directory is on this Mac and nowhere else, so say so. A pod
-			// that comes back later is sent to the node holding its data.
-			NodeAffinity: &corev1.VolumeNodeAffinity{
-				Required: &corev1.NodeSelector{
-					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
-						MatchExpressions: []corev1.NodeSelectorRequirement{{
-							Key:      "kubernetes.io/hostname",
-							Operator: corev1.NodeSelectorOpIn,
-							Values:   []string{p.node},
-						}},
-					}},
-				},
-			},
+			NodeAffinity: p.affinity(block),
 		},
 	}
 
@@ -134,8 +145,37 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 		}
 		return
 	}
-	klog.InfoS("Provisioned", "claim", claim.Namespace+"/"+claim.Name, "path", path, "size", size.String())
+	klog.InfoS("Provisioned", "claim", claim.Namespace+"/"+claim.Name, "path", path,
+		"size", size.String(), "node", selected, "block", block)
 }
+
+// Which nodes can reach a volume's data.
+//
+// A disk image only ever attaches to a pod VM on the Mac, so it is pinned to
+// the Mac's node. A directory is the same directory on the Mac and in every
+// machine the Mac runs -- they all mount one volumes directory -- so it is
+// pinned to ferry.dev/host instead, which the Mac and its machines all carry,
+// and a pod can come back on any of them. Either way it is this Mac and
+// nowhere else: a pod that comes back later is sent where its data is.
+func (p *provisioner) affinity(block bool) *corev1.VolumeNodeAffinity {
+	requirement := corev1.NodeSelectorRequirement{
+		Key: hostLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{p.node},
+	}
+	if block {
+		requirement.Key = "kubernetes.io/hostname"
+	}
+	return &corev1.VolumeNodeAffinity{
+		Required: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{requirement},
+			}},
+		},
+	}
+}
+
+// Set by `ferry up` on the Mac's node and by ferry-machined on each machine,
+// naming the Mac whose volumes directory that node can see.
+const hostLabel = "ferry.dev/host"
 
 // The disk image a single-writer volume keeps its filesystem in. ferry-cri
 // looks for exactly this name inside a volume directory, so it is part of the

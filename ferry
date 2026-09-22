@@ -1330,6 +1330,12 @@ withdraw_gpu() {
 ensure_mode_label() { # node
   kube label node "$1" ferry.dev/mode=vm-per-pod --overwrite >/dev/null 2>&1 \
     || warn "could not label $1 ferry.dev/mode=vm-per-pod; nodeSelector will not match it"
+  # Which Mac's disk this node's volumes are on. ferry-machined gives each
+  # machine the same label, naming the Mac it runs on, and a directory volume
+  # is pinned to that label rather than to one node: it is the same directory
+  # on the Mac and in every machine the Mac runs, so its pod can move between
+  # them. See ferry-storage.
+  kube label node "$1" "ferry.dev/host=$NODE_NAME" --overwrite >/dev/null 2>&1 || true
 }
 
 start_machines() {
@@ -1351,6 +1357,9 @@ start_machines() {
   # The machine's disk barrier follows the cluster's durability, so mode 2
   # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
   FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
+  # Shared into every machine at boot, so it has to exist before the first one;
+  # ferry-storage makes it too, but may not have run yet.
+  mkdir -p "$FERRY_HOME/volumes"
   "$here/bin/ferry-node" serve \
     --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
     --ca "$FERRY_HOME/pki/ca.crt" \
@@ -1359,6 +1368,7 @@ start_machines() {
     --cluster-dns "$MACHINE_DNS_IP" \
     --cluster-cidr "$CLUSTER_CIDR" \
     --switch-port "$MACHINE_RELAY_PORT" --switch-peer "127.0.0.1:$RELAY_PORT" \
+    --volumes "$FERRY_HOME/volumes" \
     >"$FERRY_RUN/logs/ferry-node.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-node.pid"
   local _
@@ -1398,7 +1408,7 @@ start_machines() {
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
     --machines "$FERRY_RUN/machines" \
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
-    --ca "$FERRY_HOME/pki/ca.crt" \
+    --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1

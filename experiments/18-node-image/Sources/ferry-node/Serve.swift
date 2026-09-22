@@ -62,6 +62,8 @@ func serve() throws {
     let switchPort = UInt16(option("--switch-port", "0")) ?? 0
     let switchPeer = option("--switch-peer", "")
     let clusterCIDR = option("--cluster-cidr", "")
+    // This Mac's PersistentVolume directory, shared into every machine.
+    let volumesDir = option("--volumes", "")
 
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
@@ -123,7 +125,8 @@ func serve() throws {
             do {
                 let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
                                        caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
-                                       clusterCIDR: clusterCIDR, podNetwork: podNetwork)
+                                       clusterCIDR: clusterCIDR, podNetwork: podNetwork,
+                                       volumesDir: volumesDir)
                 live.add(name, machine)
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,
@@ -188,7 +191,8 @@ final class RunningMachine {
 @available(macOS 26.0, *)
 func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
           caPath: String, apiServer: String, clusterDNS: String,
-          clusterCIDR: String = "", podNetwork: MachineSwitch? = nil) throws -> RunningMachine {
+          clusterCIDR: String = "", podNetwork: MachineSwitch? = nil,
+          volumesDir: String = "") throws -> RunningMachine {
     // An interface on the shared network, so every machine is on one segment
     // and a route between two of them is an ordinary route.
     guard let interface = try network.createInterface(spec.name) else {
@@ -232,7 +236,8 @@ func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
         cpus: spec.cpus, memoryMiB: spec.memoryMiB, apiServer: apiServer, token: spec.token,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
         clusterCIDR: clusterCIDR, taints: spec.taints ?? [],
-        interface: interface, console: console, podNIC: podNIC)
+        interface: interface, console: console, podNIC: podNIC,
+        volumesDir: volumesDir)
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)

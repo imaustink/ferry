@@ -338,6 +338,7 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 const (
 	modeLabel  = "ferry.dev/mode"
 	modeShared = "shared"
+	hostLabel  = "ferry.dev/host"
 )
 
 // Applied here rather than through the kubelet's --node-labels, which would be
@@ -352,10 +353,14 @@ const (
 // missing rather than wrong, so the scheduler declines to place a pod rather
 // than placing it somewhere it does not belong.
 func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node) {
-	if node.Labels[modeLabel] == modeShared {
+	host := *hostNode
+	if node.Labels[modeLabel] == modeShared && (host == "" || node.Labels[hostLabel] == host) {
 		return
 	}
 	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, modeLabel, modeShared)
+	if host != "" {
+		patch = fmt.Sprintf(`{"metadata":{"labels":{%q:%q,%q:%q}}}`, modeLabel, modeShared, hostLabel, host)
+	}
 	if _, err := c.kube.CoreV1().Nodes().Patch(ctx, node.Name,
 		types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
 		// Not fatal: the machine is running and useful, it just will not match

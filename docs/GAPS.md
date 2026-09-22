@@ -193,8 +193,14 @@ Known limits, which are not bugs:
   the image is formatted; the guest agent's mkdir ignores the mode it is asked
   for, so one that appears later is not. On Linux a late subPath is root-owned
   too, though with the volume root's mode.
-- **`chown` is refused on ReadWriteMany volumes.** They are still directories
-  shared over virtiofs, which runs as the Mac user.
+- **`chown` is refused on ReadWriteMany volumes, and on every volume in
+  mode 2.** They are directories shared over virtiofs, which runs as the Mac
+  user. A machine cannot take a disk after it has booted, so a mode 2 claim is
+  a directory in the Mac's volumes folder, which every machine mounts at boot
+  at the same path. The upside is that such a volume follows its pod: it is
+  pinned to `ferry.dev/host`, which the Mac and all of its machines carry, so
+  a pod can come back on a replacement machine, or on the Mac, and find its
+  data. Karpenter replacing a machine does not strand it.
 
 ## Works, and worth saying so
 

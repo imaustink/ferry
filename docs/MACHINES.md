@@ -444,6 +444,17 @@ than placing it somewhere it does not belong.
 Nothing balances between the two. A pod with no selector goes wherever it fits,
 which is milestone 4's job to make deliberate.
 
+**Volumes.** A PersistentVolumeClaim for a pod on a machine is a directory in
+the Mac's volumes folder, which `ferry-node` shares into every machine at boot
+and `init.sh` mounts at the same path it has on the Mac. The volume is pinned
+to `ferry.dev/host` — set on the Mac's node by `ferry up` and on each machine
+by `ferry-machined` — rather than to one node, so a pod finds its data again on
+a replacement machine or on the Mac. Until this, `ferry-storage` served only
+claims scheduled to the Mac's node, and a mode 2 pod with a claim stayed
+Pending with no event. `chown` does not work on these (virtiofs is served as
+the Mac user); a Mac-node ReadWriteOnce claim is an ext4 disk instead, which
+a machine cannot attach after boot.
+
 ## Milestones
 
 1. ~~**One machine, by hand.**~~ **Done** —

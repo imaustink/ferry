@@ -177,6 +177,9 @@ func run() throws {
     while true { sleep(3600) }
 }
 
+/// The virtiofs tag init.sh mounts the volumes share by.
+let volumesTag = "ferry-volumes"
+
 /// Everything a machine is, in one place, so `run` and `serve` cannot drift
 /// apart on what a node boots with.
 @available(macOS 26.0, *)
@@ -187,7 +190,8 @@ func machineConfiguration(
     clusterCIDR: String = "",
     taints: [String] = [],
     interface: VmnetNetwork.Interface, console: Console,
-    podNIC: MachineNIC? = nil
+    podNIC: MachineNIC? = nil,
+    volumesDir: String = ""
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
@@ -247,6 +251,25 @@ func machineConfiguration(
            !v.isEmpty, Int(v) != nil {
             arguments.append("\(param)=\(v)")
         }
+    }
+    // Where this Mac keeps PersistentVolumes, mounted in the guest at the same
+    // path it has on the Mac. A machine's pods had no storage at all:
+    // ferry-storage made every volume a directory on the Mac and pinned it to
+    // the Mac's node, so a claim scheduled to a machine was never provisioned
+    // and its pod stayed Pending without an event. The same path on both sides
+    // lets one PersistentVolume name one directory wherever its pod lands.
+    //
+    // A share, because a machine's devices are fixed when it boots and a claim
+    // arrives whenever it likes; the whole directory is shared once and each
+    // volume is a directory in it. A path with a space in it cannot ride the
+    // command line, so such a Mac gets no share and says so.
+    let sharesVolumes = !volumesDir.isEmpty && !volumesDir.contains(" ")
+        && FileManager.default.fileExists(atPath: volumesDir)
+    if sharesVolumes {
+        arguments.append("ferry.volumes=\(volumesDir)")
+    } else if !volumesDir.isEmpty {
+        FileHandle.standardError.write(Data(
+            "warning: not sharing \(volumesDir) with \(nodeName): missing, or has a space in its path\n".utf8))
     }
     boot.commandLine = arguments.joined(separator: " ")
     config.bootLoader = boot
@@ -315,6 +338,13 @@ func machineConfiguration(
     // containerd that had booted in forty-five milliseconds. It is one line and
     // it moves the whole early boot.
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+    if sharesVolumes {
+        let share = VZVirtioFileSystemDeviceConfiguration(tag: volumesTag)
+        share.share = VZSingleDirectoryShare(
+            directory: VZSharedDirectory(url: URL(filePath: volumesDir), readOnly: false))
+        config.directorySharingDevices = [share]
+    }
 
     try config.validate()
     return config

@@ -143,6 +143,19 @@ v="$(here="$sandbox" ferry_runtime_version)"
 if [[ "${v#v}" =~ $semver ]]; then ok "neither: $v"; else bad "neither gives '$v'"; fi
 echo
 
+printf '\033[1m%s\033[0m\n' "a mode 2 pod's claim has somewhere to go"
+# Each link in the chain is in a different process, and dropping any one of
+# them puts the claim back to Pending with no event.
+contains "ferry-node serve is handed the volumes directory" \
+  "$(sed -n '/"\$here\/bin\/ferry-node" serve/,/ferry-node.log/p' "$repo/ferry")" '--volumes "$FERRY_HOME/volumes"'
+contains "ferry-machined is told which Mac it labels machines with" \
+  "$(sed -n '/"\$here\/bin\/ferry-machined"/,/ferry-machined.log/p' "$repo/ferry")" '--host-node "$NODE_NAME"'
+contains "the Mac's own node carries the same label" \
+  "$(sed -n '/^ensure_mode_label()/,/^}/p' "$repo/ferry")" 'ferry.dev/host=$NODE_NAME'
+contains "the machine mounts the share before its kubelet starts" \
+  "$(sed -n '/ferry.volumes/,/kubelet/p' "$repo/experiments/18-node-image/init.sh")" "mount -t virtiofs ferry-volumes"
+echo
+
 # --- small helpers -----------------------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "telling whether a gateway is on the profile's pod network"
