@@ -60,7 +60,10 @@ printf '\033[1m%s\033[0m\n' "the list of what ferry binds"
 # with it: this list is the test's own statement of what ferry does, and the
 # check that follows is what makes a wrong statement fail here rather than in
 # whichever process loses the race a year from now.
-FERRY_UP_PORTS="6443 2379 2380 10257 10259 10248 10250 10350 8472 8700"
+# 8081 is karpenter's health probe. Karpenter defaults it to 8081 unshifted,
+# which is how a second ferry on one Mac used to panic on startup and fall
+# back to hand-declared machines; shifting it put it in this list's scope.
+FERRY_UP_PORTS="6443 2379 2380 8081 10257 10259 10248 10250 10350 8472 8700"
 
 # Anything ferry adds PORT_SHIFT to is a port it binds once per profile, which
 # is exactly what belongs in the list. The node block is not here and should
