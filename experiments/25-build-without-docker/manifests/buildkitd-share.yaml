@@ -1,0 +1,46 @@
+# The builder with somewhere to put the result that is not the network.
+#
+# `--output type=oci,dest=-` streams the whole image to the Mac over gRPC and
+# `ferry image load` then unpacks it back: a full copy of the image out and in,
+# which FINDINGS.md measured at 85% of an incremental build on a 449 MB image.
+#
+# But a volume is a host directory shared into the guest over virtiofs
+# (PodRuntime.swift:1202), so a file the pod writes into one is already a file
+# on the Mac. Exporting `type=oci,tar=false` into that volume writes the layout
+# where ferry can read it in place -- no tar, no transfer, no second copy.
+#
+# emptyDir rather than a PVC because the kubelet assembles it on the host too,
+# and it needs no storage class and no binding.
+#
+# The cache deliberately stays out of it: buildkit wants overlayfs for
+# /var/lib/buildkit and virtiofs is the wrong filesystem to put an overlay
+# upper directory on. The cache lives on the pod's own disk and is the reason
+# to keep the builder warm.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: buildkitd
+  labels:
+    app: buildkitd
+spec:
+  containers:
+    - name: buildkitd
+      image: moby/buildkit:v0.29.0
+      imagePullPolicy: IfNotPresent
+      args:
+        - --addr
+        - tcp://0.0.0.0:1234
+      securityContext:
+        privileged: true
+      ports:
+        - containerPort: 1234
+      volumeMounts:
+        - name: out
+          mountPath: /out
+      resources:
+        limits:
+          cpu: "8"
+          memory: 4Gi
+  volumes:
+    - name: out
+      emptyDir: {}
