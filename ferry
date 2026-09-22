@@ -379,6 +379,12 @@ ferry_release_version() {
   sed -n 's/^ferry=//p' "$here/VERSION" | head -1
 }
 is_release() { [ -f "$here/VERSION" ]; }
+# What ferry-cri tells the kubelet it is, and so what `kubectl get nodes` shows
+# as ferry://<version>. It was a constant, 0.1.0, through every release since.
+ferry_runtime_version() {
+  ferry_release_version 2>/dev/null | grep . \
+    || echo "dev-$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+}
 # Whether the release was packaged with the mode 2 node image. Recorded by
 # release/build.sh, because "the directory is missing" and "this build never had
 # one" are different facts and only the second has a useful answer.
@@ -387,6 +393,14 @@ release_has_node_image() {
 }
 
 # macOS pgrep does not count reliably with -c, so count lines.
+ip_in_cidr() { # address cidr
+  local ip="$1" net="${2%/*}" bits="${2#*/}"
+  [ -n "$ip" ] && [ "$net" != "$2" ] || return 1
+  toint() { local IFS=.; set -- $1; echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 )); }
+  local mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  local a b; a="$(toint "$ip")"; b="$(toint "$net")"; unset -f toint
+  [ $(( a & mask )) -eq $(( b & mask )) ]
+}
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -407,6 +421,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry up          start the cluster
                     --durability relaxed to trade crash-safety for speed
   ferry down        stop the cluster (--purge to drop its data as well)
+  ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
   ferry kubeconfig  print the path to the admin kubeconfig
@@ -977,7 +992,7 @@ cmd_up() {
 
   start_gpud
 
-  "$here/bin/ferry-cri" \
+  FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
@@ -1025,6 +1040,17 @@ cmd_up() {
     return 1
   fi
   ok "runtime on $(grep -oE 'network .*' "$FERRY_RUN/logs/ferry-cri.log" | tail -1)"
+  # Alone, ferry-cri takes another vmnet subnet rather than wait a minute or more
+  # for its own slice to be released. That is survivable, but it is a different
+  # pod network from the one 'ferry profile' names, and pods that were created
+  # before it keep addresses on the old one until they are recreated. Said as a
+  # warning, because an `ok` line with a new gateway in it is easy to read past.
+  if grep -q "is still reserved by a recent run" "$FERRY_RUN/logs/ferry-cri.log" 2>/dev/null; then
+    warn "$(grep -oE '[0-9./]+ is still reserved by a recent run; using [0-9./]+' "$FERRY_RUN/logs/ferry-cri.log" | tail -1)"
+    echo "      Pods run off this profile's pod network ($CLUSTER_CIDR) until the next"
+    echo "      restart that gets it back. Existing pods keep their old addresses"
+    echo "      until they are recreated. Waiting a minute before 'ferry up' avoids it."
+  fi
 
   # The API server must advertise the gateway of the subnet the runtime actually
   # obtained, which is not always the one requested -- vmnet networks can stay
@@ -1074,6 +1100,13 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+# Image GC is keyed off the same percentage of the same disk, and imagefs here is
+# the Mac's whole data volume, not a disk sized to the cluster: a Mac 90% full of
+# photos looks like 90% images, so kubelet deletes every idle image every five
+# minutes chasing a number images cannot move. A loaded image has no registry
+# to come back from. Disk pressure is left to imagefs.available above.
+imageGCHighThresholdPercent: 100
+imageGCLowThresholdPercent: 99
 maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -1744,7 +1777,7 @@ cmd_node_add() {
   # loss rather than a missing feature. So pods on an added node do not reach
   # machines; pods on the first node do. Fixing it means the machines' switch
   # holding a peer per node on the Mac rather than one.
-  "$here/bin/ferry-cri" \
+  FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
@@ -2185,7 +2218,7 @@ start_worker() {
   # shares the one that is already running.
   start_gpud
 
-  "$here/bin/ferry-cri" \
+  FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
@@ -2230,6 +2263,8 @@ evictionHard:
   nodefs.available: "$EVICT_DISK"
   imagefs.available: "$EVICT_DISK"
   nodefs.inodesFree: "5%"
+imageGCHighThresholdPercent: 100
+imageGCLowThresholdPercent: 99
 maxPods: $MAX_PODS
 cgroupsPerQOS: false
 enforceNodeAllocatable: []
@@ -3517,7 +3552,15 @@ cmd_image_load() {
     local exported="$staging/image.tar"
     if command -v docker >/dev/null 2>&1 && docker image inspect "$what" >/dev/null 2>&1; then
       echo "  exporting $what from docker"
-      docker save --output "$exported" "$what" >/dev/null 2>&1 || { bad "docker save failed"; return 1; }
+      # Only the node's platform. With the containerd image store, a plain save
+      # of anything multi-platform writes the whole index -- seventeen manifests
+      # for busybox -- but blobs only for the platform that was pulled, and the
+      # archive is then missing most of what it says it holds. --platform is
+      # Docker 28 and later; older ones get the plain save and ferry-cri picks
+      # the platform out of the index.
+      docker save --platform linux/arm64 --output "$exported" "$what" >/dev/null 2>&1 \
+        || docker save --output "$exported" "$what" >/dev/null 2>&1 \
+        || { bad "docker save failed"; return 1; }
     elif command -v podman >/dev/null 2>&1 && podman image exists "$what" 2>/dev/null; then
       echo "  exporting $what from podman"
       podman save --format oci-archive --output "$exported" "$what" >/dev/null 2>&1 \
@@ -3575,6 +3618,12 @@ cmd_profile() {
   echo "  runtime     $FERRY_RUN"
   echo "  node name   $NODE_NAME"
   echo "  pod network $CLUSTER_CIDR"
+  # What the running cluster actually got, which is not always the above: see
+  # the fallback in ferry-cri's prepare().
+  local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null)"
+  if running ferry-cri && [ -n "$gateway" ] && ! ip_in_cidr "$gateway" "$CLUSTER_CIDR"; then
+    warn "running off it, on ${gateway%.*}.0/24 -- its slice was still reserved at 'ferry up'"
+  fi
   echo "  api server  https://$(lan_address):$(( 6443 + PORT_SHIFT ))"
   echo "  kubelet     $(( 10250 + PORT_SHIFT ))"
   echo "  streaming   $FERRY_STREAM_ADDR"
@@ -4198,7 +4247,16 @@ cmd_service_run() {
     echo "cluster was stopped with 'ferry down'; not restarting it"
     exit 0
   fi
-  echo "ferry-cri or the kubelet stopped on their own; exiting so launchd restarts the cluster"
+  # What is left has to go before launchd starts us again. Usually only one of
+  # the two died -- ferry-cri, most often, with the kubelet and the control
+  # plane still running -- and cmd_up refuses to start over a half-running
+  # cluster, so the restart failed with "already up", launchd retried it, and
+  # the node stayed NotReady for good. ferry-cri cannot be restarted on its own:
+  # its pod VMs and its vmnet network went with it, so the gateway the control
+  # plane advertises may not be the one it gets back.
+  echo "ferry-cri or the kubelet stopped on their own; restarting the cluster"
+  cmd_down
+  clear_stopped
   exit 1
 }
 
@@ -4353,23 +4411,50 @@ cmd_kubeconfig() {
     ok "backed up $target to $(basename "$backup")"
   fi
 
-  # kubectl's own merge, renaming ferry's entries so they cannot collide with a
-  # cluster already called "ferry" in there. Written to a temporary file first:
-  # KUBECONFIG=a:b `kubectl config view --flatten` reads both and a redirect
-  # into one of them truncates it before it is read.
-  local tmp; tmp="$(mktemp)"
-  if KUBECONFIG="$target:$conf" kubectl config view --flatten > "$tmp" 2>/dev/null \
+  # Every profile's admin.conf calls its cluster "ferry" and its user "admin",
+  # and a flattened merge keeps the first entry of each name it meets. Renaming
+  # only the context, after the merge, left the second profile's context aimed
+  # at the first profile's API server. So the cluster, user and context are all
+  # given the profile's name in a copy, before anything is merged.
+  local renamed tmp; renamed="$(mktemp)"; tmp="$(mktemp)"
+  field() { KUBECONFIG="$conf" kubectl config view --minify --flatten -o jsonpath="{$1}"; }
+  local server ca cert key
+  server="$(field .clusters[0].cluster.server)"
+  ca="$(field '.clusters[0].cluster.certificate-authority-data')"
+  cert="$(field '.users[0].user.client-certificate-data')"
+  key="$(field '.users[0].user.client-key-data')"
+  unset -f field
+  if [ -z "$server" ] || [ -z "$ca" ] || [ -z "$cert" ] || [ -z "$key" ]; then
+    rm -f "$renamed" "$tmp"
+    bad "could not read the cluster's credentials from $conf"; return 1
+  fi
+  # `config set` base64-decodes what it is given for a *-data field, and these
+  # come out of --flatten already encoded. No current-context is written:
+  # merging should not move anyone off the context they are on -- someone
+  # pointed at production who adds ferry's context is still pointed at it.
+  {
+    KUBECONFIG="$renamed" kubectl config set-cluster "$context" --server="$server" &&
+    KUBECONFIG="$renamed" kubectl config set "clusters.$context.certificate-authority-data" "$ca" &&
+    KUBECONFIG="$renamed" kubectl config set "users.$context.client-certificate-data" "$cert" &&
+    KUBECONFIG="$renamed" kubectl config set "users.$context.client-key-data" "$key" &&
+    KUBECONFIG="$renamed" kubectl config set-context "$context" --cluster="$context" --user="$context"
+  } >/dev/null 2>&1 || { rm -f "$renamed" "$tmp"; bad "could not prepare the merge"; return 1; }
+
+  # ferry's copy is listed first so that, for a cluster recreated since the last
+  # merge, its new certificates win over the stale ones already in $target.
+  # Written to a temporary file first: KUBECONFIG=a:b `kubectl config view
+  # --flatten` reads both and a redirect into one of them truncates it before it
+  # is read.
+  if KUBECONFIG="$renamed:$target" kubectl config view --flatten > "$tmp" 2>/dev/null \
      && [ -s "$tmp" ]; then
     mv "$tmp" "$target"
     chmod 600 "$target"
+    rm -f "$renamed"
   else
-    rm -f "$tmp"
+    rm -f "$tmp" "$renamed"
     bad "could not merge into $target"; return 1
   fi
 
-  kubectl config rename-context "$(KUBECONFIG="$conf" kubectl config current-context)" \
-    "$context" >/dev/null 2>&1 || true
-  kubectl config use-context "$context" >/dev/null 2>&1
   ok "merged into $target as context '$context'"
   echo "  kubectl config use-context $context"
 }
@@ -4382,15 +4467,20 @@ cmd_version() {
     echo "ferry (checkout $(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown))"
   fi
 
-  # Three places know a version, and they are three different facts: what this
-  # Mac's cluster is running, what this copy of ferry carries, and -- before
-  # either exists -- what the release was packaged with. Asked in that order,
-  # because the first one that answers is the one that is true right now.
-  local k8s; k8s="$(ferry_cluster_field kubernetes 2>/dev/null || ferry_active_version)"
+  # Two different facts: what this copy of ferry carries, and what this Mac's
+  # cluster was last started at. They differ after every upgrade until the
+  # cluster is restarted, and the cluster's record outlives the cluster -- so
+  # reading the cluster's version into the first lines reported, after an
+  # install, a Kubernetes the installed release does not contain. The copy's
+  # own versions come from what bin/ points at or, before anything is built,
+  # what the release was packaged with.
+  local k8s; k8s="$(ferry_active_version)"
+  [ -z "$k8s" ] && [ -f "$here/VERSION" ] && k8s="$(sed -n 's/^kubernetes=//p' "$here/VERSION" | head -1)"
   version_of() { # field
-    ferry_cluster_field "$1" 2>/dev/null && return 0
     [ -n "$k8s" ] && ferry_manifest_field "$k8s" "$1" 2>/dev/null && return 0
     [ -f "$here/VERSION" ] && sed -n "s/^$1=//p" "$here/VERSION" | head -1 | grep . && return 0
+    [ -n "$k8s" ] && [ "$1" = control-plane ] && { ferry_control_plane_version "$k8s"; return 0; }
+    [ -n "$k8s" ] && [ "$1" = etcd ] && { ferry_etcd_version "$k8s"; return 0; }
     echo unknown
   }
   echo "  kubernetes    ${k8s:-not built}"
@@ -4399,7 +4489,22 @@ cmd_version() {
   unset -f version_of
   echo "  profile       $PROFILE"
   echo "  root          $here"
-  if running kubelet; then echo "  cluster       up"; else echo "  cluster       not running"; fi
+  local cluster; cluster="$(ferry_cluster_field kubernetes 2>/dev/null)"
+  if running kubelet; then
+    echo "  cluster       up${cluster:+, kubernetes $cluster}"
+  elif [ -n "$cluster" ]; then
+    echo "  cluster       not running (last started at kubernetes $cluster)"
+  else
+    echo "  cluster       not running"
+  fi
+}
+
+# ferry-cri cannot be restarted on its own -- see cmd_service_run -- so this is
+# the whole cluster, down and up. The data stays; the pods are recreated.
+cmd_restart() {
+  [ $# -eq 0 ] || { bad "usage: ferry restart"; return 2; }
+  cmd_down || return 1
+  cmd_up
 }
 
 cmd_status() {
@@ -4431,7 +4536,26 @@ cmd_status() {
       else bad "$component (machines are enabled)"; fi
     done
   fi
-  echo "  $(count_vms) pod VMs running"
+  # A dead runtime under a live kubelet is a node that reads NotReady and will
+  # stay that way: the runtime took its pod VMs and its vmnet network with it,
+  # and nothing brings it back but a restart of the whole cluster.
+  if ! running ferry-cri && running kubelet && ! was_stopped; then
+    warn "ferry-cri has stopped and the node cannot run pods"
+    echo "      Why:  tail -40 $FERRY_RUN/logs/ferry-cri.log"
+    echo "      Fix:  ferry restart"
+  fi
+  # count_vms sees every Virtualization.framework VM on the Mac -- Docker
+  # Desktop's, a simulator's, another profile's pods -- and none of them is
+  # attributable to a profile from the process table. The API server knows
+  # which pods are this node's, so it is asked; the Mac-wide figure is labelled
+  # for what it is.
+  if [ -f "$FERRY_HOME/admin.conf" ] && running kubelet; then
+    local pods
+    pods="$(KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get pods -A --no-headers \
+      --field-selector "spec.nodeName=$NODE_NAME,status.phase=Running" 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  $pods pods running on $NODE_NAME"
+  fi
+  echo "  $(count_vms) virtual machines on this Mac, from any app"
   if [ -f "$FERRY_HOME/admin.conf" ] && running kubelet; then
     echo
     KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes 2>/dev/null
@@ -4487,6 +4611,7 @@ case "${1:-}" in
   service)    shift; cmd_service "$@" ;;
   uninstall)  shift; cmd_uninstall "$@" ;;
   down)       shift; cmd_down "$@" ;;
+  restart)    shift; cmd_restart "$@" ;;
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
   kubeconfig) shift; cmd_kubeconfig "$@" ;;
