@@ -23,7 +23,10 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 CONTAINERIZATION_REF="${CONTAINERIZATION_REF:-0.45.0}"
 KERNEL_SOURCE="${KERNEL_SOURCE:-https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz}"
-out="$here/vmlinux-arm64"
+# OUT and CONFIG_FRAGMENT build a variant without touching the kernel ferry
+# boots: a fragment's lines are appended to Apple's configuration, and
+# olddefconfig lets a later assignment win over the earlier one.
+out="${OUT:-$here/vmlinux-arm64}"
 work="$here/.build"
 
 if [ -f "$out" ] && [ "${FORCE:-}" != "1" ]; then
@@ -68,6 +71,10 @@ echo "==> compiling (this takes a while)"
 stage="$work/stage"
 rm -rf "$stage"; mkdir -p "$stage"
 cp "$src/config-arm64" "$src/build.sh" "$stage/"
+if [ -n "${CONFIG_FRAGMENT:-}" ]; then
+  echo "==> adding $(basename "$CONFIG_FRAGMENT")"
+  { echo; cat "$CONFIG_FRAGMENT"; } >> "$stage/config-arm64"
+fi
 cp "$work/source.tar.xz" "$stage/"
 docker run --rm -v "$stage:/kernel" -w /kernel \
   -e TARGET_ARCH=arm64 -e LOCALVERSION=-ferry \

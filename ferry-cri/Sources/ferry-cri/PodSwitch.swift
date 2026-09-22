@@ -105,6 +105,11 @@ final class PodSwitch: @unchecked Sendable {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         let port = Port(podID: podID, fd: fd, source: source)
         source.setEventHandler { [weak self] in self?.readFrames(from: port) }
+        // The port owns the host end from here on, and closes it only once the
+        // source has stopped reading it. Nothing closed it before: every pod
+        // that ever ran left its socket pair open, two descriptors a pod, until
+        // a busy node ran out of them.
+        source.setCancelHandler { close(fd) }
         lock.lock(); ports[podID] = port; lock.unlock()
         source.resume()
     }

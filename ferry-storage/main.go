@@ -5,12 +5,15 @@
 // ships storage-provisioner as a default addon and kind ships
 // local-path-provisioner; ferry had neither.
 //
-// A volume here is a directory on the Mac, handed to the pod as a virtiofs
-// share, which is how every other ferry mount already works. That makes the
-// volume local to one machine, so the PersistentVolume carries node affinity and
-// the StorageClass binds late: the scheduler picks a node for the pod first, and
-// only then is a volume made on that node. A pod that comes back later is sent
-// to the node holding its data.
+// A volume here is a directory on the Mac. A claim that allows many writers is
+// handed to the pod as a virtiofs share of it, which is how every other ferry
+// mount already works; a single-writer claim also gets a disk image inside the
+// directory, which ferry-cri attaches as a block device so the volume has real
+// ownership (see singleWriter). Either way the volume is local to one machine,
+// so the PersistentVolume carries node affinity and the StorageClass binds
+// late: the scheduler picks a node for the pod first, and only then is a volume
+// made on that node. A pod that comes back later is sent to the node holding
+// its data.
 package main
 
 import (

@@ -22,6 +22,10 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func version(request: Runtime_V1_VersionRequest, context: ServerContext) async throws -> Runtime_V1_VersionResponse {
         var response = Runtime_V1_VersionResponse()
+        // Not ferry's version: this field is the version of the kubelet
+        // runtime API itself, which is "0.1.0" for every CRI runtime and what
+        // containerd answers too. The node's CONTAINER-RUNTIME column comes
+        // from runtimeVersion below, which is where the release goes.
         response.version = "0.1.0"
         response.runtimeName = "ferry"
         response.runtimeVersion = self.version
@@ -101,7 +105,7 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             var status = Runtime_V1_PodSandboxStatus()
             status.id = record.id
             status.metadata = metadata(record)
-            status.state = record.ready ? .sandboxReady : .sandboxNotready
+            status.state = record.reportedReady ? .sandboxReady : .sandboxNotready
             status.createdAt = record.createdAt
             status.network = network
             status.labels = record.labels
@@ -120,7 +124,7 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         let filter = request.hasFilter ? request.filter : nil
         var items: [Runtime_V1_PodSandbox] = []
         for record in await runtime.listSandboxes() {
-            let state: Runtime_V1_PodSandboxState = record.ready ? .sandboxReady : .sandboxNotready
+            let state: Runtime_V1_PodSandboxState = record.reportedReady ? .sandboxReady : .sandboxNotready
             if let filter {
                 if !filter.id.isEmpty && filter.id != record.id { continue }
                 if filter.hasState && filter.state.state != state { continue }

@@ -9,6 +9,7 @@ package main
 // asks here and holds the boot until they have all been created.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -68,6 +69,53 @@ type podContainers struct {
 	// Zero means the pod said nothing, and the runtime keeps its default.
 	MemoryLimitBytes int64 `json:"memoryLimitBytes"`
 	CPULimit         int32 `json:"cpuLimit"`
+	// Every subPath the pod's containers mount of each PersistentVolume, keyed
+	// by the volume's name, init containers included.
+	//
+	// A ReadWriteOnce volume is an ext4 image that ferry-cri formats the first
+	// time a pod uses it, and a subPath made then can be given the volume
+	// root's mode; one made later cannot, because the guest agent's mkdir
+	// ignores the mode it is asked for and a non-root container then finds a
+	// root-owned 0755 directory it cannot write to. CRI shows a runtime one
+	// container's mounts at a time, and a pod with an init container boots
+	// with that one alone, so the main container's subPaths would only arrive
+	// after the format. The spec has them all at once.
+	VolumeSubPaths map[string][]string `json:"volumeSubPaths,omitempty"`
+}
+
+// volumeSubPaths maps each PersistentVolume the pod mounts to the subPaths its
+// containers use of it. A claim that is not bound yet, or cannot be read, is
+// left out: the runtime then falls back to the subPaths CRI shows it.
+// subPathExpr is left out too -- it expands per container from the downward
+// API, which this does not evaluate.
+func (p *podLookup) volumeSubPaths(ctx context.Context, pod *v1.Pod) map[string][]string {
+	claims := map[string]string{} // pod volume name -> claim name
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			claims[volume.Name] = volume.PersistentVolumeClaim.ClaimName
+		}
+	}
+	if len(claims) == 0 {
+		return nil
+	}
+	subPaths := map[string][]string{} // pod volume name -> subPaths
+	all := append(append([]v1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
+	for _, c := range all {
+		for _, mount := range c.VolumeMounts {
+			if _, ok := claims[mount.Name]; ok && mount.SubPath != "" {
+				subPaths[mount.Name] = append(subPaths[mount.Name], mount.SubPath)
+			}
+		}
+	}
+	out := map[string][]string{}
+	for volume, paths := range subPaths {
+		claim, err := p.client.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, claims[volume], metav1.GetOptions{})
+		if err != nil || claim.Spec.VolumeName == "" {
+			continue
+		}
+		out[claim.Spec.VolumeName] = append(out[claim.Spec.VolumeName], paths...)
+	}
+	return out
 }
 
 // podResources aggregates what a pod's containers are allowed to use.
@@ -126,6 +174,7 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 			out.Priority = *pod.Spec.Priority
 		}
 		out.MemoryLimitBytes, out.CPULimit = podResources(pod)
+		out.VolumeSubPaths = pods.volumeSubPaths(r.Context(), pod)
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}

@@ -27,6 +27,12 @@
 // the body runs wherever dispatch calls it and the check has nothing to trap on.
 
 import Foundation
+import Synchronization
+
+/// Set once a signal has asked the process to stop. The CRI server's serve()
+/// returns during that graceful shutdown as well as when something breaks it,
+/// and only the second deserves a non-zero exit.
+let shutdownRequested = Atomic<Bool>(false)
 
 /// Runs `body` on SIGTERM or SIGINT, off the main queue.
 ///

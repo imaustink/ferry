@@ -198,7 +198,25 @@ final class ExecServer: @unchecked Sendable {
         Thread.detachNewThread {
             while true {
                 let accepted = accept(listener, nil, nil)
-                if accepted < 0 { continue }
+                if accepted < 0 {
+                    // Out of descriptors is worth riding out, but not at full
+                    // speed: accept fails again at once, and a loop that retries
+                    // without pause burns a core while the rest of the process
+                    // is trying to give descriptors back. Anything else means
+                    // the listener itself is gone, and a runtime ferry-cni and
+                    // kubectl exec cannot reach is better restarted than kept.
+                    let failure = errno
+                    switch failure {
+                    case EINTR, ECONNABORTED:
+                        continue
+                    case EMFILE, ENFILE, ENOBUFS, ENOMEM:
+                        usleep(100_000)
+                        continue
+                    default:
+                        announce("ferry-cri: exec socket accept failed: \(String(cString: strerror(failure))); exiting")
+                        exit(1)
+                    }
+                }
                 let socket = FrameSocket(descriptor: accepted)
                 Task { await Self.handle(socket: socket, runtime: runtime) }
             }
@@ -281,6 +299,12 @@ final class ExecServer: @unchecked Sendable {
         }
 
         let stdinStream = (header.stdin ?? false) ? FrameReaderStream() : nil
+        // Deleted on every way out, success or not. An exec that is only
+        // waited on keeps its guest process entry, its pipes, its vsock ports
+        // and its own agent connection for the life of the pod -- and every CNI
+        // plugin run arrives through here, so a busy node ran itself out of
+        // descriptors this way.
+        var launched: LinuxProcess?
         do {
             let process = try await runtime.exec(
                 containerID: containerID,
@@ -293,6 +317,7 @@ final class ExecServer: @unchecked Sendable {
                 environment: header.env,
                 asRoot: header.asRoot ?? false
             )
+            launched = process
             try await process.start()
 
             // Frames arriving while the command runs: input and window size.
@@ -326,6 +351,8 @@ final class ExecServer: @unchecked Sendable {
             socket.writeFrame(.stderr, Data(message.utf8))
             socket.writeFrame(.exit, Data([1]))
         }
+        // After the exit frame, so the client is not kept waiting on cleanup.
+        try? await launched?.delete()
     }
 }
 
