@@ -381,9 +381,17 @@ ferry_release_version() {
 is_release() { [ -f "$here/VERSION" ]; }
 # What ferry-cri tells the kubelet it is, and so what `kubectl get nodes` shows
 # as ferry://<version>. It was a constant, 0.1.0, through every release since.
+#
+# It has to be semver: the kubelet parses it, and anything that does not parse
+# is shown as ferry://Unknown. A checkout says how far past which release it is
+# -- `git describe` gives v0.3.0-2-gc87b652, a valid prerelease -- and one with
+# no tags at all is 0.0.0-dev.
 ferry_runtime_version() {
-  ferry_release_version 2>/dev/null | grep . \
-    || echo "dev-$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ferry_release_version 2>/dev/null | grep . && return
+  local described
+  described="$(git -C "$here" describe --tags --match 'v[0-9]*' 2>/dev/null)"
+  if [ -n "$described" ]; then echo "$described"; return; fi
+  echo "0.0.0-dev+$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 }
 # Whether the release was packaged with the mode 2 node image. Recorded by
 # release/build.sh, because "the directory is missing" and "this build never had

@@ -130,6 +130,19 @@ lacks "not the stale cluster's, as if it were installed" "$(echo "$out" | grep -
 contains "which is reported as what the stopped cluster last ran" "$out" "last started at kubernetes v1.37.0"
 echo
 
+printf '\033[1m%s\033[0m\n' "the runtime version the node reports is one the kubelet can parse"
+# Anything that is not semver is shown as ferry://Unknown -- which is what the
+# first attempt at this, "dev-<sha>", came out as.
+semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+eval "$(sed -n '/^ferry_release_version()/,/^}/p; /^ferry_runtime_version()/,/^}/p' "$repo/ferry")"
+v="$(here="$release" ferry_runtime_version)"
+if [[ "${v#v}" =~ $semver ]]; then ok "a release: $v"; else bad "a release gives '$v'"; fi
+v="$(here="$repo" ferry_runtime_version)"
+if [[ "${v#v}" =~ $semver ]]; then ok "a checkout: $v"; else bad "a checkout gives '$v'"; fi
+v="$(here="$sandbox" ferry_runtime_version)"
+if [[ "${v#v}" =~ $semver ]]; then ok "neither: $v"; else bad "neither gives '$v'"; fi
+echo
+
 # --- small helpers -----------------------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "telling whether a gateway is on the profile's pod network"

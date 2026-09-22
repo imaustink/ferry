@@ -529,7 +529,7 @@ esac
 # everything and lands on the Mac node as a pod VM programming a node kernel
 # ferry has not got, and CoreDNS becomes a second copy serving nobody.
 if command -v ruby >/dev/null 2>&1; then
-  pinning="$(ruby -ryaml -e '
+  pinning="$(cd "$repo" && ruby -ryaml -e '
     objs=[]
     ["manifests/machines/kube-proxy.yaml","manifests/machines/coredns.yaml"].each do |f|
       YAML.load_stream(File.read(f)){|d| objs << d if d}
@@ -553,7 +553,7 @@ if command -v ruby >/dev/null 2>&1; then
   # forever, because Karpenter discounts DaemonSet pods when deciding a node is
   # empty and counts everything else. Provisioning became a one-way ratchet.
   is "machine CoreDNS is a DaemonSet, so a machine can be reclaimed" \
-    "$(ruby -ryaml -e '
+    "$(cd "$repo" && ruby -ryaml -e '
       k = nil
       YAML.load_stream(File.read("manifests/machines/coredns.yaml")){|d|
         k = d["kind"] if d && d.dig("metadata","name") == "coredns-machines" &&
@@ -877,7 +877,7 @@ succeeds "  from a handler that is not main-actor isolated" \
   # Mode 1 already owns Deployment/coredns and ConfigMap/coredns in kube-system.
   # Applying a second set under those names replaces mode 1's DNS with a copy
   # pinned to nodes mode 1 does not have.
-  clash="$(ruby -ryaml -e '
+  clash="$(cd "$repo" && ruby -ryaml -e '
     def ids(files)
       s=[]
       files.each{|f| YAML.load_stream(File.read(f)){|d| s << "#{d["kind"]}/#{d.dig("metadata","name")}" if d}}
@@ -897,7 +897,7 @@ succeeds "  from a handler that is not main-actor isolated" \
   cp "$repo/manifests/machines/kube-proxy.yaml" "$joined"
   echo "---" >> "$joined"
   cat "$repo/manifests/machines/coredns.yaml" >> "$joined"
-  counts="$(ruby -ryaml -e '
+  counts="$(cd "$repo" && ruby -ryaml -e '
     sep = YAML.load_stream(File.read(ARGV[0])).compact.size +
           YAML.load_stream(File.read(ARGV[1])).compact.size
     joined = YAML.load_stream(File.read(ARGV[2])).compact
