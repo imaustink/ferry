@@ -227,7 +227,8 @@ Verified on the running cluster:
 - **More than one node per Mac, and more than one Mac**, with pod-to-pod traffic
   keeping its source address across machines.
 - **NodePort**, **LoadBalancer** above port 1024, **PersistentVolumeClaims**
-  provisioned and reclaimed, **`ferry image load`**, **UDP Services**.
+  provisioned and reclaimed, **`ferry image load`** (on machines too, with
+  `FERRY_MACHINE_REGISTRY=1`), **UDP Services**.
 - `kubectl exec`, `attach`, `port-forward`, `logs`, `cp` · Services with
   kube-proxy's own rules, including reject and hairpin · cluster DNS · sidecars
   and init containers · ConfigMaps, Secrets, projected ServiceAccount tokens,

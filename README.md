@@ -493,6 +493,12 @@ Kubernetes knows it by, because the Mac is on that subnet already: nothing is
 forwarded and nothing is proxied. The result goes straight into the image store
 pods are served from, so there is no registry in the loop.
 
+That store is the Mac's. A mode 2 machine runs its own containerd and cannot see
+it, so a pod scheduled onto one fails with `ErrImageNeverPull`. Start ferry with
+`FERRY_MACHINE_REGISTRY=1` and every image loaded or built afterwards is also
+served to machines, read-only, from the Mac; the image reference does not change.
+See `FERRY_MACHINE_REGISTRY` in [docs/INSTALL.md](docs/INSTALL.md).
+
 It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
 does not have to be installed, let alone running.
 

@@ -333,6 +333,9 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_MACHINE_IMAGE` | — | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
 | `FERRY_NODE_VERBOSE` | — | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
 | `FERRY_NODE_NO_CONFIG` | — | set to boot a machine without its generated config disk. For debugging the image itself |
+| `FERRY_MACHINE_REGISTRY` | — | `1` to serve what `ferry image load` and `ferry image build` load to machines as well. A machine has its own containerd and otherwise never sees a locally loaded image: its pods fail with `ErrImageNeverPull`. With it on, `ferry-registry` keeps a copy in `$FERRY_HOME/registry` and serves it read-only to the machine network, which reaches it at its gateway; every machine's containerd tries it first for every registry and falls through to the real one for anything not stored. Set it for `ferry up` (or `ferry machines enable`), then load; images loaded before it was on have to be loaded again. Needs a node image built with it (`ferry node-image`) |
+| `FERRY_MACHINE_REGISTRY_PORT` | `5050` + profile shift | the port it serves on. Only used when the registry is on. Not 5000, which macOS's AirPlay receiver holds |
+| `FERRY_NODE_REGISTRY_PORT` | set by ferry | what `ferry-node` reads to put `ferry.registry=<port>` on a machine's command line. ferry sets it from the two above, and blanks it when the registry is off; not meant to be set by hand |
 
 The two `MIN`/`MAX` pairs bound one machine; the two `LIMIT`s bound all of them
 together. They are separate numbers on purpose — collapsing them gives either a

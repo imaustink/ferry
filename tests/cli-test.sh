@@ -156,6 +156,33 @@ contains "the machine mounts the share before its kubelet starts" \
   "$(sed -n '/ferry.volumes/,/kubelet/p' "$repo/experiments/18-node-image/init.sh")" "mount -t virtiofs ferry-volumes"
 echo
 
+printf '\033[1m%s\033[0m\n' "no environment prefix is cut off by a comment"
+# `FOO=x \` followed by a comment line joins into `FOO=x # ...`: an ordinary
+# shell assignment, and the command below runs without it. Nothing fails. It
+# happened twice -- to karpenter's machine limits, and to FERRY_NODE_DISK_SYNC,
+# which left relaxed clusters' machines on the full disk barrier.
+cut_off="$(awk 'prev ~ /\\$/ && $0 ~ /^[[:space:]]*#/ {print NR": "$0} {prev=$0}' "$repo/ferry")"
+if [ -z "$cut_off" ]; then ok "every continued line continues into code"
+else bad "a continued line runs into a comment: $cut_off"; fi
+echo
+
+printf '\033[1m%s\033[0m\n' "a machine can pull what the Mac has loaded"
+# ErrImageNeverPull on a machine for an image `ferry image load` said it
+# loaded. Four processes each hold one link.
+contains "ferry-node is told the registry's port" \
+  "$(sed -n '/FERRY_NODE_DISK_SYNC=/,/"\$here\/bin\/ferry-node" serve/p' "$repo/ferry")" 'FERRY_NODE_REGISTRY_PORT='
+contains "which reaches the guest's command line" \
+  "$(cat "$repo/experiments/18-node-image/Sources/ferry-node/main.swift")" '"ferry.registry=\(port)"'
+contains "the guest makes it a mirror for every registry" \
+  "$(sed -n '/ferry.registry/,/starting containerd/p' "$repo/experiments/18-node-image/init.sh")" "/etc/containerd/certs.d/_default/hosts.toml"
+contains "and containerd reads that directory" \
+  "$(cat "$repo/experiments/18-node-image/files/containerd-config.toml")" "config_path = '/etc/containerd/certs.d'"
+contains "loading an image also stores it for machines" \
+  "$(sed -n '/^cmd_image_load()/,/^}/p' "$repo/ferry")" 'machine_registry_add "$layout"'
+contains "and ferry build builds the registry" \
+  "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-registry"'
+echo
+
 # --- small helpers -----------------------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "telling whether a gateway is on the profile's pod network"

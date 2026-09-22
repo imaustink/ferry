@@ -358,6 +358,14 @@ MACHINE_SUBNET="${MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
 # arrangement, which works there because a node VM has a kernel to program.
 # Cross-mode resolution is MACHINES.md milestone 6.
 MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
+# The images `ferry image load` and `ferry image build` put into ferry-cri, also
+# kept here and served to machines, which have a containerd of their own and
+# could not see any of them. Off unless asked for: it is another listening
+# process, and a second copy of every image loaded. See start_machine_registry.
+MACHINE_REGISTRY="${FERRY_MACHINE_REGISTRY:-}"
+MACHINE_REGISTRY_PORT="${FERRY_MACHINE_REGISTRY_PORT:-$(( 5050 + PORT_SHIFT ))}"
+REGISTRY_DIR="$FERRY_HOME/registry"
+machine_registry_enabled() { [ "$MACHINE_REGISTRY" = 1 ]; }
 # What the Mac will commit to machines in total.
 #
 # A quarter of memory and half the cores by default. The provisioner will spend
@@ -801,6 +809,12 @@ cmd_build() {
   echo "==> ferry-machined"
   ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
   echo "==> $here/bin/ferry-machined"
+  echo
+  # What serves locally loaded images to machines, when FERRY_MACHINE_REGISTRY
+  # asks for it. Standard library only, so it costs a second to build.
+  echo "==> ferry-registry"
+  ( cd "$here/ferry-registry" && go build -o "$here/bin/ferry-registry" . ) || return 1
+  echo "==> $here/bin/ferry-registry"
   echo
   # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
   # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
@@ -1353,13 +1367,23 @@ start_machines() {
   install_machine_dns || return 1
 
   mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
-
-  # The machine's disk barrier follows the cluster's durability, so mode 2
-  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
-  FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
   # Shared into every machine at boot, so it has to exist before the first one;
   # ferry-storage makes it too, but may not have run yet.
   mkdir -p "$FERRY_HOME/volumes"
+
+  # The machine's disk barrier follows the cluster's durability, so mode 2
+  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
+  #
+  # Keep these assignments directly above the command. A comment or a command
+  # between them and it ends the line, and they become shell variables that
+  # ferry-node never sees -- which is how FERRY_NODE_DISK_SYNC once stopped
+  # reaching it without anything failing.
+  #
+  # The registry port is passed only when the registry is on, and blank
+  # otherwise, so a FERRY_MACHINE_REGISTRY_PORT set on its own does not point
+  # machines at a registry that is not running.
+  FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
+  FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
   "$here/bin/ferry-node" serve \
     --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
     --ca "$FERRY_HOME/pki/ca.crt" \
@@ -1403,6 +1427,8 @@ start_machines() {
   # Remembered so the next start asks for the one that worked, not the default.
   [ -n "$actual_subnet" ] && printf '%s' "$actual_subnet" > "$MACHINE_SUBNET_FILE"
 
+  machine_registry_enabled && start_machine_registry "${actual_subnet:-$MACHINE_SUBNET}"
+
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
@@ -1421,6 +1447,38 @@ start_machines() {
   fi
 
   start_provisioner
+}
+
+# The images this Mac has, served to its machines. See ferry-registry/main.go.
+#
+# On every interface, answering only the machine subnet and loopback: the store
+# holds whatever was built here, and there is no reason to offer it to the LAN.
+# Not bound to the gateway, which machines reach it at, because vmnet only
+# gives the Mac that address while a machine is attached -- binding it failed
+# with "can't assign requested address" on every start, before the first
+# machine had booted. Not fatal: machines without it fall through to the real
+# registries, which is how they worked before it existed.
+start_machine_registry() { # subnet
+  [ -x "$here/bin/ferry-registry" ] || {
+    warn "FERRY_MACHINE_REGISTRY is set but bin/ferry-registry is missing -- run 'ferry build'"
+    return 0; }
+  mkdir -p "$REGISTRY_DIR"
+  "$here/bin/ferry-registry" serve --store "$REGISTRY_DIR" \
+    --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "$1" \
+    >>"$FERRY_RUN/logs/ferry-registry.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-registry.pid"
+  sleep 1
+  if running ferry-registry; then
+    ok "registry for machines on port $MACHINE_REGISTRY_PORT ($(machine_registry_count) images)"
+  else
+    rm -f "$FERRY_RUN/ferry-registry.pid"
+    warn "ferry-registry did not start; machines will not see locally loaded images"
+    tail -2 "$FERRY_RUN/logs/ferry-registry.log" 2>/dev/null | sed 's/^/      /'
+  fi
+}
+
+machine_registry_count() {
+  "$here/bin/ferry-registry" list --store "$REGISTRY_DIR" 2>/dev/null | wc -l | tr -d ' '
 }
 
 # Karpenter, with ferry as its cloud provider: machines made for pods that have
@@ -3549,6 +3607,25 @@ cmd_image_build() {
 # an image Docker or Podman is holding -- in the last case ferry asks that tool
 # to export it first. The image keeps the name it already has, so a manifest
 # saying `myapp:dev` still says that.
+# The same images for mode 2, when there is a registry to serve them.
+#
+# Also when the registry is running but the variable is not set in this shell:
+# the setting belongs to `ferry up`, and a load from another terminal that
+# quietly skipped the machines would be the bug this exists to fix, again.
+machine_registry_add() { # layout
+  machine_registry_enabled || running ferry-registry || return 0
+  [ -x "$here/bin/ferry-registry" ] || {
+    warn "not added for machines: bin/ferry-registry is missing -- run 'ferry build'"
+    return 0; }
+  local name out="$FERRY_RUN/registry-add.out" err="$FERRY_RUN/registry-add.err"
+  if "$here/bin/ferry-registry" add --store "$REGISTRY_DIR" "$1" >"$out" 2>"$err"; then
+    while read -r name; do [ -n "$name" ] && ok "served to machines as $name"; done < "$out"
+  else
+    warn "not added for machines: $(tail -1 "$err")"
+  fi
+  rm -f "$out" "$err"
+}
+
 cmd_image_load() {
   local what="${1:-}"
   [ -n "$what" ] || { bad "usage: ferry image load <name|archive.tar|oci-directory>"; return 2; }
@@ -3614,9 +3691,16 @@ cmd_image_load() {
       echo "$reply" \
         | sed -e 's/.*"images":\[//' -e 's/\].*//' -e 's/","/\n/g' -e 's/"//g' -e 's|\\/|/|g' \
         | while read -r name; do [ -n "$name" ] && ok "loaded $name"; done
+      machine_registry_add "$layout"
       echo
       echo "  Pods must not try to fetch it again: set"
-      echo "    imagePullPolicy: IfNotPresent   (or Never)"
+      if machine_registry_enabled || running ferry-registry; then
+        # Never means a machine's kubelet does not ask its containerd to pull,
+        # and pulling from the Mac is the only way a machine gets the image.
+        echo "    imagePullPolicy: IfNotPresent   (not Never, which machines cannot satisfy)"
+      else
+        echo "    imagePullPolicy: IfNotPresent   (or Never)"
+      fi
       ;;
     *'"error"'*)
       bad "$(echo "$reply" | sed -n 's/.*"error":"\(.*\)".*/\1/p')" ;;
@@ -3998,7 +4082,7 @@ stop_machines() {
     fi
   fi
 
-  for component in ferry-karpenter ferry-machined ferry-node; do
+  for component in ferry-karpenter ferry-machined ferry-registry ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"; rm -f "$pidfile"
@@ -4032,6 +4116,13 @@ cmd_machines_status() {
   [ -f "$NODE_DISK" ] && ok "node disk $NODE_DISK ($(du -h "$NODE_DISK" | awk '{print $1}') used)" \
     || echo "  node disk not unpacked yet; the first 'machines enable' does it"
   echo "  network   $MACHINE_SUBNET"
+  if running ferry-registry; then
+    ok "registry for machines, $(machine_registry_count) images -- ferry logs ferry-registry"
+  elif machine_registry_enabled; then
+    bad "FERRY_MACHINE_REGISTRY=1 but ferry-registry is not running"
+  else
+    echo "  registry  off -- machines see only what registries serve (FERRY_MACHINE_REGISTRY=1)"
+  fi
   if have_cluster; then
     echo
     kube get machines 2>/dev/null || echo "  no Machine CRD installed yet"
@@ -4553,6 +4644,10 @@ cmd_status() {
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
+    if machine_registry_enabled; then
+      if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
+      else bad "ferry-registry (FERRY_MACHINE_REGISTRY=1)"; fi
+    fi
   fi
   # A dead runtime under a live kubelet is a node that reads NotReady and will
   # stay that way: the runtime took its pod VMs and its vmnet network with it,
@@ -4583,10 +4678,10 @@ cmd_status() {
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
-    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter) tail -f "$FERRY_RUN/logs/$which.log" ;;
+    ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter|ferry-registry) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter>"; return 1 ;;
+    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter|ferry-registry>"; return 1 ;;
   esac
 }
 
