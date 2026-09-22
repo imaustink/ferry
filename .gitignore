@@ -17,3 +17,4 @@ ferry-machined/ferry-machined
 # Written by footprint_mib to pass its unread-pid count out of a subshell.
 experiments/24-benchmark-harness/.footprint-missed
 experiments/25-build-without-docker/.footprint-missed
+experiments/26-usb-hotplug/vmlinux-usb

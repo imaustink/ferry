@@ -177,6 +177,10 @@ func run() throws {
     while true { sleep(3600) }
 }
 
+/// Experiment 26's switch: machines boot with an xHCI controller, and
+/// `ferry-node serve` attaches the disk images listed in `<dir>/<name>.usb`.
+let usbHotplugEnabled = ProcessInfo.processInfo.environment["FERRY_NODE_USB"] == "1"
+
 /// The virtiofs tag init.sh mounts the volumes share by.
 let volumesTag = "ferry-volumes"
 
@@ -338,6 +342,14 @@ func machineConfiguration(
     // containerd that had booted in forty-five milliseconds. It is one line and
     // it moves the whole early boot.
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+    // Experiment 26: a USB controller, which is the one place
+    // Virtualization.framework can attach storage to a VM that is already
+    // running. Off unless asked for while the experiment decides whether it is
+    // worth keeping.
+    if usbHotplugEnabled {
+        config.usbControllers = [VZXHCIControllerConfiguration()]
+    }
 
     if sharesVolumes {
         let share = VZVirtioFileSystemDeviceConfiguration(tag: volumesTag)

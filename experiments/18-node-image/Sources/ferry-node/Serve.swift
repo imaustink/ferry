@@ -140,6 +140,13 @@ func serve() throws {
             }
         }
 
+        // Experiment 26: make each machine's USB disks match its .usb file.
+        if usbHotplugEnabled {
+            for (name, machine) in live.all() {
+                machine.reconcileUSB(wanted: usbDisks(name: name, in: dir))
+            }
+        }
+
         // Over `known` rather than over `running`, so a machine that failed to
         // boot gives its address back too.
         for name in known where wanted[name] == nil {
@@ -161,6 +168,15 @@ func serve() throws {
     }
 }
 
+/// The disk images `<dir>/<name>.usb` asks to have attached, one path a line.
+func usbDisks(name: String, in dir: String) -> [String] {
+    let path = (dir as NSString).appendingPathComponent("\(name).usb")
+    guard let body = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    return body.split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+}
+
 /// A machine this process is hosting.
 @available(macOS 26.0, *)
 final class RunningMachine {
@@ -169,6 +185,58 @@ final class RunningMachine {
     let console: Console
     let address: String
     let gateway: String
+    /// Experiment 26: USB disks attached to the running VM, by image path.
+    /// Touched only on `queue`, which is the VM's.
+    private var usb: [String: VZUSBMassStorageDevice] = [:]
+    private var usbPending: Set<String> = []
+
+    /// Attaches what is wanted and not attached, detaches what is attached and
+    /// no longer wanted. Asynchronous: each call is reported in the log with
+    /// how long the framework took, which is half of what the experiment is
+    /// measuring.
+    func reconcileUSB(wanted: [String]) {
+        queue.async { [self] in
+            guard let controller = vm.usbControllers.first else {
+                if !wanted.isEmpty { print("    usb: \(address) has no USB controller") }
+                return
+            }
+            for path in wanted where usb[path] == nil && !usbPending.contains(path) {
+                do {
+                    let attachment = try VZDiskImageStorageDeviceAttachment(
+                        url: URL(filePath: path), readOnly: false,
+                        cachingMode: .automatic, synchronizationMode: .fsync)
+                    let device = VZUSBMassStorageDevice(
+                        configuration: VZUSBMassStorageDeviceConfiguration(attachment: attachment))
+                    usbPending.insert(path)
+                    let started = Date()
+                    controller.attach(device: device) { error in
+                        self.usbPending.remove(path)
+                        let ms = Int(Date().timeIntervalSince(started) * 1000)
+                        if let error {
+                            print("    usb: attach \(path) failed after \(ms)ms: \(error.localizedDescription)")
+                        } else {
+                            self.usb[path] = device
+                            print("    usb: attached \(path) in \(ms)ms as \(device.uuid)")
+                        }
+                    }
+                } catch {
+                    print("    usb: cannot open \(path): \(error.localizedDescription)")
+                }
+            }
+            for (path, device) in usb where !wanted.contains(path) {
+                usb.removeValue(forKey: path)
+                let started = Date()
+                controller.detach(device: device) { error in
+                    let ms = Int(Date().timeIntervalSince(started) * 1000)
+                    if let error {
+                        print("    usb: detach \(path) failed after \(ms)ms: \(error.localizedDescription)")
+                    } else {
+                        print("    usb: detached \(path) in \(ms)ms")
+                    }
+                }
+            }
+        }
+    }
 
     init(vm: VZVirtualMachine, queue: DispatchQueue, console: Console, address: String, gateway: String) {
         self.vm = vm
