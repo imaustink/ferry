@@ -475,6 +475,38 @@ ferry down
 
 `ferry doctor` explains what is missing if the machine is not ready.
 
+### Building an image, without Docker
+
+```sh
+ferry image build -t myapp:dev .      # buildkit in a pod; nothing else needed
+kubectl run myapp --image=myapp:dev --image-pull-policy=IfNotPresent
+```
+
+The builder is buildkit running as an ordinary pod — its own kernel, so it gets
+the namespaces and the overlayfs it wants without anything on the Mac being
+relaxed. The client is `buildctl`, which talks to the pod at the address
+Kubernetes knows it by, because the Mac is on that subnet already: nothing is
+forwarded and nothing is proxied. The result goes straight into the image store
+pods are served from, so there is no registry in the loop.
+
+It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
+does not have to be installed, let alone running.
+
+Against the workflow it replaces — `docker buildx build` and then `kind load
+docker-image`, both warm, from an edited file to a cluster that can run it:
+
+| | `ferry image build` | docker + `kind load` |
+|:--|--:|--:|
+| alpine, one COPY | **0.47 s** | 1.02 s |
+| node app, 92 MB | **1.34 s** | 2.08 s |
+| python app, 449 MB | **5.37 s** | 6.69 s |
+
+The builder stays up between builds, because its layer cache is what makes the
+second build fast and it costs about 330 MiB of lazily-backed guest memory to
+keep — against the 1,741 MiB Docker Desktop's VM occupies before it has built
+anything. `ferry image build --stop` ends it. Measured in
+[experiment 25](experiments/25-build-without-docker/FINDINGS.md).
+
 ### Limits worth knowing
 
 - **A pod's containers are fixed at boot.** `Virtualization.framework` cannot

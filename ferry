@@ -416,7 +416,9 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node add <name>   add another node on this Mac
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
-  ferry image load <x>    run an image you built here, without a registry
+  ferry image build       build an image here, with no docker anywhere
+                          -t <name:tag>, -f <Dockerfile>, --stop to end the builder
+  ferry image load <x>    run an image you built elsewhere, without a registry
   ferry profile           which cluster this checkout runs, and on what ports
   ferry addons list       what can be turned on (metrics-server, ingress-nginx)
   ferry addons enable <n> turn one on
@@ -3117,6 +3119,206 @@ cmd_addons() {
   esac
 }
 
+# Build an image here, with no Docker anywhere.
+#
+# The builder is buildkit, running as an ordinary pod -- which is to say as a
+# virtual machine with its own kernel, so it gets the namespaces and the
+# overlayfs it wants without anything on the Mac being relaxed for it. The
+# client is buildctl on the Mac, talking to the pod at the address Kubernetes
+# knows it by: the Mac is on the pod's vmnet subnet (docs/POD-NETWORK.md), so
+# there is no port to forward and no proxy in the path.
+#
+# Sizing is not a detail. A pod inherits 2 CPUs and 512 MiB, and a builder that
+# takes the default builds `npm install` in 16.8 s where the same buildkit on 8
+# CPUs takes 7.6 s -- experiment 25 measured that gap and mistook it for an
+# argument about architecture for most of an afternoon. So the builder is sized
+# deliberately, at half the machine by default.
+#
+# It stays up between builds, because its layer cache is what makes the second
+# build fast, and at ~330 MiB of lazily-backed guest memory that is a cheap
+# thing to keep. `ferry image build --stop` ends it.
+FERRY_BUILDER_POD="${FERRY_BUILDER_POD:-ferry-builder}"
+FERRY_BUILDER_NS="${FERRY_BUILDER_NS:-kube-system}"
+FERRY_BUILDKIT_IMAGE="${FERRY_BUILDKIT_IMAGE:-moby/buildkit:v0.29.0}"
+
+# Half the machine, rounded down, and never less than two.
+#
+# Half rather than all of it because the Mac is still running the cluster, the
+# control plane and whatever the person is doing while they wait. Measured on a
+# 16-core Mac, 8 CPUs matched Docker Desktop's whole 16-CPU VM on every
+# workload, so the other half buys nothing worth having.
+ferry_builder_cpus() {
+  local total; total="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  local half=$(( total / 2 ))
+  [ "$half" -lt 2 ] && half=2
+  echo "$half"
+}
+
+# A quarter of the machine's memory, between 2 and 8 GiB.
+#
+# Guest memory is lazily backed, so this is a ceiling the builder is allowed to
+# reach rather than an allocation taken from the Mac -- an idle builder sized at
+# 4 GiB was measured at 330 MiB of host footprint. The cap is there because a
+# ceiling is not entirely free: Apple's kernel config allocates a struct page
+# per 4 KiB of it at boot.
+ferry_builder_memory_gib() {
+  local bytes; bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
+  local quarter=$(( bytes / 1073741824 / 4 ))
+  [ "$quarter" -lt 2 ] && quarter=2
+  [ "$quarter" -gt 8 ] && quarter=8
+  echo "$quarter"
+}
+
+ferry_kubectl() { KUBECONFIG="$FERRY_HOME/admin.conf" kubectl -n "$FERRY_BUILDER_NS" "$@"; }
+
+ferry_builder_ip() {
+  ferry_kubectl get pod "$FERRY_BUILDER_POD" -o jsonpath='{.status.podIP}' 2>/dev/null
+}
+
+ferry_builder_answers() {
+  local ip; ip="$(ferry_builder_ip)"
+  [ -n "$ip" ] || return 1
+  buildctl --addr "tcp://$ip:1234" debug workers >/dev/null 2>&1
+}
+
+# Bring the builder up if it is not already, and wait until it answers.
+#
+# Polled at 50 ms because it is ready in about 700 ms and half-second ticks
+# would charge most of a second for something that has already happened.
+ferry_builder_up() {
+  if ferry_builder_answers; then return 0; fi
+
+  local cpus mem
+  cpus="${FERRY_BUILDER_CPUS:-$(ferry_builder_cpus)}"
+  mem="${FERRY_BUILDER_MEMORY_GIB:-$(ferry_builder_memory_gib)}"
+
+  # Recreate rather than patch: a pod's resources are the VM's size and cannot
+  # be changed under it.
+  ferry_kubectl delete pod "$FERRY_BUILDER_POD" --ignore-not-found --wait=true >/dev/null 2>&1
+
+  echo "  starting the builder ($cpus cpu, ${mem} GiB)"
+  ferry_kubectl apply -f - >/dev/null <<YAML || { bad "could not create the builder pod"; return 1; }
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $FERRY_BUILDER_POD
+  labels:
+    app.kubernetes.io/name: ferry-builder
+    app.kubernetes.io/managed-by: ferry
+spec:
+  # Nothing in the cluster should evict the thing the person is waiting on.
+  priorityClassName: system-node-critical
+  containers:
+    - name: buildkitd
+      image: $FERRY_BUILDKIT_IMAGE
+      imagePullPolicy: IfNotPresent
+      args: ["--addr", "tcp://0.0.0.0:1234"]
+      securityContext:
+        privileged: true
+      ports:
+        - containerPort: 1234
+      resources:
+        limits:
+          cpu: "$cpus"
+          memory: ${mem}Gi
+YAML
+
+  local i=0
+  while [ "$i" -lt 1200 ]; do
+    ferry_builder_answers && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  bad "the builder did not come up; see 'kubectl -n $FERRY_BUILDER_NS logs $FERRY_BUILDER_POD'"
+  return 1
+}
+
+cmd_image_build() {
+  local tag="" dockerfile="" context="" no_cache="" progress=auto
+  local -a build_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stop)
+        ferry_kubectl delete pod "$FERRY_BUILDER_POD" --ignore-not-found >/dev/null 2>&1
+        ok "builder stopped"
+        return 0 ;;
+      -t|--tag)
+        [ $# -ge 2 ] || { bad "-t needs a name, such as myapp:dev"; return 2; }
+        tag="$2"; shift 2 ;;
+      -f|--file)
+        [ $# -ge 2 ] || { bad "-f needs a path to a Dockerfile"; return 2; }
+        dockerfile="$2"; shift 2 ;;
+      --build-arg)
+        [ $# -ge 2 ] || { bad "--build-arg needs KEY=VALUE"; return 2; }
+        build_args+=(--opt "build-arg:$2"); shift 2 ;;
+      --no-cache) no_cache=1; shift ;;
+      --quiet|-q) progress=quiet; shift ;;
+      -h|--help)
+        echo "usage: ferry image build [-t <name:tag>] [-f <Dockerfile>] [--build-arg K=V]"
+        echo "                         [--no-cache] [--quiet] [<context>]"
+        echo "       ferry image build --stop"
+        return 0 ;;
+      -*) bad "unknown flag $1"; return 2 ;;
+      *)  context="$1"; shift ;;
+    esac
+  done
+
+  context="${context:-.}"
+  [ -d "$context" ] || { bad "no such build context: $context"; return 1; }
+  context="$(cd "$context" && pwd)"
+  dockerfile="${dockerfile:-$context/Dockerfile}"
+  [ -f "$dockerfile" ] || { bad "no Dockerfile at $dockerfile"; return 1; }
+
+  [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up"; return 1; }
+
+  # buildctl is the one thing ferry does not carry. It is small, and it is the
+  # same client the rest of the world uses.
+  command -v buildctl >/dev/null 2>&1 || {
+    bad "buildctl is not installed"
+    echo "    ferry runs the builder; the client comes from buildkit:"
+    echo "        brew install buildkit"
+    return 1
+  }
+
+  # An untagged image loads as untagged@sha256:..., which nothing can write in
+  # a pod spec. Naming it is not optional, so there is a default.
+  [ -n "$tag" ] || tag="$(basename "$context"):latest"
+
+  bold "building $tag"
+  ferry_builder_up || return 1
+
+  local ip; ip="$(ferry_builder_ip)"
+  local staging; staging="$(mktemp -d "${TMPDIR:-/tmp}/ferry-build.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$staging'" RETURN
+  local layout="$staging/image.tar"
+
+  local -a args=(
+    --addr "tcp://$ip:1234" build
+    --frontend dockerfile.v0
+    --local "context=$context"
+    --local "dockerfile=$(dirname "$dockerfile")"
+    --opt "filename=$(basename "$dockerfile")"
+    --progress "$progress"
+    --output "type=oci,name=$tag,dest=$layout"
+  )
+  [ -n "$no_cache" ] && args+=(--no-cache)
+  [ ${#build_args[@]} -gt 0 ] && args+=("${build_args[@]}")
+
+  buildctl "${args[@]}" || { bad "build failed"; return 1; }
+
+  # Straight into the image store ferry-cri serves pods from, by the same path
+  # `ferry image load` uses -- so the image is present before the next `kubectl
+  # apply`, with no registry in between.
+  cmd_image_load "$layout" >/dev/null || { bad "built, but could not load it"; return 1; }
+  ok "built and loaded $tag"
+  echo
+  echo "    image: $tag"
+  echo "    Pods must not try to fetch it: set"
+  echo "      imagePullPolicy: IfNotPresent   (or Never)"
+}
+
 # Run an image you just built.
 #
 # Everything else in ferry comes from a registry, which is fine for busybox and
@@ -4098,9 +4300,10 @@ case "${1:-}" in
   addons)     shift; cmd_addons "$@" ;;
   image)      shift
               case "${1:-}" in
+                build) shift; cmd_image_build "$@" ;;
                 load) shift; cmd_image_load "$@" ;;
                 ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' 2>/dev/null | sort -u ;;
-                *) bad "usage: ferry image [load <name|archive|dir>|ls]"; exit 2 ;;
+                *) bad "usage: ferry image [build|load <name|archive|dir>|ls]"; exit 2 ;;
               esac ;;
   token)      shift; case "${1:-}" in create|"") cmd_token_create ;; *) bad "usage: ferry token create"; exit 2 ;; esac ;;
   join)       shift; cmd_join "$@" ;;
