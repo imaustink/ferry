@@ -284,6 +284,12 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_DURABILITY` | `full` | `relaxed` to acknowledge writes before they reach the disk. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered |
 | `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `relaxed`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
 | `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `relaxed` |
+| `FERRY_BUILDER_CPUS` | half the Mac's cores, at least 2 | CPUs for the `ferry image build` builder pod. buildkit on the pod default of 2 is roughly half the speed of 8 |
+| `FERRY_BUILDER_MEMORY_GIB` | a quarter of the Mac's memory, 2–8 | memory for the builder pod |
+| `FERRY_BUILDER_POD` | `ferry-builder` | the builder pod's name |
+| `FERRY_BUILDER_NS` | `kube-system` | the namespace it runs in |
+| `FERRY_BUILDKIT_IMAGE` | `moby/buildkit:v0.29.0` | the buildkit image it runs |
+| `FERRY_BUILDER_CN` | `ferry-builder` | the name in the builder's TLS certificate, which `buildctl --tlsservername` verifies against |
 | `FERRY_NODE_USB` | unset | `1` boots machines with a USB controller and attaches the disk images listed in `<machines-dir>/<name>.usb`. Experimental, and needs a kernel with USB storage; see `experiments/26-usb-hotplug` |
 | `FERRY_KUBE_API_QPS` | `500` | how fast a kubelet may talk to the API server. Upstream's 50 paces a 20-pod burst at 40ms a pod, with every container already running |
 | `FERRY_KUBE_API_BURST` | `1000` | the burst that goes with it |
