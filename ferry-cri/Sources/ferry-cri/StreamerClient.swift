@@ -128,6 +128,11 @@ struct PodContainers: Decodable {
     /// Nil or zero means the pod set no limits and the default size stands.
     let memoryLimitBytes: Int64?
     let cpuLimit: Int32?
+    /// Every subPath the pod's containers mount of each PersistentVolume, by
+    /// the volume's name, init containers included. See BlockVolume: a subPath
+    /// made at a volume's first format can have the root's mode, and one made
+    /// later cannot.
+    let volumeSubPaths: [String: [String]]?
 }
 
 extension StreamerClient {

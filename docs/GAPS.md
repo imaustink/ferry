@@ -174,7 +174,25 @@ Known limits, which are not bugs:
   allows every pod on the node. It is a disk attached to one pod's VM, so a
   second pod waits in CreateContainerError until the first has stopped; a
   rolling update of a Deployment with a claim gets there, a little slower. Its
-  contents are not browsable from Finder, being inside an ext4 image.
+  contents are not browsable from Finder, being inside an ext4 image. Kubernetes
+  scopes ReadWriteOnce to a node and ferry's pods are each a machine, so for
+  pods that must share a volume on one Mac, ask for ReadWriteMany: that is
+  still a shared directory, with the `chown` limit below.
+- **A container that crashes in a multi-container pod restarts the whole
+  pod**, not only itself. Virtualization.framework cannot add a device to a
+  running VM, and Containerization's pod will not start a container again
+  once it has stopped (upstream `main` still refuses), so the replacement has
+  nowhere to go but a new VM. The pod reports NOTREADY and the kubelet builds
+  it again. A restart in place needs that changed in Containerization.
+- **`kubectl logs --previous` fails for a few seconds after each crash.** The
+  kubelet removes the second-newest dead container, log and all, when the
+  newest dies, while the pod's status still names it until the next sync.
+  Upstream kubelet on containerd has the same window.
+- **A subPath added to a volume after its first pod is `0755 root`.** Every
+  subPath the first pod's spec names is made with the volume root's mode when
+  the image is formatted; the guest agent's mkdir ignores the mode it is asked
+  for, so one that appears later is not. On Linux a late subPath is root-owned
+  too, though with the volume root's mode.
 - **`chown` is refused on ReadWriteMany volumes.** They are still directories
   shared over virtiofs, which runs as the Mac user.
 

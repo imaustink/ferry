@@ -133,6 +133,10 @@ struct SandboxRecord {
     /// start as it always did.
     var expectedContainers: [String] = []
     var initContainerNames: [String] = []
+    /// The subPaths the pod spec mounts of each PersistentVolume, by volume
+    /// name, so a first format can make every one of them -- including those of
+    /// containers the kubelet has not shown this runtime yet.
+    var volumeSubPaths: [String: [String]] = [:]
     /// Containers in this pod that asked for ferry.dev/gpu, from its spec.
     var gpuContainerNames: [String] = []
     /// What this pod is worth against other pods waiting for the GPU.
@@ -651,6 +655,7 @@ actor PodRuntime {
             interface: interface, clusterInterface: clusterInterface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers,
+            volumeSubPaths: expected.volumeSubPaths,
             gpuContainerNames: expected.gpuContainers,
             priority: expected.priority,
             vmMemoryBytes: vmMemory,
@@ -709,17 +714,19 @@ actor PodRuntime {
     /// only sidecars are lost.
     private func podContainers(namespace: String, name: String) async
         -> (initContainers: [String], containers: [String], gpuContainers: [String],
-            priority: Int32, memoryLimit: Int64, cpuLimit: Int32)
+            priority: Int32, memoryLimit: Int64, cpuLimit: Int32,
+            volumeSubPaths: [String: [String]])
     {
-        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0, 0, 0) }
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0, 0, 0, [:]) }
         do {
             let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
             let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
             return (decoded.initContainers ?? [], decoded.containers ?? [],
                     decoded.gpuContainers ?? [], decoded.priority ?? 0,
-                    decoded.memoryLimitBytes ?? 0, decoded.cpuLimit ?? 0)
+                    decoded.memoryLimitBytes ?? 0, decoded.cpuLimit ?? 0,
+                    decoded.volumeSubPaths ?? [:])
         } catch {
-            return ([], [], [], 0, 0, 0)
+            return ([], [], [], 0, 0, 0, [:])
         }
     }
 
@@ -1306,8 +1313,12 @@ actor PodRuntime {
             subPathsByVolume[located.volume.directory, default: []].append(located.subPath)
         }
         for located in blockMounts.values {
-            try await claimBlockVolume(located.volume, sandboxID: sandboxID,
-                                       subPaths: subPathsByVolume[located.volume.directory] ?? [])
+            // And every other subPath the pod spec names for it, for the
+            // containers CRI has not shown yet -- an init container's pod boots
+            // before the main container's mounts are known.
+            let fromSpec = sandboxes[sandboxID]?.volumeSubPaths[located.volume.name] ?? []
+            let subPaths = (subPathsByVolume[located.volume.directory] ?? []) + fromSpec
+            try await claimBlockVolume(located.volume, sandboxID: sandboxID, subPaths: subPaths)
             if !located.subPath.isEmpty {
                 let guest = "\(located.volume.guestPath)/\(located.subPath)"
                 if sandboxes[sandboxID]?.blockSubPaths.contains(guest) == false {
@@ -1655,6 +1666,7 @@ actor PodRuntime {
             if !again.containers.isEmpty {
                 sandboxes[record.sandboxID]?.expectedContainers = again.containers
                 sandboxes[record.sandboxID]?.initContainerNames = again.initContainers
+                sandboxes[record.sandboxID]?.volumeSubPaths = again.volumeSubPaths
             }
             // Re-read: the actor may have moved on while the spec was fetched.
             guard let current = sandboxes[record.sandboxID] else {
