@@ -8,6 +8,23 @@ import GRPCNIOTransportHTTP2
 // stdout would discard exactly the log that says how far it got.
 setvbuf(stdout, nil, _IONBF, 0)
 
+// A task scheduled on an event loop that has shut down is, by default, a
+// printed line and a dropped closure -- whoever was waiting on it waits
+// forever. That is how a stress run ended: the same NIO error 534 times, and
+// then a dead runtime. Strict mode makes it a crash instead: pods no
+// longer shut down loops anyone else uses (see PodRuntime.eventLoops), so the
+// only way left to reach this is a runtime that is already broken, and a
+// process that exits non-zero is one a supervisor can restart. Set before any
+// event loop exists; an explicit SWIFTNIO_STRICT from the environment wins.
+setenv("SWIFTNIO_STRICT", "1", 0)
+
+// Every pod is a VM, and every VM holds descriptors on the host: vsock
+// connections to its agent, one per stdio stream, virtiofs and vmnet handles.
+// The inherited soft limit is often 256, which fourteen pods can exhaust, and
+// what that looks like from inside is process launches failing for no stated
+// reason. Raised to what the hard limit and the kernel allow.
+raiseDescriptorLimit()
+
 let args = Array(CommandLine.arguments.dropFirst())
 func option(_ name: String, _ fallback: String) -> String {
     guard let i = args.firstIndex(of: name), i + 1 < args.count else { return fallback }
@@ -87,7 +104,9 @@ guard FileManager.default.fileExists(atPath: config.kernelPath) else {
     exit(1)
 }
 
-print("==> ferry-cri")
+let runtimeVersion = FerryVersion.resolve()
+
+print("==> ferry-cri \(runtimeVersion)")
 print("    endpoint  unix://\(socketPath)")
 print("    state     \(config.stateDir.path())")
 print("    kernel    \(config.kernelPath)")
@@ -120,7 +139,7 @@ let server = GRPCServer(
         transportSecurity: .plaintext
     ),
     services: [
-        FerryRuntimeService(runtime: runtime, version: "0.1.0",
+        FerryRuntimeService(runtime: runtime, version: runtimeVersion,
                             streamer: StreamerClient(socketPath: streamerControl)),
         FerryImageService(runtime: runtime),
     ]
@@ -142,6 +161,7 @@ let server = GRPCServer(
 // seen an answer.
 let shutdownSocketPath = socketPath
 let shutdownSignals = onShutdownSignal {
+    shutdownRequested.store(true, ordering: .sequentiallyConsistent)
     Task.detached {
         announce("\n==> stopping pods and releasing the pod network")
         await runtime.shutdown()
@@ -208,4 +228,39 @@ func fetchRuleset(_ proxyd: StreamerClient, after generation: UInt64?,
 }
 
 print("    serving")
-try await server.serve()
+// serve() only returns when the server stops, and the one intended way to stop
+// it is the signal handler above, which exits on its own. Anything else --
+// the transport failing, its listener closing underneath it -- leaves a process
+// that looks alive to its supervisor and answers nothing, so it exits non-zero
+// to be restarted rather than lingering.
+do {
+    try await server.serve()
+    if !shutdownRequested.load(ordering: .sequentiallyConsistent) {
+        announce("ferry-cri: the CRI server stopped unexpectedly; exiting")
+        exit(1)
+    }
+} catch {
+    if !shutdownRequested.load(ordering: .sequentiallyConsistent) {
+        announce("ferry-cri: the CRI server failed: \(error); exiting")
+        exit(1)
+    }
+}
+// A requested stop: the signal handler is still stopping pods and exits 0 when
+// it is done, so this waits for it rather than cutting it short.
+while true { try? await Task.sleep(for: .seconds(60)) }
+
+/// See the call above for why.
+func raiseDescriptorLimit() {
+    var limit = rlimit()
+    guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+    // macOS refuses RLIM_INFINITY here, and anything above
+    // kern.maxfilesperproc, so the ceiling is the smaller of the two.
+    var perProcess: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    let kernelMax = sysctlbyname("kern.maxfilesperproc", &perProcess, &size, nil, 0) == 0
+        ? rlim_t(perProcess) : rlim_t(OPEN_MAX)
+    let target = min(limit.rlim_max, kernelMax)
+    guard target > limit.rlim_cur else { return }
+    limit.rlim_cur = target
+    _ = setrlimit(RLIMIT_NOFILE, &limit)
+}
