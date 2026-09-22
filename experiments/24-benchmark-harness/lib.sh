@@ -64,17 +64,39 @@ ferry_vm_pids() {
 # phys_footprint -- what macOS charges a process, resident minus the shared
 # pages every VM process maps its own copy of. Slow (~1-3s per VM process),
 # so it is taken at rest rather than sampled.
+# Writes the number of pids it could not read to $FOOTPRINT_MISSED_FILE, which
+# footprint_missed reads back.
+#
+# Through a file rather than a variable because every caller uses this in a
+# command substitution -- `fp=$(footprint_mib $pids)` -- and a variable set
+# inside that subshell is gone before the caller can look at it. The single
+# number on stdout is the contract the other scripts already depend on.
+#
+# It used to drop those silently. vmmap prints nothing useful if the process
+# has exited, or is still being sampled, or refuses the read -- and the awk
+# below then reached END with the running total untouched, so an unreadable VM
+# and a VM costing nothing produced the same number. Caught by a mode 2 run
+# reporting 670.8 MiB across two VMs where every other run of the same shape
+# reported ~980: one ~310 MiB pod VM had not been read, and nothing said so.
+FOOTPRINT_MISSED_FILE="${FOOTPRINT_MISSED_FILE:-$BENCH_HOME/.footprint-missed}"
+footprint_missed() { cat "$FOOTPRINT_MISSED_FILE" 2>/dev/null || echo 0; }
 footprint_mib() {
-  local total=0 pid
+  local total=0 pid one missed=0
   for pid in "$@"; do
     [ -z "$pid" ] && continue
-    total=$(vmmap --summary "$pid" 2>/dev/null | awk -v t="$total" '
+    one=$(vmmap --summary "$pid" 2>/dev/null | awk '
       /^Physical footprint:/ {
         v=$3; u=substr(v,length(v)); n=substr(v,1,length(v)-1)
         if (u=="G") n*=1024; else if (u=="K") n/=1024; else if (u!="M") n=v
-        t+=n; exit}
-      END {printf "%.1f", t}')
+        printf "%.1f", n; exit}')
+    if [ -z "$one" ]; then
+      missed=$((missed + 1))
+      echo "footprint_mib: could not read pid $pid" >&2
+      continue
+    fi
+    total=$(python3 -c "print(f'{$total + $one:.1f}')")
   done
+  printf '%s\n' "$missed" > "$FOOTPRINT_MISSED_FILE"
   echo "$total"
 }
 

@@ -13,3 +13,6 @@ guest/nft/
 ferry-proxy/ferry-proxy
 ferry-netpol/ferry-netpol
 ferry-machined/ferry-machined
+
+# Written by footprint_mib to pass its unread-pid count out of a subshell.
+experiments/24-benchmark-harness/.footprint-missed

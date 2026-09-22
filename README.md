@@ -39,26 +39,27 @@ is not the baseline ferry actually has.
 | a pod is | its own VM | its own VM | a container | a container | a container | a container |
 | needs Docker Desktop | **no** | **no** | **no** | **no** | yes | yes |
 | writes survive power loss | **yes** | no | **yes** | no | no | no |
-| create a cluster | 11.9 s | **10.7 s** | 26.1 s | 24.6 s | 25.4 s | 30.3 s |
-| delete it | **0.35 s** | 0.36 s | 0.54 s | 0.48 s | 0.47 s | 12.5 s |
-| start one pod | 0.48 s | 0.45 s | 0.32 s | **0.27 s** | 0.61 s | 0.60 s |
-| start 10 | 1.19 s | 0.79 s | 0.71 s | **0.31 s** | 0.70 s | 1.08 s |
-| start 20 | 3.61 s | 3.41 s | 1.11 s | **0.50 s** | 0.93 s | 2.18 s |
-| idle memory | **432 MiB** | **430 MiB** | 1,184 MiB | 1,188 MiB | 4,144 MiB | 3,730 MiB |
-| ↳ of that, Docker before any cluster | **0** | **0** | **0** | **0** | 1,689 MiB | 1,681 MiB |
-| idle CPU | 2.5% | **2.1%** | 8.1% | 8.7% | 24.4% | 29.0% |
-| per pod | 239 MiB | 240 MiB | 9 MiB | 9 MiB | **6 MiB** | 16 MiB |
+| create a cluster | 12.4 s | **11.4 s** | 25.7 s | 19.9 s | 25.8 s | 29.4 s |
+| delete it | 0.35 s | 0.35 s | 0.49 s | **0.43 s** | 0.45 s | 13.5 s |
+| start one pod | 0.46 s | **0.40 s** | 0.57 s | 0.52 s | 0.56 s | 0.60 s |
+| start 10 | 1.70 s | 0.63 s | 0.85 s | **0.60 s** | 0.67 s | 1.09 s |
+| start 20 | 3.39 s | 3.27 s | 1.19 s | **0.77 s** | 0.89 s | 1.99 s |
+| idle memory | **432 MiB** | **436 MiB** | 1,196 MiB | 1,189 MiB | 4,148 MiB | 3,632 MiB |
+| ↳ of that, Docker before any cluster | **0** | **0** | **0** | **0** | 1,685 MiB | 1,679 MiB |
+| idle CPU | **2.7%** | **2.6%** | 8.3% | 6.8% | 29.4% | 27.8% |
+| per pod | 240 MiB | 239 MiB | **14 MiB** | **14 MiB** | 20 MiB | 20 MiB |
 
 `relaxed` is `ferry up --durability relaxed`, explained below. The four ferry
 columns are two choices, not four products: a pod is either its own VM or a
 container on a shared one, and writes either reach the disk before they are
 acknowledged or they do not.
 
-**Relaxed buys mode 2 a great deal and mode 1 almost nothing** — 0.34 s to
-0.20 s a pod against 0.47 s to 0.44 s. That is the honest shape of it: mode
-1's pod start is a virtual machine booting, and no disk barrier was ever the
-thing holding it up. If you want the fast numbers you want mode 2, and if you
-want one kernel per pod you are paying for the kernel, not for `fsync`.
+**Relaxed buys mode 2 a great deal and mode 1 almost nothing.** A 20-pod
+burst goes 1.19 s to 0.77 s on mode 2 and 3.39 s to 3.27 s on mode 1. That is
+the honest shape of it: mode 1's pod start is a virtual machine booting, and
+no disk barrier was ever the thing holding it up. If you want the fast numbers
+you want mode 2, and if you want one kernel per pod you are paying for the
+kernel, not for `fsync`.
 
 CPU is percent of one core over a 60-second window with the cluster up and
 nothing scheduled. This Mac has sixteen.
@@ -93,27 +94,29 @@ kind's 695 and cost ferry a comparison it wins.
 The indented row is why the top one is not the whole story either way. Docker
 Desktop holds **15.6 GiB and 16 CPUs before the first pod exists**, and is
 charging the Mac 1.7 GiB while doing nothing — so if you already run it for
-other work, kind's marginal cost is the difference, 2,455 MiB, and if you
-don't, it is the whole 4,144. A pod on kind then costs the Mac nothing extra:
+other work, kind's marginal cost is the difference, 2,463 MiB, and if you
+don't, it is the whole 4,148. A pod on kind then costs the Mac nothing extra:
 it costs a slice of a VM already taken, and when the slice is gone, pods stop
 fitting. ferry reserves nothing, so the two numbers are the same and the
 indented row is zero.
 
 Mode 1 trades memory for isolation and does not hide it — a pod is a VM with
 its own kernel, and 240 MiB each is what that costs. Mode 2 is the other end:
-9 MiB a pod, read inside the guest the way kind is read, and still no Docker.
+14 MiB a pod against kind's 20, on the same host basis, and still no Docker.
 
-Read inside the guest, the basis kind's old cell used, mode 2's node holds
-213 MiB against kind's 760 and minikube's 693 — but that row flatters ferry
-and is not the one above: kind and minikube put an entire cluster inside one
-guest, while mode 2's guest holds only the node, its control plane being the
-native processes already counted in the host row.
+Read inside the guest instead — the basis kind's cell used to be on — mode 2's
+node holds 227 MiB against kind's 769 and minikube's 698. That row flatters
+ferry and is not the one above: kind and minikube put an entire cluster inside
+one guest, while mode 2's guest holds only the node, its control plane being
+the native processes already counted in the host row.
 
 **Where ferry is slower, it is slower.** kind starts 20 pods faster than
-ferry mode 2 at full durability (0.93 s against 1.11 s), costs a third as
-much per pod, and deletes a cluster faster than mode 2 does. Mode 2 takes
-twice as long as mode 1 to create, because it is a mode 1 control plane with
-a Linux node booted on top of it.
+ferry mode 2 at full durability — 0.89 s against 1.19 s — and deletes a
+cluster a shade faster than mode 2 does. Mode 2 also takes twice as long as
+mode 1 to create, because it is a mode 1 control plane with a Linux node
+booted on top of it. Relaxed durability turns the burst around (0.77 s) and
+is the setting to reach for if that row is the one you care about, but at full
+durability the row belongs to kind.
 
 Deleting used to be on that list and is not any more, which took three
 rounds. Both it and mode 2's creation were mostly waiting rather than work:
@@ -158,17 +161,17 @@ ferry up --durability relaxed   # speed instead, remembered for this cluster
 
 | | mode 2 `full` | mode 2 `relaxed` | mode 1 `full` | mode 1 `relaxed` |
 |:--|--:|--:|--:|--:|
-| start one pod | 0.32 s | **0.27 s** | 0.48 s | 0.45 s |
-| start 10 | 0.71 s | **0.31 s** | 1.19 s | 0.79 s |
-| start 20 | 1.11 s | **0.50 s** | 3.61 s | 3.41 s |
+| start one pod | 0.57 s | **0.52 s** | 0.46 s | 0.40 s |
+| start 10 | 0.85 s | **0.60 s** | 1.70 s | 0.63 s |
+| start 20 | 1.19 s | **0.77 s** | 3.39 s | 3.27 s |
 | an etcd commit | 9.7 ms | **0.14 ms** | 9.7 ms | 0.14 ms |
 | survives power loss | **yes** | no | **yes** | no |
 
-In mode 2 that is 1.9× kind on a 20-pod burst and 2.3× on a single pod — the
-fastest thing in the table. In mode 1 it barely registers on a single pod,
-because a pod there is a virtual machine booting and `fsync` was never what
-it was waiting for. The flag is worth reaching for on mode 2 and close to
-pointless on mode 1.
+In mode 2 that turns a 20-pod burst from slower than kind into faster than it,
+1.19 s to 0.77 s against kind's 0.89 s. In mode 1 it does nothing for a
+20-pod burst at all — 3.39 s to 3.27 s — because a pod there is a virtual
+machine booting and `fsync` was never what it was waiting for. The flag is
+worth reaching for on mode 2 and close to pointless on mode 1.
 
 It is the right setting for a cluster you recreate from a script, and the
 wrong one for a cluster holding something you would have to rebuild by hand.
@@ -212,24 +215,35 @@ per-pod figures for kind and mode 2 are a few MiB read inside a guest and are
 noisy at this scale — the 10-pod cell put kind at 0.9 MiB a pod and the 20-pod
 cell at 5.8.
 
-**The memory rows were re-measured separately** (2026-09-21,
-`experiments/24-benchmark-harness/crossmem.sh`) after the basis above was
-found to differ per stack; the timing rows are the original battery's.
-Two things that measurement had to get right, and the first battery did not:
+**Every row above is one battery**, re-run 2026-09-21 after three things were
+found wrong with the previous one. Each is now recorded per stack in
+`results/raw.tsv` rather than left to be noticed:
 
 - **A Docker-based stack needs Docker restarted before its baseline.** Docker
   Desktop's VM does not release pages when a cluster is deleted — measured at
   3,891.2 MiB before a `kind delete` and 3,891.2 MiB after — so minikube,
   running second, inherited kind's pages as its baseline and its own cluster
   fitted inside memory already charged. That is why the cluster was once
-  reported as adding 10 MiB. Restarted first, it adds 2,049 MiB — the 3,730
-  above, less the 1,681 Docker was holding before it. ferry needs no
+  reported as adding 10 MiB. Restarted first, it adds 1,953 MiB — the 3,632
+  above, less the 1,679 Docker was holding before it. ferry needs no
   equivalent: its VMs exit with the cluster, so its baseline is a real zero.
-- **Mode 2's node is sized as ferry ships it,** 2 GiB, not the 15 GiB the
-  harness used to mirror Docker Desktop with. A ceiling is not free even
-  untouched — the guest kernel allocates a `struct page` per 4 KiB of it at
-  boot — so 15 GiB cost 1,538 MiB idle against 1,182, and bought nothing: the
-  20-pod burst is 1.22–1.26 s across 2, 4, 8 and 15 GiB, medians of three.
+- **Durability has to be passed, not inherited.** `ferry up` remembers the
+  setting per cluster and `ferry down --purge` does not clear it, so an
+  unflagged run silently takes the last one's. Measured that way, all four
+  ferry columns came out `relaxed` and mode 2's 20-pod burst read 0.64 s
+  instead of 1.19 s — a number that would have had mode 2 beating kind on a
+  row it loses. The harness now passes `--durability` every time and records
+  what `ferry status` reports back.
+- **An unreadable VM is not a free one.** `vmmap` occasionally returns nothing
+  for a process, and the footprint helper used to skip it silently, so a mode 2
+  cluster reported 670.8 MiB across two VMs where every comparable run reported
+  ~980. Reads that fail are now counted into a `footprint_unread` row.
+
+**Mode 2's node is sized as ferry ships it,** 2 GiB, not the 15 GiB the harness
+used to mirror Docker Desktop with. A ceiling is not free even untouched — the
+guest kernel allocates a `struct page` per 4 KiB of it at boot — so 15 GiB cost
+1,538 MiB idle against 1,182, and bought nothing: the 20-pod burst is
+1.22–1.26 s across 2, 4, 8 and 15 GiB, medians of three.
 
 Pod semantics fall out of the VM boundary: one VM is one network stack, so
 containers in a pod share localhost and IPC by construction. No pause

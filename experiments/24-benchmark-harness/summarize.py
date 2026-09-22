@@ -106,8 +106,18 @@ def guest_at(s, phase):
     return n(s, f"{phase}.guest_used_mib")
 
 def guest_added(s, phase="idle"):
-    a, b = guest_at(s, phase), guest_at(s, "baseline")
-    return None if a is None or b is None else a - b
+    a = guest_at(s, phase)
+    if a is None:
+        return None
+    # A missing baseline is zero, not unknown, when the guest did not exist
+    # yet. kind and minikube read Docker Desktop's VM, which is up and holding
+    # a few hundred MiB before any cluster, so theirs is a real subtraction.
+    # Mode 2's guest is the node VM, which `ferry up` creates -- there is
+    # nothing to read beforehand and the idle figure is already the cluster's
+    # own. Subtracting an absent baseline blanked this cell for exactly the
+    # stack the row exists to compare.
+    b = guest_at(s, "baseline")
+    return a - (b if b is not None else 0)
 
 # Kept for the scaling tables below, which ask "how much did N pods add" of
 # whichever basis a stack reports. Prefers the host row, since that is now

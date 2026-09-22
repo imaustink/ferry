@@ -144,15 +144,32 @@ KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:$K8S_VERSION}"
 # stack_up has to write a config file for it rather than pass a flag.
 KUBELET_V="${KUBELET_V:-}"
 
-kubeconfig_of() {
+# `ferryrelaxed` and `ferry2relaxed` are the same two stacks with
+# `--durability relaxed`, not two more. The report has always had four ferry
+# columns and the harness only ever knew two names, so those rows were produced
+# by hand and could not be regenerated -- which is the same failure as memory
+# numbers the summarizer cannot reproduce, one table over. Every case below
+# keys off the base name and only stack_up reads the durability.
+base_stack() { # ferry2relaxed -> ferry2
   case "$1" in
+    ferryrelaxed)  echo ferry ;;
+    ferry2relaxed) echo ferry2 ;;
+    *)             echo "$1" ;;
+  esac
+}
+durability_of() {
+  case "$1" in *relaxed) echo relaxed ;; *) echo "" ;; esac
+}
+
+kubeconfig_of() {
+  case "$(base_stack "$1")" in
     ferry|ferry2) "$FERRY" kubeconfig 2>/dev/null ;;
     kind)     echo "$KC_DIR/kind.yaml" ;;
     minikube) echo "$KC_DIR/minikube.yaml" ;;
   esac
 }
 context_of() {
-  case "$1" in
+  case "$(base_stack "$1")" in
     ferry|ferry2) echo "" ;;
     kind)     echo "kind-$CLUSTER" ;;
     minikube) echo "$CLUSTER" ;;
@@ -165,14 +182,14 @@ context_of() {
 # kind/minikube: Docker Desktop's VM, which is where the whole cluster lives.
 stack_vm_pids() {
   local d; d=$(docker_vm_pid)
-  case "$1" in
+  case "$(base_stack "$1")" in
     # By what they have open, not by "not Docker's" -- see ferry_vm_pids.
     ferry|ferry2) ferry_vm_pids ;;
     *)     echo "$d" ;;
   esac
 }
 stack_host_pids() {
-  case "$1" in
+  case "$(base_stack "$1")" in
     ferry|ferry2) ferry_host_pids ;;
     *)     docker_host_pids ;;
   esac
@@ -190,7 +207,7 @@ stack_host_pids() {
 #
 # Mode 1 needs no selector: `ferry machines disable` leaves one node.
 node_selector_of() {
-  case "$1" in
+  case "$(base_stack "$1")" in
     ferry2) printf '      nodeSelector: {ferry.dev/mode: shared}\n' ;;
     *)      : ;;
   esac
@@ -199,8 +216,18 @@ node_selector_of() {
 # --- lifecycle -----------------------------------------------------------
 
 stack_up() {
-  local s="$1" kc; kc=$(kubeconfig_of "$s")
-  case "$s" in
+  local s="$1" kc dur; kc=$(kubeconfig_of "$s")
+  dur=$(durability_of "$s")
+  # Always passed, never left to default. ferry remembers durability per
+  # cluster in $FERRY_HOME/durability, `ferry up` with no flag keeps whatever
+  # is there, and `ferry down --purge` does not remove it -- it clears etcd,
+  # the version files and the machine disks and leaves that marker behind. So
+  # an unflagged run inherits the previous run's setting, and the battery
+  # measured all four ferry columns at `relaxed` because a relaxed run had
+  # happened before it. Nothing in the output said so; it had to be read back
+  # out of the up-logs. Being explicit makes the run order stop mattering.
+  local durflag=(--durability "${dur:-full}")
+  case "$(base_stack "$s")" in
     ferry)
       # Mode 1 means mode 1 only. With machines enabled `ferry up` also applies
       # kube-proxy and coredns-machines, which -- as ferry says when it does it
@@ -208,7 +235,7 @@ stack_up() {
       # there measures mode 1 on a cluster that is half mode 2, and wedges the
       # readiness wait on pods that can never schedule.
       "$FERRY" machines disable >"$RESULTS/$s-up.log" 2>&1
-      "$FERRY" up >>"$RESULTS/$s-up.log" 2>&1 ;;
+      "$FERRY" up ${durflag[@]+"${durflag[@]}"} >>"$RESULTS/$s-up.log" 2>&1 ;;
     ferry2)
       # Mode 1 first -- mode 2 is a controller and a Machine on top of the same
       # control plane, not a separate cluster.
@@ -223,7 +250,7 @@ stack_up() {
       export FERRY_MACHINE_SUBNET="192.168.$n.0/24"
       # Read by ferry-node when it builds the machine's kernel command line.
       [ -n "$KUBELET_V" ] && export FERRY_KUBELET_V="$KUBELET_V"
-      "$FERRY" up >"$RESULTS/$s-up.log" 2>&1
+      "$FERRY" up ${durflag[@]+"${durflag[@]}"} >"$RESULTS/$s-up.log" 2>&1
       # vmnet holds a subnet after the process using it stops -- documented as
       # about a minute, observed far longer -- so an enable that follows a
       # teardown is refused. Waiting is unreliable; moving to a subnet this run
@@ -288,7 +315,7 @@ YAML
 
 stack_down() {
   local s="$1" kc; kc=$(kubeconfig_of "$s")
-  case "$s" in
+  case "$(base_stack "$s")" in
     ferry|ferry2) "$FERRY" down --purge >"$RESULTS/$s-down.log" 2>&1 ;;
     kind)     kind delete cluster --name "$CLUSTER" --kubeconfig "$kc" \
                 >"$RESULTS/$s-down.log" 2>&1 ;;
@@ -300,7 +327,7 @@ stack_down() {
 # Disk the cluster occupies. ferry keeps its state in the checkout; kind and
 # minikube keep theirs in a Docker volume inside the VM.
 stack_disk_mib() {
-  case "$1" in
+  case "$(base_stack "$1")" in
     # FERRY_HOME, not ~/.ferry: under a profile the state lives in
     # ~/.ferry-<profile>, and the hardcoded path measured whichever unrelated
     # cluster happened to own the default directory -- or nothing at all.
