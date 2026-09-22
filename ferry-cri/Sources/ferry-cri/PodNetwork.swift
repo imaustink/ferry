@@ -94,15 +94,37 @@ final class PodNetwork: @unchecked Sendable {
         let host: UInt32
         if let existing = assigned[id] {
             host = existing
-        } else if let recycled = reusable.popLast() {
-            host = recycled
-            assigned[id] = host
-        } else {
-            // The last address is the broadcast address, so stop before it.
-            guard next < subnet.upper.value else { return nil }
+        } else if next < subnet.upper.value {
+            // An address nothing has used yet, in preference to one that has.
+            //
+            // The Mac is on this subnet natively (docs/POD-NETWORK.md), which
+            // means it keeps an ARP entry per pod address, and macOS holds
+            // those for minutes. Handing a freed address straight to the next
+            // pod points the host at a MAC that no longer exists, and nothing
+            // from the Mac reaches that pod until the entry is revalidated --
+            // measured at 2.2 s in the good case and 165 s in the bad one
+            // (experiments/25-build-without-docker/reachability.sh). The pod
+            // is Running and answering on its own network the whole time, so
+            // it looks like a pod that works from inside the cluster and not
+            // from the Mac.
+            //
+            // Nothing announces the new MAC: vmnet's DHCP is disabled above
+            // and the address is configured in the guest by vminit, so there
+            // is no gratuitous ARP to be sent from here. What ferry can do is
+            // not reuse an address while the host still remembers it, and a
+            // /24 gives ~250 to get through first.
             host = next
             next += 1
             assigned[id] = host
+        } else if !reusable.isEmpty {
+            // Exhausted: recycle, oldest release first, so the address handed
+            // out is the one the host is likeliest to have forgotten. This was
+            // popLast() -- the most recently freed address, which is the worst
+            // available choice for exactly the reason above.
+            host = reusable.removeFirst()
+            assigned[id] = host
+        } else {
+            return nil
         }
 
         return VmnetNetwork.Interface(

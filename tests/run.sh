@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Every test that runs without a cluster.
 #
+# Some of them do more when there is one. image-identity-test.sh checks its
+# invariants against the source either way, and additionally builds an image
+# twice and runs it when a cluster is up -- so running this after `ferry up`
+# tests strictly more than running it before.
+#
 #   ./tests/run.sh
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"

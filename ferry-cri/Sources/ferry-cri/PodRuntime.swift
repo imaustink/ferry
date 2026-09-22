@@ -1582,8 +1582,22 @@ actor PodRuntime {
     private func cache(_ image: Containerization.Image, as keys: Set<String>, canonical: String,
                        platform: ContainerizationOCI.Platform) async throws -> String {
 
-        if rootfsCache[canonical] == nil {
-            let safe = canonical.replacingOccurrences(of: "/", with: "_")
+        // A root filesystem belongs to the image's content, not to its name.
+        //
+        // This used to ask `rootfsCache[canonical] == nil` and unpack to
+        // image-<name>.ext4. A tag is not a stable identifier: `myapp:dev`
+        // built twice is two different images, and both the cache key and the
+        // file name collided, so the second load reused the first image's
+        // root filesystem. The build, the load and `ferry image list` all
+        // reported the new image, and the pod ran the old one -- measured, with
+        // a marker file: built and loaded VERSION-TWO, the pod printed
+        // VERSION-ONE. That is the loop this feature exists to serve, so it is
+        // keyed by digest here and the name is an alias for it.
+        let identity = image.digest.isEmpty ? canonical : image.digest
+        let previous = rootfsCache[canonical]
+
+        if rootfsCache[identity] == nil {
+            let safe = identity.replacingOccurrences(of: "/", with: "_")
                 .replacingOccurrences(of: ":", with: "_")
             let path = config.stateDir.appending(component: "image-\(safe).ext4")
             let mount: Containerization.Mount
@@ -1593,11 +1607,49 @@ actor PodRuntime {
             } catch let error as ContainerizationError where error.code == .exists {
                 mount = .block(format: "ext4", source: path.path(), destination: "/", options: [])
             }
-            for key in keys { rootfsCache[key] = mount }
-            if !image.digest.isEmpty { rootfsCache[image.digest] = mount }
-        } else {
-            for key in keys { rootfsCache[key] = rootfsCache[canonical] }
+            rootfsCache[identity] = mount
         }
+        for key in keys { rootfsCache[key] = rootfsCache[identity] }
+
+        // The image the name used to point at, once no name points at it.
+        //
+        // Without this an edit-rebuild loop leaves one ext4 per build on disk,
+        // each the size of the unpacked image -- measured at 4 GiB a build for
+        // a python image, which fills a disk in an afternoon.
+        //
+        // "No name points at it" is the test, not "nothing points at it". The
+        // superseded image keeps its own digest key, and that key is a
+        // reference, so asking whether anything at all still resolves to the
+        // old rootfs answers yes forever and nothing is ever collected. What
+        // makes it garbage is that no *tag* names it any more: an image you can
+        // only reach by a digest you no longer have written down anywhere is
+        // not reachable.
+        //
+        // A running container does not need it either: createContainer clones
+        // the base to its own <id>.ext4 (:1145) and runs from the clone, so the
+        // base is not open once a pod has started.
+        if let stale = previous, stale.source != rootfsCache[identity]?.source {
+            let namedBy = rootfsCache.filter {
+                !$0.key.hasPrefix("sha256:") && $0.value.source == stale.source
+            }
+            if namedBy.isEmpty {
+                let orphaned = rootfsCache.filter { $0.value.source == stale.source }.map(\.key)
+                for key in orphaned {
+                    rootfsCache.removeValue(forKey: key)
+                    imageConfigs.removeValue(forKey: key)
+                    pulledImages.removeValue(forKey: key)
+                }
+                try? FileManager.default.removeItem(atPath: stale.source)
+            }
+        }
+        // The digest is now `identity` above, so it is a key on every path
+        // rather than only on the one that unpacks. It has to be: the kubelet
+        // resolves an image to its ID once it knows one and passes that to
+        // CreateContainer, so the digest is the key the *second* pod from an
+        // image is looked up by, while pulledImages below records it
+        // unconditionally. When the two disagreed, a pod that had run once
+        // failed with "image sha256:... has not been pulled" while the image
+        // sat in the store with its ext4 beside it.
 
         if let imageConfig = try? await image.config(for: platform).config {
             for key in keys { imageConfigs[key] = imageConfig }
@@ -1631,12 +1683,53 @@ actor PodRuntime {
     }
     func listImages() -> [Runtime_V1_Image] { Array(pulledImages.values) }
 
+    /// Removes an image: every name it is known by, and the root filesystem.
+    ///
+    /// This used to remove the key it was handed and the normalised form of it,
+    /// and nothing else -- which left the store in a state no caller could make
+    /// sense of, and did so on a timer.
+    ///
+    /// The kubelet's image garbage collector calls this **by image ID**, which
+    /// here is the digest. Removing only that key left every *name* still
+    /// pointing at the rootfs, so `imageStatus` went on answering "present"
+    /// while `createContainer` -- which the kubelet calls with the ID -- could
+    /// no longer resolve it. The pod then failed with "image sha256:... has not
+    /// been pulled" about an image that was sitting in the store with its ext4
+    /// beside it, and `kubectl describe` said "already present on machine" two
+    /// lines above the error.
+    ///
+    /// It also freed nothing. The ext4 is the only thing here that occupies
+    /// disk, and it was left behind, so the collector saw no more space than
+    /// before, ran again five minutes later, and broke the next image. On a
+    /// full disk that is a loop that takes the node apart one image at a time,
+    /// which is what "the wrong image keeps coming back" turned out to be.
+    ///
+    /// So removal is by identity: whatever the caller names, the whole record
+    /// goes, and the disk is actually given back.
     func removeImage(_ reference: String) {
-        for key in Set([reference, ImageReference.normalize(reference)]) {
+        let direct = Set([reference, ImageReference.normalize(reference)])
+        // The rootfs identifies the image; the names are aliases for it. If the
+        // reference does not resolve to one, there is nothing to be coherent
+        // about and the direct keys are all there is to drop.
+        guard let mount = direct.compactMap({ rootfsCache[$0] }).first else {
+            for key in direct {
+                pulledImages.removeValue(forKey: key)
+                rootfsCache.removeValue(forKey: key)
+                imageConfigs.removeValue(forKey: key)
+            }
+            return
+        }
+
+        let aliases = rootfsCache.filter { $0.value.source == mount.source }.map(\.key)
+        for key in Set(aliases).union(direct) {
             pulledImages.removeValue(forKey: key)
             rootfsCache.removeValue(forKey: key)
             imageConfigs.removeValue(forKey: key)
         }
+
+        // Safe while a pod is running from it: createContainer clones the base
+        // to its own <id>.ext4 (:1145) and the clone is an independent file.
+        try? FileManager.default.removeItem(atPath: mount.source)
     }
 
     /// Stops every pod and releases every address. Without this the vmnet
