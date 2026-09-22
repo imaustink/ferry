@@ -528,6 +528,10 @@ ferry kubeconfig            # prints the path
 ferry kubeconfig --merge    # adds it to ~/.kube/config as context "ferry"
 ```
 
+The merge leaves your current context where it was, and gives each profile
+its own cluster, user and context name (`ferry-e2e` for the `e2e` profile), so
+two clusters on one Mac cannot end up sharing one API server's entry.
+
 Merging is offered rather than done. `~/.kube/config` usually points at clusters
 that matter, and an installer that rewrites it uninvited eventually ruins
 somebody's afternoon. `--merge` backs the file up first, and uses kubectl's own

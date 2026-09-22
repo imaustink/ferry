@@ -170,6 +170,13 @@ Known limits, which are not bugs:
 - **A volume is local to one Mac.** The PersistentVolume says so through node
   affinity, and a pod that comes back is sent to the node holding its data --
   which is correct, and still not the same as network storage.
+- **A ReadWriteOnce volume is mounted by one pod at a time**, where Kubernetes
+  allows every pod on the node. It is a disk attached to one pod's VM, so a
+  second pod waits in CreateContainerError until the first has stopped; a
+  rolling update of a Deployment with a claim gets there, a little slower. Its
+  contents are not browsable from Finder, being inside an ext4 image.
+- **`chown` is refused on ReadWriteMany volumes.** They are still directories
+  shared over virtiofs, which runs as the Mac user.
 
 ## Works, and worth saying so
 
