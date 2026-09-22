@@ -1,0 +1,14 @@
+# A pod whose only job is to prove an already-pulled image still starts.
+#
+# Run it, then `ferry image load` something, then run it again.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: canary
+spec:
+  restartPolicy: Never
+  containers:
+    - name: canary
+      image: ghcr.io/linuxcontainers/alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "echo canary-ok"]

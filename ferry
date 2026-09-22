@@ -416,7 +416,9 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node add <name>   add another node on this Mac
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
-  ferry image load <x>    run an image you built here, without a registry
+  ferry image build       build an image here, with no docker anywhere
+                          -t <name:tag>, -f <Dockerfile>, --stop to end the builder
+  ferry image load <x>    run an image you built elsewhere, without a registry
   ferry profile           which cluster this checkout runs, and on what ports
   ferry addons list       what can be turned on (metrics-server, ingress-nginx)
   ferry addons enable <n> turn one on
@@ -3117,6 +3119,373 @@ cmd_addons() {
   esac
 }
 
+# Build an image here, with no Docker anywhere.
+#
+# The builder is buildkit, running as an ordinary pod -- which is to say as a
+# virtual machine with its own kernel, so it gets the namespaces and the
+# overlayfs it wants without anything on the Mac being relaxed for it. The
+# client is buildctl on the Mac, talking to the pod at the address Kubernetes
+# knows it by: the Mac is on the pod's vmnet subnet (docs/POD-NETWORK.md), so
+# there is no port to forward and no proxy in the path.
+#
+# Sizing is not a detail. A pod inherits 2 CPUs and 512 MiB, and a builder that
+# takes the default builds `npm install` in 16.8 s where the same buildkit on 8
+# CPUs takes 7.6 s -- experiment 25 measured that gap and mistook it for an
+# argument about architecture for most of an afternoon. So the builder is sized
+# deliberately, at half the machine by default.
+#
+# It stays up between builds, because its layer cache is what makes the second
+# build fast, and at ~330 MiB of lazily-backed guest memory that is a cheap
+# thing to keep. `ferry image build --stop` ends it.
+FERRY_BUILDER_POD="${FERRY_BUILDER_POD:-ferry-builder}"
+FERRY_BUILDER_NS="${FERRY_BUILDER_NS:-kube-system}"
+FERRY_BUILDKIT_IMAGE="${FERRY_BUILDKIT_IMAGE:-moby/buildkit:v0.29.0}"
+
+# Certificates for the builder, so that reaching it is not the same as using it.
+#
+# buildkitd has to listen on the pod's real address: the Mac talks to pods over
+# the pod network and there is no other path to it -- `kubectl port-forward`
+# dials the pod's address too, so binding to the pod's localhost only makes it
+# unreachable from everywhere including here. That address is one every pod on
+# the cluster shares, and a privileged build daemon that anything can drive is
+# a way to run as root in a VM with the whole build cache in it.
+#
+# A NetworkPolicy says the right thing and is not enough on its own. ferry
+# enforces policy with nftables in the pod's own kernel, and the stock guest
+# kernel has no nftables -- `nft` there fails with "cache initialization
+# failed", the same reason ClusterIPs need a host proxy until you build a
+# kernel with `ferry kernel`. So on a default install the policy is inert. It
+# is applied anyway, because it is correct and it does enforce on a kernel that
+# can, but it cannot be the only thing standing between a workload and this.
+#
+# Mutual TLS does not care what the guest kernel can do. The daemon requires a
+# client certificate, the Mac has the only one, and the exposure goes from
+# "every pod on the network" to "whoever can read $FERRY_HOME/pki/builder".
+#
+# The certificates are ferry's own, not the cluster's: reusing the Kubernetes
+# CA for a service Kubernetes does not know about would make one CA's
+# compromise mean more than it has to.
+ferry_builder_pki_dir() { echo "$FERRY_HOME/pki/builder"; }
+
+# The name the client asks for, and the only name the server certificate
+# carries.
+#
+# It is not a resolvable name and does not need to be: the pod's address is
+# what gets dialled, and `buildctl --tlsservername` says what to verify against
+# once connected. A certificate pinned to an address instead would have to be
+# reissued every time the builder pod is recreated, which is every time it is
+# resized.
+FERRY_BUILDER_CN="${FERRY_BUILDER_CN:-ferry-builder}"
+
+ferry_builder_pki() {
+  local dir; dir="$(ferry_builder_pki_dir)"
+  # Reissue when anything is missing or the server certificate has expired, so
+  # a builder that has not been started in a year still starts.
+  if [ -f "$dir/client.key" ] && [ -f "$dir/server.key" ] && [ -f "$dir/ca.crt" ] \
+     && openssl x509 -in "$dir/server.crt" -checkend 0 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  echo "  issuing builder certificates"
+
+  # Ten years: this is a local development CA whose private key sits next to the
+  # certificates it signed, so a short lifetime buys nothing and an expiry in
+  # the middle of a working day costs something.
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$dir/ca.key" -out "$dir/ca.crt" \
+    -subj "/CN=ferry builder CA" >/dev/null 2>&1 || return 1
+
+  # The server. The SAN is what --tlsservername will be checked against; the
+  # CN is ignored by modern verifiers and is set to match only for readability.
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$dir/server.key" -out "$dir/server.csr" \
+    -subj "/CN=$FERRY_BUILDER_CN" >/dev/null 2>&1 || return 1
+  openssl x509 -req -in "$dir/server.csr" -days 3650 \
+    -CA "$dir/ca.crt" -CAkey "$dir/ca.key" -CAcreateserial \
+    -extfile <(printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$FERRY_BUILDER_CN") \
+    -out "$dir/server.crt" >/dev/null 2>&1 || return 1
+
+  # The client. buildkitd requires one because it is given a CA to verify
+  # against, which is what turns TLS into authentication rather than encryption.
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$dir/client.key" -out "$dir/client.csr" \
+    -subj "/CN=ferry" >/dev/null 2>&1 || return 1
+  openssl x509 -req -in "$dir/client.csr" -days 3650 \
+    -CA "$dir/ca.crt" -CAkey "$dir/ca.key" -CAcreateserial \
+    -extfile <(printf 'extendedKeyUsage=clientAuth\n') \
+    -out "$dir/client.crt" >/dev/null 2>&1 || return 1
+
+  rm -f "$dir/server.csr" "$dir/client.csr"
+  chmod 600 "$dir"/*.key
+}
+
+# Half the machine, rounded down, and never less than two.
+#
+# Half rather than all of it because the Mac is still running the cluster, the
+# control plane and whatever the person is doing while they wait. Measured on a
+# 16-core Mac, 8 CPUs matched Docker Desktop's whole 16-CPU VM on every
+# workload, so the other half buys nothing worth having.
+ferry_builder_cpus() {
+  local total; total="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  local half=$(( total / 2 ))
+  [ "$half" -lt 2 ] && half=2
+  echo "$half"
+}
+
+# A quarter of the machine's memory, between 2 and 8 GiB.
+#
+# Guest memory is lazily backed, so this is a ceiling the builder is allowed to
+# reach rather than an allocation taken from the Mac -- an idle builder sized at
+# 4 GiB was measured at 330 MiB of host footprint. The cap is there because a
+# ceiling is not entirely free: Apple's kernel config allocates a struct page
+# per 4 KiB of it at boot.
+ferry_builder_memory_gib() {
+  local bytes; bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
+  local quarter=$(( bytes / 1073741824 / 4 ))
+  [ "$quarter" -lt 2 ] && quarter=2
+  [ "$quarter" -gt 8 ] && quarter=8
+  echo "$quarter"
+}
+
+ferry_kubectl() { KUBECONFIG="$FERRY_HOME/admin.conf" kubectl -n "$FERRY_BUILDER_NS" "$@"; }
+
+ferry_builder_ip() {
+  ferry_kubectl get pod "$FERRY_BUILDER_POD" -o jsonpath='{.status.podIP}' 2>/dev/null
+}
+
+# The client half of the connection, used by every buildctl call here.
+#
+# --tlsservername is what lets one certificate outlive the pod: it is checked
+# against the SAN instead of the address, and the address changes whenever the
+# builder is recreated.
+ferry_buildctl_tls() {
+  local pki; pki="$(ferry_builder_pki_dir)"
+  printf '%s\n' \
+    --tlscacert "$pki/ca.crt" \
+    --tlscert "$pki/client.crt" \
+    --tlskey "$pki/client.key" \
+    --tlsservername "$FERRY_BUILDER_CN"
+}
+
+ferry_builder_answers() {
+  local ip; ip="$(ferry_builder_ip)"
+  [ -n "$ip" ] || return 1
+  local tls=(); while IFS= read -r a; do tls+=("$a"); done < <(ferry_buildctl_tls)
+  buildctl --addr "tcp://$ip:1234" "${tls[@]}" debug workers >/dev/null 2>&1
+}
+
+# Bring the builder up if it is not already, and wait until it answers.
+#
+# Polled at 50 ms because it is ready in about 700 ms and half-second ticks
+# would charge most of a second for something that has already happened.
+ferry_builder_up() {
+  if ferry_builder_answers; then return 0; fi
+
+  local cpus mem
+  cpus="${FERRY_BUILDER_CPUS:-$(ferry_builder_cpus)}"
+  mem="${FERRY_BUILDER_MEMORY_GIB:-$(ferry_builder_memory_gib)}"
+
+  # Recreate rather than patch: a pod's resources are the VM's size and cannot
+  # be changed under it.
+  ferry_kubectl delete pod "$FERRY_BUILDER_POD" --ignore-not-found --wait=true >/dev/null 2>&1
+
+  ferry_builder_pki || { bad "could not issue builder certificates"; return 1; }
+  local pki; pki="$(ferry_builder_pki_dir)"
+  # Recreated from the files on every start, so rotating them is deleting the
+  # directory and building again.
+  ferry_kubectl delete secret "$FERRY_BUILDER_POD-tls" --ignore-not-found >/dev/null 2>&1
+  ferry_kubectl create secret generic "$FERRY_BUILDER_POD-tls" \
+    --from-file=ca.crt="$pki/ca.crt" \
+    --from-file=tls.crt="$pki/server.crt" \
+    --from-file=tls.key="$pki/server.key" >/dev/null 2>&1 \
+    || { bad "could not store the builder certificates"; return 1; }
+
+  echo "  starting the builder ($cpus cpu, ${mem} GiB)"
+  # The policy goes on with the pod, in one apply, so there is no window where
+  # the builder is up and unprotected.
+  ferry_kubectl apply -f - >/dev/null <<YAML || { bad "could not create the builder pod"; return 1; }
+# Nothing in the cluster may talk to the builder.
+#
+# buildkitd listens on tcp://0.0.0.0:1234 with no TLS and no authentication,
+# and it is privileged -- anything that can reach it can run arbitrary builds
+# as root inside the builder VM. That is fine for the client it is meant for
+# and not fine for the rest of the cluster, which can reach it: the Mac is on
+# the pod subnet natively, so pods and host share one flat network and there
+# is no proxy in between to say no.
+#
+# An ingress policy selecting nothing denies every pod. The Mac keeps working
+# without being named, because ferry-netpol exempts each node's own address on
+# the pod network from ingress policy before any rule is consulted
+# (ferry-netpol/compile.go:164) -- it has to, or a kubelet probe could not
+# reach a pod that denies ingress. So "deny all pods, allow the developer" is
+# the empty policy, and nothing here has to know the gateway's address.
+#
+# This is enforcement in the builder's own kernel, not advice: ferry-netpol
+# compiles it to nftables and ferry-cri loads it into that pod
+# (docs/NETWORK-POLICY.md). If ferry-netpol is not running the policy is inert,
+# which is the same exposure as before it existed rather than a new one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $FERRY_BUILDER_POD
+  labels:
+    app.kubernetes.io/name: ferry-builder
+    app.kubernetes.io/managed-by: ferry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ferry-builder
+  policyTypes: [Ingress]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $FERRY_BUILDER_POD
+  labels:
+    app.kubernetes.io/name: ferry-builder
+    app.kubernetes.io/managed-by: ferry
+spec:
+  # Nothing in the cluster should evict the thing the person is waiting on.
+  priorityClassName: system-node-critical
+  containers:
+    - name: buildkitd
+      image: $FERRY_BUILDKIT_IMAGE
+      imagePullPolicy: IfNotPresent
+      # --tlscacert is what makes this authentication and not just encryption:
+      # given a CA, buildkitd requires a client certificate signed by it. The
+      # Mac holds the only one.
+      args:
+        - --addr
+        - tcp://0.0.0.0:1234
+        - --tlscacert
+        - /certs/ca.crt
+        - --tlscert
+        - /certs/tls.crt
+        - --tlskey
+        - /certs/tls.key
+      securityContext:
+        privileged: true
+      ports:
+        - containerPort: 1234
+      volumeMounts:
+        - name: tls
+          mountPath: /certs
+          readOnly: true
+      resources:
+        limits:
+          cpu: "$cpus"
+          memory: ${mem}Gi
+  volumes:
+    - name: tls
+      secret:
+        secretName: $FERRY_BUILDER_POD-tls
+YAML
+
+  local i=0
+  while [ "$i" -lt 1200 ]; do
+    ferry_builder_answers && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  bad "the builder did not come up; see 'kubectl -n $FERRY_BUILDER_NS logs $FERRY_BUILDER_POD'"
+  return 1
+}
+
+cmd_image_build() {
+  local tag="" dockerfile="" context="" no_cache="" progress=auto
+  local -a build_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stop)
+        ferry_kubectl delete pod "$FERRY_BUILDER_POD" --ignore-not-found >/dev/null 2>&1
+        ferry_kubectl delete networkpolicy "$FERRY_BUILDER_POD" --ignore-not-found >/dev/null 2>&1
+        # The secret goes too: it holds the server key, and leaving it in the
+        # cluster after the thing that used it is gone is how a key outlives
+        # anyone's memory of it. The Mac's copy under $FERRY_HOME/pki/builder
+        # stays, so the next build reuses the same CA rather than reissuing.
+        ferry_kubectl delete secret "$FERRY_BUILDER_POD-tls" --ignore-not-found >/dev/null 2>&1
+        ok "builder stopped"
+        return 0 ;;
+      -t|--tag)
+        [ $# -ge 2 ] || { bad "-t needs a name, such as myapp:dev"; return 2; }
+        tag="$2"; shift 2 ;;
+      -f|--file)
+        [ $# -ge 2 ] || { bad "-f needs a path to a Dockerfile"; return 2; }
+        dockerfile="$2"; shift 2 ;;
+      --build-arg)
+        [ $# -ge 2 ] || { bad "--build-arg needs KEY=VALUE"; return 2; }
+        build_args+=(--opt "build-arg:$2"); shift 2 ;;
+      --no-cache) no_cache=1; shift ;;
+      --quiet|-q) progress=quiet; shift ;;
+      -h|--help)
+        echo "usage: ferry image build [-t <name:tag>] [-f <Dockerfile>] [--build-arg K=V]"
+        echo "                         [--no-cache] [--quiet] [<context>]"
+        echo "       ferry image build --stop"
+        return 0 ;;
+      -*) bad "unknown flag $1"; return 2 ;;
+      *)  context="$1"; shift ;;
+    esac
+  done
+
+  context="${context:-.}"
+  [ -d "$context" ] || { bad "no such build context: $context"; return 1; }
+  context="$(cd "$context" && pwd)"
+  dockerfile="${dockerfile:-$context/Dockerfile}"
+  [ -f "$dockerfile" ] || { bad "no Dockerfile at $dockerfile"; return 1; }
+
+  [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up"; return 1; }
+
+  # buildctl is the one thing ferry does not carry. It is small, and it is the
+  # same client the rest of the world uses.
+  command -v buildctl >/dev/null 2>&1 || {
+    bad "buildctl is not installed"
+    echo "    ferry runs the builder; the client comes from buildkit:"
+    echo "        brew install buildkit"
+    return 1
+  }
+
+  # An untagged image loads as untagged@sha256:..., which nothing can write in
+  # a pod spec. Naming it is not optional, so there is a default.
+  [ -n "$tag" ] || tag="$(basename "$context"):latest"
+
+  bold "building $tag"
+  ferry_builder_up || return 1
+
+  local ip; ip="$(ferry_builder_ip)"
+  local staging; staging="$(mktemp -d "${TMPDIR:-/tmp}/ferry-build.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$staging'" RETURN
+  local layout="$staging/image.tar"
+
+  local -a tls=(); while IFS= read -r a; do tls+=("$a"); done < <(ferry_buildctl_tls)
+  local -a args=(
+    --addr "tcp://$ip:1234" "${tls[@]}" build
+    --frontend dockerfile.v0
+    --local "context=$context"
+    --local "dockerfile=$(dirname "$dockerfile")"
+    --opt "filename=$(basename "$dockerfile")"
+    --progress "$progress"
+    --output "type=oci,name=$tag,dest=$layout"
+  )
+  [ -n "$no_cache" ] && args+=(--no-cache)
+  [ ${#build_args[@]} -gt 0 ] && args+=("${build_args[@]}")
+
+  buildctl "${args[@]}" || { bad "build failed"; return 1; }
+
+  # Straight into the image store ferry-cri serves pods from, by the same path
+  # `ferry image load` uses -- so the image is present before the next `kubectl
+  # apply`, with no registry in between.
+  cmd_image_load "$layout" >/dev/null || { bad "built, but could not load it"; return 1; }
+  ok "built and loaded $tag"
+  echo
+  echo "    image: $tag"
+  echo "    Pods must not try to fetch it: set"
+  echo "      imagePullPolicy: IfNotPresent   (or Never)"
+}
+
 # Run an image you just built.
 #
 # Everything else in ferry comes from a registry, which is fine for busybox and
@@ -4098,9 +4467,10 @@ case "${1:-}" in
   addons)     shift; cmd_addons "$@" ;;
   image)      shift
               case "${1:-}" in
+                build) shift; cmd_image_build "$@" ;;
                 load) shift; cmd_image_load "$@" ;;
                 ls|"") KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' 2>/dev/null | sort -u ;;
-                *) bad "usage: ferry image [load <name|archive|dir>|ls]"; exit 2 ;;
+                *) bad "usage: ferry image [build|load <name|archive|dir>|ls]"; exit 2 ;;
               esac ;;
   token)      shift; case "${1:-}" in create|"") cmd_token_create ;; *) bad "usage: ferry token create"; exit 2 ;; esac ;;
   join)       shift; cmd_join "$@" ;;

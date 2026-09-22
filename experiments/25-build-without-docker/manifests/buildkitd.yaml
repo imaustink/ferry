@@ -1,0 +1,31 @@
+# buildkitd as an ordinary ferry pod.
+#
+# The pod is its own virtual machine, so buildkitd gets a kernel to itself and
+# the namespaces it wants are not shared with anything. The Mac is on the pod's
+# vmnet subnet (docs/POD-NETWORK.md), so buildctl reaches this at its real pod
+# address with nothing forwarded.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: buildkitd
+  labels:
+    app: buildkitd
+spec:
+  containers:
+    - name: buildkitd
+      image: moby/buildkit:v0.29.0
+      # IfNotPresent, and it works now.
+      #
+      # This was Always, to work around a bug where a second pod from an
+      # already-pulled image failed with "image sha256:... has not been
+      # pulled". That is fixed in PodRuntime.swift -- the digest is registered
+      # as a rootfsCache key on every path, not only the one that unpacks --
+      # so the pull no longer has to be forced, and `start` is measurable.
+      imagePullPolicy: IfNotPresent
+      args:
+        - --addr
+        - tcp://0.0.0.0:1234
+      securityContext:
+        privileged: true
+      ports:
+        - containerPort: 1234

@@ -1,0 +1,41 @@
+# The same builder, sized like the VM it is being compared against.
+#
+# ferry's default pod is 2 CPUs and 512 MiB. Docker Desktop's VM on this Mac is
+# 16 CPUs and 15.6 GiB, and it is that whole VM that `docker buildx` gets. The
+# first run of this experiment compared the two anyway and charged the
+# difference to the substrate, which it is not: `npm install` on 2 cores is
+# slower than `npm install` on 16 for reasons that have nothing to do with
+# whether the kernel is shared.
+#
+# 8 CPUs and 4 GiB is what the feature would actually ship as a default -- half
+# the machine, which a build can use and an idle builder does not hold, since
+# guest memory here is lazily backed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: buildkitd
+  labels:
+    app: buildkitd
+spec:
+  containers:
+    - name: buildkitd
+      image: moby/buildkit:v0.29.0
+      # IfNotPresent, and it works now.
+      #
+      # This was Always, to work around a bug where a second pod from an
+      # already-pulled image failed with "image sha256:... has not been
+      # pulled". That is fixed in PodRuntime.swift -- the digest is registered
+      # as a rootfsCache key on every path, not only the one that unpacks --
+      # so the pull no longer has to be forced, and `start` is measurable.
+      imagePullPolicy: IfNotPresent
+      args:
+        - --addr
+        - tcp://0.0.0.0:1234
+      securityContext:
+        privileged: true
+      ports:
+        - containerPort: 1234
+      resources:
+        limits:
+          cpu: "8"
+          memory: 4Gi

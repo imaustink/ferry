@@ -1,0 +1,12 @@
+# The proof that the loop closes: a pod running the image the builder just
+# made, with nothing fetched from a registry.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  restartPolicy: Never
+  containers:
+    - name: myapp
+      image: myapp:dev
+      imagePullPolicy: IfNotPresent

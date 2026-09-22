@@ -1,0 +1,16 @@
+# Does a rebuilt tag actually run the new content?
+#
+# `ferry image load` is the second half of every build, and the loop it serves
+# reuses one tag forever: build myapp:dev, run it, edit, build myapp:dev again.
+# If the store keys the unpacked rootfs on the name, the second run is the
+# first image.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stale
+spec:
+  restartPolicy: Never
+  containers:
+    - name: stale
+      image: stale:dev
+      imagePullPolicy: IfNotPresent
