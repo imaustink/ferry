@@ -44,7 +44,14 @@ vm_pids() {
 # whoever it belongs to.
 ferry_vm_pids() {
   local run home pid
-  run="${FERRY_RUN:-/tmp/ferry-run${FERRY_PROFILE:+-$FERRY_PROFILE}}"
+  # Asked of ferry rather than reconstructed. A checkout runs a profile named
+  # after its directory unless told otherwise, and FERRY_PROFILE is set only
+  # when someone overrode it -- so the fallback below resolved to the
+  # unsuffixed /tmp/ferry-run, which belongs to a different cluster. Pod VMs
+  # then matched only by way of $home, and on a profile whose state directory
+  # is also suffixed they would not have matched at all.
+  run="${FERRY_RUN:-$("$FERRY" profile 2>/dev/null | awk '/^  runtime /{print $2}')}"
+  run="${run:-/tmp/ferry-run${FERRY_PROFILE:+-$FERRY_PROFILE}}"
   home="$(dirname "$("$FERRY" kubeconfig 2>/dev/null)")"
   [ -d "$home" ] || home="${FERRY_HOME:-$HOME/.ferry}"
   for pid in $(vm_pids); do
@@ -176,4 +183,36 @@ rss_mib() {
 docker_guest_used_mib() {
   docker run --rm alpine:3.20 free -m 2>/dev/null \
     | awk '/^Mem:/ {print $3}'
+}
+
+# The same reading, for whichever stack has a shared guest, in one place and
+# one definition -- "used" and "total - available" both, from a single `free`
+# so the two cannot drift apart.
+#
+# Two things this fixes. run.sh used to skip ferry entirely here (`case $STACK
+# in ferry|ferry2) ;;`), so the in-guest basis existed for kind and minikube
+# and not for the stack they were being compared against -- which is how the
+# report came to print ferry's host-side footprint next to kind's in-guest
+# used as though they were one column. And the harness carried two different
+# definitions of "used": docker_guest_used_mib above takes `free` column 3,
+# m2mem.sh takes $2-$7. On ferry's 15Gi node those disagree by 190 MiB, so
+# which one a cell happens to use is not a detail.
+#
+# Mode 1 has no shared guest -- every pod is its own kernel -- so it reports
+# nothing rather than a number that would have to be invented.
+guest_mem_mib() { # stack [kubeconfig] -> "used total_minus_available"
+  local stack="$1" kc="${2:-}" out=""
+  case "$stack" in
+    ferry|ferryrelaxed) echo "- -"; return ;;
+    ferry2|ferry2relaxed)
+      [ -n "$kc" ] || { echo "- -"; return; }
+      out=$(KUBECONFIG="$kc" kubectl run gmem-$RANDOM --rm -i --restart=Never \
+            --image="${POD_IMAGE:-alpine:3.20}" \
+            --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-0"}}}' \
+            -- free -m 2>/dev/null | awk '/^Mem:/{print $3, $2-$7}') ;;
+    *)
+      out=$(docker run --rm "${POD_IMAGE:-alpine:3.20}" free -m 2>/dev/null \
+            | awk '/^Mem:/{print $3, $2-$7}') ;;
+  esac
+  echo "${out:-- -}"
 }

@@ -6,7 +6,13 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 KC_DIR="$BENCH_HOME/kubeconfigs"; mkdir -p "$KC_DIR"
-CLUSTER=bench
+# Overridable because a kind cluster can outlive the ability to delete it. A
+# node container killed by the OOM reaper left a record `docker ps -a` lists
+# and `docker inspect` and `docker rm` both deny exists, surviving a Docker
+# Desktop restart -- so `kind create` refused the name and `kind delete` could
+# not clear it. Purging Docker's data would fix it and take every other
+# container on the machine with it; a different name costs nothing.
+CLUSTER="${CLUSTER:-bench}"
 
 # Docker Desktop's VM. Its parent is launchd, not Docker, so parentage is no
 # help; it is identified by the disk image it has open.
@@ -18,6 +24,37 @@ CLUSTER=bench
 # puts an unrelated VM's memory in kind's column and leaves Docker's out.
 DOCKER_VM_PID_FILE="$BENCH_HOME/.docker-vm-pid"
 docker_vm_pid() { cat "$DOCKER_VM_PID_FILE" 2>/dev/null; }
+# Docker Desktop, stopped and started again, so the next stack's baseline is a
+# baseline.
+#
+# Its VM never gives pages back. Deleting a kind cluster leaves the VM process
+# exactly where that cluster left it -- measured: 3891.2 MiB before the delete
+# and 3891.2 MiB after -- so the stack measured next inherits those pages as
+# its "baseline" and its own cluster then fits inside memory the host has
+# already been charged for. That is the whole of minikube's 4403.2 -> 4403.2
+# idle row: it ran second, behind kind, and the subtraction had nothing left to
+# find. kind's own number is sound only because it ran first.
+#
+# Restarting is the only thing that returns the pages, which is the same fact
+# experiment 14 records inside ferry's guests, one level out. ferry needs no
+# equivalent: its VMs exit with the cluster, so its baseline is a real zero.
+docker_restart() {
+  osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1
+  local n=0
+  while pgrep -f 'Docker.app/Contents/MacOS/com.docker.backend' >/dev/null 2>&1; do
+    sleep 2; n=$((n + 1)); [ "$n" -gt 60 ] && break
+  done
+  sleep 3
+  open -a "Docker Desktop" >/dev/null 2>&1 || open -a Docker >/dev/null 2>&1
+  n=0
+  until docker info >/dev/null 2>&1; do
+    sleep 3; n=$((n + 1)); [ "$n" -gt 100 ] && { echo "docker did not come back" >&2; return 1; }
+  done
+  # Settle: the VM keeps touching pages for a while after the socket answers,
+  # and a baseline taken into that climb reads low.
+  sleep 20
+}
+
 pin_docker_vm() {
   local pid
   : > "$DOCKER_VM_PID_FILE"
@@ -28,16 +65,39 @@ pin_docker_vm() {
   done
 }
 
-# Mode 2's node is sized to mirror Docker Desktop's VM, which is what kind and
-# minikube get to put their node in. Guest memory is lazily backed, so a ceiling
-# it does not touch costs nothing (experiment 14).
+# Mode 2's node is sized the way ferry ships it, which is what a user actually
+# gets: ferry-machined defaults spec.memory to 2Gi (crd.yaml).
 #
-# It said that and did not do it: the CPU count was hardcoded to 10 while
+# It was 15Gi, to mirror Docker Desktop's VM, on the reasoning that "guest
+# memory is lazily backed, so a ceiling it does not touch costs nothing
+# (experiment 14)". That is true of the guest's pages and false of the guest's
+# kernel. Apple's config is CONFIG_ARM64_4K_PAGES with SPARSEMEM_VMEMMAP, so a
+# struct page is allocated for every 4 KiB of the *ceiling* at boot, and
+# several hash tables are sized from total RAM besides. Those pages are
+# touched, and experiment 14's own finding is that touched pages never come
+# back. Measured standalone, guest touching nothing: 112 / 136 / 240 / 325 /
+# 469 MiB resident at 1 / 2 / 4 / 8 / 15 GiB configured -- about 105 MiB fixed
+# plus 2.5% of the ceiling.
+#
+# End to end that was 356 MiB of mode 2's idle row spent on memory no pod can
+# use (1,538 MiB at 15Gi against 1,182 at 2Gi), and it bought nothing: the
+# 20-pod burst is 1.22-1.26 s across the whole range, medians of three, with
+# per-run spread of 0.03 s. m2-size-sweep.sh is that measurement.
+#
+# Set MACHINE_MEM=15Gi for the Docker-matched comparison; it is a fair thing to
+# want, it is just not what the product does.
+
+# The CPU count still mirrors Docker Desktop, because cores are not memory:
+# an unused core costs the host nothing, so matching them costs nothing and an
+# unmatched burst measures the mismatch.
+#
+# It claimed to be matched and was not: the count was hardcoded to 10 while
 # Docker Desktop on this machine had all 16, so every burst gave kind 60% more
 # CPU than ferry. Asked directly rather than guessed now. (Measured before
 # fixing it, for the record: ferry's 20-pod burst comes out the same at 10 and
 # at 16, so this was never the concurrency gap -- but a comparison that claims
 # to be matched should be matched.)
+#
 # Asked of Docker when it is running, and of the Mac when it is not -- the
 # ferry runs stop Docker Desktop on purpose, and Docker Desktop takes every
 # core by default, so the host's count is the same answer from the other side.
@@ -54,7 +114,7 @@ machine_cpus_default() {
   case "$v" in ''|*[!0-9]*|0) echo 10 ;; *) echo "$v" ;; esac
 }
 MACHINE_CPUS="${MACHINE_CPUS:-$(machine_cpus_default)}"
-MACHINE_MEM="${MACHINE_MEM:-15Gi}"
+MACHINE_MEM="${MACHINE_MEM:-2Gi}"
 
 # The Kubernetes the other stacks run, pinned to the one ferry is built at.
 #

@@ -53,7 +53,13 @@ measure_mem() { # label
   r "${label}.vm_rss"          "$(rss_mib $vms)"
   r "${label}.host_footprint"  "$fp_host"
   r "${label}.host_rss"        "$(rss_mib $hosts)"
-  case "$STACK" in ferry|ferry2) ;; *) r "${label}.guest_used_mib" "$(docker_guest_used_mib)" ;; esac
+  # Every stack that has a shared guest, read the same way. This used to run
+  # for kind and minikube only, which left the report comparing ferry's
+  # host-side footprint against their in-guest used. Mode 1 returns "-".
+  local g_used g_unavail
+  read -r g_used g_unavail <<<"$(guest_mem_mib "$STACK" "${kc:-}")"
+  r "${label}.guest_used_mib"   "$g_used"
+  r "${label}.guest_unavail_mib" "$g_unavail"
   r "${label}.vm_count"        "$(echo $vms | wc -w | tr -d ' ')"
   r "${label}.cpu_pct"         "$(cpu_of $vms $hosts)"
 }
@@ -115,6 +121,20 @@ YAML
 }
 
 # ---------------------------------------------------------------- run ----
+
+# Docker-based stacks get a restarted Docker first, so their baseline is not
+# the previous stack's leftovers. See docker_restart in stacks.sh: the VM does
+# not release pages when a cluster is deleted, and the battery runs kind before
+# minikube, which is exactly how minikube's published host-side row came to be
+# a 10 MiB non-result. Skippable for a single-stack run that has just restarted
+# Docker anyway.
+case "$STACK" in
+  kind|minikube)
+    if [ "${SKIP_DOCKER_RESTART:-}" != "1" ]; then
+      say "restarting Docker Desktop so this stack's baseline is its own"
+      docker_restart || exit 1
+    fi ;;
+esac
 
 pin_docker_vm
 say "docker VM is pid $(docker_vm_pid)"
