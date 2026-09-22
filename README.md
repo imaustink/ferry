@@ -44,9 +44,8 @@ is not the baseline ferry actually has.
 | start one pod | 0.48 s | 0.45 s | 0.32 s | **0.27 s** | 0.61 s | 0.60 s |
 | start 10 | 1.19 s | 0.79 s | 0.71 s | **0.31 s** | 0.70 s | 1.08 s |
 | start 20 | 3.61 s | 3.41 s | 1.11 s | **0.50 s** | 0.93 s | 2.18 s |
-| idle memory the cluster adds | **432 MiB** | **430 MiB** | 1,184 MiB | 1,188 MiB | 2,455 MiB | 2,049 MiB |
-| already resident before it | **0** | **0** | **0** | **0** | 1,689 MiB | 1,681 MiB |
-| idle memory, total | **432 MiB** | **430 MiB** | 1,184 MiB | 1,188 MiB | 4,144 MiB | 3,730 MiB |
+| idle memory | **432 MiB** | **430 MiB** | 1,184 MiB | 1,188 MiB | 4,144 MiB | 3,730 MiB |
+| ↳ of that, Docker before any cluster | **0** | **0** | **0** | **0** | 1,689 MiB | 1,681 MiB |
 | idle CPU | 2.5% | **2.1%** | 8.1% | 8.7% | 24.4% | 29.0% |
 | per pod | 239 MiB | 240 MiB | 9 MiB | 9 MiB | **6 MiB** | 16 MiB |
 
@@ -84,20 +83,21 @@ manager takes 7.5 s on ferry and 8.9 s on kind to get from starting up to
 running its deployment controller, and CoreDNS is a Deployment, so its pod
 cannot exist until that happens.
 
-**The memory rows are one measurement, taken the same way for every column** —
-physical footprint on the Mac, of that stack's VMs and its own daemons, whole
-cluster in every case. That is a correction, and it went the other way: this
-table used to print ferry's host-side footprint beside kind's memory *used
-inside Docker's VM*, which made mode 2 read as 1,485 MiB against kind's 695
-and cost ferry a comparison it wins. Measured alike, a kind cluster adds 2,455
-MiB to this Mac and mode 2 adds 1,184.
+**Idle memory is one measurement, taken the same way for every column** —
+physical footprint on the Mac, of that stack's VMs and its own daemons, with
+the cluster up and nothing scheduled. That is a correction. The table used to
+print ferry's host-side footprint beside kind's memory *used inside Docker's
+VM* and call both "idle memory", which made mode 2 read as 1,485 MiB against
+kind's 695 and cost ferry a comparison it wins.
 
-The second row is the part that does not show up in a per-cluster number at
-all. Docker Desktop holds **15.6 GiB and 16 CPUs before the first pod
-exists**, and is charging the Mac 1.7 GiB while doing nothing. A pod on kind
-then costs the Mac nothing extra — it costs a slice of a VM already taken, and
-when the slice is gone, pods stop fitting. ferry reserves nothing, so its
-baseline is a measured zero and its two rows are the same number.
+The indented row is why the top one is not the whole story either way. Docker
+Desktop holds **15.6 GiB and 16 CPUs before the first pod exists**, and is
+charging the Mac 1.7 GiB while doing nothing — so if you already run it for
+other work, kind's marginal cost is the difference, 2,455 MiB, and if you
+don't, it is the whole 4,144. A pod on kind then costs the Mac nothing extra:
+it costs a slice of a VM already taken, and when the slice is gone, pods stop
+fitting. ferry reserves nothing, so the two numbers are the same and the
+indented row is zero.
 
 Mode 1 trades memory for isolation and does not hide it — a pod is a VM with
 its own kernel, and 240 MiB each is what that costs. Mode 2 is the other end:
@@ -221,8 +221,9 @@ Two things that measurement had to get right, and the first battery did not:
   Desktop's VM does not release pages when a cluster is deleted — measured at
   3,891.2 MiB before a `kind delete` and 3,891.2 MiB after — so minikube,
   running second, inherited kind's pages as its baseline and its own cluster
-  fitted inside memory already charged. That is why its idle memory was once
-  reported as 10 MiB. Restarted first, it costs 2,049 MiB. ferry needs no
+  fitted inside memory already charged. That is why the cluster was once
+  reported as adding 10 MiB. Restarted first, it adds 2,049 MiB — the 3,730
+  above, less the 1,681 Docker was holding before it. ferry needs no
   equivalent: its VMs exit with the cluster, so its baseline is a real zero.
 - **Mode 2's node is sized as ferry ships it,** 2 GiB, not the 15 GiB the
   harness used to mirror Docker Desktop with. A ceiling is not free even

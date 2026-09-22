@@ -92,9 +92,12 @@ def host_suspect(s):
     h, g = host_added(s), guest_added(s)
     return h is not None and g is not None and g > 100 and h < g
 
+# The cell shows what is resident with the cluster up; the row under it shows
+# how much of that was there beforehand, so the marginal cost is the
+# subtraction and both readings are available without a third row. The warning
+# is still decided on the subtraction, which is the part that can be wrong.
 def host_cell(s):
-    v = host_added(s)
-    return fmt(v, " MiB", 0) + (" ⚠" if host_suspect(s) else "")
+    return fmt(host_at(s, "idle"), " MiB", 0) + (" ⚠" if host_suspect(s) else "")
 
 # Used inside the one guest a stack shares, where it has one. Recorded for
 # every stack now; mode 1 writes "-" because a pod per kernel has no such
@@ -154,21 +157,26 @@ table("Cluster lifecycle", [
 "column on its own.")
 
 table("Idle — cluster up, nothing scheduled", [
-    row("**host memory the cluster adds**", host_cell),
-    row("already resident before it", lambda s: fmt(host_at(s, "baseline"), " MiB", 0)),
-    row("**total resident to have it**", lambda s: fmt(host_at(s, "idle"), " MiB", 0)),
+    row("**idle memory**", host_cell),
+    row("  ↳ of that, resident before any cluster",
+        lambda s: fmt(host_at(s, "baseline"), " MiB", 0)),
     row("used inside the shared guest", lambda s: fmt(guest_added(s), " MiB", 0)),
     row("CPU, cluster down", lambda s: fmt(n(s, "baseline.cpu_core_pct"), "%", 1)),
     row("CPU, cluster up and empty", lambda s: fmt(n(s, "idle.cpu_core_pct"), "%", 1)),
-], "**Both memory rows are now the same measurement for every column.** They did\n"
-   "not used to be: this row was `vm_footprint + host_footprint` for ferry and\n"
-   "`used` inside Docker's VM for kind and minikube, printed side by side, which\n"
-   "made ferry look about twice kind's cost when on either basis it is well under\n"
-   "it. Read the first row for the question \"what does this cost my Mac\" -- it is\n"
-   "whole-cluster for every stack. The guest row is narrower than it looks for\n"
-   "ferry: kind and minikube put the entire cluster inside one guest, while mode\n"
-   "2's guest holds only the node, its control plane being native processes in the\n"
-   "host row, and mode 1 has no shared guest at all.\n\n"
+], "**Idle memory is now the same measurement for every column.** It was not:\n"
+   "the cell was `vm_footprint + host_footprint` for ferry and `used` inside\n"
+   "Docker's VM for kind and minikube, printed side by side, which made ferry\n"
+   "look about twice kind's cost when on either basis it is well under it. It is\n"
+   "host phys_footprint throughout now -- that stack's VMs plus its own daemons,\n"
+   "with the cluster up -- which is whole-cluster for all of them.\n\n"
+   "The indented row is how much of that was already resident with no cluster,\n"
+   "so the marginal cost of the cluster is the subtraction. Which of the two\n"
+   "matters depends on whether Docker Desktop would be running anyway. ferry's\n"
+   "is zero because its processes and VMs do not exist until `ferry up`.\n\n"
+   "The guest row is narrower than it looks for ferry: kind and minikube put the\n"
+   "entire cluster inside one guest, while mode 2's guest holds only the node,\n"
+   "its control plane being native processes counted in the row above, and mode\n"
+   "1 has no shared guest at all.\n\n"
    "The host row is only a subtraction if the baseline was clean. Docker\n"
    "Desktop's VM does not release pages when a cluster is deleted, so a\n"
    "Docker-based stack measured behind another one reads far too low -- `run.sh`\n"
