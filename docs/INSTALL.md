@@ -273,6 +273,24 @@ not in the installer.
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
 
+### Durability and speed
+
+`ferry up --durability relaxed` sets the first two together and is the
+supported way in; the rest are here because the code reads them and are worth
+knowing when one of them is the thing you want to change on its own.
+
+| | default | |
+|---|---|---|
+| `FERRY_DURABILITY` | `full` | `relaxed` to acknowledge writes before they reach the disk. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered |
+| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `relaxed`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
+| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `relaxed` |
+| `FERRY_KUBE_API_QPS` | `500` | how fast a kubelet may talk to the API server. Upstream's 50 paces a 20-pod burst at 40ms a pod, with every container already running |
+| `FERRY_KUBE_API_BURST` | `1000` | the burst that goes with it |
+| `FERRY_KUBELET_V` | `2` | klog level for both kubelets. At `4` the kubelet logs its own per-pod phase boundaries, which is what `experiments/24-benchmark-harness/syncphases.py` reads |
+| `FERRY_VOLUME_RECONCILE_MS` | `10` | the volume manager's reconciler period, patched into the kubelet at build time. Upstream is 100 |
+| `FERRY_VOLUME_POPULATE_MS` | `10` | its desired-state populator period. Upstream is 100 |
+| `FERRY_VOLUME_RETRY_MS` | `20` | how often `WaitForAttachAndMount` re-checks. Upstream is 300. Together these three were ~290ms of sleeping on the critical path of every pod start |
+
 ### Networking
 
 | | default | |

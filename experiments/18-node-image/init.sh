@@ -54,6 +54,26 @@ DNS_SERVICE=$(param ferry.dnssvc)
 # older than the parameter -- in both cases the flag is simply not passed.
 TAINTS=$(param ferry.taints)
 CLUSTER_CIDR=$(param ferry.clustercidr)
+# klog's level, so a burst can be watched at --v=4 -- where the kubelet logs
+# each pod's phase boundaries and phases.py can read them -- without rebuilding
+# this image to find out which phase stretched. Absent on a node booted by an
+# older ferry-node, and the default is the 2 that was hardcoded here.
+KUBELET_V=$(param ferry.kubeletv)
+# How fast the kubelet is allowed to talk to the API server.
+#
+# Upstream defaults to 50 QPS with a burst of 100, which paces a 20-pod burst
+# at a very regular 40ms a pod -- two requests each, one token per 20ms -- and
+# the pods are Running long before their statuses say so. Measured: the
+# kubelet had all twenty containers started within 55ms and the last status
+# was not stored for another 580ms, against kind's 198ms.
+#
+# Those defaults are sized for a node in a cluster with hundreds of others,
+# where a kubelet that floods the API server is a real hazard. A ferry node is
+# one of one or two, talking to an API server on the same Mac.
+# Defaulted here as well as on the host, so a guest booted by a ferry-node
+# that does not pass the parameter still gets them.
+KUBE_API_QPS=$(param ferry.apiqps); KUBE_API_QPS=${KUBE_API_QPS:-500}
+KUBE_API_BURST=$(param ferry.apiburst); KUBE_API_BURST=${KUBE_API_BURST:-1000}
 
 hostname "$NODE_NAME" 2>/dev/null
 echo "$NODE_NAME" > /etc/hostname
@@ -152,6 +172,8 @@ ${DNS_SERVICE:+clusterDNS: ["$DNS_SERVICE"]}
 cgroupDriver: cgroupfs
 failSwapOn: false
 readOnlyPort: 0
+${KUBE_API_QPS:+kubeAPIQPS: $KUBE_API_QPS}
+${KUBE_API_BURST:+kubeAPIBurst: $KUBE_API_BURST}
 # Sized to this machine's disk rather than to a Mac's. Asking for gigabytes
 # free on a node whose root filesystem is a few gigabytes means DiskPressure
 # from the first heartbeat, and everything scheduled here is evicted.
@@ -186,7 +208,7 @@ log "taints: ${TAINTS:-none}"
   --hostname-override="$NODE_NAME" \
   --node-ip="${ADDRESS%%/*}" \
   --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
-  --v=2 > /var/log/kubelet.log 2>&1 &
+  --v="${KUBELET_V:-2}" > /var/log/kubelet.log 2>&1 &
 kubelet_pid=$!
 
 # Stream the lines that matter to the console as they happen. Sampling the log
@@ -199,19 +221,29 @@ kubelet_pid=$!
 # Report early rather than after three minutes of silence: a node that cannot
 # reach its cluster says so in the first seconds, and waiting out the timeout
 # to find out is how an afternoon goes missing.
-sleep 8
-log "route: $(ip route show default 2>&1 | head -1)"
-# Whether this is a network problem or an authentication one, said plainly.
-# A kubelet blocked in TLS bootstrap logs nothing at all while it waits.
-log "api /healthz: $(curl -sk -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 8 "$API_SERVER/healthz" 2>&1)"
-# klog marks errors with a leading E and warnings with W; the flag dump at
-# startup contains the word "fail" and is not what is wanted here.
-log "kubelet alive: $(kill -0 $kubelet_pid 2>/dev/null && echo yes || echo NO), log lines $(wc -l < /var/log/kubelet.log 2>/dev/null)"
-# Everything except the flag dump, which is two hundred lines of noise that
-# swallowed every attempt to sample this log.
-log "--- kubelet, first lines that are not flags ---"
-grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
-log "--- end ---"
+#
+# In the background, because this is diagnosis and the node's readiness is
+# not waiting for it. It used to be `sleep 8` inline, and everything that
+# makes this node Ready is downstream of it -- the kubelet cannot report
+# NetworkReady until the CNI configuration exists, and that is written at the
+# bottom of this script. So eight seconds of logging sat on the critical path
+# of every mode 2 cluster creation, which measured 7.09s from the Machine
+# running to the node going Ready.
+(
+  sleep 8
+  log "route: $(ip route show default 2>&1 | head -1)"
+  # Whether this is a network problem or an authentication one, said plainly.
+  # A kubelet blocked in TLS bootstrap logs nothing at all while it waits.
+  log "api /healthz: $(curl -sk -o /dev/null -w '%{http_code} in %{time_total}s' --max-time 8 "$API_SERVER/healthz" 2>&1)"
+  # klog marks errors with a leading E and warnings with W; the flag dump at
+  # startup contains the word "fail" and is not what is wanted here.
+  log "kubelet alive: $(kill -0 $kubelet_pid 2>/dev/null && echo yes || echo NO), log lines $(wc -l < /var/log/kubelet.log 2>/dev/null)"
+  # Everything except the flag dump, which is two hundred lines of noise that
+  # swallowed every attempt to sample this log.
+  log "--- kubelet, first lines that are not flags ---"
+  grep -v "FLAG:" /var/log/kubelet.log 2>/dev/null | head -25 > /dev/console
+  log "--- end ---"
+) &
 
 # Routes to the other nodes' pods.
 #
@@ -269,11 +301,16 @@ log "registered ($(elapsed)ms)"
 # addresses nobody else can reach, which is exactly what happened the first
 # time this ran.
 cert=/var/lib/kubelet/pki/kubelet-client-current.pem
-for _ in $(seq 1 120); do
+# 0.2s, not 1s, and the same two minutes of patience. The CIDR is allocated by
+# kube-controller-manager's node-ipam controller, which on a cold control
+# plane takes a few seconds to get to; asking in whole seconds rounded that
+# wait up, and the CNI configuration below -- and so the node going Ready --
+# is waiting on the answer.
+for _ in $(seq 1 600); do
   POD_CIDR=$(curl -s --cacert /etc/kubernetes/ca.crt --cert "$cert" --key "$cert" \
     "$API_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null | jq -r '.spec.podCIDR // empty')
   [ -n "$POD_CIDR" ] && break
-  sleep 1
+  sleep 0.2
 done
 log "pod cidr $POD_CIDR"
 

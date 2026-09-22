@@ -18,7 +18,15 @@ for line in raw.read_text().splitlines():
     if len(p) == 3:
         d[p[0]][p[1]] = p[2]
 
-STACKS = [s for s in ("ferry", "ferry2", "kind", "minikube") if s in d]
+# The order columns appear in, and the only names this knows about. The
+# relaxed variants are the same stacks with `--durability relaxed`, recorded
+# under their own tag by the runner; without them here they sat in raw.tsv
+# and never reached a table, which is a quiet way to lose half a comparison.
+STACK_ORDER = ("ferry", "ferryrelaxed", "ferry2", "ferry2relaxed",
+               "kind", "minikube")
+LABELS = {"ferryrelaxed": "ferry, relaxed", "ferry2": "ferry, mode 2",
+          "ferry2relaxed": "ferry, mode 2, relaxed"}
+STACKS = [s for s in STACK_ORDER if s in d]
 
 def n(s, k):
     try:    return float(d[s][k])
@@ -32,7 +40,7 @@ def row(label, fn):
 
 def table(title, rows, note=None):
     print(f"\n### {title}\n")
-    print("| | " + " | ".join(STACKS) + " |")
+    print("| | " + " | ".join(LABELS.get(s, s) for s in STACKS) + " |")
     print("|:--" + "|--:" * len(STACKS) + "|")
     for r in rows: print(r)
     if note: print(f"\n{note}")
@@ -64,9 +72,15 @@ table("What each stack actually is", [
         "native macOS processes" if s.startswith("ferry") else "static pods in a container"),
     row("API server platform", lambda s: d[s].get("platform", "—")),
     row("a pod is", lambda s:
-        "its own VM, own kernel" if s == "ferry" else "a container on a shared kernel"),
+        "its own VM, own kernel" if s in ("ferry", "ferryrelaxed")
+        else "a container on a shared kernel"),
     row("pods at rest", lambda s: d[s].get("idle_syspods", "—")),
     row("needs Docker Desktop", lambda s: "no" if s.startswith("ferry") else "yes"),
+    # The row kind and minikube have no answer to. etcd inside Docker's VM
+    # acknowledges a commit before it is on the drive; ferry at full
+    # durability does not.
+    row("writes survive power loss", lambda s:
+        "no" if (s.endswith("relaxed") or not s.startswith("ferry")) else "yes"),
 ])
 
 table("Cluster lifecycle", [
@@ -74,7 +88,13 @@ table("Cluster lifecycle", [
     row("create, artifacts cached", lambda s: fmt(n(s, "create_warm_s"), "s")),
     row("delete", lambda s: fmt(n(s, "delete_s"), "s")),
     row("disk once created", lambda s: fmt(n(s, "disk_mib"), " MiB", 0)),
-])
+],
+"**The disk row is not a comparison.** ferry's is everything under FERRY_HOME,\n"
+"including the node image it boots. kind's and minikube's is the node\n"
+"container's writable layer only -- the ~1.3 GiB node image underneath it is a\n"
+"Docker image shared with every other cluster that tool makes, and counting it\n"
+"once per cluster would be as wrong as counting it zero times. Read each\n"
+"column on its own.")
 
 table("Idle — cluster up, nothing scheduled", [
     row("memory the cluster adds", lambda s: fmt(mem_added(s), " MiB", 0)),
@@ -82,9 +102,11 @@ table("Idle — cluster up, nothing scheduled", [
         "VM + host footprint" if s.startswith("ferry") else "used in Docker's VM"),
     row("Docker Desktop host processes", lambda s:
         "n/a" if s.startswith("ferry") else fmt(n(s, "idle.host_footprint"), " MiB", 0)),
-    row("CPU, cluster down", lambda s: fmt(n(s, "baseline.cpu_pct"), "%")),
-    row("CPU, cluster up and empty", lambda s: fmt(n(s, "idle.cpu_pct"), "%")),
-], "CPU is cumulative CPU-time over a 60s window, not `ps %cpu`.")
+    row("CPU, cluster down", lambda s: fmt(n(s, "baseline.cpu_core_pct"), "%", 1)),
+    row("CPU, cluster up and empty", lambda s: fmt(n(s, "idle.cpu_core_pct"), "%", 1)),
+], "CPU is percent of one core, from cumulative CPU-time over a 60s window with\n"
+   "the cluster left alone -- not `ps %cpu`, which is a decaying average over a\n"
+   "window the kernel picks. This machine has 16 cores, so 100% is one of them.")
 
 def lat(s):
     v = [n(s, f"pod_start_s.{i}") for i in range(1, 9)]
@@ -126,5 +148,11 @@ if len(STACKS) > 1 and "ferry" in STACKS:
         ob, os_ = mem_added(s), per_pod(s, counts[-1])
         if None in (fb, fs, ob, os_) or fs == os_: continue
         x = (ob - fb) / (fs - os_)
-        print(f"- ferry costs less than **{s}** below **{x:.1f} pods**, more above "
-              f"(before counting Docker Desktop itself, which only {s} needs).")
+        # Only the Docker-based stacks pay for Docker Desktop. ferry2 is a
+        # ferry mode and needs it no more than ferry does; saying otherwise
+        # was a formatting string that never checked which stack it was on.
+        extra = ("" if s.startswith("ferry") else
+                 ", before counting Docker Desktop itself, which only "
+                 f"{s} needs")
+        print(f"- ferry costs less than **{s}** below **{x:.1f} pods**, "
+              f"more above{extra}.")

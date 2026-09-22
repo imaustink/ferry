@@ -600,6 +600,159 @@ succeeds "  and the guest hands them to --register-with-taints" \
 succeeds "  only when there are some" \
   grep -q 'if !taints.isEmpty' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
 
+# The kubelet's log level, over the same channel. At --v=4 the kubelet records
+# its own per-pod phase boundaries, which is the only direct way to see which
+# phase stretches when a burst of pods arrives at once. It was hardcoded to 2
+# inside the image, so asking that question meant a node-image rebuild --
+# minutes, Docker, and a staged kubelet -- and the investigation in
+# experiments/24 stopped at the point where it became the next step.
+succeeds "ferry-node puts the kubelet's log level on the kernel command line" \
+  grep -q 'ferry.kubeletv=' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  from the environment, so it needs no rebuild" \
+  grep -q 'FERRY_KUBELET_V' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  and the guest hands it to --v" \
+  grep -q 'v="\${KUBELET_V:-2}"' "$repo/experiments/18-node-image/init.sh"
+# Unset has to mean the 2 that was hardcoded, not an empty --v= the kubelet
+# rejects, and not a level nobody asked for on every node ferry ever boots.
+succeeds "  defaulting to 2 when nothing asks" \
+  grep -q 'KUBELET_V:-2' "$repo/experiments/18-node-image/init.sh"
+
+# The volume manager's poll intervals. Three unexported constants upstream
+# exposes through no flag, worth ~270ms on every pod start, and the reason
+# ferry compiling its own kubelet is worth anything at all here.
+succeeds "the volume manager's poll intervals are shortened in one place" \
+  grep -q 'ferry_shorten_volume_polls()' "$repo/lib/overlay.sh"
+succeeds "  the mac kubelet gets it" \
+  grep -q 'ferry_shorten_volume_polls' "$repo/build-kubelet.sh"
+succeeds "  and so does the guest's" \
+  grep -q 'ferry_shorten_volume_polls' "$repo/build-kubelet-linux.sh"
+# A constant upstream renames leaves the sed matching nothing and the build
+# silently back at 100ms, which is a regression with nothing pointing at it.
+succeeds "  and the build fails if a constant moved" \
+  grep -q 'could not set' "$repo/lib/overlay.sh"
+# BSD sed does not read \t as a tab in a pattern; the version that spelled it
+# that way matched nothing and looked like it had worked.
+succeeds "  matching indentation without relying on \\t" \
+  grep -q 'reconcilerLoopSleepPeriod' "$repo/lib/overlay.sh"
+succeeds "the guest kubelet is stamped with its version" \
+  grep -q 'gitVersion=\$GUEST_VERSION' "$repo/build-kubelet-linux.sh"
+# Upstream's download and ferry's build are the same version and the same
+# name; without the marker there is no way to tell which one got baked in.
+succeeds "a ferry-built guest kubelet is marked as one" \
+  grep -q 'kubelet.ferry-built' "$repo/build-kubelet-linux.sh"
+succeeds "  and stage.sh keeps it instead of downloading" \
+  grep -q 'kubelet.ferry-built' "$repo/experiments/17-node-vm/stage.sh"
+
+# The two durability barriers, both opt-in. Measured: ferry's etcd averages
+# 4.85ms per WAL fsync on APFS against kind's 0.88ms inside Docker's VM, and
+# a host fsync stalls the guest's disk too.
+succeeds "etcd's fsync can be turned off for a local cluster" \
+  grep -q 'unsafe-no-fsync' "$repo/control-plane/up.sh"
+succeeds "  behind an environment variable, not by default" \
+  grep -q 'FERRY_ETCD_NO_FSYNC' "$repo/control-plane/up.sh"
+succeeds "the node disk's barrier is a knob" \
+  grep -q 'FERRY_NODE_DISK_SYNC' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+succeeds "  still .fsync unless asked otherwise" \
+  grep -q 'default:     sync = .fsync' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+# "${a[@]}" with set -u on bash 3.2 -- which is the bash macOS ships -- is an
+# unbound variable, so the control plane would not start with the flag off.
+succeeds "  and an empty flag list does not break bash 3.2" \
+  grep -q 'etcd_fsync_args\[@\]+' "$repo/control-plane/up.sh"
+
+# kubeAPIQPS. Upstream's 50 paces a 20-pod burst at 40ms a pod -- two
+# requests each, one token per 20ms -- with every container already running.
+# Both kubelets get the raised value or neither comparison means anything.
+succeeds "the mac kubelet is not rate-limited to upstream's 50 QPS" \
+  grep -q 'kubeAPIQPS: \$FERRY_KUBE_API_QPS' "$repo/ferry"
+succeeds "  and neither is the guest's" \
+  grep -q 'kubeAPIQPS: \$KUBE_API_QPS' "$repo/experiments/18-node-image/init.sh"
+succeeds "  overridable from the environment" \
+  grep -q 'FERRY_KUBE_API_QPS:-' "$repo/ferry"
+succeeds "  and reaching the guest over the kernel command line" \
+  grep -q 'ferry.apiqps' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+# Both heredocs in ferry write a kubelet.yaml; one of them having it is a
+# cluster where the first node is fast and a node added later is not.
+succeeds "  in both of ferry's kubelet configs" \
+  test "$(grep -c 'kubeAPIQPS:' "$repo/ferry")" = 2
+
+# Teardown. Measured: a mode 1 purge was 3.9s and a mode 2 one 8.1s, almost
+# all of it waiting -- 0.5s poll ticks, a fixed `sleep 1`, and the API server
+# draining watches on its way to a data directory about to be deleted.
+succeeds "teardown polls finely rather than in half seconds" \
+  grep -q 'ferry_await_exit()' "$repo/ferry"
+# Only the teardown loops: `ferry up` waits on sockets appearing with the same
+# spelling, and those are a different thing left alone.
+succeeds "  and no teardown loop still sleeps half a second" \
+  test "$(grep -c 'kill -0 "$pid" 2>/dev/null || break; sleep 0.5' "$repo/ferry")" = 0
+succeeds "  including the ones that stop machines" \
+  test "$(grep -c 'running ferry-machined || break; sleep 0.5' "$repo/ferry")" = 0
+succeeds "  nor does the control plane's" \
+  test "$(grep -c 'sleep 0.5' "$repo/control-plane/down.sh")" = 0
+# --purge deletes etcd's data directory a few lines later, so draining it
+# first is time spent settling state that is about to be removed.
+succeeds "--purge stops the control plane without a graceful drain" \
+  grep -q 'purging' "$repo/control-plane/down.sh"
+# ...but a plain `ferry down` is meant to come back, so that path keeps it.
+succeeds "  and a plain down still drains" \
+  grep -q 'kill -TERM "$pid" 2>/dev/null || continue' "$repo/control-plane/down.sh"
+# ferry-proxy never exits on SIGTERM; waiting for it politely made teardown
+# four times worse than the `sleep 1` it replaced.
+succeeds "  and the service proxy is forced rather than waited out" \
+  grep -q 'sudo kill -KILL "$proxy_pid"' "$repo/ferry"
+
+# Startup. The same tick problem as teardown: five steps of `ferry up` landed
+# within 43ms of each other at half a second, and the control plane polled
+# etcd and the API server in whole seconds.
+succeeds "startup waits on a condition rather than a tick" \
+  grep -q 'ferry_await()' "$repo/ferry"
+succeeds "  and no socket wait still polls at half a second" \
+  test "$(grep -c 'break; sleep 0.5; done' "$repo/ferry")" = 0
+succeeds "  nor does the control plane poll in whole seconds" \
+  test "$(grep -cE '^  sleep 1$' "$repo/control-plane/up.sh")" = 0
+# The kubelet cannot report NetworkReady until its CNI configuration exists,
+# and that is written after this block -- so eight seconds of logging sat on
+# the critical path of every mode 2 cluster creation.
+succeeds "the guest's startup diagnostics do not block its readiness" \
+  grep -q '^) &' "$repo/experiments/18-node-image/init.sh"
+# Every other port ferry uses is shifted by the profile index. This one was
+# not, so a second ferry on the same Mac panicked on it.
+succeeds "karpenter's health probe port is shifted like the rest" \
+  grep -q 'health-probe-port' "$repo/ferry"
+
+# Durability, as a flag rather than two environment variables nobody finds.
+# Full is the default because it is the guarantee kind and minikube cannot
+# offer at all; relaxed is worth 3x on a pod start and is the caller's call.
+succeeds "durability is a flag on ferry up" \
+  grep -q 'durability relaxed to trade crash-safety for speed' "$repo/ferry"
+succeeds "  validated rather than trusted" \
+  grep -q "expected 'full' or 'relaxed'" "$repo/ferry"
+succeeds "  remembered for the cluster, the way machines is" \
+  grep -q 'DURABILITY_MARKER=' "$repo/ferry"
+succeeds "  and it reaches etcd" \
+  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed' "$repo/ferry"
+succeeds "  and the machine disks, so mode 2 does not disagree with mode 1" \
+  grep -q 'FERRY_NODE_DISK_SYNC="$(durability_is_relaxed' "$repo/ferry"
+# A relaxed cluster that looks like a full one is the failure mode worth
+# preventing: it is only ever discovered after something is lost.
+succeeds "  a relaxed cluster says so every time it starts" \
+  grep -q 'writes are acknowledged before they reach the disk' "$repo/ferry"
+succeeds "  and ferry status says which one you are on" \
+  test "$(grep -c 'durability_is_relaxed' "$repo/ferry")" -ge 4
+
+# --purge destroys the cluster, so the control plane does not have to wait
+# its turn behind the components -- nothing between them needs an API server.
+succeeds "--purge stops the control plane alongside the components" \
+  grep -q 'cp_job=\$!' "$repo/ferry"
+succeeds "  and collects it where the serial stop used to be" \
+  grep -q 'wait "\$cp_job"' "$repo/ferry"
+# withdraw_gpu patches the node's status, which on --purge is a write to an
+# object about to be deleted -- and would race the API server going down.
+succeeds "  and does not patch a node that is being deleted" \
+  grep -q '\[ -n "\$purge" \] || withdraw_gpu' "$repo/ferry"
+# A plain `ferry down` keeps the old order: that cluster is coming back.
+succeeds "  while a plain down still stops it in order" \
+  grep -q 'STATE="\$FERRY_HOME" "\$here/control-plane/down.sh" >/dev/null' "$repo/ferry"
+
 # --- both modes on one pod network (milestone 6) --------------------------
 #
 # vmnet will not route between its own networks, so a machine and a mode 1 pod

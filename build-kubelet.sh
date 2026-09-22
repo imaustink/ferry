@@ -258,6 +258,14 @@ if [ -f "$pods_file" ]; then
   echo "    ~ pkg/kubelet/kubelet_pods.go"
 fi
 
+# The volume manager's poll intervals, which are upstream's pacing rather than
+# anything ferry chose. See ferry_shorten_volume_polls in lib/overlay.sh for
+# the measurement and the reasoning; the guest kubelet mode 2 boots gets the
+# same rewrite, which is why it lives there and not here.
+echo "==> shortening the volume manager's poll intervals"
+ferry_shorten_volume_polls "$src" || exit 1
+echo "    ~ pkg/kubelet/volumemanager/volume_manager.go"
+
 echo "==> building darwin/arm64 kubelet ($K8S_VERSION)"
 cd "$src"
 # cgo is on because the node's CPU usage has no other source. macOS publishes no

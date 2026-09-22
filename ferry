@@ -136,6 +136,21 @@ PORT_SHIFT=$(( PROFILE_INDEX * 1000 ))
 
 # Cluster state that should survive a restart: certificates and etcd.
 FERRY_HOME="${FERRY_HOME:-$HOME/.ferry$SUFFIX}"
+
+# How fast a kubelet may talk to the API server.
+#
+# Upstream defaults to 50 QPS with a burst of 100, sized for a node that is
+# one of hundreds and where a kubelet flooding the API server is a real
+# hazard. A ferry cluster is one or two nodes and an API server on the same
+# Mac, and at those defaults a 20-pod burst is paced at a very regular 40ms a
+# pod -- two requests each, one token per 20ms. The containers are all started
+# within 55ms and the last pod's status is not stored for another 580ms, so
+# the whole burst is waiting on a rate limiter rather than on any work.
+#
+# Measured, 20-pod burst, last pod Running: 875ms at the defaults, 347ms at
+# these. See experiments/24-benchmark-harness/FINDINGS.md.
+FERRY_KUBE_API_QPS="${FERRY_KUBE_API_QPS:-500}"
+FERRY_KUBE_API_BURST="${FERRY_KUBE_API_BURST:-1000}"
 # Runtime state lives under /tmp deliberately. macOS caps unix socket paths at
 # ~104 bytes and the kubelet builds its podresources socket beneath --root-dir,
 # so a long home directory would break it.
@@ -283,6 +298,37 @@ FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
 # the login agent bring machines back for a cluster that had them.
 MACHINES_MARKER="$FERRY_HOME/machines-enabled"
 machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
+
+# How hard this cluster tries not to lose a write.
+#
+#   full      every etcd commit reaches the SSD before it is acknowledged
+#   relaxed   it reaches the OS, and the SSD when the OS gets to it
+#
+# The difference is one syscall and it is not small. Go's os.File.Sync() is
+# fcntl(F_FULLFSYNC) on darwin -- a flush of the drive's own write cache --
+# and plain fsync(2) on linux. etcd is Go and ferry runs it natively, so
+# ferry asks for the expensive one where kind, inside a Linux VM, gets the
+# cheap one for free. On this Mac: 0.031ms against 3.961ms, and every pod
+# status update is an etcd write.
+#
+# 'relaxed' gives that up deliberately. A cluster you recreate on demand
+# loses nothing it minds losing, and a 20-pod burst goes from 1.16s to
+# 0.39s. A cluster holding something you would have to rebuild by hand
+# should stay 'full', which is the default and what you get by saying
+# nothing.
+#
+# In FERRY_HOME so the choice outlives a restart, the same way machines does:
+# a cluster brought back by the login agent keeps the durability it was
+# created with rather than silently changing character.
+DURABILITY_MARKER="$FERRY_HOME/durability"
+ferry_durability() {
+  # The environment wins, for a one-off run that does not want to change the
+  # cluster's recorded setting.
+  if [ -n "${FERRY_DURABILITY:-}" ]; then echo "$FERRY_DURABILITY"; return; fi
+  local v; v="$(cat "$DURABILITY_MARKER" 2>/dev/null)"
+  case "$v" in relaxed|full) echo "$v" ;; *) echo full ;; esac
+}
+durability_is_relaxed() { [ "$(ferry_durability)" = relaxed ]; }
 # Where the node image lives in a checkout and in a release. 'ferry node-image'
 # writes it; release/build.sh ships it.
 NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
@@ -359,6 +405,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry up          start the cluster
+                    --durability relaxed to trade crash-safety for speed
   ferry down        stop the cluster (--purge to drop its data as well)
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
@@ -873,12 +920,31 @@ start_control_plane() { # version
     ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
     SERVICE_NODE_PORT_RANGE="$(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))" \
+    FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -20 "$FERRY_RUN/logs/control-plane.log" | sed 's/^/    /'; return 1; }
   ok "control plane $version advertising $gateway"
 }
 
 cmd_up() {
+  # --durability full|relaxed, remembered for this cluster. Parsed before
+  # anything starts, because it decides how etcd and the machine disks are
+  # opened and those happen early.
+  local want_durability=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --durability) want_durability="${2:-}"; shift 2 ;;
+      --durability=*) want_durability="${1#*=}"; shift ;;
+      --fast) want_durability=relaxed; shift ;;
+      *) shift ;;
+    esac
+  done
+  case "$want_durability" in
+    "") ;;
+    full|relaxed) : ;;
+    *) bad "--durability $want_durability: expected 'full' or 'relaxed'"; return 2 ;;
+  esac
+
   for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
   done
@@ -895,8 +961,17 @@ cmd_up() {
   # Which kind of node this Mac is, for the login agent to read after a reboot.
   # A server can be started again from FERRY_HOME alone; a worker cannot.
   echo server > "$FERRY_HOME/role"
+  [ -n "$want_durability" ] && printf '%s\n' "$want_durability" > "$DURABILITY_MARKER"
 
   bold "starting ferry"
+  # Said every time, not only when it changes: someone reading this scrollback
+  # to work out why a cluster lost data should not have to remember which day
+  # they passed the flag.
+  if durability_is_relaxed; then
+    warn "durability: relaxed -- writes are acknowledged before they reach the disk"
+    echo "      Fine for a cluster you recreate. A hard power loss can leave"
+    echo "      etcd needing a restore. 'ferry up --durability full' to change it."
+  fi
 
   start_gpud
 
@@ -971,7 +1046,7 @@ cmd_up() {
       --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
       >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-streamer.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_STREAMER_SOCK"
     [ -S "$FERRY_STREAMER_SOCK" ] && ok "streaming server on $FERRY_STREAM_ADDR" \
       || warn "streaming server did not start; kubectl exec will not work"
   else
@@ -987,6 +1062,8 @@ podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
+kubeAPIQPS: $FERRY_KUBE_API_QPS
+kubeAPIBurst: $FERRY_KUBE_API_BURST
 # The upstream hard-eviction defaults are sized for small cloud nodes; on a
 # laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
 # node taints itself NoSchedule.
@@ -1032,7 +1109,7 @@ EOF
       --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
       >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
     [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
       || warn "ferry-proxyd did not start; Services will not route"
   fi
@@ -1072,7 +1149,7 @@ start_netpol() {
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_NETPOL_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
   [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
     || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
 }
@@ -1098,7 +1175,7 @@ start_gpud() {
     --time-slice "$GPU_SLICE" \
     >"$FERRY_RUN/logs/ferry-gpud.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-gpud.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_GPUD_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_GPUD_SOCK"
   if [ -S "$FERRY_GPUD_SOCK" ]; then
     ok "GPU offered to pods: $(sed -n 's/.*device  *//p' "$FERRY_RUN/logs/ferry-gpud.log" | head -1)"
   else
@@ -1228,6 +1305,9 @@ start_machines() {
 
   mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
 
+  # The machine's disk barrier follows the cluster's durability, so mode 2
+  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
+  FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
   "$here/bin/ferry-node" serve \
     --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
     --ca "$FERRY_HOME/pki/ca.crt" \
@@ -1341,6 +1421,21 @@ start_provisioner() {
   #
   # Leader election off: it is one process on one Mac, and the lease it would
   # take is a cluster object ferry would then have to clean up.
+  # --health-probe-port is shifted with every other port this profile uses.
+  # Karpenter defaults it to 8081, which is not shifted, so a second ferry on
+  # the same Mac finds it taken and the process panics on startup --
+  # "bind: address already in use", reported as "ferry-karpenter did not
+  # start; machines must be declared by hand", 4.6s into `machines enable`.
+  # Found with a stray karpenter from an earlier run holding the port, which
+  # is the same shape as the default-profile etcd that docs/BENCHMARKING.md
+  # warns about.
+  #
+  # Nothing may come between these assignments and the command they prefix.
+  # A comment here does not interrupt the line continuation -- it swallows
+  # the rest of the line, so the assignments become an ordinary shell
+  # statement and the binary runs with none of them in its environment. That
+  # is exactly what happened when this comment was first written in the gap
+  # below, and it silently dropped karpenter's machine limits and node disk.
   KUBECONFIG="$FERRY_HOME/admin.conf" \
   FERRY_MACHINE_LIMIT_CPUS="$MACHINE_LIMIT_CPUS" \
   FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
@@ -1349,6 +1444,7 @@ start_provisioner() {
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
+    --health-probe-port "$(( 8081 + PORT_SHIFT ))" \
     >"$FERRY_RUN/logs/ferry-karpenter.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-karpenter.pid"
   sleep 2
@@ -1678,7 +1774,7 @@ cmd_node_add() {
     --peers-file "$PEERS_FILE" \
     >"$FERRY_RUN/logs/node-$index-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index-streamer.pid"
-  for _ in $(seq 1 30); do [ -S "$streamer_sock" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$streamer_sock"
 
   # The kubelet's config differs from node 0's only in where things live and
   # which ports it holds; everything that makes a kubelet work on darwin is the
@@ -2125,6 +2221,8 @@ podLogsDir: $FERRY_RUN/podlogs
 containerRuntimeEndpoint: unix://$FERRY_SOCK
 imageServiceEndpoint: unix://$FERRY_SOCK
 volumePluginDir: $FERRY_RUN/volume-plugins
+kubeAPIQPS: $FERRY_KUBE_API_QPS
+kubeAPIBurst: $FERRY_KUBE_API_BURST
 evictionHard:
   memory.available: "$EVICT_MEMORY"
   nodefs.available: "$EVICT_DISK"
@@ -2168,7 +2266,7 @@ EOF
     --peers-file "$PEERS_FILE" --gpud-socket "$FERRY_GPUD_SOCK" \
     >"$FERRY_RUN/logs/ferry-streamer.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-streamer.pid"
-  for _ in $(seq 1 30); do [ -S "$FERRY_STREAMER_SOCK" ] && break; sleep 0.5; done
+  ferry_await 15 test -S "$FERRY_STREAMER_SOCK"
   ok "advertising this node's switch at $LAN_IP:$RELAY_PORT"
 
   # The node object exists now, so its GPU capacity can go on it.
@@ -2185,7 +2283,7 @@ EOF
       --node-name "$name" --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
       >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    for _ in $(seq 1 30); do [ -S "$FERRY_PROXYD_SOCK" ] && break; sleep 0.5; done
+    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
     [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
       || warn "ferry-proxyd did not start; Services will not route on this node"
   else
@@ -2384,7 +2482,7 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
     --kubeconfig="$kubeconfig" \
     --node-labels="ferry.dev/mode=vm-per-pod${index:+,ferry.dev/node-index=$index}" \
     --hostname-override="$name" --root-dir="$run/kubelet" \
-    --cert-dir="$run/pki" --v=2 >"$logfile" 2>&1 &
+    --cert-dir="$run/pki" --v="${FERRY_KUBELET_V:-2}" >"$logfile" 2>&1 &
   echo $! > "$pidfile"
   echo "$name" > "$run/node-name"
 }
@@ -3123,6 +3221,63 @@ cmd_profile() {
   echo "  Set FERRY_PROFILE to override."
 }
 
+# Wait for a pid to go, polling finely.
+#
+# Every teardown loop here used `sleep 0.5`, so a process that exits in 15ms
+# still cost half a second to notice, and seven of them made a teardown that
+# was mostly rounding. 50ms keeps the same overall patience -- the timeout is
+# still ten seconds -- and stops charging for it.
+# Wait until a command succeeds, polling finely.
+#
+#   ferry_await [timeout_s] command...
+#
+# The startup half of ferry_await_gone. Every socket this script waits for
+# during `ferry up` appears in tens of milliseconds and was polled for at
+# half-second ticks, so five of them turned about 150ms of real waiting into
+# roughly 2.6 seconds of startup. The timeout is optional and leads.
+ferry_await() {
+  local limit=15
+  case "${1:-}" in ''|*[!0-9]*) ;; *) limit="$1"; shift ;; esac
+  local i=0 ticks; ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Wait until a command stops succeeding, polling finely. The sibling of
+# ferry_await_exit for the teardown conditions that are not a pid -- a helper
+# that reports whether something is running, or a status file that a server
+# removes when its machine has gone.
+#
+#   ferry_await_gone [timeout_s] command...
+#
+# The timeout is optional and leads; anything else is the command.
+ferry_await_gone() {
+  local limit=10
+  case "${1:-}" in ''|*[!0-9]*) ;; *) limit="$1"; shift ;; esac
+  local i=0 ticks; ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    "$@" >/dev/null 2>&1 || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
+ferry_await_exit() { # pid [timeout_s]
+  local pid="$1" limit="${2:-10}" i=0 ticks
+  ticks=$(( limit * 20 ))
+  while [ "$i" -lt "$ticks" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 cmd_down() {
   local purge=""
   case "${1:-}" in
@@ -3136,10 +3291,27 @@ cmd_down() {
   mark_stopped
   # ferry-proxy runs as root, so stopping it does too.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
-    sudo kill -TERM "$(cat "$FERRY_RUN/ferry-proxy.pid")" 2>/dev/null \
+    local proxy_pid; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
+    sudo kill -TERM "$proxy_pid" 2>/dev/null \
       && ok "Service proxy stopped"
     rm -f "$FERRY_RUN/ferry-proxy.pid"
-    sleep 1
+    # Waited for rather than slept through, but briefly and then forced.
+    #
+    # This was `sleep 1`. Replacing it with an ordinary wait made teardown
+    # four times *worse*: ferry-proxy does not exit on SIGTERM at all -- the
+    # `sudo pkill` further down is what has always actually ended it -- so the
+    # wait sat out its full timeout every time. The point of the pause is that
+    # the listener has released its ports before the next `ferry up`, which a
+    # kill achieves and patience does not.
+    # A tenth of a second of courtesy, then the kill that was always going to
+    # happen -- ferry-proxy has never once exited on SIGTERM, so this is a
+    # gesture towards a version that might. It was a quarter second and that
+    # was 42% of what a teardown had left.
+    # No courtesy on --purge: nothing it could flush is being kept.
+    [ -n "$purge" ] || for _ in 1 2; do
+      kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05
+    done
+    sudo kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
   local index
@@ -3150,8 +3322,7 @@ cmd_down() {
       [ -f "$pidfile" ] || continue
       local pid; pid="$(cat "$pidfile")"; rm -f "$pidfile"
       kill -TERM "$pid" 2>/dev/null || continue
-      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-      kill -KILL "$pid" 2>/dev/null
+      ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     done
     rm -f "/tmp/ferry-cri$SUFFIX-$index.sock" "/tmp/ferry-exec$SUFFIX-$index.sock" \
           "/tmp/ferry-str$SUFFIX-$index.sock"
@@ -3162,17 +3333,40 @@ cmd_down() {
   # the control plane it reports to does.
   stop_machines
 
+  # Signalled in order, then waited for together.
+  #
+  # The order the signals go out in matters -- the kubelet should hear about it
+  # before the runtime it is talking to -- but the waits do not have to be
+  # serial, and they were. Seven components at about 70ms each is half a
+  # second of watching processes that had already been told to go, and it was
+  # the largest thing left between ferry's teardown and kind's `docker rm -f`.
+  #
+  # ferry-cri must still finish releasing its vmnet network before another run
+  # can claim the same subnet, so it is waited for -- just not on its own.
+  local stopping=() stopnames=() component pidfile pid
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
-    local pidfile="$FERRY_RUN/$component.pid"
+    pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
-    local pid; pid="$(cat "$pidfile")"
+    pid="$(cat "$pidfile")"
     rm -f "$pidfile"
     kill -TERM "$pid" 2>/dev/null || continue
-    # ferry-cri must finish releasing its vmnet network before another run can
-    # claim the same subnet.
-    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -KILL "$pid" 2>/dev/null
-    ok "$component stopped"
+    stopping+=("$pid"); stopnames+=("$component")
+  done
+  # On --purge the control plane is killed outright and its data directory
+  # removed, and nothing between here and there needs an API server. So it
+  # goes down alongside the components rather than after them, which takes its
+  # ~100ms off the total instead of adding it.
+  local cp_job=""
+  if [ -n "$purge" ]; then
+    STATE="$FERRY_HOME" "$here/control-plane/down.sh" --purge >/dev/null 2>&1 &
+    cp_job=$!
+  fi
+
+  local i=0
+  while [ "$i" -lt "${#stopping[@]}" ]; do
+    ferry_await_exit "${stopping[$i]}" || kill -KILL "${stopping[$i]}" 2>/dev/null
+    ok "${stopnames[$i]} stopped"
+    i=$((i + 1))
   done
   # A listener that outlives its pid file holds the node port against the next
   # run, and the symptom -- "address already in use" buried in a log -- is a poor
@@ -3182,10 +3376,26 @@ cmd_down() {
 
   # After the streamer, which would otherwise put it straight back, and before
   # the control plane, which has to be up to accept the patch.
-  withdraw_gpu
+  #
+  # Not on --purge: the node object goes with etcd a moment later, so the
+  # patch is a write to something being deleted -- and the API server may
+  # already be on its way down, above.
+  [ -n "$purge" ] || withdraw_gpu
 
-  STATE="$FERRY_HOME" "$here/control-plane/down.sh" ${purge:+--purge} >/dev/null 2>&1 \
-    && ok "control plane stopped"
+  # --purge reaches down.sh, which then stops the API server and etcd without
+  # a graceful drain: their data directory is deleted a few milliseconds
+  # later, so draining it is two to five seconds spent flushing state that is
+  # about to be removed. See control-plane/down.sh.
+  #
+  # On --purge that was started above and has been running while the
+  # components were reaped; here it is only collected.
+  if [ -n "$cp_job" ]; then
+    wait "$cp_job" 2>/dev/null
+    ok "control plane stopped"
+  else
+    STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1 \
+      && ok "control plane stopped"
+  fi
   # --purge drops etcd's data, which is the cluster. The recorded version goes
   # with it: what is left is not a cluster at an older version, it is no
   # cluster, and the next 'ferry up' should start at whatever is built rather
@@ -3336,21 +3546,18 @@ stop_machines() {
     # them again.
     if running ferry-karpenter; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-karpenter.pid")" 2>/dev/null
-      for _ in $(seq 1 20); do running ferry-karpenter || break; sleep 0.5; done
+      ferry_await_gone running ferry-karpenter
       rm -f "$FERRY_RUN/ferry-karpenter.pid"
     fi
     if running ferry-machined; then
       kill -TERM "$(cat "$FERRY_RUN/ferry-machined.pid")" 2>/dev/null
-      for _ in $(seq 1 20); do running ferry-machined || break; sleep 0.5; done
+      ferry_await_gone running ferry-machined
     fi
     if ls "$FERRY_RUN/machines"/*.json >/dev/null 2>&1; then
       rm -f "$FERRY_RUN/machines"/*.json
       # Long enough for a guest to shut down and vmnet to be given back; a
       # machine that has not gone by then is stopped with its server anyway.
-      for _ in $(seq 1 60); do
-        ls "$FERRY_RUN/machines"/*.status.json >/dev/null 2>&1 || break
-        sleep 0.5
-      done
+      ferry_await_gone 30 ls "$FERRY_RUN/machines"/*.status.json
       ok "machines stopped"
     fi
   fi
@@ -3362,8 +3569,7 @@ stop_machines() {
     kill -TERM "$pid" 2>/dev/null || continue
     # ferry-node has to release its vmnet network before another run can claim
     # the same subnet, exactly as ferry-cri does.
-    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -KILL "$pid" 2>/dev/null
+    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     ok "$component stopped"
   done
 }
@@ -3836,6 +4042,11 @@ cmd_status() {
     warn "kubernetes $cluster (this checkout is built at $active)"
   else
     echo "  kubernetes ${cluster:-${active:-not built}}"
+  fi
+  if durability_is_relaxed; then
+    echo "  durability relaxed -- writes acknowledged before they reach the disk"
+  else
+    echo "  durability full -- every etcd commit reaches the disk first"
   fi
   for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"

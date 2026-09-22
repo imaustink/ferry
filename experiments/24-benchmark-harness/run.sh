@@ -16,6 +16,23 @@ POD_IMAGE="${POD_IMAGE:-alpine:3.20}"
 LAT_REPS="${LAT_REPS:-5}"
 SCALES="${SCALES:-10 20}"
 QUIESCE="${QUIESCE:-45}"
+CPU_WINDOW="${CPU_WINDOW:-60}"
+# Unset means "wherever the scheduler likes", which for ferry2 is both modes at
+# once. node_selector_of pins the stacks that need it; see stacks.sh.
+#
+# The trailing newline is part of the value, because the template below splices
+# it in ahead of `containers:` on the next line -- which is how altbench.sh and
+# pleg.sh spell it, as $'...\n'. Command substitution strips trailing newlines,
+# so taking it from node_selector_of dropped it and produced
+#
+#   nodeSelector: {ferry.dev/mode: shared}      containers:
+#
+# on one line. Every ferry2 battery run since the selector was added died at
+# the first apply with a YAML parse error twelve lines from the cause.
+if [ -z "${NODE_SELECTOR+set}" ]; then
+  NODE_SELECTOR="$(node_selector_of "$STACK")"
+  [ -n "$NODE_SELECTOR" ] && NODE_SELECTOR="$NODE_SELECTOR"$'\n'
+fi
 
 kc=""; ctx=""
 say() { printf '\n== %s: %s\n' "$STACK" "$*"; }
@@ -39,6 +56,22 @@ measure_mem() { # label
   case "$STACK" in ferry|ferry2) ;; *) r "${label}.guest_used_mib" "$(docker_guest_used_mib)" ;; esac
   r "${label}.vm_count"        "$(echo $vms | wc -w | tr -d ' ')"
   r "${label}.cpu_pct"         "$(cpu_of $vms $hosts)"
+}
+
+# Average CPU over a window we chose, rather than one the kernel chose.
+#
+# Reported as percent of one core, so 100 means one core saturated and this
+# machine has sixteen. Taken over CPU_WINDOW seconds with the cluster left
+# alone, which is what "overhead at rest" has to mean.
+measure_cpu() { # label seconds
+  local label="$1" secs="${2:-$CPU_WINDOW}" vms hosts a b t0 t1
+  vms=$(stack_vm_pids "$STACK" | tr '\n' ' ')
+  hosts=$(stack_host_pids "$STACK" | tr '\n' ' ')
+  a=$(cpu_seconds_of $vms $hosts); t0=$(now_ms)
+  sleep "$secs"
+  b=$(cpu_seconds_of $vms $hosts); t1=$(now_ms)
+  r "${label}.cpu_core_pct" \
+    "$(python3 -c "print(f'{max(0.0,($b-$a))*100000/max(1,$t1-$t0):.1f}')")"
 }
 
 # Wall time from `kubectl apply` to every replica Running, polled tightly.
@@ -86,6 +119,8 @@ YAML
 pin_docker_vm
 say "docker VM is pid $(docker_vm_pid)"
 measure_mem baseline
+say "baseline CPU over ${CPU_WINDOW}s (nothing of this stack is running yet)"
+measure_cpu baseline
 
 say "first create (includes pulling the stack's own artifacts)"
 t0=$(now_ms); stack_up "$STACK"
@@ -100,6 +135,9 @@ k "$kc" "$ctx" version -o json 2>/dev/null | python3 -c \
 say "settling ${QUIESCE}s, then idle cost"
 quiesce "$QUIESCE"
 measure_mem idle
+say "idle CPU over ${CPU_WINDOW}s"
+measure_cpu idle
+r disk_mib "$(stack_disk_mib "$STACK")"
 r idle_nodes "$(k "$kc" "$ctx" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 r idle_syspods "$(k "$kc" "$ctx" get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 

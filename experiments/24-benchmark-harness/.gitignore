@@ -1,0 +1,20 @@
+# What a run leaves behind. results/raw.tsv is the exception -- it is the
+# battery's accumulated output and is checked in, so it is unignored below.
+# results/* rather than results/, because the tool does not descend into an
+# excluded directory, so a negation for a file inside one never takes effect
+# and adding results/raw.tsv is refused.
+results/*
+!results/raw.tsv
+kubeconfigs/
+# Per-run scratch: the subnet counter that survives create/delete cycles, the
+# kind config written only when KUBELET_V asks for one, and the pinned pid of
+# Docker Desktop's VM.
+.machine-subnet-seq
+.kind-config.yaml
+.docker-vm-pid
+# Previous raw.tsv files, kept when a run replaces them. Useful locally for
+# comparing against an earlier machine or an earlier ferry; not history the
+# repository needs to carry.
+results-archive/
+# The Deployment manifests run.sh renders per replica count.
+.dep-*.yaml

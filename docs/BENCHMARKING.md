@@ -87,6 +87,13 @@ measurement of the right thing. It is a measurement of the wrong thing.** That
 swing is what exposed the basis error; without two runs to compare it would have
 shipped.
 
+> **Later correction.** Page cache may not be the cause. The battery was also
+> scheduling half of ferry2's pods onto the Mac node as mode-1 VMs -- see
+> "With mode 2 on, an unpinned pod is not a mode-2 pod" below -- and a varying
+> mode-1 share explains a varying per-pod figure at least as well. The
+> conclusion to draw from the swing is unchanged: the number was measuring
+> something other than what it claimed.
+
 ### `ps %cpu` is not a CPU measurement
 
 It is a decaying average over the process's *lifetime*. For a process that has
@@ -231,6 +238,149 @@ Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s
 sandbox creation 0.063 vs 0.065s, container start 0.034 vs 0.045s. The remaining
 gap is not in any of them.
 
+### Time the readiness bar, not the prompt coming back
+
+`kind create cluster` returns in 7.7s. The cluster is not usable for another
+18.9s -- kind hands the prompt back and finishes behind you. `ferry up`
+returns in 12.7s and is done 0.3s later, because it waits for CoreDNS before
+it says it is up.
+
+Timing "when the command returned" makes kind 1.6x faster at cluster
+creation. Timing "every node Ready and every kube-system pod Running" makes
+it 2x slower. Both numbers are real and only the second one is a comparison,
+because it is the only one that means the same thing for both tools -- and
+which one a stack reports is a UX choice its authors made, not a property of
+how fast it is.
+
+So define the bar first and apply it to everything, including the stack whose
+own command already blocks. run.sh does this by timing `stack_up` *plus*
+`wait_ready`, which is why its kind figure is 25s against the 8s a person
+sees at their prompt. Expect to have to explain that to anyone who has run
+kind themselves.
+
+The same trap sits behind any "ready" that a tool defines for itself: a node
+that is `Ready` before its CNI is configured, a Deployment that is
+`Available` at zero replicas, a `ferry up` that returned before CoreDNS.
+Decide what working means, measure that.
+
+### A very regular number is a rate limiter, and small ones are not logged
+
+The last thing standing between ferry and kind on a 20-pod burst was the pod
+statuses landing 39.6ms apart -- min 2.7ms, max 41.7ms. That regularity is
+the finding. Real work is variable; a token bucket is not.
+
+It was `kubeAPIQPS`, which defaults to 50: one token per 20ms, two spent per
+pod, so 40ms a pod with every container already running. Three things made it
+hard to see, and all three generalise:
+
+- **client-go only logs a throttle wait over 50ms.** At 20ms a token nothing
+  appears in the log at any verbosity, so "grep for throttling, found none"
+  is not evidence that there is none.
+- **`rest_client_rate_limiter_duration_seconds` is cumulative across every
+  goroutine**, so both stacks showed seconds of it and the comparison said
+  nothing. It does not tell you whether the wait was on the critical path.
+- **Per-operation latency was identical on both stacks.** A sequential PATCH
+  is 2.07ms from inside ferry's node and 2.02ms from inside kind's. Measuring
+  the operation harder would never have found this; what found it was
+  measuring the *gap between* operations.
+
+So when a sequence is slower than the sum of its parts, stop timing the parts
+and time the spacing.
+
+### The port you curl may belong to someone else's cluster
+
+`curl 127.0.0.1:2379/metrics` returned etcd metrics, and they were not this
+cluster's. ferry shifts every port by the profile's index, so the profile
+under test had its etcd on 11379; 2379 was a different ferry entirely, left
+running by another worktree. The numbers looked entirely reasonable -- 5.13ms
+per WAL fsync, against the 4.85ms the right process turned out to be -- and
+the conclusion drawn from them happened to survive being re-measured, which
+is luck and not method.
+
+A localhost port is not an identifier. Find the process, confirm its
+`--data-dir` is the state directory under test, and read the port off that:
+
+```sh
+ps -Ao pid=,command= | grep "[b]in/versions/.*/etcd --data-dir=$FERRY_HOME"
+lsof -nP -iTCP -sTCP:LISTEN -a -p <pid>
+```
+
+The same applies to anything else this harness reaches by a fixed port on
+127.0.0.1. On a machine that runs more than one ferry -- which is every
+machine with more than one worktree -- the default port is the one *least*
+likely to be the cluster you mean.
+
+### Docker Desktop's VM has a cheaper fsync than macOS does
+
+Worth knowing before attributing anything to the runtime. ferry's etcd runs
+natively and averages 4.85ms per WAL fsync and 11.12ms per backend commit.
+kind's runs inside Docker Desktop's VM and averages 0.88ms and 1.78ms, on
+the same Mac and the same physical disk.
+
+kind's etcd is not better tuned, and the reason is more specific than
+"Docker relaxed it" -- which is what this section said first, on a
+measurement that did not support it. Plain `fsync(2)` is 0.031 ms natively on
+macOS and 0.042 ms inside Docker's VM: no difference worth having.
+
+The difference is which call gets made. macOS has two, and Go picks between
+them by GOOS:
+
+| same Mac, same SSD | |
+|:--|--:|
+| `fsync(2)` natively | 0.031 ms |
+| `fcntl(F_FULLFSYNC)` natively | **3.961 ms** |
+| `fsync(2)` in Docker's VM | 0.042 ms |
+
+`os.File.Sync()` is `F_FULLFSYNC` on darwin and `fsync(2)` on linux. etcd is
+Go. So the same source line flushes the drive's write cache when etcd runs
+natively and does not when it runs on Linux in a VM -- 128x, decided at
+compile time and invisible in the code.
+
+The lesson generalises past fsync: when the same program is fast on one
+platform and slow on another, check whether its runtime is quietly calling
+something different, before concluding anything about the platform. The
+measurement that finds this is the *syscall*, not the program -- timing etcd
+would only ever have told you etcd was slower.
+
+The corollary, which cost an afternoon to notice: an `F_FULLFSYNC` flushes
+the device cache, so it stalls whatever else is queued on that volume.
+`CreateContainer` runs inside the guest and got 4x faster when *etcd on the
+host* stopped fsyncing, with nothing in the guest changed. Processes that
+share a disk are not independent, and a profile taken of one of them will
+not show the other one causing its stalls.
+
+### A tie is not the same as nothing to win
+
+Both bullets above are still true and the second conclusion drawn from the
+first was wrong. "The mount is 3ms, the rest is the kubelet's own 100ms
+populator and reconciler periods, which both stacks pay identically" is a
+correct measurement, and it got filed as a phase ferry does not lose in, so
+not worth returning to. Which is right if the question is *why is ferry
+slower than kind*, and wrong if the question is *how does ferry get faster*.
+
+It was ~290ms of sleeping on the critical path of every pod start, doing
+nothing, on both stacks. Three unexported constants in
+`pkg/kubelet/volumemanager/volume_manager.go` that no flag and no
+KubeletConfiguration field reaches. kind runs the stock binary and cannot
+turn them down; ferry compiles its own and can. Doing it took mode 2's
+single-pod start from 501ms to 229ms against kind's 500ms, and mode 1's from
+710ms to 406ms.
+
+So when a phase comes out a tie, it is worth asking a second question before
+moving on: *is this a floor, and can we alone move it?* A cost both stacks
+pay identically is invisible to any A/B between them, which makes a
+comparative harness exactly the wrong instrument for finding it. The thing
+that found it was the absolute breakdown -- 301ms of wait against 10ms of
+work, with the ratio printed rather than left to be noticed.
+
+The corollary is the trap: this only pays where ferry controls the binary. It
+reached mode 1 immediately and mode 2 only after `build-kubelet-linux.sh`,
+because mode 2's guest kubelet was upstream's download. Before claiming a
+patch like this, check which of ferry's own configurations actually run the
+thing that was patched -- and keep an unpatched one in the run as a control.
+Mode 2 sitting at 497ms while mode 1 moved 710 to 431 is the only reason the
+279ms is attributable to the patch rather than to the afternoon.
+
 ### A burst's wall time is the last pod, not the typical one
 
 Twenty pods reaching Running in 2.72s says nothing about whether they went
@@ -238,6 +388,69 @@ together or in a staircase. `burstshape.py` reports the spread inside the burst
 and `spread.sh` answers the serialized-versus-parallel question directly. A
 change that improves the median pod and not the last one does not move the
 number you are reporting.
+
+### With mode 2 on, an unpinned pod is not a mode-2 pod
+
+The worst measurement error found so far, and it was in this harness for three
+runs.
+
+`ferry machines enable` gives the cluster **two nodes of different
+architectures** -- the Mac node, where a pod is a VM with its own kernel, and
+the machine node, where a pod is a container sharing one. A Deployment with no
+`nodeSelector` is scheduled across both. Measured, with ten replicas and the
+battery's own manifest:
+
+```
+  5 ferry-mac-...    vm-per-pod
+  5 perf-0           shared
+```
+
+An even split. So every ferry2 row the battery produced was **half mode 1 and
+half mode 2**, and the ratio moved from run to run with whatever the scheduler
+scored. That single bug produced:
+
+- *"mode 2 starts a pod in 0.82s against kind's 0.62s."* Watched rather than
+  polled, and pinned, it is **541ms against kind's 544ms** -- a tie. (A tie
+  only until the volume manager's poll intervals came down; it is now 229ms
+  against 500ms. See "A tie is not the same as nothing to win" above.)
+- *"mode 2's ten-pod time (3.63s) is slower than its twenty-pod time (2.72s),
+  which should not happen."* It does not happen. That was the mixture changing
+  between the two cells.
+- Very likely the **19× per-pod memory swing** attributed above to guest page
+  cache. Ten mode-1 pod VMs at ~220 MiB is 2,200 MiB, against an observed
+  2,814 MiB at twenty pods, where a pure mode-2 burst costs ~8 MiB a pod. The
+  page-cache explanation is not needed to account for it and the arithmetic
+  fits the mixture better. Not yet confirmed by a dedicated run -- treat the
+  cause as open, but do not trust the old number either way.
+
+`stacks.sh:node_selector_of` now pins ferry2. `whereland.sh` is the check:
+apply the battery's own manifest unpinned and print where the pods went.
+
+> **The general form:** if a stack can put the work in more than one place,
+> pin it, and have the harness *report* where it landed. `burst.py` prints the
+> node histogram with every result for exactly this reason. A latency number
+> with no statement of where it ran is not a measurement of an architecture.
+
+### Watch, do not poll, when the thing you are timing is sub-second
+
+The battery polls `kubectl get pods` until the count is right, so its
+resolution is one iteration of that command -- **40.7ms against ferry and
+48.5ms against kind** (`pollcost.sh`). On a 0.5s event that is 10% of the
+answer, and it is not the same 10% for both stacks.
+
+Polling was not what produced the wrong headline here -- ferry is the *faster*
+of the two to poll, so the bias ran the other way -- but it is why the
+battery's absolute numbers sit ~200ms above the watched ones. `timeline.py`
+and `burst.py` watch the API instead, through `kubectl proxy`.
+
+Two traps in doing that:
+
+- `kubectl get pod <name> -w` on a pod that **does not exist yet exits
+  immediately**, and the watch has to be established before the apply. Watch
+  the namespace and filter by name.
+- `kubectl get -w -o json` **block-buffers into a pipe**; events arrive long
+  after they happened, or never. Going through `kubectl proxy` and reading
+  newline-delimited JSON avoids it and handles both stacks' auth identically.
 
 ## vmnet, which will waste an afternoon
 
@@ -266,6 +479,12 @@ Recorded so nobody re-runs them hopefully.
 | The gap is CPU | No. Mid-burst the guest used 48% of *one* core out of ten |
 | The gap is the CNI path | No. `hostNetwork` pods, which skip CNI entirely, do not close it |
 | The gap is volume setup | No. 0.307s vs kind's 0.306s |
+| The gap is API round-trip latency across the host/guest boundary | No. 1.15ms from inside ferry's node against kind's 0.84ms, and a pod start makes nothing like the 645 round trips that would need. `rtt.sh` |
+| The gap is the control plane or the scheduler | No. All 20 pods of a burst are created by 142ms and scheduled by 152ms. `burst.py` |
+| The gap is the durability barrier, still | No. fsync costs 0.085ms inside ferry's node against kind's 0.098ms -- the `.fsync` change fixed it thoroughly. `fsynccost.sh` |
+| The gap is containerd serializing | No. 20 containers in 165ms with a 6x speedup from concurrency, kubelet not involved. `ctrconc.sh` |
+| The gap is kubelet configuration | No. Neither sets kubeAPIQPS/Burst, and ferry uses cgroupfs where kind uses the slower systemd driver. `knobs.sh` |
+| The battery's poll loop is biased against ferry | No. It costs 40.7ms an iteration against ferry and 48.5ms against kind. `pollcost.sh` |
 
 ## Two real causes, for reference
 

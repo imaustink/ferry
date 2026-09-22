@@ -42,9 +42,23 @@ get() { # url dest
 # from this one by its name. Without this the node is built with the kubelet of
 # whichever version happened to be staged first, while everything that reports
 # the node's version -- `ferry node-image` included -- says this one.
+# The marker goes with it: a ferry-built kubelet for another version is just
+# as stale as the binary, and leaving the marker behind would claim the
+# download that replaces it was ferry's.
 [ "$(cat "$STAGE/kubelet.version" 2>/dev/null)" = "$KUBERNETES_VERSION" ] \
-  || rm -f "$STAGE/kubelet"
-get "https://dl.k8s.io/release/$KUBERNETES_VERSION/bin/linux/arm64/kubelet" "$STAGE/kubelet"
+  || rm -f "$STAGE/kubelet" "$STAGE/kubelet.ferry-built"
+# ../../build-kubelet-linux.sh writes a kubelet here itself, with the volume
+# manager's poll intervals shortened, and leaves this marker beside it. Both
+# binaries are the same version and the same size to the eye, so without the
+# marker the only way to tell which one the node image baked is to run it and
+# time a pod -- and a stale one left behind by an experiment would be read as
+# a regression in something else entirely.
+if [ -f "$STAGE/kubelet.ferry-built" ] && [ -f "$STAGE/kubelet" ]; then
+  echo "==> kubelet: ferry-built ($(cat "$STAGE/kubelet.version" 2>/dev/null))"
+  echo "    rm $STAGE/kubelet{,.ferry-built} for upstream's"
+else
+  get "https://dl.k8s.io/release/$KUBERNETES_VERSION/bin/linux/arm64/kubelet" "$STAGE/kubelet"
+fi
 chmod +x "$STAGE/kubelet"
 printf '%s\n' "$KUBERNETES_VERSION" > "$STAGE/kubelet.version"
 

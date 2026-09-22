@@ -94,17 +94,49 @@ start() { # name cmd...
 
 echo "==> starting control plane (advertise=$ADVERTISE)"
 
+# etcd's durability barrier, which on macOS is not the same bargain it is on
+# Linux.
+#
+# Measured on a 20-pod burst: ferry's etcd averages 5.13ms per WAL fsync and
+# 10.26ms per backend commit, against kind's 0.88ms and 1.78ms. kind's etcd is
+# not better tuned -- it is inside Docker Desktop's VM, where the guest's
+# fsync reaches a virtual disk whose host-side durability Docker has already
+# relaxed. ferry's runs natively and pays a real APFS barrier for every write.
+#
+# Every pod status update is an etcd write, and the kubelet's status manager
+# issues them from one goroutine, so those milliseconds are serial and land on
+# the critical path of a burst: phase=Running to status stored is 188ms median
+# on ferry against kind's 8ms.
+#
+# Off by default. This is the cluster's data, and a Mac that loses power
+# mid-write can leave it needing a restore -- not something to impose on
+# anyone who has not asked. FERRY_ETCD_NO_FSYNC=1 opts in, and for a cluster
+# that is recreated on demand it is close to free.
+# Spelled ${a[@]+"${a[@]}"} below: under `set -u` bash 3.2, which is the bash
+# macOS ships, expanding an empty array as "${a[@]}" is an unbound variable
+# and the control plane would not start at all when the flag is off.
+etcd_fsync_args=()
+if [ -n "${FERRY_ETCD_NO_FSYNC:-}" ]; then
+  etcd_fsync_args+=(--unsafe-no-fsync)
+  echo "    ! etcd --unsafe-no-fsync (FERRY_ETCD_NO_FSYNC)"
+fi
+
 start etcd "$bin/etcd" \
   --data-dir="$STATE/etcd" \
+  ${etcd_fsync_args[@]+"${etcd_fsync_args[@]}"} \
   --listen-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --advertise-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --listen-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
   --initial-advertise-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
   --initial-cluster=default=http://127.0.0.1:$ETCD_PEER_PORT
 
-for i in $(seq 1 30); do
+# 0.1s, not 1s, and the same thirty seconds of patience. etcd answers in about
+# a fifth of a second; at one-second granularity that cost a whole one, and
+# the same was true of both API server checks below. Three rounded-up waits
+# were most of the 4.6s this script contributed to `ferry up`.
+for i in $(seq 1 300); do
   "$bin/etcdctl" --endpoints=127.0.0.1:$ETCD_CLIENT_PORT endpoint health >/dev/null 2>&1 && break
-  sleep 1
+  sleep 0.1
 done
 
 start kube-apiserver "$bin/kube-apiserver" \
@@ -140,10 +172,10 @@ start kube-apiserver "$bin/kube-apiserver" \
   --service-node-port-range="${SERVICE_NODE_PORT_RANGE:-30000-32767}"
 
 echo "    . waiting for /livez"
-for i in $(seq 1 60); do
+for i in $(seq 1 600); do
   curl -sk --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
     https://127.0.0.1:$API_PORT/livez 2>/dev/null | grep -q ok && break
-  sleep 1
+  sleep 0.1
 done
 
 start kube-controller-manager "$bin/kube-controller-manager" \
@@ -173,9 +205,9 @@ export KUBECONFIG="$STATE/admin.conf"
 # bootstrap hooks run after that, and applying manifests before they finish
 # fails, so wait on /healthz which covers them.
 echo "    . waiting for /healthz"
-for i in $(seq 1 60); do
+for i in $(seq 1 600); do
   [ "$(kubectl get --raw /healthz 2>/dev/null)" = "ok" ] && break
-  sleep 1
+  sleep 0.1
 done
 
 # The Node authorizer covers a kubelet's access to objects tied to its own

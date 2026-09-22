@@ -222,6 +222,32 @@ func machineConfiguration(
     if !taints.isEmpty {
         arguments.append("ferry.taints=\(taints.joined(separator: ","))")
     }
+    // The kubelet's klog level, as an environment variable rather than a flag
+    // because every caller that boots a machine would otherwise have to thread
+    // it through, and nothing but an investigation ever wants it. `ferry up`
+    // execs this process, so `FERRY_KUBELET_V=4 ferry up` reaches the guest.
+    //
+    // At --v=4 the kubelet logs its own per-pod phase boundaries, which is the
+    // direct answer to which phase stretches under concurrency; it was
+    // hardcoded to 2 in the guest, so asking the question used to mean
+    // rebuilding the node image. Only appended when set, so an unset variable
+    // leaves the command line exactly as it was.
+    if let level = ProcessInfo.processInfo.environment["FERRY_KUBELET_V"],
+       !level.isEmpty, Int(level) != nil {
+        arguments.append("ferry.kubeletv=\(level)")
+    }
+    // How fast the kubelet may talk to the API server. Upstream's 50 QPS
+    // paces a 20-pod burst at 40ms a pod and leaves the statuses trailing the
+    // containers by half a second; see ferry.apiqps in init.sh. Same shape as
+    // the level above -- an environment variable, only appended when set, so
+    // an unset one leaves the guest on upstream's defaults.
+    for (env, param) in [("FERRY_KUBE_API_QPS", "ferry.apiqps"),
+                         ("FERRY_KUBE_API_BURST", "ferry.apiburst")] {
+        if let v = ProcessInfo.processInfo.environment[env],
+           !v.isEmpty, Int(v) != nil {
+            arguments.append("\(param)=\(v)")
+        }
+    }
     boot.commandLine = arguments.joined(separator: " ")
     config.bootLoader = boot
 
@@ -233,9 +259,27 @@ func machineConfiguration(
     // waits out a barrier. Profiling a burst showed ten goroutines parked on
     // core/metadata's mutex with another inside a syscall, while the guest used
     // 48% of one core out of ten.
+    //
+    // .fsync still makes every guest fsync a host fsync. Measured with the
+    // kubelet's --v=4 log, CreateContainer in a 20-pod burst costs 265ms on a
+    // ferry node against 35ms on kind -- and CreateContainer is snapshot
+    // creation plus a bbolt transaction, which is to say fsync. So the mode is
+    // a knob rather than a constant, and FERRY_NODE_DISK_SYNC=none prices what
+    // is left of the barrier.
+    //
+    // Not the default. .none means the guest's fsync returns before the data
+    // is on the Mac's disk, so a host crash or power loss can leave the node
+    // filesystem torn -- survivable for a node that is a disposable clone,
+    // not something to impose on anyone who has not asked for it.
+    let sync: VZDiskImageSynchronizationMode
+    switch ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"] {
+    case "none": sync = .none
+    case "full": sync = .full
+    default:     sync = .fsync
+    }
     let rootAttachment = try VZDiskImageStorageDeviceAttachment(
         url: URL(filePath: disk), readOnly: false,
-        cachingMode: .automatic, synchronizationMode: .fsync)
+        cachingMode: .automatic, synchronizationMode: sync)
     config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)]
     if ProcessInfo.processInfo.environment["FERRY_NODE_NO_CONFIG"] == nil {
         let configAttachment = try VZDiskImageStorageDeviceAttachment(
