@@ -284,6 +284,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_DURABILITY` | `full` | `relaxed` to acknowledge writes before they reach the disk. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered |
 | `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `relaxed`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
 | `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `relaxed` |
+| `FERRY_NODE_USB` | unset | `1` boots machines with a USB controller and attaches the disk images listed in `<machines-dir>/<name>.usb`. Experimental, and needs a kernel with USB storage; see `experiments/26-usb-hotplug` |
 | `FERRY_KUBE_API_QPS` | `500` | how fast a kubelet may talk to the API server. Upstream's 50 paces a 20-pod burst at 40ms a pod, with every container already running |
 | `FERRY_KUBE_API_BURST` | `1000` | the burst that goes with it |
 | `FERRY_KUBELET_V` | `2` | klog level for both kubelets. At `4` the kubelet logs its own per-pod phase boundaries, which is what `experiments/24-benchmark-harness/syncphases.py` reads |
