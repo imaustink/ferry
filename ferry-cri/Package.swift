@@ -14,6 +14,9 @@ let package = Package(
         // Already in the graph through Containerization and gRPC; named here only
         // so ferry-cri can own the one event loop group every pod VM shares.
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.83.0"),
+        // Also already in the graph; named so ferry-cri can hand FilePath to the
+        // ext4 formatter when it formats a PersistentVolume's disk image.
+        .package(url: "https://github.com/apple/swift-system.git", from: "1.4.0"),
     ],
     targets: [
         .executableTarget(
@@ -28,6 +31,7 @@ let package = Package(
                 .product(name: "GRPCNIOTransportHTTP2", package: "grpc-swift-nio-transport"),
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "SystemPackage", package: "swift-system"),
             ],
             plugins: [
                 .plugin(name: "GRPCProtobufGenerator", package: "grpc-swift-protobuf")

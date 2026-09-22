@@ -67,8 +67,27 @@ func (sp *subpath) CleanSubPaths(podDir string, volumeName string) error {
 	return nil
 }
 
-// SafeMakeDir creates a directory, provided it lands inside base.
-func (sp *subpath) SafeMakeDir(pathname string, base string, perm os.FileMode) error {
+// SafeMakeDir creates subdir beneath base, provided it stays inside base.
+//
+// subdir is relative to base -- the kubelet passes the volumeMount's subPath
+// as written, exactly as subpath_linux.go expects. Treating it as a path of
+// its own resolved it against the kubelet's working directory, which is never
+// inside the volume, so every subPath that did not already exist failed with
+// "failed to create subPath directory".
+//
+// perm is the volume root's mode, and it is applied past the umask the way
+// Linux's doSafeMakeDir does with fchmod: the kubelet creates the directory
+// up front precisely so it gets the root's permissions rather than whatever a
+// later auto-create would give it.
+func (sp *subpath) SafeMakeDir(subdir string, base string, perm os.FileMode) error {
+	pathname := subdir
+	if !filepath.IsAbs(pathname) {
+		pathname = filepath.Join(base, subdir)
+	}
+	existed := true
+	if _, err := os.Lstat(pathname); os.IsNotExist(err) {
+		existed = false
+	}
 	if _, err := containedPath(pathname, base); err != nil {
 		// A path that does not exist yet cannot escape by symlink at its final
 		// component; check the deepest parent that does exist instead.
@@ -79,8 +98,14 @@ func (sp *subpath) SafeMakeDir(pathname string, base string, perm os.FileMode) e
 	if err := os.MkdirAll(pathname, perm); err != nil {
 		return err
 	}
-	_, err := containedPath(pathname, base)
-	return err
+	resolved, err := containedPath(pathname, base)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return os.Chmod(resolved, perm.Perm())
+	}
+	return nil
 }
 
 // containedPath resolves path and verifies it is base or lies beneath it, with

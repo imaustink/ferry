@@ -68,12 +68,6 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 		return // already made, waiting to bind
 	}
 
-	path := filepath.Join(p.root, name)
-	if err := os.MkdirAll(path, 0o777); err != nil {
-		klog.ErrorS(err, "Could not create the volume directory", "path", path)
-		return
-	}
-
 	size := claim.Spec.Resources.Requests[corev1.ResourceStorage]
 	if size.IsZero() {
 		size = resource.MustParse("1Gi")
@@ -81,6 +75,18 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	modes := claim.Spec.AccessModes
 	if len(modes) == 0 {
 		modes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	}
+
+	path := filepath.Join(p.root, name)
+	if err := os.MkdirAll(path, 0o777); err != nil {
+		klog.ErrorS(err, "Could not create the volume directory", "path", path)
+		return
+	}
+	if singleWriter(modes) {
+		if err := makeImage(filepath.Join(path, imageName), size.Value()); err != nil {
+			klog.ErrorS(err, "Could not create the volume's disk image", "path", path)
+			return
+		}
 	}
 	reclaim := corev1.PersistentVolumeReclaimDelete
 	hostPathType := corev1.HostPathDirectoryOrCreate
@@ -129,6 +135,53 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 		return
 	}
 	klog.InfoS("Provisioned", "claim", claim.Namespace+"/"+claim.Name, "path", path, "size", size.String())
+}
+
+// The disk image a single-writer volume keeps its filesystem in. ferry-cri
+// looks for exactly this name inside a volume directory, so it is part of the
+// contract between the two and not a detail of either.
+const imageName = "disk.ext4"
+
+// singleWriter reports whether a claim can only ever be used by one pod at a
+// time, which is what lets its volume be a block device instead of a share.
+//
+// A share is served by Virtualization.framework's virtiofs server, which runs
+// as the Mac user and so refuses every chown -- an init container that chowns
+// its data directory, or postgres insisting its directory be its own and 0700,
+// fails with EPERM even as root. An ext4 filesystem inside the pod's own
+// kernel has real ownership. But one filesystem can only be mounted by one
+// kernel at a time, and every pod here is its own kernel, so only a claim that
+// promises a single writer can have one. ReadWriteMany and ReadOnlyMany stay
+// shared directories, and chown on them is still unsupported.
+func singleWriter(modes []corev1.PersistentVolumeAccessMode) bool {
+	for _, mode := range modes {
+		if mode != corev1.ReadWriteOnce && mode != corev1.ReadWriteOncePod {
+			return false
+		}
+	}
+	return len(modes) > 0
+}
+
+// makeImage creates the volume's disk image at the claim's size. It is sparse,
+// so it costs what is written to it rather than what the claim asked for, and
+// it is left unformatted: ferry-cri formats it the first time a pod mounts it,
+// with the same ext4 writer it builds root filesystems with -- there is no
+// mkfs on a Mac to do it here. An image left over from an attempt that failed
+// before its PersistentVolume was made is kept as it is.
+func makeImage(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
 }
 
 // reclaim removes the directory once its volume has been released, which is what

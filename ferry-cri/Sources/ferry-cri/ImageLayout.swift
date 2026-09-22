@@ -31,6 +31,14 @@ enum NodeLayout {
         var trimmer = Trimmer(source: source, scratch: scratch)
         var kept: [Descriptor] = []
         for entry in index.manifests {
+            // `docker save --platform` lists the image's build attestation
+            // beside it at the top level, with no platform and no name. Kept,
+            // it was loaded as an image of its own -- "untagged@sha256:..." in
+            // the output and in the node's image list -- which nothing can run.
+            if isAttestation(entry) {
+                trimmer.changed = true
+                continue
+            }
             let name = imageName(entry)
             guard let result = try trimmer.trim(entry, image: name) else {
                 throw RuntimeFailure.invalid(trimmer.explainMissing(image: name))
@@ -66,6 +74,15 @@ enum NodeLayout {
                             subject: index.subject, artifactType: index.artifactType)
         try JSONEncoder().encode(trimmed).write(to: scratch.appending(component: "index.json"))
         return scratch
+    }
+
+    /// A manifest describing another one rather than an image: BuildKit's
+    /// provenance and SBOM attestations, which containerd marks with the image
+    /// they are about, and Docker with a reference type.
+    private static func isAttestation(_ entry: Descriptor) -> Bool {
+        let annotations = entry.annotations ?? [:]
+        return annotations["io.containerd.manifest.subject"] != nil
+            || annotations["vnd.docker.reference.type"] == "attestation-manifest"
     }
 
     /// The name an entry will be registered under, for messages.

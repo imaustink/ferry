@@ -13,8 +13,10 @@ enum FerryVersion {
     /// because the launcher is what knows which release it belongs to.
     static let environmentKey = "FERRY_VERSION"
 
-    /// The release's own version, without a leading "v", or "dev" for a build
-    /// from a checkout.
+    /// The release's own version, without a leading "v", or "0.0.0-dev" for a
+    /// build that cannot tell. Always semver: the kubelet parses it, and shows
+    /// anything that does not parse as ferry://Unknown -- which is what
+    /// "dev" came out as. A checkout's launcher passes `git describe` instead.
     ///
     /// In order: FERRY_VERSION; then a VERSION file beside the binary or one
     /// level up, which is the release layout -- bin/ferry-cri with VERSION at
@@ -31,7 +33,7 @@ enum FerryVersion {
                 if !value.isEmpty { return normalize(value) }
             }
         }
-        return "dev"
+        return "0.0.0-dev"
     }
 
     /// CRI runtime versions are conventionally bare semver -- containerd

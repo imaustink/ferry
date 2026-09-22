@@ -78,12 +78,16 @@ enum RuntimeFailure: Error, CustomStringConvertible {
     case notFound(String)
     case invalid(String)
     case unsupported(String)
+    /// Something this call needs is held by another pod, and will be free once
+    /// that pod is gone. The kubelet retries, so this resolves on its own.
+    case busy(String)
 
     var description: String {
         switch self {
         case .notFound(let m): "not found: \(m)"
         case .invalid(let m): "invalid: \(m)"
         case .unsupported(let m): "unsupported: \(m)"
+        case .busy(let m): "in use: \(m)"
         }
     }
 }
@@ -118,6 +122,9 @@ struct SandboxRecord {
     /// Kept so the VM can be rebuilt if every container in it has stopped --
     /// see createContainer.
     let interface: any Interface
+    /// eth1, kept for the same reason: a pod rebuilt before it boots -- see
+    /// rebuildUnbootedPod -- has to be the same machine it was about to be.
+    var clusterInterface: SwitchInterface?
     let config: Runtime_V1_PodSandboxConfig
     /// Names of the pod's regular containers, from its spec. The kubelet
     /// creates them one at a time and this hypervisor cannot add a container to
@@ -142,6 +149,19 @@ struct SandboxRecord {
     /// Whether the guest half of the CNI chain has run. The kubelet starts each
     /// container in turn and the chain is per pod, not per container.
     var cniChainDone: Bool = false
+    /// Block-backed PersistentVolumes this pod holds, attached to its VM as
+    /// pod-level volumes. A LinuxPod's volumes are fixed when it is made, and
+    /// the kubelet only says which volumes a container wants when it creates
+    /// that container, so a new one here means a new LinuxPod.
+    var blockVolumes: [BlockVolume] = []
+    /// The ones the current LinuxPod was made with. Differing from
+    /// blockVolumes is what says it has to be made again.
+    var podVolumes: [BlockVolume] = []
+    /// subPaths inside those volumes, as guest paths, to create once the VM
+    /// is up. A bind mount needs its source to exist, and on Linux the kubelet
+    /// would have made the directory -- here it made one on the Mac beside the
+    /// image, which the filesystem inside it knows nothing about.
+    var blockSubPaths: [String] = []
 }
 
 struct ContainerRecord {
@@ -167,6 +187,14 @@ struct ContainerRecord {
     /// for stdin must see it closed, or anything reading from it hangs instead
     /// of getting EOF.
     var stdinFeeder: FrameReaderStream?
+    /// What it was added to its LinuxPod with, so it can be added again to a
+    /// replacement made before the VM boots -- see rebuildUnbootedPod.
+    var registration: ContainerRegistration?
+}
+
+struct ContainerRegistration: Sendable {
+    let rootfs: Containerization.Mount
+    let configure: @Sendable (inout LinuxPod.ContainerConfiguration) throws -> Void
 }
 
 enum ContainerRunState {
@@ -224,6 +252,16 @@ actor PodRuntime {
     /// by this process; exit reclaims it.
     private let eventLoops = MultiThreadedEventLoopGroup(
         numberOfThreads: ProcessInfo.processInfo.activeProcessorCount)
+
+    /// Which sandbox holds each block-backed PersistentVolume, and the
+    /// descriptor its lock is held on. Keyed by the volume's directory.
+    ///
+    /// The map is what stops two pods on this node attaching one image; the
+    /// lock -- flock on the volume directory -- is what stops two processes,
+    /// another ferry-cri on this Mac, from doing the same. Both live only as
+    /// long as this process, which is also how long its VMs live, so a restart
+    /// starts with nothing attached and nothing claimed.
+    private var blockClaims: [String: (sandboxID: String, fd: Int32)] = [:]
 
     private var idCounter: UInt64 = 0
     /// Used only to read pod specs, so the VM can wait for a pod's whole
@@ -610,7 +648,7 @@ actor PodRuntime {
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
             usesReservedAddress: wantsReserved && dnsInterfaceInUse,
-            interface: interface, config: cfg,
+            interface: interface, clusterInterface: clusterInterface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers,
             gpuContainerNames: expected.gpuContainers,
@@ -710,10 +748,12 @@ actor PodRuntime {
                          cfg: Runtime_V1_PodSandboxConfig,
                          clusterInterface: SwitchInterface? = nil,
                          memoryBytes: UInt64? = nil,
-                         cpus: Int? = nil) throws -> LinuxPod {
+                         cpus: Int? = nil,
+                         volumes: [BlockVolume] = []) throws -> LinuxPod {
         try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs,
                                                      group: eventLoops)) { c in
             c.cpus = cpus ?? config.defaultCPUs
+            c.volumes = volumes.map(\.podVolume)
             c.memoryInBytes = memoryBytes ?? config.defaultMemoryBytes
             // eth0 is vmnet and keeps the default route; eth1, when there is a
             // cluster, is ferry's own segment.
@@ -742,6 +782,11 @@ actor PodRuntime {
             containers[containerID]?.finishedAt = Self.now()
         }
         if wasBooted { try? await record.pod.stop() }
+        // After the stop, not before: the VM has to have let go of the image
+        // before another pod's VM may attach it.
+        releaseBlockVolumes(sandboxID: id)
+        record.blockVolumes = []
+        record.podVolumes = []
         releaseGPU(record)
         record.gpuGranted = false
         record.ready = false
@@ -764,6 +809,9 @@ actor PodRuntime {
     func removePodSandbox(_ id: String) async throws {
         guard sandboxes[id] != nil else { return }
         try? await stopPodSandbox(id)
+        // Normally the stop has done this already. Repeated so that no path to
+        // a removed sandbox can leave a volume claimed by a pod that is gone.
+        releaseBlockVolumes(sandboxID: id)
         for containerID in containers.values.filter({ $0.sandboxID == id }).map(\.id) {
             containers.removeValue(forKey: containerID)
         }
@@ -1220,15 +1268,57 @@ actor PodRuntime {
             // Rebuilt at the size this pod was admitted with, not at the
             // default: the pod's limits have not changed just because its
             // first container failed to start.
+            // With its cluster interface: this is every crashed container's
+            // restart, and without it the pod came back on vmnet alone --
+            // reachable from this Mac, unreachable from pods on any other.
+            // The socket pair outlives the VM (the guest end is not closed on
+            // dealloc) and stays on the switch until the sandbox is removed.
             let rebuilt = try makePod(id: sandboxID, interface: sandbox.interface,
                                       cfg: sandbox.config,
+                                      clusterInterface: sandbox.clusterInterface,
                                       memoryBytes: sandbox.vmMemoryBytes > 0 ? sandbox.vmMemoryBytes : nil,
-                                      cpus: sandbox.vmCPUs > 0 ? sandbox.vmCPUs : nil)
+                                      cpus: sandbox.vmCPUs > 0 ? sandbox.vmCPUs : nil,
+                                      volumes: sandbox.blockVolumes)
             sandboxes[sandboxID]?.pod = rebuilt
+            sandboxes[sandboxID]?.podVolumes = sandbox.blockVolumes
             sandboxes[sandboxID]?.booted = false
             // A new kernel has none of the old one's portmap rules.
             sandboxes[sandboxID]?.cniChainDone = false
         }
+        // Block-backed PersistentVolumes first, before anything is made for
+        // this container: a volume another pod holds fails the call, and it
+        // should fail before there is a root filesystem clone to clean up.
+        var blockMounts: [String: (volume: BlockVolume, subPath: String)] = [:]
+        for mount in cfg.mounts where !mount.hostPath.isEmpty && !mount.containerPath.isEmpty {
+            guard let located = BlockVolume.locate(hostPath: mount.hostPath) else { continue }
+            blockMounts[mount.hostPath] = located
+        }
+        // Every subPath this container wants of each volume, so a first format
+        // can make them the way the kubelet makes a subPath on Linux: with the
+        // volume root's mode. The guest agent's mkdir ignores the mode it is
+        // given, so one made later comes out 0755 root and a non-root pod
+        // cannot write to it.
+        var subPathsByVolume: [String: [String]] = [:]
+        for located in blockMounts.values where !located.subPath.isEmpty {
+            subPathsByVolume[located.volume.directory, default: []].append(located.subPath)
+        }
+        for located in blockMounts.values {
+            try await claimBlockVolume(located.volume, sandboxID: sandboxID,
+                                       subPaths: subPathsByVolume[located.volume.directory] ?? [])
+            if !located.subPath.isEmpty {
+                let guest = "\(located.volume.guestPath)/\(located.subPath)"
+                if sandboxes[sandboxID]?.blockSubPaths.contains(guest) == false {
+                    sandboxes[sandboxID]?.blockSubPaths.append(guest)
+                }
+            }
+        }
+        // Compared rather than tracked from the claims above: a call that took
+        // one volume and was then refused another has left the sandbox holding
+        // a volume its LinuxPod does not have, and the retry must still add it.
+        if let held = sandboxes[sandboxID], held.blockVolumes != held.podVolumes {
+            try await rebuildUnbootedPod(sandboxID)
+        }
+
         // Re-read: the record may have just been rebuilt.
         guard let sandbox = sandboxes[sandboxID] else {
             throw RuntimeFailure.notFound("sandbox \(sandboxID)")
@@ -1280,6 +1370,7 @@ actor PodRuntime {
         let capabilities = Self.capabilities(for: security)
         let runAsUser = security.hasRunAsUser ? UInt32(security.runAsUser.value) : nil
         let runAsGroup = security.hasRunAsGroup ? UInt32(security.runAsGroup.value) : nil
+        let supplementalGroups = security.supplementalGroups.map { UInt32(truncatingIfNeeded: $0) }
         let userString = Self.userString(runAsUser: runAsUser, runAsGroup: runAsGroup,
                                          runAsUsername: security.runAsUsername,
                                          image: imageConfig?.user ?? "")
@@ -1300,6 +1391,25 @@ actor PodRuntime {
                 // if we silently skip it, so say so rather than starting a pod
                 // that is quietly missing its token.
                 throw RuntimeFailure.invalid("mount source \(mount.hostPath) does not exist")
+            }
+            // A block-backed volume is already attached to the pod, once, and
+            // mounted in the VM; each use of it is a bind mount of that mount.
+            // The whole volume goes through the framework's own shared-volume
+            // mount. A subPath has to name a path beneath the volume, which
+            // that cannot, so it is a plain bind from the guest path.
+            if let block = blockMounts[mount.hostPath] {
+                let readOnly = mount.readonly ? ["ro"] : []
+                if block.subPath.isEmpty {
+                    collected.append(.sharedMount(
+                        name: block.volume.name, destination: mount.containerPath, options: readOnly))
+                } else {
+                    collected.append(.any(
+                        type: "none",
+                        source: "\(block.volume.guestPath)/\(block.subPath)",
+                        destination: mount.containerPath,
+                        options: ["bind"] + readOnly))
+                }
+                continue
             }
             collected.append(.share(
                 source: mount.hostPath,
@@ -1354,7 +1464,7 @@ actor PodRuntime {
         // assumed -- experiments/08-vsock-socket-relay.
         let gpuSocket = try gpuGrant(for: sandboxID, containerName: cfg.metadata.name)
 
-        try await sandbox.pod.addContainer(id, rootfs: rootfs) { c in
+        let configure: @Sendable (inout LinuxPod.ContainerConfiguration) throws -> Void = { c in
             c.process.arguments = arguments
             c.process.terminal = cfg.tty
             if let stdinFeeder { c.process.stdin = stdinFeeder }
@@ -1368,6 +1478,11 @@ actor PodRuntime {
             if let runAsUser { c.process.user.uid = runAsUser }
             if let runAsGroup { c.process.user.gid = runAsGroup }
             if let userString { c.process.user.username = userString }
+            // The kubelet folds fsGroup into these, so without them fsGroup did
+            // nothing: a pod that was given a volume's group could not use it.
+            // vminitd adds the user's own groups from /etc/group to whatever is
+            // here rather than replacing it.
+            if !supplementalGroups.isEmpty { c.process.user.additionalGids = supplementalGroups }
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
             if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
@@ -1386,6 +1501,7 @@ actor PodRuntime {
                     direction: .into))
             }
         }
+        try await sandbox.pod.addContainer(id, rootfs: rootfs, configuration: configure)
 
         containers[id] = ContainerRecord(
             id: id, sandboxID: sandboxID,
@@ -1399,9 +1515,126 @@ actor PodRuntime {
             imageRef: pulledImages[imageRef]?.id ?? imageRef,
             labels: cfg.labels, annotations: cfg.annotations,
             logPath: absoluteLogPath, createdAt: Self.now(), tty: cfg.tty,
-            logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder
+            logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder,
+            registration: ContainerRegistration(rootfs: rootfs, configure: configure)
         )
         return id
+    }
+
+    // MARK: - Block volumes
+
+    /// Takes a block-backed PersistentVolume for a sandbox, formatting its
+    /// image the first time anything uses it. A sandbox that already holds it
+    /// has nothing to do.
+    ///
+    /// Refuses while another pod holds it. That is the ordinary state of a
+    /// Deployment's rolling update on a ReadWriteOnce claim -- the new pod is
+    /// created while the old one still runs -- and the kubelet retries
+    /// CreateContainer, so the new pod starts once the old one has stopped.
+    /// Attaching it anyway would put one ext4 filesystem under two kernels,
+    /// each caching and writing it without knowing about the other, which
+    /// corrupts it.
+    private func claimBlockVolume(_ volume: BlockVolume, sandboxID: String,
+                                  subPaths: [String] = []) async throws {
+        if let held = blockClaims[volume.directory] {
+            if held.sandboxID == sandboxID { return }
+            let holder = sandboxes[held.sandboxID].map { "\($0.namespace)/\($0.name)" } ?? held.sandboxID
+            throw RuntimeFailure.busy("""
+                volume \(volume.name) is attached to pod \(holder); a ReadWriteOnce \
+                volume is a disk that only one pod VM can mount at a time, so this \
+                container will start once that pod has stopped
+                """)
+        }
+        let fd = open(volume.directory, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw RuntimeFailure.invalid("cannot open volume \(volume.directory): \(String(cString: strerror(errno)))")
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw RuntimeFailure.busy("""
+                volume \(volume.name) is attached by another process on this Mac; \
+                it can be mounted by one pod VM at a time
+                """)
+        }
+        // Recorded before formatting, which suspends: a second call for this
+        // volume arriving meanwhile must find it taken.
+        blockClaims[volume.directory] = (sandboxID, fd)
+        do {
+            // Off the actor: a large claim's journal is tens of megabytes of
+            // zeroes to write, and every other CRI call would wait behind it.
+            let image = volume.image
+            let formatted = try await Task.detached {
+                try BlockVolume.formatIfNeeded(image: image, subPaths: subPaths)
+            }.value
+            if formatted { print("    volume    formatted \(image)") }
+        } catch {
+            blockClaims.removeValue(forKey: volume.directory)
+            close(fd)
+            throw error
+        }
+        sandboxes[sandboxID]?.blockVolumes.append(volume)
+    }
+
+    /// Hands back every block volume a sandbox holds. Only once its VM has
+    /// stopped -- the callers see to that -- since the claim is what lets
+    /// another pod's VM attach the image.
+    private func releaseBlockVolumes(sandboxID: String) {
+        for (directory, held) in blockClaims where held.sandboxID == sandboxID {
+            close(held.fd)  // releases the flock with it
+            blockClaims.removeValue(forKey: directory)
+        }
+    }
+
+    /// Replaces a sandbox's LinuxPod, before it has booted, with one that has
+    /// every block volume the sandbox now holds.
+    ///
+    /// A LinuxPod's volumes are part of its configuration and cannot change,
+    /// and a pod VM cannot take a device once it is running either, so the
+    /// volume has to be there when the VM is made. Nothing is lost: the old
+    /// LinuxPod never made a VM, and the containers already added to it are
+    /// added again from what they were registered with.
+    private func rebuildUnbootedPod(_ sandboxID: String) async throws {
+        guard let sandbox = sandboxes[sandboxID], !sandbox.booted else { return }
+        let fresh = try makePod(id: sandboxID, interface: sandbox.interface, cfg: sandbox.config,
+                                clusterInterface: sandbox.clusterInterface,
+                                memoryBytes: sandbox.vmMemoryBytes > 0 ? sandbox.vmMemoryBytes : nil,
+                                cpus: sandbox.vmCPUs > 0 ? sandbox.vmCPUs : nil,
+                                volumes: sandbox.blockVolumes)
+        let registered = containers.values.filter { $0.sandboxID == sandboxID && $0.state == .created }
+        for record in registered {
+            guard let registration = record.registration else { continue }
+            try await fresh.addContainer(record.id, rootfs: registration.rootfs,
+                                         configuration: registration.configure)
+        }
+        sandboxes[sandboxID]?.pod = fresh
+        sandboxes[sandboxID]?.podVolumes = sandbox.blockVolumes
+    }
+
+    /// Creates the subPath directories a pod's containers bind from, once the
+    /// VM is up and its volumes are mounted.
+    ///
+    /// Not fatal: a subPath the workload made into a file is still bound, and
+    /// anything genuinely wrong surfaces when the container starts, with the
+    /// runtime's own error.
+    ///
+    /// A symlink planted in the volume can point this somewhere else in the
+    /// pod's own VM, never at the Mac: the VM is the boundary, and everything
+    /// in it belongs to this pod.
+    private func makeBlockSubPaths(_ sandboxID: String) async {
+        guard let sandbox = sandboxes[sandboxID], !sandbox.blockSubPaths.isEmpty else { return }
+        let paths = sandbox.blockSubPaths
+        do {
+            try await sandbox.pod.withVirtualMachineInstance { vm in
+                let agent = try await vm.dialAgent()
+                for path in paths {
+                    try? await agent.mkdir(path: path, all: true, perms: 0o777)
+                }
+                try? await agent.close()
+            }
+        } catch {
+            FileHandle.standardError.write(
+                "warning: could not create subPath directories in \(sandboxID): \(error)\n".data(using: .utf8)!)
+        }
     }
 
     func startContainer(_ id: String) async throws {
@@ -1458,6 +1691,7 @@ actor PodRuntime {
 
             try await sandbox.pod.create()
             sandboxes[record.sandboxID]?.booted = true
+            await makeBlockSubPaths(record.sandboxID)
 
             for waiting in sandboxes[record.sandboxID]?.pendingStart ?? [] where waiting != id {
                 try? await sandbox.pod.startContainer(waiting)
@@ -1874,7 +2108,14 @@ actor PodRuntime {
     func imageStatus(_ reference: String) -> Runtime_V1_Image? {
         pulledImages[reference] ?? pulledImages[ImageReference.normalize(reference)]
     }
-    func listImages() -> [Runtime_V1_Image] { Array(pulledImages.values) }
+    /// One entry per image, not per name: pulledImages holds each image under
+    /// its tag, its normalized reference and its digest, and listing the
+    /// dictionary's values put every image into node.status.images two or
+    /// three times over.
+    func listImages() -> [Runtime_V1_Image] {
+        var seen = Set<String>()
+        return pulledImages.values.filter { seen.insert($0.id).inserted }
+    }
 
     /// Removes an image: every name it is known by, and the root filesystem.
     ///
@@ -1936,6 +2177,7 @@ actor PodRuntime {
     func shutdown() async {
         for record in sandboxes.values {
             try? await record.pod.stop()
+            releaseBlockVolumes(sandboxID: record.id)
             network.releaseInterface(record.id)
         }
         sandboxes.removeAll()
