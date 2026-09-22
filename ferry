@@ -1421,12 +1421,7 @@ start_provisioner() {
   #
   # Leader election off: it is one process on one Mac, and the lease it would
   # take is a cluster object ferry would then have to clean up.
-  KUBECONFIG="$FERRY_HOME/admin.conf" \
-  FERRY_MACHINE_LIMIT_CPUS="$MACHINE_LIMIT_CPUS" \
-  FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
-  FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
-  FERRY_NODE_DISK="$NODE_DISK" \
-  # The health probe port is shifted with every other port this profile uses.
+  # --health-probe-port is shifted with every other port this profile uses.
   # Karpenter defaults it to 8081, which is not shifted, so a second ferry on
   # the same Mac finds it taken and the process panics on startup --
   # "bind: address already in use", reported as "ferry-karpenter did not
@@ -1434,6 +1429,18 @@ start_provisioner() {
   # Found with a stray karpenter from an earlier run holding the port, which
   # is the same shape as the default-profile etcd that docs/BENCHMARKING.md
   # warns about.
+  #
+  # Nothing may come between these assignments and the command they prefix.
+  # A comment here does not interrupt the line continuation -- it swallows
+  # the rest of the line, so the assignments become an ordinary shell
+  # statement and the binary runs with none of them in its environment. That
+  # is exactly what happened when this comment was first written in the gap
+  # below, and it silently dropped karpenter's machine limits and node disk.
+  KUBECONFIG="$FERRY_HOME/admin.conf" \
+  FERRY_MACHINE_LIMIT_CPUS="$MACHINE_LIMIT_CPUS" \
+  FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
+  FERRY_NODE_DISK="$NODE_DISK" \
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
