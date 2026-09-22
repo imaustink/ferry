@@ -39,10 +39,11 @@ bad()  { fail=$((fail + 1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 note() { skip=$((skip + 1)); printf '  \033[33m-\033[0m %s\n' "$1"; }
 
 contains() { # description file needle
-  if grep -qF "$3" "$2"; then ok "$1"; else bad "$1"; echo "      '$3' is not in $(basename "$2")"; fi
+  # -e, because a needle that starts with a dash is a flag otherwise.
+  if grep -qF -e "$3" "$2"; then ok "$1"; else bad "$1"; echo "      '$3' is not in $(basename "$2")"; fi
 }
 lacks() { # description file needle
-  if grep -qF "$3" "$2"; then bad "$1"; echo "      '$3' is back in $(basename "$2")"; else ok "$1"; fi
+  if grep -qF -e "$3" "$2"; then bad "$1"; echo "      '$3' is back in $(basename "$2")"; else ok "$1"; fi
 }
 
 runtime="$repo/ferry-cri/Sources/ferry-cri/PodRuntime.swift"
@@ -162,13 +163,24 @@ YAML
 
   # And the rootfs for the superseded image goes away, rather than one ext4
   # per build accumulating until the disk is full.
-  state="$("$ferry" profile 2>/dev/null | awk '/^  runtime /{print $2}')/cri"
-  count() { ls "$state" 2>/dev/null | grep -c 'image-sha256' || echo 0; }
-  before="$(count)"
-  build_and_run VERSION-THREE >/dev/null
-  after="$(count)"
-  [ "$after" -le "$before" ] && ok "a rebuild does not leak a root filesystem" \
-    || bad "a rebuild does not leak a root filesystem ($before -> $after)"
+  # `grep -c` prints 0 and exits non-zero when it matches nothing, so `|| echo 0`
+  # would append a second line and make this "0\n0" -- which `-le` then rejects
+  # as not an integer, reporting a leak that did not happen. It prints the count
+  # on its own.
+  runtime_dir="$("$ferry" profile 2>/dev/null | awk '/^  runtime /{print $2}')"
+  state="$runtime_dir/cri"
+  count() { ls "$state" 2>/dev/null | grep -c 'image-sha256'; }
+
+  if [ -z "$runtime_dir" ] || [ ! -d "$state" ]; then
+    # Rather than comparing two zeroes and calling it a pass.
+    note "could not find the image store; leak check skipped"
+  else
+    before="$(count)"
+    build_and_run VERSION-THREE >/dev/null
+    after="$(count)"
+    [ "$after" -le "$before" ] && ok "a rebuild does not leak a root filesystem" \
+      || bad "a rebuild does not leak a root filesystem ($before -> $after)"
+  fi
 
   k delete pod "$pod" --ignore-not-found >/dev/null 2>&1
 fi

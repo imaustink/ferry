@@ -492,6 +492,16 @@ pods are served from, so there is no registry in the loop.
 It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
 does not have to be installed, let alone running.
 
+The builder speaks mutual TLS, because it has to listen on the pod's real
+address -- that is the only path the Mac has to it -- and that address is on a
+network every pod shares. A privileged build daemon anything could drive would
+be a way to run as root in a VM holding your whole build cache. ferry issues a
+CA, a server certificate and one client certificate into `~/.ferry/pki/builder`
+on the first build; the daemon requires the client certificate and the Mac has
+the only copy. A NetworkPolicy denying every pod goes on as well, though that
+one only bites on a kernel built by `ferry kernel` -- the stock guest kernel has
+no nftables to enforce it with.
+
 Against the workflow it replaces — `docker buildx build` and then `kind load
 docker-image`, both warm, from an edited file to a cluster that can run it:
 
