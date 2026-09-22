@@ -46,14 +46,23 @@ measure_mem() { # label
   vms=$(stack_vm_pids "$STACK" | tr '\n' ' ')
   hosts=$(stack_host_pids "$STACK" | tr '\n' ' ')
   used=$(used_mib)
-  fp_vm=$(footprint_mib $vms)
-  fp_host=$(footprint_mib $hosts)
+  fp_vm=$(footprint_mib $vms); local missed_vm; missed_vm=$(footprint_missed)
+  fp_host=$(footprint_mib $hosts); local missed_host; missed_host=$(footprint_missed)
+  # Recorded, not just warned about: a footprint that silently omitted a VM is
+  # the one number in this file that looks completely normal when it is wrong.
+  r "${label}.footprint_unread" "$((missed_vm + missed_host))"
   r "${label}.used_mib"        "$used"
   r "${label}.vm_footprint"    "$fp_vm"
   r "${label}.vm_rss"          "$(rss_mib $vms)"
   r "${label}.host_footprint"  "$fp_host"
   r "${label}.host_rss"        "$(rss_mib $hosts)"
-  case "$STACK" in ferry|ferry2) ;; *) r "${label}.guest_used_mib" "$(docker_guest_used_mib)" ;; esac
+  # Every stack that has a shared guest, read the same way. This used to run
+  # for kind and minikube only, which left the report comparing ferry's
+  # host-side footprint against their in-guest used. Mode 1 returns "-".
+  local g_used g_unavail
+  read -r g_used g_unavail <<<"$(guest_mem_mib "$STACK" "${kc:-}")"
+  r "${label}.guest_used_mib"   "$g_used"
+  r "${label}.guest_unavail_mib" "$g_unavail"
   r "${label}.vm_count"        "$(echo $vms | wc -w | tr -d ' ')"
   r "${label}.cpu_pct"         "$(cpu_of $vms $hosts)"
 }
@@ -116,6 +125,34 @@ YAML
 
 # ---------------------------------------------------------------- run ----
 
+# Docker-based stacks get a restarted Docker first, so their baseline is not
+# the previous stack's leftovers. See docker_restart in stacks.sh: the VM does
+# not release pages when a cluster is deleted, and the battery runs kind before
+# minikube, which is exactly how minikube's published host-side row came to be
+# a 10 MiB non-result. Skippable for a single-stack run that has just restarted
+# Docker anyway.
+case "$(base_stack "$STACK")" in
+  kind|minikube)
+    if [ "${SKIP_DOCKER_RESTART:-}" != "1" ]; then
+      say "restarting Docker Desktop so this stack's baseline is its own"
+      docker_restart || exit 1
+    fi ;;
+  ferry|ferry2)
+    # ferry does not use Docker, and leaving 15.6 GiB of idle VM on the machine
+    # is not the baseline ferry actually has -- the report says so and the runs
+    # were done that way by hand. Done here instead, so the protocol is in the
+    # harness rather than in someone's memory of it.
+    if [ "${KEEP_DOCKER:-}" != "1" ] && pgrep -f 'Docker.app/Contents/MacOS/com.docker.backend' >/dev/null 2>&1; then
+      say "stopping Docker Desktop -- ferry does not use it and it is not part of ferry's baseline"
+      osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1
+      n=0
+      while pgrep -f 'Docker.app/Contents/MacOS/com.docker.backend' >/dev/null 2>&1; do
+        sleep 2; n=$((n + 1)); [ "$n" -gt 60 ] && break
+      done
+      sleep 5
+    fi ;;
+esac
+
 pin_docker_vm
 say "docker VM is pid $(docker_vm_pid)"
 measure_mem baseline
@@ -127,6 +164,15 @@ t0=$(now_ms); stack_up "$STACK"
 kc=$(kubeconfig_of "$STACK"); ctx=$(context_of "$STACK")
 if wait_ready "$kc" "$ctx" 600; then r create_cold_s "$(since "$t0")"
 else r create_cold_s FAILED; tail -20 "$RESULTS/$STACK-up.log"; exit 1; fi
+
+# What the cluster says it is, not what the driver meant to ask for. The four
+# ferry columns once all ran relaxed because `ferry up` inherits a remembered
+# setting and nothing checked; a row that records the answer makes the next
+# occurrence visible in raw.tsv instead of in a log nobody reads.
+case "$(base_stack "$STACK")" in
+  ferry|ferry2)
+    r durability "$("$FERRY" status 2>/dev/null | awk '/durability/{print $2}')" ;;
+esac
 
 k "$kc" "$ctx" version -o json 2>/dev/null | python3 -c \
   'import json,sys; d=json.load(sys.stdin); print("server", d["serverVersion"]["gitVersion"], d["serverVersion"].get("platform",""))' \

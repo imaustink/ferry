@@ -44,7 +44,14 @@ vm_pids() {
 # whoever it belongs to.
 ferry_vm_pids() {
   local run home pid
-  run="${FERRY_RUN:-/tmp/ferry-run${FERRY_PROFILE:+-$FERRY_PROFILE}}"
+  # Asked of ferry rather than reconstructed. A checkout runs a profile named
+  # after its directory unless told otherwise, and FERRY_PROFILE is set only
+  # when someone overrode it -- so the fallback below resolved to the
+  # unsuffixed /tmp/ferry-run, which belongs to a different cluster. Pod VMs
+  # then matched only by way of $home, and on a profile whose state directory
+  # is also suffixed they would not have matched at all.
+  run="${FERRY_RUN:-$("$FERRY" profile 2>/dev/null | awk '/^  runtime /{print $2}')}"
+  run="${run:-/tmp/ferry-run${FERRY_PROFILE:+-$FERRY_PROFILE}}"
   home="$(dirname "$("$FERRY" kubeconfig 2>/dev/null)")"
   [ -d "$home" ] || home="${FERRY_HOME:-$HOME/.ferry}"
   for pid in $(vm_pids); do
@@ -57,17 +64,39 @@ ferry_vm_pids() {
 # phys_footprint -- what macOS charges a process, resident minus the shared
 # pages every VM process maps its own copy of. Slow (~1-3s per VM process),
 # so it is taken at rest rather than sampled.
+# Writes the number of pids it could not read to $FOOTPRINT_MISSED_FILE, which
+# footprint_missed reads back.
+#
+# Through a file rather than a variable because every caller uses this in a
+# command substitution -- `fp=$(footprint_mib $pids)` -- and a variable set
+# inside that subshell is gone before the caller can look at it. The single
+# number on stdout is the contract the other scripts already depend on.
+#
+# It used to drop those silently. vmmap prints nothing useful if the process
+# has exited, or is still being sampled, or refuses the read -- and the awk
+# below then reached END with the running total untouched, so an unreadable VM
+# and a VM costing nothing produced the same number. Caught by a mode 2 run
+# reporting 670.8 MiB across two VMs where every other run of the same shape
+# reported ~980: one ~310 MiB pod VM had not been read, and nothing said so.
+FOOTPRINT_MISSED_FILE="${FOOTPRINT_MISSED_FILE:-$BENCH_HOME/.footprint-missed}"
+footprint_missed() { cat "$FOOTPRINT_MISSED_FILE" 2>/dev/null || echo 0; }
 footprint_mib() {
-  local total=0 pid
+  local total=0 pid one missed=0
   for pid in "$@"; do
     [ -z "$pid" ] && continue
-    total=$(vmmap --summary "$pid" 2>/dev/null | awk -v t="$total" '
+    one=$(vmmap --summary "$pid" 2>/dev/null | awk '
       /^Physical footprint:/ {
         v=$3; u=substr(v,length(v)); n=substr(v,1,length(v)-1)
         if (u=="G") n*=1024; else if (u=="K") n/=1024; else if (u!="M") n=v
-        t+=n; exit}
-      END {printf "%.1f", t}')
+        printf "%.1f", n; exit}')
+    if [ -z "$one" ]; then
+      missed=$((missed + 1))
+      echo "footprint_mib: could not read pid $pid" >&2
+      continue
+    fi
+    total=$(python3 -c "print(f'{$total + $one:.1f}')")
   done
+  printf '%s\n' "$missed" > "$FOOTPRINT_MISSED_FILE"
   echo "$total"
 }
 
@@ -176,4 +205,36 @@ rss_mib() {
 docker_guest_used_mib() {
   docker run --rm alpine:3.20 free -m 2>/dev/null \
     | awk '/^Mem:/ {print $3}'
+}
+
+# The same reading, for whichever stack has a shared guest, in one place and
+# one definition -- "used" and "total - available" both, from a single `free`
+# so the two cannot drift apart.
+#
+# Two things this fixes. run.sh used to skip ferry entirely here (`case $STACK
+# in ferry|ferry2) ;;`), so the in-guest basis existed for kind and minikube
+# and not for the stack they were being compared against -- which is how the
+# report came to print ferry's host-side footprint next to kind's in-guest
+# used as though they were one column. And the harness carried two different
+# definitions of "used": docker_guest_used_mib above takes `free` column 3,
+# m2mem.sh takes $2-$7. On ferry's 15Gi node those disagree by 190 MiB, so
+# which one a cell happens to use is not a detail.
+#
+# Mode 1 has no shared guest -- every pod is its own kernel -- so it reports
+# nothing rather than a number that would have to be invented.
+guest_mem_mib() { # stack [kubeconfig] -> "used total_minus_available"
+  local stack="$1" kc="${2:-}" out=""
+  case "$stack" in
+    ferry|ferryrelaxed) echo "- -"; return ;;
+    ferry2|ferry2relaxed)
+      [ -n "$kc" ] || { echo "- -"; return; }
+      out=$(KUBECONFIG="$kc" kubectl run gmem-$RANDOM --rm -i --restart=Never \
+            --image="${POD_IMAGE:-alpine:3.20}" \
+            --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"worker-0"}}}' \
+            -- free -m 2>/dev/null | awk '/^Mem:/{print $3, $2-$7}') ;;
+    *)
+      out=$(docker run --rm "${POD_IMAGE:-alpine:3.20}" free -m 2>/dev/null \
+            | awk '/^Mem:/{print $3, $2-$7}') ;;
+  esac
+  echo "${out:-- -}"
 }

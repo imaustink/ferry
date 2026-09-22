@@ -122,10 +122,33 @@ changed on a running VM, and the answer bounds this design:
 
 So `spec.cpus` and `spec.memory` are a commitment made at creation. Changing
 them rolls the machine rather than resizing it in place, which is the Cluster
-API model anyway: machines are cattle. Because untouched guest memory is nearly
-free — a 4 GiB VM that allocates 1 GiB costs 1434 MiB, not 4096 — a generous
-ceiling is cheap, and the balloon is available to hold a guest to `spec.memory`
-without paying for it up front.
+API model anyway: machines are cattle.
+
+**Size the ceiling to the workload, not generously.** This used to say the
+opposite — that untouched guest memory is nearly free, so a generous ceiling
+costs little and the balloon can hold the guest down to `spec.memory`. The
+first half is true of the guest's *pages* and false of the guest's *kernel*.
+Apple's kernel configuration is `CONFIG_ARM64_4K_PAGES` with
+`SPARSEMEM_VMEMMAP`, so Linux allocates a `struct page` for every 4 KiB of the
+configured ceiling during boot, and sizes several hash tables from total RAM
+besides. Those pages are touched, and the finding above is that touched pages
+never come back.
+
+Measured against ferry's own kernel, with the guest touching nothing at all:
+
+| configured | 1 GiB | 2 GiB | 4 GiB | 8 GiB | 15 GiB |
+|:--|--:|--:|--:|--:|--:|
+| host footprint | 112 MiB | 136 MiB | 240 MiB | 325 MiB | 469 MiB |
+
+About **105 MiB fixed plus 2.5% of the ceiling**, paid at boot whether or not
+a pod ever asks for it. On a real mode 2 cluster that is 356 MiB between a
+15 GiB node and the 2 GiB one ferry actually defaults to — 1,538 MiB of idle
+against 1,182 — and it buys nothing measurable: the 20-pod burst is 1.22–1.26 s
+across that whole range, medians of three runs. See
+`experiments/24-benchmark-harness/m2-size-sweep.sh`.
+
+So the balloon is worth having to enforce a limit, and not worth a ceiling
+raised above what the workload needs.
 
 And it points at how capacity is actually managed here. **Deleting a VM is the
 only thing that returns memory to the host.** The balloon does not, and nothing

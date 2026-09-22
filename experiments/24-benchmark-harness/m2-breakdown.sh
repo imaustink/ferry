@@ -28,14 +28,21 @@ for _ in $(seq 1 240); do
 done
 sleep 45   # settle
 
-# A pod VM is held by ferry-cri; the node VM is held by ferry-node, which keeps
-# its state under $FERRY_RUN/machines. That is how the two are told apart.
+# A pod VM is held by ferry-cri; a node VM boots the disk ferry-machined cloned
+# to <state>/machined/<name>.ext4 (ferry-machined/main.go:125). That open file is
+# how the two are told apart.
+#
+# This tested for "/machines/" instead, which is where the machine's *spec* file
+# goes, not its disk. No VM ever has it open, so every node VM was charged to the
+# pod column and node_vm_mib came out 0 -- which is what the row this script
+# exists to measure was supposed to contain.
+state=$("$FERRY" profile 2>/dev/null | awk '/^  state /{print $2}')
 d=$(docker_vm_pid)
 echo "=== $TAG ==="
 node_total=0; pod_total=0
 for pid in $(vm_pids | grep -v "^${d}$"); do
   fp=$(footprint_mib "$pid")
-  if lsof -p "$pid" -Fn 2>/dev/null | grep -q "/machines/"; then
+  if lsof -p "$pid" -Fn 2>/dev/null | grep -qE "^n$state/.*\.ext4$"; then
     kind=node-vm; node_total=$(python3 -c "print($node_total+$fp)")
   else
     kind=pod-vm; pod_total=$(python3 -c "print($pod_total+$fp)")
