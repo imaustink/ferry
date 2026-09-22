@@ -52,6 +52,12 @@ struct SwitchInterface: Interface, VZInterface, @unchecked Sendable {
         self.macAddress = mac
     }
 
+    /// Closes the VM's end of the pair, once the VM that used it has stopped.
+    /// The host end belongs to the pod switch, which closes it on detach.
+    func closeGuestSide() {
+        try? guestSide.close()
+    }
+
     func device() throws -> VZVirtioNetworkDeviceConfiguration {
         let config = VZVirtioNetworkDeviceConfiguration()
         let attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: guestSide)

@@ -796,6 +796,9 @@ actor PodRuntime {
         // clusterDNS then points at nothing.
         if record.usesReservedAddress { dnsInterfaceInUse = false }
         podSwitch?.detach(podID: id)
+        // A stopped sandbox is never started again -- the kubelet makes a new
+        // one -- so the VM's end of its switch link can go with it.
+        record.clusterInterface?.closeGuestSide()
         defer { publishHostPorts() }
         // The guest half of DEL already ran, above, while there was still a
         // kernel to run it in. This is the rest of the chain unwinding.
