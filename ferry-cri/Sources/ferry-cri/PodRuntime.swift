@@ -74,6 +74,9 @@ struct RuntimeConfig: Sendable {
     var execSocket: String?
     /// Appended to every pod VM's kernel command line, after ferry's own.
     var extraKernelArgs: [String] = []
+    /// Read-ahead of a pod's image, scratch and volume disks, in KiB. The init
+    /// disk stays at the kernel's 128. See ReadAhead.swift.
+    var podReadAheadKB: Int = ReadAhead.defaultKB
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -1976,6 +1979,10 @@ actor PodRuntime {
         try await pod.create()
         mark("create")
         sandboxes[sandboxID]?.booted = true
+        // Alongside the rest of the boot, and done before it returns: nothing
+        // in the pod reads its disks until a container starts, which is after.
+        let readAheadKB = ReadAhead.kilobytes(annotations: sandbox.annotations, node: config.podReadAheadKB)
+        async let readAhead = ReadAhead.apply(pod, podID: sandboxID, kb: readAheadKB)
         await makeBlockSubPaths(sandboxID)
 
         for record in waiting {
@@ -1989,6 +1996,11 @@ actor PodRuntime {
             }
         }
         mark("add")
+        let raised = await readAhead
+        mark("readahead")
+        if Self.tracing, !raised.isEmpty {
+            print("    trace     read-ahead \(sandboxID) \(readAheadKB) KiB on \(raised.joined(separator: ","))")
+        }
         if Self.tracing { print("    trace     boot \(sandboxID) images=\(layout.images.count) " + phases.joined(separator: " ")) }
     }
 
