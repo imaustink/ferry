@@ -451,9 +451,23 @@ to `ferry.dev/host` — set on the Mac's node by `ferry up` and on each machine
 by `ferry-machined` — rather than to one node, so a pod finds its data again on
 a replacement machine or on the Mac. Until this, `ferry-storage` served only
 claims scheduled to the Mac's node, and a mode 2 pod with a claim stayed
-Pending with no event. `chown` does not work on these (virtiofs is served as
-the Mac user); a Mac-node ReadWriteOnce claim is an ext4 disk instead, which
-a machine cannot attach after boot.
+Pending with no event. `chown` does not hold on these: virtiofs is served as
+the Mac user, and on macOS 26 it reports each caller's own uid as the owner,
+so a chown appears to succeed and nothing is kept
+([experiment 33](../experiments/33-cluster-images-and-volumes/FINDINGS.md)).
+
+A claim that needs real ownership asks for `storageClassName:
+ferry-local-block`. A ReadWriteOnce claim in that class, on a machine, is an
+ext4 image the machine takes over USB mass storage after it has booted -- the
+one device Virtualization.framework will attach to a running VM (experiment
+26). `ferry-machined` decides which machine holds each disk, one at a time,
+from the pods scheduled to them; `ferry-node` formats, labels and attaches
+it; the node image's `ferry.dev/block` FlexVolume driver finds it by label,
+mounts it once, and bind-mounts it into every pod on the machine that uses
+it. It follows its pod to a replacement machine like a directory does. The
+cost is synced small writes at about a third of the share's rate (0.43-0.64
+ms a commit against 0.13-0.16), which is why it is a class to ask for and not
+the default.
 
 ## Milestones
 
