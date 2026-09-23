@@ -1,0 +1,16 @@
+# hostPorts that differ from the container port, and one below 1024 on a
+# particular hostIP, so both the portmap rewrite and the narrowed wildcard are
+# exercised. HOST_IP is the Mac's LAN address.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hp
+  labels: {app: hp}
+spec:
+  nodeName: NODE
+  containers:
+    - name: nginx
+      image: nginx:alpine
+      ports:
+        - {name: http, containerPort: 80, hostPort: 5001}
+        - {name: low, containerPort: 80, hostPort: 81, hostIP: HOST_IP}

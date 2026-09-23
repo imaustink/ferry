@@ -1,0 +1,68 @@
+# SCTP inside the cluster: a server pod, a ClusterIP Service in front of it,
+# and a client that reaches both. python3's socket module speaks SCTP one-to-one
+# (SOCK_STREAM + IPPROTO_SCTP) with nothing but the kernel's own support.
+#
+# NODE pins both pods; run.sh sets it, so the same file covers same-node and
+# cross-node.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sctp-scripts
+data:
+  server.py: |
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 9999)); s.listen(16)
+    host = socket.gethostname()
+    print("listening sctp/9999", flush=True)
+    while True:
+        c, peer = s.accept()
+        data = c.recv(1024)
+        c.sendall(b"sctp-echo from " + host.encode() + b" to " + peer[0].encode() + b": " + data)
+        c.close()
+  client.py: |
+    import socket, sys, time
+    host, port = sys.argv[1], int(sys.argv[2])
+    t = time.time()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP)
+    s.settimeout(5)
+    s.connect((host, port)); s.sendall(b"hello")
+    print(s.recv(1024).decode(), "(%.2f ms)" % ((time.time() - t) * 1000))
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sctp-server
+  labels: {app: sctp-server}
+spec:
+  nodeName: SERVER_NODE
+  containers:
+    - name: server
+      image: python:3.13-alpine
+      command: ["python3", "-u", "/scripts/server.py"]
+      ports: [{containerPort: 9999, protocol: SCTP, name: echo}]
+      volumeMounts: [{name: scripts, mountPath: /scripts}]
+  volumes: [{name: scripts, configMap: {name: sctp-scripts}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sctp-client
+  labels: {app: sctp-client}
+spec:
+  nodeName: CLIENT_NODE
+  containers:
+    - name: client
+      image: python:3.13-alpine
+      command: ["sleep", "infinity"]
+      volumeMounts: [{name: scripts, mountPath: /scripts}]
+  volumes: [{name: scripts, configMap: {name: sctp-scripts}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sctp-echo
+spec:
+  selector: {app: sctp-server}
+  ports: [{name: echo, port: 7777, targetPort: 9999, protocol: SCTP}]

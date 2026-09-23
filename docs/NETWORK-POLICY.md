@@ -56,53 +56,134 @@ The API's own shape:
 - A pod no policy selects is unrestricted.
 - A pod any policy selects **for a direction** is default-deny in that direction,
   with the union of every matching rule allowed back in.
-- `from`/`to` may be `podSelector`, `namespaceSelector` or `ipBlock`; ports may
-  name a protocol and a port. An empty `from` means every peer; an empty `ports`
-  means every port.
+- `from`/`to` may be `podSelector`, `namespaceSelector` or `ipBlock`, and an
+  `ipBlock`'s `except` is honoured. Ports may name a protocol, a number, a range
+  with `endPort`, or a container port by name -- resolved against the pod for
+  ingress, and against the peers for egress. An empty `from` means every peer;
+  an empty `ports` means every port. A port name no container uses matches
+  nothing.
 - An omitted `policyTypes` means Ingress, plus Egress if the policy has egress
   rules.
 
 Return traffic is always allowed. A policy describes who may start a
-conversation, not who may answer.
+conversation, not who may answer. So is a pod talking to itself, over loopback
+or its own address: containers in a pod share one network stack.
+
+## Clients from outside the cluster
+
+A NodePort, a LoadBalancer or a hostPort is a listener on the Mac, in
+`ferry-proxy`, which dials the pod. So every such connection reaches the pod from
+the Mac's own address on the pod network, whoever the client was -- and that is
+the address the pod has to let in for its probes (below). Until this was
+measured, the result was that **no ingress policy applied to any client of the
+edge**:
+
+```
+                                      before      after
+deny-all
+  LAN        192.168.1.29:34345       served      refused
+  pod -> node port 10.171.0.1:34345   served      refused    <- a pod laundering itself
+  pod -> pod                          refused     refused
+  web (probed on its own port)        Ready       Ready, 0 restarts
+```
+
+So the edge enforces the same policy, against the address the client actually
+connected from, before it dials. `ferry-netpol` renders the rules once and
+serves them twice -- as nftables for the pods, and as a small JSON document at
+`/edge` that `ferry-proxy` follows the same way `ferry-cri` follows the rules.
+The pod and the edge cannot disagree about what a policy means, because it was
+resolved once.
+
+Measured on a running cluster, with a LoadBalancer on port 80 and its node port
+in front of a pod whose probes use a port of their own
+([experiments/27-edge-policy-sctp](../experiments/27-edge-policy-sctp/FINDINGS.md)):
+
+| policy | LAN :80 | localhost :80 | LAN node port | pod -> pod | pod -> node port | pod |
+|---|---|---|---|---|---|---|
+| none | served | served | served | served | served | Ready |
+| `deny-all` | refused | refused | refused | refused | refused | Ready |
+| `ipBlock: <LAN address>/32`, port 80 | served | refused | served | refused | refused | Ready |
+| `ipBlock: 0.0.0.0/0 except <LAN address>/32` | refused | served | refused | served | served | Ready |
+| `podSelector` naming one pod | refused | refused | refused | served | served (that pod) | Ready |
+| a rule for port 81 only | refused | refused | refused | refused | refused | Ready |
+
+A refusal at the edge is a reset, which a client sees as "connection refused".
+
+The cost is one map lookup per connection -- a miss, for a pod no policy
+isolates -- against a snapshot swapped in atomically, with no lock on the
+connection path. Connection latency and throughput through the node port were
+the same before and after within the noise of the measurement.
+
+Two things the edge cannot do, and does not pretend to:
+
+- **A connection this Mac hands to another Mac's node port** reaches that Mac
+  from this one's address, and is checked there against this Mac, not the
+  client. That is what `externalTrafficPolicy: Cluster` means on any cluster:
+  the source is rewritten on the way through. A pod on another node *of the
+  same Mac* is dialled directly and checked against the real client.
+- **A Mac that joined the cluster enforces nothing** -- neither in its pods nor
+  at its edge -- because `ferry-netpol` runs on the first Mac and the others do
+  not have its socket. This is from reading `ferry join`, not a two-Mac
+  measurement.
 
 ## One deliberate difference
 
-**Ingress policies do not filter traffic from the Mac itself.**
+**Ingress policies do not filter traffic from the pod's own node.**
 
 A node reaches its pods from its own address on the pod network -- the first
-address of the slice it hands out, so `10.244.1.1` for a node whose podCIDR is
-`10.244.1.0/24`. That is where the kubelet's health probes come from, and where
-connections forwarded in from a node port come from. The API does not exempt
-those. ferry does, because dropping a probe does not isolate a pod, it takes it
-down: a failed probe restarts the container, and the result looks like a crash
-loop rather than a policy.
+address of the slice it hands out, so `10.244.1.1` for a pod at `10.244.1.7`.
+That is where the kubelet's health probes come from, and where the API server
+comes from when it calls a webhook or an aggregated API such as metrics-server,
+and where `ferry image build` reaches its builder. The API does not exempt those.
+ferry does, because dropping a probe does not isolate a pod, it takes it down: a
+failed probe restarts the container, and the result looks like a crash loop
+rather than a policy. Cilium and Calico make the same exception for the local
+host.
 
-Most CNI plugins strike the same bargain. It is written here so it is a decision
-rather than a surprise.
+What it no longer covers is anyone the node is merely carrying. The edge is
+policed at the edge, above. And only the pod's **own** node is exempt: another
+node's address is a peer like any other, which is what the API says. It used to
+be every node's, and before that everything outside the cluster CIDR as well --
+which let every edge client in and made an `ipBlock` for an outside network mean
+nothing.
 
-This exemption used to be written as "anything that did not arrive on `eth1`",
+The consequence worth knowing: a process on the Mac that dials a pod's address
+directly, rather than through a Service's node port, is the node, and is let in.
+`curl 10.244.0.5` from the Mac works under `deny-all`; `curl localhost:80` for
+the same pod's LoadBalancer does not.
+
+The address is worked out from the pod's own address rather than the node's
+podCIDR, because the two can disagree: a node re-added under an old name keeps
+the Node object and its podCIDR while its runtime takes a different slice.
+Measured -- podCIDR `10.171.1.0/24`, pods on `10.171.2.x` -- and every probe was
+dropped under `deny-all` until this changed.
+
+This exemption was first written as "anything that did not arrive on `eth1`",
 `eth1` being the cluster switch and `eth0` the vmnet interface the Mac is on.
 That described where the node's traffic comes from correctly and where pod
 traffic comes from wrongly: two pods on the **same node** reach each other over
 `eth0` as well, because each node's slice is a route their kernels resolve
-directly. The exemption therefore covered every same-node conversation, and a
-`deny-all` policy isolated a pod from the rest of the cluster while leaving it
-open to the neighbours most likely to be talking to it. Matching on the source
-address instead says what was meant.
+directly. The exemption therefore covered every same-node conversation. Matching
+on the source address instead says what was meant.
 
 **Egress policies have no such exemption**, and restrict everything the pod
 starts, including traffic to the internet -- which is what the API asks for. It
 follows that a pod under a deny-all egress policy cannot reach cluster DNS unless
 the policy allows it. That surprises people on every Kubernetes cluster, and it
-is correct.
+is correct. Loopback is exempt: a deny-all egress policy used to cut a pod off
+from its own localhost, and a sidecar from the container beside it.
 
 ## Known limits
 
-- **TCP, UDP and SCTP ports are rendered**, but only TCP has been tested.
-- **`endPort` ranges are not implemented.**
+- **TCP is tested end to end, at the pod and at the edge.** UDP is checked at
+  the edge per conversation, when the session to a pod is made. SCTP ports are
+  rendered as `sctp dport`; SCTP itself works between pods (see
+  [SERVICES.md](SERVICES.md)) but has not been run under a policy.
+- **IPv6 `ipBlock`s** are carried to the edge, which listens on both families,
+  and left out of the pods' rules, which are IPv4 -- pods have no IPv6 address.
 - **Cross-machine enforcement works**, and so does same-machine. Both were
   measured on a two-node cluster: with a `deny-all` in place a pod refuses its
-  neighbour on the same Mac and a pod on the other Mac, and with an
-  `ingress.from.podSelector` it accepts the peer that policy names -- same node
-  or not -- and refuses the rest.
-- Policy changes reach a pod in a couple of seconds, not instantly.
+  neighbour on the same Mac and a pod on the other node, keeps passing its own
+  node's probes, and refuses the edge.
+- Policy changes reach a pod in a couple of seconds, not instantly, and apply to
+  new connections: an established one is return traffic.
