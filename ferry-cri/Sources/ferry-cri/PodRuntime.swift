@@ -183,7 +183,9 @@ struct ContainerRecord {
     let imageRef: String
     let labels: [String: String]
     let annotations: [String: String]
-    let logPath: String
+    /// Where the kubelet reads the log. For a removed container, the link
+    /// retainedLog made to it instead.
+    var logPath: String
     let createdAt: Int64
     var startedAt: Int64 = 0
     var finishedAt: Int64 = 0
@@ -273,7 +275,19 @@ actor PodRuntime {
     /// starts with nothing attached and nothing claimed.
     private var blockClaims: [String: (sandboxID: String, fd: Int32)] = [:]
 
-    private var idCounter: UInt64 = 0
+    /// Starts at this boot's time rather than zero, so an ID is never reused
+    /// by a later ferry-cri. The kubelet keeps the IDs it saw -- a pod's
+    /// status names its last container through a restart of this process --
+    /// and a counter from zero handed those same IDs to new containers.
+    /// Seconds shifted past 24 bits of counter: a run would need 16 million
+    /// IDs per second of uptime before it met the next boot's.
+    private var idCounter: UInt64 = UInt64(Date().timeIntervalSince1970) << 24
+
+    /// Containers the kubelet has removed, kept answering ContainerStatus for a
+    /// minute with their log at the link retainedLog made -- see removeContainer.
+    /// Never listed, so nothing the kubelet derives from ListContainers changes.
+    private var removedContainers: [String: ContainerRecord] = [:]
+    static let removedContainerTTL: Duration = .seconds(60)
     /// Used only to read pod specs, so the VM can wait for a pod's whole
     /// container set before booting.
     var streamer: StreamerClient?
@@ -283,6 +297,18 @@ actor PodRuntime {
         try FileManager.default.createDirectory(at: config.stateDir, withIntermediateDirectories: true)
         self.store = try ImageStore(path: config.stateDir)
         self.kernel = Kernel(path: URL(filePath: config.kernelPath), platform: .linuxArm)
+        // Nothing from a previous run is running: its VMs died with it. So its
+        // retained logs and its containers' root filesystem clones are
+        // orphans, which a counter from zero used to overwrite one by one and
+        // IDs that never repeat would otherwise leave behind for good.
+        let fm = FileManager.default
+        try? fm.removeItem(at: config.stateDir.appending(component: Self.retainedLogDirectory))
+        try? fm.createDirectory(at: config.stateDir.appending(component: Self.retainedLogDirectory),
+                                withIntermediateDirectories: true)
+        for name in (try? fm.contentsOfDirectory(atPath: config.stateDir.path())) ?? []
+        where name.hasPrefix("ctr") && name.hasSuffix(".ext4") {
+            try? fm.removeItem(at: config.stateDir.appending(component: name))
+        }
     }
 
     /// Pulls the guest agent image and creates the pod network. Kept out of
@@ -912,6 +938,7 @@ actor PodRuntime {
         releaseBlockVolumes(sandboxID: id)
         for containerID in containers.values.filter({ $0.sandboxID == id }).map(\.id) {
             containers.removeValue(forKey: containerID)
+            unlink(retainedLogPath(containerID))
         }
         // The reserved DNS address stays reserved across CoreDNS restarts; only
         // ordinary pod addresses go back to the allocator.
@@ -1924,6 +1951,7 @@ actor PodRuntime {
         // Flush whatever the container wrote without a trailing newline.
         for writer in containers[id]?.logWriters ?? [] { try? writer.close() }
         containers[id]?.logFile?.close()
+        retainLog(id)
         containers[id]?.state = .exited
         containers[id]?.exitCode = code
         containers[id]?.finishedAt = Self.now()
@@ -1938,11 +1966,54 @@ actor PodRuntime {
         recordExit(id, code: 0)
     }
 
+    /// The kubelet removes a container's log before the container, and it
+    /// removes the second-newest dead container of a pod as soon as the newest
+    /// dies -- while the pod's status, until the kubelet's next sync, still
+    /// names that one as the last to terminate. `kubectl logs --previous` in
+    /// that window asked ContainerStatus for a container that was gone and
+    /// failed. So a removed container that has exited stays answerable for a
+    /// minute, under the log link retainLog made, then goes for good.
     func removeContainer(_ id: String) async throws {
-        guard let record = containers[id] else { return }
+        guard var record = containers[id] else { return }
         if record.state == .running { try? await stopContainer(id, timeout: 0) }
         try? FileManager.default.removeItem(atPath: config.stateDir.appending(component: "\(id).ext4").path())
         containers.removeValue(forKey: id)
+        let retained = retainedLogPath(id)
+        guard FileManager.default.fileExists(atPath: retained) else { return }
+        record.state = .exited
+        record.logPath = retained
+        record.logWriters = []
+        record.logFile = nil
+        record.stdinFeeder = nil
+        record.registration = nil
+        removedContainers[id] = record
+        Task { [weak self] in
+            try? await Task.sleep(for: Self.removedContainerTTL)
+            await self?.forgetRemoved(id)
+        }
+    }
+
+    private func forgetRemoved(_ id: String) {
+        removedContainers.removeValue(forKey: id)
+        unlink(retainedLogPath(id))
+    }
+
+    /// Where a stopped container's log is kept once the kubelet has deleted
+    /// its own name for it. Under the state directory, outside every path the
+    /// kubelet globs when it cleans a container's logs up.
+    static let retainedLogDirectory = "logs"
+    private func retainedLogPath(_ id: String) -> String {
+        config.stateDir.appending(component: Self.retainedLogDirectory).appending(component: "\(id).log").path()
+    }
+
+    /// A hard link to a container's log, made as it exits: one link(2), no
+    /// copy, and it costs no space until the kubelet deletes the original.
+    /// Nothing is written to the log after exit, so the link is the whole log.
+    private func retainLog(_ id: String) {
+        guard let path = containers[id]?.logPath, !path.isEmpty else { return }
+        let retained = retainedLogPath(id)
+        unlink(retained)
+        link(path, retained)
     }
 
     /// Runs a command in a container's VM for `kubectl exec`. An empty command
@@ -2033,7 +2104,9 @@ actor PodRuntime {
     }
 
     func container(_ id: String) throws -> ContainerRecord {
-        guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
+        guard let record = containers[id] ?? removedContainers[id] else {
+            throw RuntimeFailure.notFound("container \(id)")
+        }
         return record
     }
 
