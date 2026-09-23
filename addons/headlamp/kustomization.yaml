@@ -1,0 +1,20 @@
+# Upstream's in-cluster manifest, pinned and corrected rather than copied.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- headlamp.yaml
+- admin.yaml
+images:
+# Upstream says :latest, which is a different program every week.
+- name: ghcr.io/headlamp-k8s/headlamp
+  newTag: v0.45.0
+patches:
+# Upstream turns on tracing to an otel-collector it does not ship, so every
+# request logs a failed export.
+- target: {kind: Deployment, name: headlamp}
+  patch: |-
+    - op: remove
+      path: /spec/template/spec/containers/0/env
+    - op: replace
+      path: /spec/template/spec/containers/0/readinessProbe/initialDelaySeconds
+      value: 2

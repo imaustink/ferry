@@ -1,0 +1,14 @@
+Forward it to the Mac and open http://localhost:9090/ :
+
+  kubectl -n monitoring port-forward svc/prometheus 9090
+
+It scrapes the API server, the kubelet, the kubelet's per-container CPU and
+memory, and any pod annotated prometheus.io/scrape: "true" (with
+prometheus.io/port and prometheus.io/path). `ferry addons enable
+kube-state-metrics` adds object metrics -- deployments, pod phases, restarts --
+and is picked up without a restart. Data is kept for 7 days on a
+PersistentVolume, so it survives the pod.
+
+There is no node-exporter: it reads a Linux node's /proc and /sys, and a ferry
+node is the Mac. For the same reason the kubelet's cAdvisor endpoint has no
+container series here, so per-container usage comes from /metrics/resource.

@@ -1,0 +1,21 @@
+Push from the Mac, run from the cluster, under the same name:
+
+  crane copy --platform linux/arm64 busybox:1.36 localhost:5001/busybox:1.36
+  kubectl run hello --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
+
+A pod's image is pulled by ferry-cri, on the Mac, so `localhost` in an image
+name is the Mac -- which is where this registry answers. ferry-cri speaks plain
+HTTP to loopback and to the Mac's own addresses, so <this Mac's LAN IP>:5001
+works as well; any other plain-HTTP registry has to be named in
+FERRY_INSECURE_REGISTRIES (comma separated) when ferry starts.
+
+It is on 5001 because macOS's AirPlay Receiver holds 5000 on every address and
+answers a registry request there with 403.
+
+crane treats localhost as plain HTTP by itself. skopeo and podman
+need to be told: `--dest-tls-verify=false`, or `--tls-verify=false`. A client
+inside the cluster -- a builder, say -- pushes to registry.registry.svc:5000,
+also plain HTTP; the pods that run the result still name localhost:5001.
+
+Images live on a PersistentVolume under this cluster's state, so they survive
+the pod and `ferry down`, and go with `ferry down --purge` or disabling this.

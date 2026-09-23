@@ -1,0 +1,23 @@
+A self-signed issuer and a certificate from it, to see it work:
+
+  kubectl apply -f - <<'EOF'
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata: {name: selfsigned}
+  spec: {selfSigned: {}}
+  ---
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata: {name: example, namespace: default}
+  spec:
+    secretName: example-tls
+    dnsNames: [example.ferry.test]
+    issuerRef: {name: selfsigned, kind: ClusterIssuer}
+  EOF
+  kubectl wait --for=condition=Ready certificate/example
+
+The webhook needs the API server to reach a pod, which it does here because the
+Mac is on the pod network. ACME issuers need the challenge reachable from the
+internet, which a laptop usually is not; DNS-01 works where HTTP-01 cannot.
+
+Disabling removes the CRDs, and with them every Certificate and Issuer.

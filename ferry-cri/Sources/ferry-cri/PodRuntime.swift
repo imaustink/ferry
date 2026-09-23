@@ -2190,7 +2190,7 @@ actor PodRuntime {
         // keyed by both that and whatever the manifest actually said, so a pod
         // written as `busybox:1.36` finds the image it just pulled.
         let canonical = ImageReference.normalize(reference)
-        let image = try await store.pull(reference: canonical, platform: platform)
+        let image = try await store.pull(reference: canonical, platform: platform, insecure: ImageReference.insecure(canonical))
         return try await cache(image, as: Set([reference, canonical]), canonical: canonical,
                                platform: platform)
     }

@@ -1,0 +1,30 @@
+# Envoy Gateway's release bundle carries its own copy of the Gateway API CRDs,
+# a patch release behind the gateway-api addon, together with the policy that
+# refuses to let an older bundle overwrite a newer one. Two addons owning the
+# same CRDs would fight on every enable and delete each other's on disable, so
+# the gateway-api addon owns them and they are dropped here. Envoy's own CRDs
+# and the experimental x-k8s.io ones stay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- envoy-gateway.yaml
+- gatewayclass.yaml
+patches:
+- target: {kind: CustomResourceDefinition, name: '.*\.gateway\.networking\.k8s\.io'}
+  patch: |-
+    $patch: delete
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata: {name: any}
+- target: {kind: ValidatingAdmissionPolicy, name: safe-upgrades.gateway.networking.k8s.io}
+  patch: |-
+    $patch: delete
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicy
+    metadata: {name: any}
+- target: {kind: ValidatingAdmissionPolicyBinding, name: safe-upgrades.gateway.networking.k8s.io}
+  patch: |-
+    $patch: delete
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicyBinding
+    metadata: {name: any}

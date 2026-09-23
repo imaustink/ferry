@@ -1,0 +1,10 @@
+Forward it to the Mac and open http://localhost:4466/ :
+
+  kubectl -n kube-system port-forward svc/headlamp 4466:80
+
+Sign in with the token written above (`pbcopy < <that file>`). It is not a
+LoadBalancer for the same reason as the dashboard: that would put a
+cluster-admin console on the Mac's LAN address.
+
+Headlamp also ships as a desktop app that reads ~/.kube/config directly and
+needs nothing in the cluster: `ferry kubeconfig --merge`, then open it.

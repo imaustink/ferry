@@ -1,0 +1,7 @@
+#!/bin/sh
+# Keep the login token in a file rather than printing it: a cluster-admin
+# credential in terminal scrollback outlives the cluster it was for.
+umask 077
+kubectl -n kubernetes-dashboard get secret admin-user -o jsonpath='{.data.token}' |
+  base64 -d > "$ADDON_STATE/token" || exit 1
+echo "login token in $ADDON_STATE/token"

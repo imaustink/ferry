@@ -272,6 +272,14 @@ not in the installer.
 | `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~226 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
+| `FERRY_INSECURE_REGISTRIES` | — | registries pods may pull from over plain HTTP, comma separated, `host` or `host:port`. Loopback and this Mac's own addresses always are, which is what makes `ferry addons enable registry`'s `localhost:5001` work; everything else is HTTPS. Read by `ferry-cri` when ferry starts |
+
+### Addons
+
+| | default | |
+|---|---|---|
+| `FERRY_ADDON_CACHE` | `$FERRY_HOME/cache/addons` | where pinned upstream manifests are kept, by sha256, so an addon enabled once enables again with no network |
+| `FERRY_ADDON_TIMEOUT` | the addon's own, else `300` | seconds `ferry addons enable` waits for rollouts and checks |
 
 ### Durability and speed
 

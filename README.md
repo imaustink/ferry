@@ -394,6 +394,8 @@ release/publish.sh                   put one on GitHub Releases
 ferry                                the CLI: doctor, build, up, down, status, logs,
                                      upgrade, machines, service, uninstall
 lib/versions.sh                      the version store, and what may follow what
+lib/addons.sh                        ferry addons: render, fetch, apply, wait, record
+addons/                              the addons, each an addon.conf and manifests
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 patches/kubelet-vX.Y/                per-minor shims, laid over the shared tree
@@ -530,6 +532,25 @@ second build fast and it costs about 330 MiB of lazily-backed guest memory to
 keep — against the 1,741 MiB Docker Desktop's VM occupies before it has built
 anything. `ferry image build --stop` ends it. Measured in
 [experiment 25](experiments/25-build-without-docker/FINDINGS.md).
+
+### Addons
+
+```sh
+ferry addons list
+ferry addons enable registry          # localhost:5001, for the Mac and for pods
+crane copy busybox:1.36 localhost:5001/busybox:1.36
+kubectl run hi --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
+```
+
+Ten, each pinned to a version that has been run here and checked for what it is
+for, not only for its pods going Ready: metrics-server, ingress-nginx, a
+registry, the Kubernetes Dashboard and Headlamp, cert-manager, the Gateway API
+CRDs and Envoy Gateway, kube-state-metrics and a single Prometheus. `enable`
+waits until the addon works and says why when it does not; `disable` removes
+exactly what was applied. Upstream manifests are fetched by sha256 and cached,
+so a second enable needs no network. Every pod is a VM of roughly 300 MiB, so
+the addons are the lean variants, and [addons/README.md](addons/README.md) lists
+each one's pods and measured memory.
 
 ### Limits worth knowing
 
