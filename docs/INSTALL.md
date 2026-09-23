@@ -318,6 +318,8 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_COREDNS_IMAGE` | `docker.io/coredns/coredns:1.11.3` | the CoreDNS mode 1 runs, and mode 2's machines run |
 | `FERRY_NODE_INDEX` | `0` | which `/24` of the cluster CIDR this node owns |
 | `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs. The base of a range, not one port: node N added with `ferry node add` uses this plus N, up to 99 |
+| `FERRY_NETPOL_PEER_PORT` | `6444` + profile shift | on the control plane's Mac: the TLS port its ferry-netpol serves the other Macs' nodes their own pods' NetworkPolicy rules on. Only a kubelet client certificate the cluster CA signed, in `system:nodes`, is answered, and only with that node's pods |
+| `FERRY_NETPOL_UPSTREAM` | the join address's host, its port + 1 | on a joined Mac: where to follow the control plane's ferry-netpol, for a control plane whose peer port is not one above its API server's |
 | `FERRY_PEERS` | read from `$FERRY_HOME/peers` | the other Macs' relay endpoints |
 | `FERRY_ALLOW_OFF_SLICE` | — | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
 | `FERRY_HOST_CLUSTER_IPS` | `false` | `1` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |

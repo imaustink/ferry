@@ -64,8 +64,9 @@ printf '\033[1m%s\033[0m\n' "the list of what ferry binds"
 # which is how a second ferry on one Mac used to panic on startup and fall
 # back to hand-declared machines; shifting it put it in this list's scope.
 # 5050 is ferry-registry and 5051 its port for the other Macs. Not 5000, which
-# macOS's AirPlay receiver holds.
-FERRY_UP_PORTS="6443 2379 2380 8081 10257 10259 10248 10250 10350 8472 8700 5050 5051"
+# macOS's AirPlay receiver holds. 6444 is ferry-netpol's port for the other
+# Macs' nodes; a joining Mac finds it one above the API server's.
+FERRY_UP_PORTS="6443 6444 2379 2380 8081 10257 10259 10248 10250 10350 8472 8700 5050 5051"
 
 # Anything ferry adds PORT_SHIFT to is a port it binds once per profile, which
 # is exactly what belongs in the list. The node block is not here and should

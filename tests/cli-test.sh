@@ -188,7 +188,7 @@ echo
 printf '\033[1m%s\033[0m\n' "NetworkPolicies are only called enforced where they can be"
 # The fallback kernel has no nf_tables, and 'ferry up' said "enforced" on it
 # while every rule apply in every pod failed.
-netpol="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+netpol="$(sed -n '/^netpol_verdict()/,/^}/p' "$repo/ferry")"
 contains "the fallback kernel is told apart" "$netpol" '[ "$KERNEL" != "$NAT_KERNEL" ]'
 contains "  and said out loud" "$netpol" "NetworkPolicies NOT enforced"
 echo
@@ -239,11 +239,26 @@ printf '\033[1m%s\033[0m\n' "a joined Mac enforces NetworkPolicy in its pods and
 # Measured before: a deny-all on a joined node's pod let every client through,
 # pod and edge alike, because nothing on that Mac served ferry-netpol's socket.
 worker="$(sed -n '/^start_worker()/,/^}/p' "$repo/ferry")"
-contains "start_worker runs ferry-netpol as the node" "$worker" 'start_netpol "$FERRY_RUN/kubelet.conf"'
+contains "start_worker follows the control plane's ferry-netpol as the node" "$worker" \
+  'start_netpol_follower "$server" "$FERRY_RUN/kubelet.conf"'
 contains "and its ferry-proxy asks it" \
   "$(echo "$worker" | sed -n '/bin\/ferry-proxy"/,/ferry-proxy.log/p')" '--netpol-socket "$FERRY_NETPOL_SOCK"'
-contains "and a token lets a node's certificate read what policy needs" \
-  "$(sed -n '/^cmd_token_create()/,/^}/p' "$repo/ferry")" 'ferry_netpol_rbac'
+leader="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+contains "the control plane serves the other Macs' nodes their rules" "$leader" '--listen "0.0.0.0:$NETPOL_PEER_PORT"'
+contains "presenting the API server's certificate" "$leader" '--tls-cert "$FERRY_HOME/pki/apiserver.crt"'
+PORT_SHIFT=3000
+eval "$(sed -n '/^NETPOL_PEER_PORT=/p' "$repo/ferry")"
+follower="$(sed -n '/^start_netpol_follower()/,/^}/p' "$repo/ferry")"
+server="192.168.1.29:$(( 6443 + PORT_SHIFT ))"
+eval "$(echo "$follower" | grep -m1 'local upstream=' | sed 's/^ *local //; s/ flags=() conf$//')"
+is "a joined Mac finds the peer port one above the API server's" "$upstream" "192.168.1.29:$NETPOL_PEER_PORT"
+# Measured before: every kubelet credential in the cluster could list every
+# pod, which is wider than the Node authorizer allows. Nothing grants it now,
+# and a cluster that has it loses it.
+token="$(sed -n '/^cmd_token_create()/,/^}/p' "$repo/ferry")"
+contains "a token takes the old grant away" "$token" 'ferry_netpol_rbac_remove'
+contains "and so does starting the control plane" "$leader" 'ferry_netpol_rbac_remove'
+lacks "and nothing in ferry makes it any more" "$(cat "$repo/ferry")" 'metadata: {name: ferry-node-netpol}'
 echo
 
 printf '\033[1m%s\033[0m\n' "an added node's podCIDR is the slice its runtime is on"
