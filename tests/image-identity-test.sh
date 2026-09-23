@@ -62,9 +62,18 @@ contains "the unpack guard asks about the identity" "$runtime" \
 lacks "the unpack guard no longer asks about the name" "$runtime" \
   'if rootfsCache[canonical] == nil {'
 
-# The file name, which collided for the same reason the key did.
-contains "the ext4 path is derived from the identity" "$runtime" \
+# The file name, which collided for the same reason the key did. It is the
+# platform manifest's digest rather than the image's: an index records the name
+# it was tagged as, so one build under two tags is two identities over one
+# filesystem, and naming the file by the index unpacked it twice.
+contains "the ext4 path is derived from the platform manifest" "$runtime" \
+  'let content = (try? await image.descriptor(for: platform).digest) ?? identity'
+contains "the ext4 path is derived from that content digest" "$runtime" \
+  'let path = imageDisk(content)'
+lacks "the ext4 path is no longer derived from the index" "$runtime" \
   'let safe = identity.replacingOccurrences'
+contains "a second identity over the same content reuses the disk" "$runtime" \
+  'rootfsCache[identity] = shared'
 
 # Names are aliases for the identity, never the other way round.
 contains "names resolve to the identity" "$runtime" \
@@ -89,8 +98,14 @@ echo "removing an image removes all of it"
 # and took the next image apart. That is what made this bug look recurrent.
 contains "removal resolves the reference to a root filesystem" "$runtime" \
   'guard let mount = direct.compactMap({ rootfsCache[$0] }).first else {'
-contains "removal drops every name the rootfs is known by" "$runtime" \
+contains "removal drops every name the image is known by" "$runtime" \
+  'let aliases = id.map { id in pulledImages.filter { $0.value.id == id }.map(\.key) } ?? []'
+# But not every name on the disk: two tags of one build share it, and removing
+# the unused one must not take the names of the one a pod is running.
+lacks "removal does not drop another image's names that share the disk" "$runtime" \
   'let aliases = rootfsCache.filter { $0.value.source == mount.source }.map(\.key)'
+contains "removal gives the disk back once nothing unpacks to it" "$runtime" \
+  'if !rootfsCache.values.contains(where: { $0.source == mount.source }) {'
 contains "removal gives the disk back" "$runtime" \
   'try? FileManager.default.removeItem(atPath: mount.source)'
 

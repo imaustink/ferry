@@ -2670,6 +2670,13 @@ actor PodRuntime {
         return max(floor, UInt64(compressed) * rootfsCompressionFactor + UInt64(2.gib()))
     }
 
+    /// Where the root filesystem unpacked for a digest lives.
+    private func imageDisk(_ digest: String) -> URL {
+        let safe = digest.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+        return config.stateDir.appending(component: "image-\(safe).ext4")
+    }
+
     /// Unpacks an image to a root filesystem and records it where the kubelet
     /// will look. Shared by pulling and loading, which differ only in where the
     /// image came from.
@@ -2690,10 +2697,32 @@ actor PodRuntime {
         let identity = image.digest.isEmpty ? canonical : image.digest
         let previous = rootfsCache[canonical]
 
+        // The disk, though, belongs to what it unpacks, which is the platform's
+        // manifest and not the index around it. An index also records the name
+        // it was pushed or loaded as, so the same build tagged twice -- skaffold
+        // tags every image by content hash and `latest` -- is two index digests
+        // over one manifest, and each unpacked its own copy: 10 such pairs,
+        // 2.2 GiB, on a cluster of 42 images (the v0.5.0 verification's
+        // "stored twice"). The identity above is still what the kubelet is told
+        // and what a lookup resolves; only the file is shared.
+        let content = (try? await image.descriptor(for: platform).digest) ?? identity
+        let path = imageDisk(content)
+
+        if rootfsCache[identity] == nil,
+           let shared = rootfsCache.values.first(where: {
+               ($0.source as NSString).lastPathComponent == path.lastPathComponent
+           }) {
+            rootfsCache[identity] = shared
+        }
         if rootfsCache[identity] == nil {
-            let safe = identity.replacingOccurrences(of: "/", with: "_")
-                .replacingOccurrences(of: ":", with: "_")
-            let path = config.stateDir.appending(component: "image-\(safe).ext4")
+            // Disks used to be named by the index digest. Renamed rather than
+            // unpacked again, or the first start after an upgrade re-expands
+            // every image before the kubelet gets an answer. A pod running from
+            // the old name holds the file open and does not notice.
+            let legacy = imageDisk(identity)
+            if legacy != path, !FileManager.default.fileExists(atPath: path.path(percentEncoded: false)) {
+                try? FileManager.default.moveItem(at: legacy, to: path)
+            }
             let mount: Containerization.Mount
             do {
                 mount = try await EXT4Unpacker(capacityInBytes: Self.rootfsCapacity(for: image, platform: platform))
@@ -2848,7 +2877,12 @@ actor PodRuntime {
             return
         }
 
-        let aliases = rootfsCache.filter { $0.value.source == mount.source }.map(\.key)
+        // Every name this image is known by, found by its ID. Not "everything
+        // on the same disk": two tags of one build share a root filesystem, and
+        // the collector removing the unused one would take the other's names
+        // with it, so a pod still running that other image could not restart.
+        let id = direct.compactMap { pulledImages[$0]?.id }.first
+        let aliases = id.map { id in pulledImages.filter { $0.value.id == id }.map(\.key) } ?? []
         for key in Set(aliases).union(direct) {
             pulledImages.removeValue(forKey: key)
             rootfsCache.removeValue(forKey: key)
@@ -2858,10 +2892,13 @@ actor PodRuntime {
             try? await store.delete(reference: key, performCleanup: false)
         }
 
-        // Safe while a pod is running from it: the pod's VM attached the file
-        // when it was made and holds it open, so removing the path does not
-        // take the disk away from it.
-        try? FileManager.default.removeItem(atPath: mount.source)
+        // The disk goes with the last image that unpacks to it. Safe while a
+        // pod is running from it: the pod's VM attached the file when it was
+        // made and holds it open, so removing the path does not take the disk
+        // away from it.
+        if !rootfsCache.values.contains(where: { $0.source == mount.source }) {
+            try? FileManager.default.removeItem(atPath: mount.source)
+        }
     }
 
     /// Stops every pod and releases every address. Without this the vmnet
