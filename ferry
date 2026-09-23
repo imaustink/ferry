@@ -1786,7 +1786,7 @@ start_proxy() {
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
-    local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
+    local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" | head -1)"
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-ports --node-name "$NODE_NAME" \
@@ -3902,9 +3902,10 @@ cmd_down() {
   done
   # A listener that outlives its pid file holds the node port against the next
   # run, and the symptom -- "address already in use" buried in a log -- is a poor
-  # way to find that out.
-  pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
-  sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
+  # way to find that out. Matched on this profile's kubeconfig: every checkout runs
+  # one, and a bare name here stopped every other profile's ferry-proxy too.
+  pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
+  sudo pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
 
   # After the streamer, which would otherwise put it straight back, and before
   # the control plane, which has to be up to accept the patch.
