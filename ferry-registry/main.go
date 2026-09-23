@@ -32,6 +32,7 @@
 //	                     [--peer-listen ADDR --kubeconfig FILE
 //	                      (--peers-file FILE --peer-port N --self IP[,IP] | --peers URL[,URL])]
 //	ferry-registry add   --store DIR LAYOUT
+//	ferry-registry import --store DIR CRI-STATE-DIR
 //	ferry-registry list  --store DIR
 package main
 
@@ -114,6 +115,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, "ferry-registry:", err)
 			os.Exit(1)
 		}
+	case "import":
+		if flags.NArg() != 1 {
+			usage()
+		}
+		added, err := importCRI(*store, flags.Arg(0))
+		for _, name := range added {
+			fmt.Println(name)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ferry-registry:", err)
+			os.Exit(1)
+		}
 	case "list":
 		list, err := names(*store)
 		if err != nil {
@@ -131,6 +144,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: ferry-registry serve --store DIR --listen ADDR [--allow CIDR,...]")
 	fmt.Fprintln(os.Stderr, "       ferry-registry add   --store DIR LAYOUT")
+	fmt.Fprintln(os.Stderr, "       ferry-registry import --store DIR CRI-STATE-DIR")
 	fmt.Fprintln(os.Stderr, "       ferry-registry list  --store DIR")
 	os.Exit(2)
 }

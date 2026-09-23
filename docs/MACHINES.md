@@ -474,6 +474,15 @@ cost is synced small writes at about a third of the share's rate (0.43-0.64
 ms a commit against 0.13-0.16), which is why it is a class to ask for and not
 the default.
 
+A ReadWriteOnce claim made for a pod on the Mac's own node is different: it
+is an ext4 disk attached to that pod's VM, and pinned to the Mac's node by
+`kubernetes.io/hostname`. So a stateful workload does not follow when it is
+moved from the Mac to a machine: cordoning the Mac leaves it Pending with
+`didn't match PersistentVolume's node affinity`. It is where its data is, as a
+local volume is anywhere. To move it, delete its claims and let them be made
+again on the machine — which starts it with empty volumes — or give it
+ReadWriteMany claims, which are the shared directory on both.
+
 ## Milestones
 
 1. ~~**One machine, by hand.**~~ **Done** —

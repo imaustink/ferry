@@ -1061,8 +1061,22 @@ cmd_up() {
   for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
   done
+  # Already up is what was asked for, so it is not a failure: a script that
+  # runs 'ferry up' before its tests should not need to ask first. Half up is --
+  # ferry-cri cannot be started on its own under a running kubelet, since its
+  # pod VMs and vmnet network went with it -- and so is a durability the
+  # running cluster was not started with, which only a restart can change.
+  if running ferry-cri && running kubelet; then
+    if [ -n "$want_durability" ] && [ "$want_durability" != "$(ferry_durability)" ]; then
+      bad "ferry is up with durability $(ferry_durability); 'ferry down' first to change it"
+      return 1
+    fi
+    ok "ferry is already up"
+    return 0
+  fi
   if running ferry-cri || running kubelet; then
-    warn "ferry is already up; run 'ferry down' first"; return 1
+    bad "ferry is half up ($(running ferry-cri && echo ferry-cri || echo kubelet) alone); run 'ferry down' first"
+    return 1
   fi
   align_to_cluster_version || return 1
 
@@ -1459,10 +1473,10 @@ ensure_mode_label() { # node
 start_machines() {
   machines_ready || return 1
 
-  # The CRD and the DNS objects live in etcd, so `ferry down --purge` takes them
-  # with the rest of the cluster while the enabled marker -- which is a file --
-  # survives. Restarting then ran the controller against a cluster with no
-  # Machine kind, logging errors forever at a cluster that looked fine. Both
+  # The CRD and the DNS objects live in etcd, so they go whenever etcd's data
+  # does. `ferry down --purge` now takes the enabled marker with it, but etcd can
+  # be lost other ways, and a controller run against a cluster with no Machine
+  # kind logs errors forever at a cluster that looks fine. Both
   # applies are idempotent, so doing them on every start costs a moment and
   # removes the difference between a cluster that was enabled and one that was
   # enabled, purged and brought back.
@@ -1586,6 +1600,16 @@ start_registry() { # [machine-subnet]
     rm -f "$FERRY_RUN/ferry-registry.pid"
   fi
   mkdir -p "$REGISTRY_DIR"
+  # What was loaded while the registry was off -- it was opt-in before, and
+  # FERRY_MACHINE_REGISTRY=0 still turns it off -- so turning it on does not mean
+  # loading every image again. Loaded ones only; see ferry-registry's importCRI.
+  local imported err="$FERRY_RUN/registry-import.err"
+  if imported="$("$here/bin/ferry-registry" import --store "$REGISTRY_DIR" "$FERRY_RUN/cri" 2>"$err")"; then
+    [ -z "$imported" ] || echo "  $(echo "$imported" | wc -l | tr -d ' ') loaded images added to the registry"
+  else
+    warn "loaded images not added to the registry: $(tail -1 "$err")"
+  fi
+  rm -f "$err"
   "$here/bin/ferry-registry" serve --store "$REGISTRY_DIR" \
     --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "${1:-}" \
     --peer-listen "0.0.0.0:$REGISTRY_PEER_PORT" --kubeconfig "$kubeconfig" \
@@ -4490,6 +4514,14 @@ cmd_down() {
     # Purging the cluster has to take them, because nothing else ever will.
     [ -n "${FERRY_HOME:-}" ] && [ "$FERRY_HOME" != "/" ] && [ "$FERRY_HOME" != "$HOME" ] \
       && rm -rf "${FERRY_HOME:?}/machined"
+    # And the setting that brought them up. It is a file rather than anything in
+    # etcd, so it outlived the cluster it was set for, and the next 'ferry up'
+    # -- of what was meant to be a new, mode 1 cluster -- started ferry-machined,
+    # ferry-node and the provisioner anyway.
+    if machines_enabled; then
+      rm -f "$MACHINES_MARKER"
+      echo "  machines are off again; 'ferry machines enable' after the next 'ferry up'"
+    fi
     ok "cluster data purged"
   fi
   # The peers file is deliberately not removed: it is what tells the next

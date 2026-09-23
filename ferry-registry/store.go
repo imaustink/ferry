@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"syscall"
 )
 
@@ -169,6 +170,87 @@ func add(store, src string) ([]string, error) {
 	if len(incoming.Manifests) == 0 {
 		return nil, fmt.Errorf("%s has no index.json entries", src)
 	}
+	added, err := merge(store, src, incoming.Manifests)
+	if err == nil && len(added) == 0 {
+		return nil, fmt.Errorf("no named images in %s", src)
+	}
+	return added, err
+}
+
+// The files of ferry-cri's image store that say what it holds. state.json is
+// Containerization's own record, a descriptor per reference, with the blobs in
+// content/ laid out as an OCI layout's are. loaded-images is ferry-cri's: the
+// names that came from `ferry image load` rather than a registry, one a line.
+const (
+	criState  = "state.json"
+	criLoaded = "loaded-images"
+	criBlobs  = "content"
+)
+
+// importCRI adds every image ferry-cri was loaded with that the store does not
+// already hold at the same digest, and returns the names it added.
+//
+// `ferry image load` adds an image here only while the registry is enabled, so
+// without this, turning it on served none of what the Mac already had: every
+// image had to be loaded again. Only loaded images: one ferry-cri pulled is
+// better pulled by the machine from where it came, since served from here a
+// mutable tag would stay whatever this Mac last saw.
+func importCRI(store, cri string) ([]string, error) {
+	loaded, err := os.ReadFile(filepath.Join(cri, criLoaded))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	wanted := map[string]bool{}
+	for _, line := range strings.Split(string(loaded), "\n") {
+		if name := normalize(line); name != "" {
+			wanted[name] = true
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(cri, criState))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var state map[string]descriptor
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Join(cri, criState), err)
+	}
+	current, err := readIndex(store)
+	if err != nil {
+		return nil, err
+	}
+	stored := map[string]string{} // name -> digest
+	for _, entry := range current.Manifests {
+		stored[entry.Annotations[annotationImageName]] = entry.Digest
+	}
+	var entries []descriptor
+	seen := map[string]bool{}
+	for reference, d := range state {
+		name := normalize(reference)
+		if !wanted[name] || seen[name] || stored[name] == d.Digest {
+			continue
+		}
+		seen[name] = true
+		d.Annotations = map[string]string{annotationImageName: name}
+		entries = append(entries, d)
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Annotations[annotationImageName] < entries[j].Annotations[annotationImageName]
+	})
+	return merge(store, filepath.Join(cri, criBlobs), entries)
+}
+
+// merge copies the named entries, and everything they reach, from the layout
+// whose blobs are under src into the store.
+func merge(store, src string, incoming []descriptor) ([]string, error) {
 	if err := os.MkdirAll(filepath.Join(store, "blobs", "sha256"), 0o755); err != nil {
 		return nil, err
 	}
@@ -184,7 +266,7 @@ func add(store, src string) ([]string, error) {
 	}
 
 	var added []string
-	for _, entry := range incoming.Manifests {
+	for _, entry := range incoming {
 		// BuildKit's attestations sit beside the image with no name of their
 		// own; ferry-cri drops them for the same reason.
 		if entry.Annotations[annotationSubject] != "" ||
@@ -217,7 +299,7 @@ func add(store, src string) ([]string, error) {
 		added = append(added, name)
 	}
 	if len(added) == 0 {
-		return nil, fmt.Errorf("no named images in %s", src)
+		return nil, nil
 	}
 
 	if err := writeFile(filepath.Join(store, "oci-layout"), []byte(`{"imageLayoutVersion":"1.0.0"}`)); err != nil {
