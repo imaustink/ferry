@@ -1,0 +1,16 @@
+#!/bin/bash
+# podmem <namespace>...: host phys_footprint of each running pod's VM.
+# A pod's VM is the Virtualization process holding its kubelet pod dir open.
+k="${K:-kubectl}"   # KUBECONFIG set to the cluster under test
+map="$(lsof -Fpn -c com.apple.Virtualization 2>/dev/null | awk '/^p/{p=substr($0,2)} /^n.*\/kubelet\/pods\//{split($0,a,"/kubelet/pods/"); split(a[2],b,"/"); print b[1], p}' | sort -u)"
+total=0; n=0
+for ns in "$@"; do
+  while read -r name uid; do
+    pid="$(echo "$map" | awk -v u="$uid" '$1==u{print $2; exit}')"
+    [ -n "$pid" ] || { echo "  $ns/$name: no VM"; continue; }
+    mib=$(footprint -p "$pid" 2>/dev/null | awk '/Footprint:/{for(i=1;i<=NF;i++) if($i=="Footprint:"){v=$(i+1); u=$(i+2)}} END{ if (u ~ /GB/) v*=1024; if (u ~ /KB/) v/=1024; printf "%.0f", v}')
+    echo "  $ns/$name: pid $pid ${mib} MiB"
+    total=$((total + mib)); n=$((n + 1))
+  done < <($k -n "$ns" get pods --field-selector=status.phase=Running -o custom-columns=N:.metadata.name,U:.metadata.uid --no-headers)
+done
+echo "  pods: $n, total ${total} MiB"

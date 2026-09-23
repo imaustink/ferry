@@ -1,0 +1,14 @@
+The dashboard answers on the cluster network only. Forward it to the Mac:
+
+  kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard 8443:443
+
+then open https://localhost:8443/ and sign in with the token written above,
+for example with `pbcopy < <that file>`. The certificate is self-signed, so the
+browser warns once. `kubectl proxy` does not work for this: the dashboard
+refuses a token sign-in over plain HTTP.
+
+It is not exposed as a LoadBalancer on purpose. A LoadBalancer on ferry is the
+Mac's LAN address, and this is a cluster-admin console.
+
+This is the retired Kubernetes Dashboard; `ferry addons enable headlamp` is
+its successor, with the same kind of sign-in.

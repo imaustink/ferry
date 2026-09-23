@@ -1,0 +1,186 @@
+# One Prometheus, and nothing else of the usual monitoring stack.
+#
+# kube-prometheus is an operator, an alertmanager, grafana, node-exporter on
+# every node and two replicas of most of it -- a dozen pods, which here is a
+# dozen virtual machines at a quarter of a gigabyte each. node-exporter would
+# not work anyway: it reads the node's /proc and /sys through hostPath, and the
+# node is a Mac. What is left worth having fits in one pod, scraping what the
+# cluster already serves.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferry-prometheus
+rules:
+- apiGroups: [""]
+  resources: [nodes, nodes/metrics, services, endpoints, pods]
+  verbs: [get, list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferry-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferry-prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+    scrape_configs:
+    - job_name: prometheus
+      static_configs: [{targets: ["localhost:9090"]}]
+
+    - job_name: apiserver
+      scheme: https
+      authorization: {credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token}
+      tls_config: {ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt}
+      kubernetes_sd_configs: [{role: endpointslice, namespaces: {names: [default]}}]
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: kubernetes
+        action: keep
+
+    # The kubelet's own address and port come from the Node object, so this
+    # finds a ferry node's per-profile kubelet port without being told it. Its
+    # serving certificate is self-signed, as metrics-server also has to allow.
+    - job_name: kubelet
+      scheme: https
+      authorization: {credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token}
+      tls_config: {insecure_skip_verify: true}
+      kubernetes_sd_configs: [{role: node}]
+
+    # Per-container CPU and memory come from /metrics/resource, which the
+    # kubelet fills from the runtime. /metrics/cadvisor is where they usually
+    # are, and on a Mac cAdvisor has no cgroups to read: it serves machine
+    # facts and no container series at all, measured.
+    - job_name: resource
+      scheme: https
+      metrics_path: /metrics/resource
+      authorization: {credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token}
+      tls_config: {insecure_skip_verify: true}
+      kubernetes_sd_configs: [{role: node}]
+
+    # kube-state-metrics, if that addon is on, and any pod that asks with the
+    # usual prometheus.io/scrape annotation.
+    - job_name: kube-state-metrics
+      kubernetes_sd_configs: [{role: endpointslice, namespaces: {names: [kube-system]}}]
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpointslice_port_name]
+        regex: kube-state-metrics;http-metrics
+        action: keep
+
+    - job_name: pods
+      kubernetes_sd_configs: [{role: pod}]
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: "true"
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        regex: (.+)
+        target_label: __metrics_path__
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        # A new config is a new pod; there is no reloader sidecar to pay for.
+        ferry.dev/config: v3
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        fsGroup: 65534
+      containers:
+      - name: prometheus
+        image: quay.io/prometheus/prometheus:v3.14.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.retention.time=7d
+        - --storage.tsdb.retention.size=8GB
+        ports:
+        - containerPort: 9090
+          name: web
+        readinessProbe:
+          httpGet: {path: /-/ready, port: 9090}
+        volumeMounts:
+        - {name: config, mountPath: /etc/prometheus}
+        - {name: data, mountPath: /prometheus}
+      volumes:
+      - name: config
+        configMap: {name: prometheus}
+      - name: data
+        persistentVolumeClaim: {claimName: prometheus}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - name: web
+    port: 9090
+    targetPort: 9090
