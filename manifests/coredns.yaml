@@ -86,6 +86,10 @@ spec:
     spec:
       serviceAccountName: coredns
       dnsPolicy: Default
+      # The reserved address is the first node's -- every kubelet's clusterDNS
+      # is its .2 -- and a runtime can only hand out its own node's. Scheduled
+      # anywhere else CoreDNS lands on that node's .2, which nothing asks.
+      nodeSelector: {kubernetes.io/hostname: "__DNS_NODE__"}
       containers:
         - name: coredns
           image: __COREDNS_IMAGE__

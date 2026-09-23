@@ -690,9 +690,24 @@ actor PodRuntime {
         // DNS lands where the kubelet was already told to look.
         let wantsReserved = cfg.annotations[Self.reservedAddressAnnotation] == "dns"
         let interface: any Interface
-        if wantsReserved, let reserved = dnsInterface, !dnsInterfaceInUse {
+        var takesReserved = false
+        if wantsReserved, let reserved = dnsInterface {
+            // Held means a predecessor is still being stopped: a force delete,
+            // or an etcd restore handing back a CoreDNS the kubelet has not
+            // killed yet. Taking an ordinary address instead is permanent --
+            // measured, CoreDNS at .8 until recreated, and every pod's resolver
+            // at .2 answering nothing -- so wait for it, and past that make the
+            // kubelet retry. The actor is free while this sleeps, which is what
+            // lets the stop that releases it run.
+            for _ in 0..<30 where dnsInterfaceInUse {
+                try? await Task.sleep(for: .seconds(1))
+            }
+            guard !dnsInterfaceInUse else {
+                throw RuntimeFailure.busy("the cluster DNS address is still held by a stopping sandbox")
+            }
             interface = reserved
             dnsInterfaceInUse = true
+            takesReserved = true
         } else {
             guard let fresh = try network.createInterface(id) else {
                 throw RuntimeFailure.invalid("pod network exhausted; no address available")
@@ -749,9 +764,17 @@ actor PodRuntime {
         let vmCPUs = expected.cpuLimit > 0
             ? max(config.defaultCPUs, Int(expected.cpuLimit)) : config.defaultCPUs
 
-        let pod = try makePod(id: id, interface: interface, cfg: cfg,
+        let pod: LinuxPod
+        do {
+            pod = try makePod(id: id, interface: interface, cfg: cfg,
                               clusterInterface: clusterInterface,
                               memoryBytes: vmMemory, cpus: vmCPUs)
+        } catch {
+            // No record exists yet for a stop to find, so nothing else would
+            // ever hand the DNS address back.
+            if takesReserved { dnsInterfaceInUse = false }
+            throw error
+        }
         if let clusterInterface {
             podSwitch?.attach(podID: id, fd: clusterInterface.hostFD)
         }
@@ -766,7 +789,10 @@ actor PodRuntime {
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
             ip: ip, logDirectory: cfg.logDirectory, createdAt: Self.now(),
-            usesReservedAddress: wantsReserved && dnsInterfaceInUse,
+            // Whether this sandbox took it, not whether anyone holds it: the
+            // second read made an ordinary-address CoreDNS free its
+            // predecessor's reservation on stop and leak its own address.
+            usesReservedAddress: takesReserved,
             interface: interface, clusterInterface: clusterInterface, config: cfg,
             expectedContainers: expected.containers,
             initContainerNames: expected.initContainers,

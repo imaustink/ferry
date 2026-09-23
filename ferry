@@ -1828,6 +1828,7 @@ install_dns() { # gateway dns-address
       `# what every other client already uses.` \
       -e "s|__APISERVER_HOST__|$advertise|g" \
       -e "s|__APISERVER_PORT__|$(( 6443 + PORT_SHIFT ))|g" \
+      -e "s|__DNS_NODE__|$NODE_NAME|g" \
       "$here/manifests/coredns.yaml" > "$rendered"
 
   KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f "$rendered" >/dev/null 2>&1 \
