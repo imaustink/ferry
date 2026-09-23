@@ -123,6 +123,10 @@ cp "$root/kernel/vmlinux-arm64" "$dir/kernel/"
 ok "guest kernel with NAT support"
 
 [ -x "$root/guest/nft/nft" ] || die "guest/nft is missing -- run: ./guest/build-nft.sh"
+# One packaged before its loader was baked in runs only through ferry-cri's
+# explicit loader call, and portmap, which runs it by PATH, fails in every pod.
+grep -qa '/.ferry/lib/ld-musl-aarch64.so.1' "$root/guest/nft/nft" \
+  || die "guest/nft/nft wants /lib's loader, which pods lack -- run: ./guest/build-nft.sh"
 mkdir -p "$dir/guest"
 cp -R "$root/guest/nft" "$dir/guest/nft"
 ok "nft, with its loader"
