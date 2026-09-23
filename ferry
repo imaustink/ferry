@@ -700,7 +700,15 @@ build_kubernetes_binaries() { # version
   local version="$1"
   local dir; dir="$(ferry_version_dir "$version")"
 
+  # Rebuilt when its patches have changed as well as when it is missing. A
+  # kubelet with no record of its inputs predates the record, and so may
+  # predate any patch; it is rebuilt once to find out.
+  local inputs; inputs="$(ferry_kubelet_inputs "$version")"
+  local built; built="$(cat "$dir/kubelet.inputs" 2>/dev/null || true)"
   if [ ! -x "$dir/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
+    K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+  elif [ -n "$inputs" ] && [ "$inputs" != "$built" ]; then
+    echo "==> kubelet $version was built from other patches; rebuilding"
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
   else
     echo "==> kubelet present, $version (--rebuild to force)"

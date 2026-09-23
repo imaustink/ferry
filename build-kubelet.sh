@@ -274,9 +274,11 @@ cd "$src"
 # zero, metrics-server drops the node, and `kubectl top nodes` fails while
 # `kubectl top pods` works. This builds on the Mac that will run it, so the C
 # toolchain is the one already installed for Swift.
-rm -f "$out"
+rm -f "$out" "$out.inputs"
 GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
   go build -ldflags "$ldflags" -o "$out" ./cmd/kubelet
+# What it was built from, so 'ferry build' can tell when that has moved on.
+ferry_kubelet_inputs "$K8S_VERSION" > "$out.inputs"
 
 echo "==> $out"
 ls -lh "$out"
