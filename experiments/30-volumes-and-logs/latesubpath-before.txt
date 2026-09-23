@@ -1,0 +1,21 @@
+total 16
+drwxrwxrwx    4 root     root          4096 Sep 23 05:14 .
+drwxr-xr-x   22 root     root          4096 Sep 23 05:14 ..
+drwx------    2 root     root          4096 Sep 23 05:14 kept
+drwx------    2 root     root          4096 Sep 23 05:14 lost+found
+uid=1000 gid=1000 groups=1000
+/data:
+total 20
+drwxrwxrwx    5 root     root          4096 Sep 23 05:14 .
+drwxr-xr-x   24 root     root          4096 Sep 23 05:14 ..
+drwx------    2 root     root          4096 Sep 23 05:14 kept
+drwx------    2 root     root          4096 Sep 23 05:14 lost+found
+drwxr-xr-x    3 root     root          4096 Sep 23 05:14 new
+
+/data/new:
+total 12
+drwxr-xr-x    3 root     root          4096 Sep 23 05:14 .
+drwxrwxrwx    5 root     root          4096 Sep 23 05:14 ..
+drwxr-xr-x    2 root     root          4096 Sep 23 05:14 dir
+sh: can't create /sub/f: Permission denied
+700 root

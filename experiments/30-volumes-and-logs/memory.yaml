@@ -1,0 +1,24 @@
+# A memory-backed emptyDir, written by an init container (a different VM from
+# the main container's) and read by a non-root main container through the
+# volume and through a subPath.
+apiVersion: v1
+kind: Pod
+metadata: {name: memvol}
+spec:
+  terminationGracePeriodSeconds: 0
+  initContainers:
+  - name: seed
+    image: alpine:3.20
+    command: [sh, -c, 'echo from-init > /mem/seed; mkdir -p /mem/owned && chown 1000:1000 /mem/owned && echo mine > /mem/owned/f']
+    volumeMounts: [{name: mem, mountPath: /mem}]
+  containers:
+  - name: main
+    image: alpine:3.20
+    securityContext: {runAsUser: 1000, runAsGroup: 1000}
+    command: [sleep, "3600"]
+    volumeMounts:
+    - {name: mem, mountPath: /mem}
+    - {name: mem, mountPath: /sub, subPath: late/sub}
+  volumes:
+  - name: mem
+    emptyDir: {medium: Memory, sizeLimit: 64Mi}

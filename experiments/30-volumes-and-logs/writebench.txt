@@ -1,0 +1,27 @@
+/disk 256MiB+fsync 190 ms
+/disk 2000-small-files+syncfs 40 ms
+/disk rm-2000+syncfs 10 ms
+/disk 500x-4KiB-append+fsync 210 ms
+/mem 256MiB+fsync 30 ms
+/mem 2000-small-files+syncfs 10 ms
+/mem rm-2000+syncfs 0 ms
+/mem 500x-4KiB-append+fsync 70 ms
+/dev/vdb /disk ext4 rw,relatime 0 0
+/disk 256MiB+fsync 150 ms
+/disk 2000-small-files+syncfs 40 ms
+/disk rm-2000+syncfs 0 ms
+/disk 500x-4KiB-append+fsync 430 ms
+/mem 256MiB+fsync 40 ms
+/mem 2000-small-files+syncfs 10 ms
+/mem rm-2000+syncfs 0 ms
+/mem 500x-4KiB-append+fsync 80 ms
+/dev/vdb /disk ext4 rw,relatime 0 0
+/disk 256MiB+fsync 100 ms
+/disk 2000-small-files+syncfs 40 ms
+/disk rm-2000+syncfs 0 ms
+/disk 500x-4KiB-append+fsync 370 ms
+/mem 256MiB+fsync 50 ms
+/mem 2000-small-files+syncfs 0 ms
+/mem rm-2000+syncfs 10 ms
+/mem 500x-4KiB-append+fsync 70 ms
+/dev/vdc /disk ext4 rw,relatime 0 0
