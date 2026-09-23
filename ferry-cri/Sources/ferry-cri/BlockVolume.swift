@@ -30,6 +30,17 @@
 // as long as the emptyDir should: past container restarts and VM rebuilds,
 // which is why it cannot be a directory inside the guest, and gone when the
 // kubelet tears the volume down with the pod.
+//
+// Except `medium: Memory`. macOS has no tmpfs, so ferry's kubelet makes that a
+// plain directory like any other emptyDir's, and it used to become an ext4
+// image on the Mac's disk too -- which is not what anyone asking for memory
+// wants: it is slower, and it is on a disk. The pod spec says which emptyDirs
+// asked (ferry-streamer reports them), and those are a tmpfs inside the pod's
+// own VM, the framework's PodVolume.Source.tmpfs, mounted where an image would
+// be and bound into containers the same way. What an image got from living on
+// the Mac -- surviving the VM being rebuilt when a container restarts or an init
+// container hands over to the next -- a tmpfs gets by being carried across:
+// PodRuntime archives it out of the old VM, in memory, and back into the new one.
 
 import Containerization
 import ContainerizationEXT4
@@ -40,6 +51,12 @@ struct BlockVolume: Sendable, Equatable {
     /// The PersistentVolume's directory on the Mac, ferry-storage's
     /// `<root>/pvc-<uid>`. Also the pod volume's name, by its last component.
     let directory: String
+
+    /// Set for an emptyDir with `medium: Memory`: a tmpfs of this many bytes
+    /// inside the VM rather than an image on the Mac. Zero lets the guest
+    /// kernel choose, which is half the VM's memory.
+    var tmpfsBytes: UInt64? = nil
+    var isMemory: Bool { tmpfsBytes != nil }
 
     /// Unique within a pod, since one claim is attached to a pod at most once,
     /// and stable across rebuilds of the pod's LinuxPod.
@@ -83,7 +100,13 @@ struct BlockVolume: Sendable, Equatable {
     static let imageName = "disk.ext4"
 
     var podVolume: LinuxPod.PodVolume {
-        LinuxPod.PodVolume(name: name, source: .diskImage(path: URL(filePath: image)), format: "ext4")
+        if let tmpfsBytes {
+            // The root is 1777, tmpfs's own default, which is what a memory
+            // emptyDir's root is on Linux.
+            return LinuxPod.PodVolume(name: name, source: .tmpfs(sizeBytes: tmpfsBytes > 0 ? tmpfsBytes : nil),
+                                      format: "tmpfs")
+        }
+        return LinuxPod.PodVolume(name: name, source: .diskImage(path: URL(filePath: image)), format: "ext4")
     }
 
     /// The block volume a kubelet mount belongs to, and the subPath within it.
@@ -100,14 +123,17 @@ struct BlockVolume: Sendable, Equatable {
     /// never mistaken for one and attached as a disk.
     ///
     /// An emptyDir counts whether or not its image exists yet, since making
-    /// it is this runtime's job.
-    static func locate(hostPath: String) -> (volume: BlockVolume, subPath: String)? {
+    /// it is this runtime's job. One named in `memory` is a tmpfs of that size.
+    static func locate(hostPath: String, memory: [String: UInt64] = [:])
+        -> (volume: BlockVolume, subPath: String)?
+    {
         var current = (hostPath as NSString).standardizingPath
         var below: [String] = []
         while current != "/" && !current.isEmpty {
             let name = (current as NSString).lastPathComponent
             if isEmptyDir(current) {
-                return (BlockVolume(directory: current), below.reversed().joined(separator: "/"))
+                return (BlockVolume(directory: current, tmpfsBytes: memory[name]),
+                        below.reversed().joined(separator: "/"))
             }
             if name.hasPrefix("pvc-") {
                 var isDirectory: ObjCBool = false

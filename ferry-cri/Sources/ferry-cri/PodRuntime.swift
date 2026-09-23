@@ -166,6 +166,12 @@ struct SandboxRecord {
     /// would have made the directory -- here it made one on the Mac beside the
     /// image, which the filesystem inside it knows nothing about.
     var blockSubPaths: [String] = []
+    /// emptyDirs with `medium: Memory`, by volume name, and the size of the
+    /// tmpfs each one is -- see memoryVolumeSizes.
+    var memoryVolumes: [String: UInt64] = [:]
+    /// Their contents, archived out of a VM that is being replaced, to be put
+    /// back into the next one once it boots. Empty the rest of the time.
+    var carriedVolumes: [String: Data] = [:]
 }
 
 struct ContainerRecord {
@@ -685,7 +691,8 @@ actor PodRuntime {
         // died of a guest OOM well inside the limit Kubernetes had granted it.
         let expected = await podContainers(
             namespace: cfg.metadata.namespace, name: cfg.metadata.name)
-        let vmMemory = vmMemory(forPodLimit: expected.memoryLimit)
+        let memoryVolumes = Self.memoryVolumeSizes(expected.memoryVolumes, podLimit: expected.memoryLimit)
+        let vmMemory = vmMemory(forPodLimit: expected.memoryLimit, memoryVolumes: memoryVolumes)
         let vmCPUs = expected.cpuLimit > 0
             ? max(config.defaultCPUs, Int(expected.cpuLimit)) : config.defaultCPUs
 
@@ -714,7 +721,8 @@ actor PodRuntime {
             gpuContainerNames: expected.gpuContainers,
             priority: expected.priority,
             vmMemoryBytes: vmMemory,
-            vmCPUs: vmCPUs
+            vmCPUs: vmCPUs,
+            memoryVolumes: memoryVolumes
         )
         return id
     }
@@ -770,18 +778,18 @@ actor PodRuntime {
     private func podContainers(namespace: String, name: String) async
         -> (initContainers: [String], containers: [String], gpuContainers: [String],
             priority: Int32, memoryLimit: Int64, cpuLimit: Int32,
-            volumeSubPaths: [String: [String]])
+            volumeSubPaths: [String: [String]], memoryVolumes: [String: Int64])
     {
-        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0, 0, 0, [:]) }
+        guard !namespace.isEmpty, !name.isEmpty, let streamer else { return ([], [], [], 0, 0, 0, [:], [:]) }
         do {
             let body = try streamer.get(path: "/pod?namespace=\(namespace)&name=\(name)")
             let decoded = try JSONDecoder().decode(PodContainers.self, from: body)
             return (decoded.initContainers ?? [], decoded.containers ?? [],
                     decoded.gpuContainers ?? [], decoded.priority ?? 0,
                     decoded.memoryLimitBytes ?? 0, decoded.cpuLimit ?? 0,
-                    decoded.volumeSubPaths ?? [:])
+                    decoded.volumeSubPaths ?? [:], decoded.memoryVolumes ?? [:])
         } catch {
-            return ([], [], [], 0, 0, 0, [:])
+            return ([], [], [], 0, 0, 0, [:], [:])
         }
     }
 
@@ -796,9 +804,34 @@ actor PodRuntime {
     /// floor: sizing a machine below it makes nothing smaller, since guest
     /// memory is lazily backed and costs what it touches rather than what it
     /// was promised.
-    private func vmMemory(forPodLimit limit: Int64) -> UInt64 {
-        guard limit > 0 else { return config.defaultMemoryBytes }
-        return max(config.defaultMemoryBytes, UInt64(limit) + Self.guestMemoryHeadroom)
+    ///
+    /// A memory-backed emptyDir is added on top. On Linux its pages are charged
+    /// to the container that wrote them and so fall inside that container's
+    /// limit, and here they are too while the VM lasts -- but what is carried
+    /// into a replacement VM is written by the guest agent, which no container
+    /// limit covers, and the container can then use its whole limit besides.
+    /// So the machine has room for both. It costs nothing until it is written.
+    private func vmMemory(forPodLimit limit: Int64, memoryVolumes: [String: UInt64] = [:]) -> UInt64 {
+        let volumes = memoryVolumes.values.reduce(0, +)
+        guard limit > 0 else { return config.defaultMemoryBytes + volumes }
+        return max(config.defaultMemoryBytes, UInt64(limit) + Self.guestMemoryHeadroom + volumes)
+    }
+
+    /// How large each memory-backed emptyDir's tmpfs is: its sizeLimit, no
+    /// larger than the pod's memory limit, or the pod's limit when it set no
+    /// sizeLimit -- which is how the kubelet sizes one on Linux. A pod with
+    /// neither gets 0, leaving it to the guest kernel's default of half the
+    /// VM; Linux would give it the node's allocatable memory, which is not a
+    /// number a VM with a fixed size can honour.
+    static func memoryVolumeSizes(_ volumes: [String: Int64], podLimit: Int64) -> [String: UInt64] {
+        volumes.mapValues { sizeLimit in
+            switch (sizeLimit > 0, podLimit > 0) {
+            case (true, true): UInt64(min(sizeLimit, podLimit))
+            case (true, false): UInt64(sizeLimit)
+            case (false, true): UInt64(podLimit)
+            case (false, false): 0
+            }
+        }
     }
 
     /// What the guest kernel, vminitd and the pod's own page cache need beyond
@@ -1310,6 +1343,7 @@ actor PodRuntime {
                     the sandbox is marked not ready so the kubelet recreates the pod
                     """)
             }
+            await carryMemoryVolumes(sandboxID)
             try? await sandbox.pod.stop()
             // The old containers keep their records, and with them their exit
             // codes and log paths. This path is the ordinary restart of a
@@ -1357,7 +1391,8 @@ actor PodRuntime {
         // should fail before there is a root filesystem clone to clean up.
         var blockMounts: [String: (volume: BlockVolume, subPath: String)] = [:]
         for mount in cfg.mounts where !mount.hostPath.isEmpty && !mount.containerPath.isEmpty {
-            guard let located = BlockVolume.locate(hostPath: mount.hostPath) else { continue }
+            guard let located = BlockVolume.locate(hostPath: mount.hostPath,
+                                                   memory: sandbox.memoryVolumes) else { continue }
             blockMounts[mount.hostPath] = located
         }
         // Every subPath this container wants of each volume, so a first format
@@ -1607,6 +1642,13 @@ actor PodRuntime {
     /// corrupts it.
     private func claimBlockVolume(_ volume: BlockVolume, sandboxID: String,
                                   subPaths: [String] = []) async throws {
+        // A tmpfs is the VM's own: nothing to format, and nobody else's to take.
+        if volume.isMemory {
+            if sandboxes[sandboxID]?.blockVolumes.contains(volume) == false {
+                sandboxes[sandboxID]?.blockVolumes.append(volume)
+            }
+            return
+        }
         if let held = blockClaims[volume.directory] {
             if held.sandboxID == sandboxID { return }
             let holder = sandboxes[held.sandboxID].map { "\($0.namespace)/\($0.name)" } ?? held.sandboxID
@@ -1686,26 +1728,80 @@ actor PodRuntime {
         sandboxes[sandboxID]?.podVolumes = sandbox.blockVolumes
     }
 
-    /// Creates the subPath directories a pod's containers bind from, once the
-    /// VM is up and its volumes are mounted.
+    /// Archives each memory-backed emptyDir out of a sandbox's VM before it is
+    /// replaced, for makeBlockSubPaths to put back once the next one boots.
+    ///
+    /// This is what lets a tmpfs keep the emptyDir promise that its contents
+    /// outlive a container: here a container restarting, or an init container
+    /// handing over to the next, is a new VM. Held in this process's memory,
+    /// never written to the Mac's disk. A VM that died on its own takes its
+    /// tmpfs with it, as a node that loses power does on Linux.
+    private func carryMemoryVolumes(_ sandboxID: String) async {
+        guard let sandbox = sandboxes[sandboxID], sandbox.booted else { return }
+        let volumes = sandbox.podVolumes.filter(\.isMemory)
+        guard !volumes.isEmpty else { return }
+        for volume in volumes {
+            do {
+                let root = volume.guestPath
+                let started = ContinuousClock.now
+                let data = try await sandbox.pod.withVirtualMachineInstance { vm in
+                    try await GuestFiles.archive(vm: vm, root: root)
+                }
+                sandboxes[sandboxID]?.carriedVolumes[volume.name] = data
+                print("    volume    carried \(volume.name) of \(sandbox.namespace)/\(sandbox.name): "
+                    + "\(data.count) bytes archived in \(ContinuousClock.now - started)")
+            } catch {
+                FileHandle.standardError.write(
+                    "warning: could not carry \(volume.name) over to \(sandboxID)'s next VM: \(error)\n"
+                        .data(using: .utf8)!)
+            }
+        }
+    }
+
+    /// Puts carried memory volumes back, then creates the subPath directories a
+    /// pod's containers bind from, once the VM is up and its volumes are
+    /// mounted. Before any container starts, so nothing in the pod can race it.
+    ///
+    /// A subPath already there is left as it is. A missing one is made with the
+    /// volume root's mode, root-owned, which is what the kubelet does on Linux
+    /// -- and not through the agent's mkdir, which would make it 0755 whatever
+    /// it was asked for, so a non-root container could not write to a subPath
+    /// that appeared after the volume's first format. See GuestFiles.
     ///
     /// Not fatal: a subPath the workload made into a file is still bound, and
     /// anything genuinely wrong surfaces when the container starts, with the
     /// runtime's own error.
-    ///
-    /// A symlink planted in the volume can point this somewhere else in the
-    /// pod's own VM, never at the Mac: the VM is the boundary, and everything
-    /// in it belongs to this pod.
     private func makeBlockSubPaths(_ sandboxID: String) async {
-        guard let sandbox = sandboxes[sandboxID], !sandbox.blockSubPaths.isEmpty else { return }
+        guard let sandbox = sandboxes[sandboxID] else { return }
+        let carried = sandbox.carriedVolumes
+        guard !sandbox.blockSubPaths.isEmpty || !carried.isEmpty else { return }
+        sandboxes[sandboxID]?.carriedVolumes = [:]
+        let volumes = sandbox.podVolumes
         let paths = sandbox.blockSubPaths
         do {
             try await sandbox.pod.withVirtualMachineInstance { vm in
-                let agent = try await vm.dialAgent()
-                for path in paths {
-                    try? await agent.mkdir(path: path, all: true, perms: 0o777)
+                for volume in volumes {
+                    if let archive = carried[volume.name] {
+                        do {
+                            let started = ContinuousClock.now
+                            try await GuestFiles.restore(vm: vm, root: volume.guestPath, archive: archive)
+                            print("    volume    restored \(volume.name) in \(sandboxID): "
+                                + "\(archive.count) bytes in \(ContinuousClock.now - started)")
+                        } catch {
+                            FileHandle.standardError.write(
+                                "warning: could not restore \(volume.name) in \(sandboxID): \(error)\n"
+                                    .data(using: .utf8)!)
+                        }
+                    }
+                    let prefix = volume.guestPath + "/"
+                    let subPaths = paths.filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
+                    guard !subPaths.isEmpty else { continue }
+                    let mode = try await GuestFiles.mode(vm: vm, of: volume.guestPath)
+                    for subPath in subPaths {
+                        _ = try? await GuestFiles.makeDirectory(vm: vm, root: volume.guestPath,
+                                                                path: subPath, mode: mode)
+                    }
                 }
-                try? await agent.close()
             }
         } catch {
             FileHandle.standardError.write(
