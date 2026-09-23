@@ -10,17 +10,22 @@
 // worked before the guest kernel could NAT, and it is now the fallback for a
 // kernel that cannot -- ordinarily the rules live in each pod instead.
 //
-// NodePort needs no privilege: the range is 30000-32767. Loopback aliases for
-// ClusterIPs do, and so does a LoadBalancer port below 1024.
+// NodePort needs no privilege: the range is 30000-32767. Nor does a
+// LoadBalancer, on any port (expose.go). Loopback aliases for ClusterIPs do.
+//
+// NetworkPolicy is checked here too, against the client's own address, because
+// the pod only ever sees this Mac (policy.go).
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -45,6 +50,7 @@ func main() {
 	loadBalancerIP := flag.String("load-balancer-ip", "", "address to answer LoadBalancer services on, usually this Mac's LAN address")
 	nodeName := flag.String("node-name", "", "this node, so endpoints elsewhere can be told apart from endpoints here")
 	hostPortPath := flag.String("host-ports", "", "file ferry-cri writes listing each pod's hostPorts")
+	netpolSocket := flag.String("netpol-socket", "", "ferry-netpol's socket, to hold outside clients to NetworkPolicy")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -72,6 +78,10 @@ func main() {
 		clusterIPs:     *clusterIPs,
 		nodePorts:      *nodePorts,
 		loadBalancerIP: *loadBalancerIP,
+	}
+
+	if *netpolSocket != "" {
+		watchEdgePolicy(*netpolSocket)
 	}
 
 	// hostPort has nothing to do with Services, so it watches a file rather
@@ -126,6 +136,8 @@ type controller struct {
 	// Ports that could not be bound, so the reason is logged once rather than
 	// on every reconcile.
 	complained map[string]bool
+	// Services already told their SCTP ports have no edge, by service name.
+	sctpWarned map[string]bool
 }
 
 func (c *controller) shutdown() {
@@ -164,6 +176,8 @@ func (c *controller) reconcile() {
 	type portKey struct{ service, portName string }
 	endpoints := map[portKey][]backend{}
 	remoteNodes := map[portKey][]string{}
+	nodes := c.nodeAddresses()
+	mine := localAddressSet()
 	for _, slice := range slices {
 		serviceName := slice.Labels[discoveryv1.LabelServiceName]
 		if serviceName == "" {
@@ -186,7 +200,13 @@ func (c *controller) reconcile() {
 					continue
 				}
 				key := portKey{service, name}
-				onThisMac := endpoint.NodeName == nil || *endpoint.NodeName == c.nodeName
+				// Another node on this Mac counts as this Mac: its vmnet
+				// network is the Mac's too, so its pods are dialled directly.
+				// Handing them to its node port instead meant dialling our own
+				// listener, which forwarded to itself until it ran out of file
+				// descriptors -- measured, 850 MB and an empty reply.
+				onThisMac := endpoint.NodeName == nil || *endpoint.NodeName == c.nodeName ||
+					mine[nodes[*endpoint.NodeName]]
 				if !onThisMac {
 					remoteNodes[key] = append(remoteNodes[key], *endpoint.NodeName)
 					continue
@@ -195,9 +215,7 @@ func (c *controller) reconcile() {
 					// A pod on this Mac is reachable at the address the cluster
 					// knows it by: its vmnet subnet is this node's slice of the
 					// pod network, and the Mac is on that subnet.
-					endpoints[key] = append(endpoints[key], backend{
-						address: joinHostPort(address, *port.Port),
-					})
+					endpoints[key] = append(endpoints[key], podBackend(joinHostPort(address, *port.Port)))
 				}
 			}
 		}
@@ -206,6 +224,7 @@ func (c *controller) reconcile() {
 	if c.complained == nil {
 		c.complained = map[string]bool{}
 	}
+	sctpWanted := map[string]bool{}
 
 	desired := map[string]bool{}
 	for _, service := range services {
@@ -215,11 +234,24 @@ func (c *controller) reconcile() {
 		// Mac is standing in for one.
 		var wanted []exposure
 		if c.nodePorts || c.loadBalancerIP != "" {
-			for _, e := range exposuresFor(service, c.loadBalancerIP) {
+			exposures, sctp := exposuresFor(service, c.loadBalancerIP)
+			for _, e := range exposures {
 				if e.kind == "NodePort" && !c.nodePorts {
 					continue
 				}
 				wanted = append(wanted, e)
+			}
+			if len(sctp) > 0 {
+				// Said once, where `kubectl describe svc` shows it, rather than
+				// skipped in silence -- which is what used to happen.
+				sctpWanted[name] = true
+				if !c.sctpWarned[name] {
+					klog.InfoS("SCTP has no host edge on macOS", "service", name, "ports", sctp)
+					warnOnService(context.Background(), c.client, service, "SCTPNotServed",
+						fmt.Sprintf("ferry cannot serve SCTP on %s: macOS has no SCTP sockets, and raw IP "+
+							"needs root. The ClusterIP carries SCTP between pods; reach it from inside the cluster.",
+							strings.Join(sctp, ", ")))
+				}
 			}
 		}
 
@@ -254,37 +286,33 @@ func (c *controller) reconcile() {
 						continue
 					}
 				}
-				proxy, err := newServiceProxy(e.key, e.address, e.port, e.protocol)
+				var proxy *serviceProxy
+				err := c.ownPortConflict(e)
+				if err == nil {
+					proxy, err = newServiceProxy(e.key, e.address, e.port, e.protocol, e.only)
+				}
 				if err != nil {
-					// A privileged port without privilege is the common case and
-					// deserves a sentence, not a stack of identical errors.
+					// A port somebody else holds is the common case and deserves
+					// a sentence, not a stack of identical errors.
 					if !c.complained[e.key] {
 						c.complained[e.key] = true
-						if e.port < 1024 {
-							klog.ErrorS(err, "Could not listen on a privileged port; run ferry-proxy as root to serve it",
-								"service", name, "addr", e.describe(), "kind", e.kind)
-							warnOnService(context.Background(), c.client, service, "PortNotPermitted",
-								fmt.Sprintf("ferry cannot listen on %s: ports below 1024 need root. "+
-									"Restart the cluster with 'FERRY_HOST_CLUSTER_IPS=1 ferry up', which runs "+
-									"ferry-proxy under sudo, or reach this Service on its node port instead.",
-									e.describe()))
-						} else {
-							klog.ErrorS(err, "Could not listen for service",
-								"service", name, "addr", e.describe(), "kind", e.kind)
-							warnOnService(context.Background(), c.client, service, "ListenFailed",
-								fmt.Sprintf("ferry could not listen on %s: %v", e.describe(), err))
-						}
+						reason, message := listenFailure(e, err)
+						klog.ErrorS(err, "Could not listen for service",
+							"service", name, "addr", e.describe(), "kind", e.kind, "reason", reason)
+						warnOnService(context.Background(), c.client, service, reason, message)
 					}
 					continue
 				}
 				c.proxies[e.key] = proxy
 				if e.protocol == corev1.ProtocolUDP {
-					u, err := newUDPProxy(e.key, e.address, e.port, proxy)
+					u, err := newUDPProxy(e.key, e.address, e.port, proxy, e.only)
 					if err != nil {
 						if !c.complained[e.key] {
 							c.complained[e.key] = true
+							reason, message := listenFailure(e, err)
 							klog.ErrorS(err, "Could not listen for service",
 								"service", name, "addr", e.describe(), "kind", e.kind, "protocol", "UDP")
+							warnOnService(context.Background(), c.client, service, reason, message)
 						}
 						delete(c.proxies, e.key)
 						continue
@@ -293,10 +321,16 @@ func (c *controller) reconcile() {
 				}
 				delete(c.complained, e.key)
 				klog.InfoS("Serving", "kind", e.kind, "service", name, "addr", e.describe())
+				if proxy.shared {
+					warnOnService(context.Background(), c.client, service, "PortShared",
+						fmt.Sprintf("another process on this Mac holds *:%d -- on macOS the AirPlay Receiver "+
+							"holds 5000 and 7000 -- so ferry answers at %s and on loopback only, ahead of it.",
+							e.port, e.describe()))
+				}
 			}
 			pk := portKey{name, e.portName}
 			c.proxies[e.key].setBackends(
-				chooseBackends(endpoints[pk], remoteNodes[pk], c.nodeAddresses(), e.nodePort))
+				chooseBackends(endpoints[pk], remoteNodes[pk], nodes, e.nodePort))
 
 			if e.kind == "LoadBalancer" && !published {
 				published = true
@@ -304,6 +338,8 @@ func (c *controller) reconcile() {
 			}
 		}
 	}
+
+	c.sctpWarned = sctpWanted
 
 	for key, proxy := range c.proxies {
 		if desired[key] {
@@ -317,6 +353,51 @@ func (c *controller) reconcile() {
 		}
 		klog.InfoS("Stopped serving", "service", key)
 	}
+}
+
+// ownPortConflict refuses a node port or load balancer this process already
+// has a wildcard listener on the port of, for another Service.
+//
+// A listener used to be the arbiter: two Services asking for one port, the
+// second failed to bind. With the fallback to particular addresses when the
+// wildcard is taken (newServiceProxy), the second would instead bind them and
+// quietly take the first one's traffic. So a port that is ours already is
+// in use here, before the kernel is asked.
+func (c *controller) ownPortConflict(e exposure) error {
+	slot := slotOf(e.key)
+	if slot == "" {
+		return nil
+	}
+	for key := range c.proxies {
+		if key != e.key && slotOf(key) == slot {
+			return fmt.Errorf("%s is already served for %s: %w", slot, key, syscall.EADDRINUSE)
+		}
+	}
+	return nil
+}
+
+// slotOf is the "port/protocol" a node port or load balancer key listens on,
+// both being wildcard listeners.
+func slotOf(key string) string {
+	if !strings.HasPrefix(key, "nodeport/") && !strings.HasPrefix(key, "loadbalancer/") {
+		return ""
+	}
+	return key[strings.LastIndex(key, ":")+1:]
+}
+
+// localAddressSet is every address this Mac answers on.
+func localAddressSet() map[string]bool {
+	out := map[string]bool{}
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return out
+	}
+	for _, a := range addresses {
+		if n, ok := a.(*net.IPNet); ok {
+			out[n.IP.String()] = true
+		}
+	}
+	return out
 }
 
 // nodeAddresses returns where each node can be reached from another Mac.
