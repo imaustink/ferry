@@ -26,6 +26,8 @@ enum LogStream: String {
 /// A live subscriber to a container's output, used by `kubectl attach`.
 protocol OutputSink: AnyObject, Sendable {
     func receive(_ data: Data, stream: LogStream)
+    /// The container has exited; nothing more will arrive.
+    func ended(exitCode: Int32)
 }
 
 /// The log file for one container, and the fan-out point for attach.
@@ -39,9 +41,31 @@ final class ContainerLogFile: @unchecked Sendable {
     private var sinks: [ObjectIdentifier: any OutputSink] = [:]
     private let sinkLock = NSLock()
 
+    /// Set once the container has exited, so a late subscriber is told at
+    /// once instead of waiting for output that will never come.
+    private var exitCode: Int32?
+
     func subscribe(_ sink: any OutputSink) {
-        sinkLock.lock(); defer { sinkLock.unlock() }
-        sinks[ObjectIdentifier(sink)] = sink
+        sinkLock.lock()
+        guard let code = exitCode else {
+            sinks[ObjectIdentifier(sink)] = sink
+            sinkLock.unlock()
+            return
+        }
+        sinkLock.unlock()
+        sink.ended(exitCode: code)
+    }
+
+    /// Tells everyone attached that the container is gone. Without it an
+    /// attached client -- `kubectl attach`, `kubectl run -i`, `kubectl debug
+    /// -i` -- sat on a dead container until it was interrupted.
+    func ended(exitCode code: Int32) {
+        sinkLock.lock()
+        exitCode = code
+        let current = Array(sinks.values)
+        sinks.removeAll()
+        sinkLock.unlock()
+        for sink in current { sink.ended(exitCode: code) }
     }
 
     func unsubscribe(_ sink: any OutputSink) {

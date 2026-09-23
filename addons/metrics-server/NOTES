@@ -6,7 +6,8 @@ local-cluster distribution does the same thing for the same reason.
   kubectl top pods -A
   kubectl top nodes
 
-It needs about fifteen seconds after enabling before it has anything to report.
+It has nothing to report for its first fifteen seconds or so, which is why
+enabling it waits until `kubectl top nodes` answers.
 
 This used to come with a warning that the aggregated API could not be reached
 unless ClusterIPs were bound on the Mac with FERRY_HOST_CLUSTER_IPS=1. That is

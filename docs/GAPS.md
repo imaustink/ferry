@@ -1,243 +1,121 @@
 # What ferry does not do yet
 
-Measured against minikube and kind, which are what people will compare it to.
-Everything below was checked against a running cluster rather than assumed.
+This is measured against minikube and kind, which are what people will compare ferry to. Everything below was checked against a running cluster rather than assumed. Each claim links to the experiment that measured it.
 
-Most of the original list is closed. What is left is three features that are
-honestly absent and one correction, which is worth reading first.
+This revision closed most of what the last one listed. It also found that three of those entries were wrong about the cause, and one was wrong about the risk. Those corrections come first.
 
-## A correction
+## Corrections
 
-The previous revision of this document reported that **a NetworkPolicy does not
-reach pods that are already running**. That was the wrong diagnosis of a real
-bug, and the difference mattered.
+- **SCTP was never missing from the guest kernel.** The kernel ferry boots has `CONFIG_IP_SCTP=y`, `CONFIG_NF_CT_PROTO_SCTP=y` and the SCTP match, and did before. What stopped SCTP was that vmnet drops IP protocol 132 between two pods on one node, and that macOS has no SCTP at all. See [experiment 27](../experiments/27-edge-policy-sctp/FINDINGS.md).
+- **A LoadBalancer below 1024 never needed root.** macOS refuses a low port to an unprivileged process only when it binds a specific address; the wildcard is allowed. Binding the wildcard and answering only at the LAN address and loopback is all it took. See experiment 27.
+- **A crash never restarted the whole pod because Containerization refuses to restart a container.** The kubelet never restarts a container; it creates a new one with a new ID. The pod was rebuilt because each container was its own disk, and a running VM cannot take another disk. See [experiment 31](../experiments/31-restart-in-place/FINDINGS.md).
+- **"Ingress policies do not filter traffic from the node" understated the risk.** ferry-proxy dialled pods from the node's own address, and ingress policy let the node through. So every NodePort, LoadBalancer and hostPort client bypassed NetworkPolicy entirely: a `deny-all` stopped other pods and nothing from the internet. Anything from outside the cluster CIDR was accepted as well, which made `ipBlock` meaningless. Policy is now enforced at the edge, where the client's address is still known. See experiment 27.
 
-The symptom was that applying `deny-all` to a namespace whose pods were already
-up changed nothing, while a pod recreated afterwards came up isolated. The
-conclusion drawn -- rules are programmed only at pod start -- fit those two
-observations and was wrong. What was actually happening is that ingress policy
-exempted *anything that did not arrive on `eth1`*, intending to exempt the Mac's
-health probes, and two pods on the **same node** reach each other over `eth0`.
-So same-node traffic was never policed at all, at any point in a pod's life, and
-the recreated pod appeared isolated for an unrelated reason.
+The last revision's lesson holds: two observations can be consistent with a theory that is still wrong. Every item above was re-measured before it was changed.
 
-The measurement that settled it: with `deny-all` in place, a pod on the same Mac
-got through and a pod on the other Mac did not. That is fixed now, and the
-current behaviour is in the last section.
+## Closed in this revision
 
-The lesson is the one this document keeps relearning: two observations can be
-consistent with a theory that is still wrong. Change one variable at a time and
-re-measure rather than reasoning from the source.
+| was | now | measured in |
+|---|---|---|
+| NodePort, LoadBalancer and hostPort clients bypass NetworkPolicy | ferry-proxy checks each client against the chosen pod's rules before dialling (6–18 ns, 0 allocations per accept); `ipBlock`, `except`, `endPort` and named ports are compiled; joined Macs enforce policy too | [27](../experiments/27-edge-policy-sctp/FINDINGS.md), [34](../experiments/34-join-policy/) |
+| a LoadBalancer below 1024 needs root | ingress-nginx gets the LAN address on 80 and 443 unprivileged; `localhost` reaches LoadBalancers | 27 |
+| SCTP Services absent | SCTP to a pod and to a ClusterIP works on one node (0.5–0.6 ms) and across nodes (~1 ms) | 27 |
+| a crash in a multi-container pod restarts the pod | the container restarts inside the running VM in ~45 ms, with the same IP and sibling PIDs; a container of an image the pod already runs can join after boot, `kubectl debug` included; the ~22-container ceiling per pod is gone | [31](../experiments/31-restart-in-place/FINDINGS.md) |
+| an idle pod costs 226 MiB; maxPods 72 on 32 GiB | **133 MiB**, flat at 20 and 60 pods; maxPods 110 from 32 GiB up, 61 on 16 GiB | [32](../experiments/32-pod-memory-footprint/FINDINGS.md) |
+| no zero-downtime control plane upgrade | 0 failed requests under a 50 ms probe; the slowest held request took 1.5 s | [28](../experiments/28-control-plane-upgrades/FINDINGS.md) |
+| a minor bump on a running cluster only reasoned about | v1.34 → v1.35 → v1.36 applied live, with the node roll and a rollback | 28 |
+| every node on one Mac moves together | each node runs its kubelet from its own version directory | 28 |
+| an image is loaded per node | a loaded or built image reaches every node on the Mac, every machine, and other Macs through their registries, with mutual TLS | [33](../experiments/33-cluster-images-and-volumes/FINDINGS.md) |
+| `chown` refused, and no real ReadWriteOnce, on mode 2 volumes | `storageClassName: ferry-local-block` is an ext4 disk attached to the machine over USB: ownership is kept, pods on one machine share it, and it moves between machines | 33 |
+| two addons | ten, each enabled, used and disabled on a cluster: metrics-server, ingress-nginx, registry, dashboard, headlamp, cert-manager, gateway-api, envoy-gateway, kube-state-metrics, prometheus | [addons/README.md](../addons/README.md) |
+| `medium: Memory` is disk | a tmpfs in the pod VM, sized from `sizeLimit` or the pod limit, charged to the container's cgroup, and carried over any VM replacement | [30](../experiments/30-volumes-and-logs/FINDINGS.md) |
+| a late subPath is `0755 root` | a late subPath gets the volume root's mode, as on Linux | 30 |
+| `kubectl logs --previous` fails after each crash | 0 of 932 polls failed, against 255 of 921 before. The window was 12–32 s, not "a few seconds". | 30 |
+
+**Found and fixed on the way:**
+
+- **An etcd restore did not bump the revision**, so every watcher silently missed it.
+- **`ferry down` killed every profile's ferry-proxy.**
+- **A NodePort for a pod on another node of the same Mac forwarded to itself** until it ran out of file descriptors.
+- **A hostPort in front of a different containerPort was dialled at the hostPort.**
+- **Exec probes never ran:** ExecSync was not implemented.
+- **Containers were never asked to stop:** they got SIGKILL at once.
+- **`ferry node add` reused a stale podCIDR.**
+- **CoreDNS could lose its reserved address.**
+- **Nothing refused an unsafe upgrade:** the node skew check only warned, only looked at local nodes, and `apply` also moved the kubelet.
+- **ferry-proxyd was never upgraded.**
+- **A rollback across a minor kept the newer data.**
+- **Several kubelet build seams were skipped silently** when their upstream file moved.
 
 ## Expected, and missing
 
-- **SCTP Services.** UDP is carried end to end now. SCTP is not: `ferry-proxy`
-  skips it outright on the host edge, and the guest kernel is built from Apple's
-  configuration plus four netfilter symbols, which does not include
-  `CONFIG_IP_SCTP`. Both halves would have to change, and the kernel build is
-  the slow one that needs Docker.
-- **Dashboard**, **registry**, and the rest of the addon ecosystem. The addon
-  mechanism exists -- `ferry addons list|enable|disable`, reading
-  `addons/<name>/` -- and carries two. minikube has around thirty.
-- **Choosing the Kubernetes version is a build input, and now also an upgrade
-  input.** `ferry build --kubernetes-version vX.Y.Z` picks it, and one version
-  now drives the kubelet, `ferry-proxyd`, the control plane and etcd together --
-  before, the kubelet and the control plane had separate defaults that nothing
-  reconciled, so asking for a version newer than the control plane's default
-  produced a kubelet newer than the API server with nothing saying so.
-  v1.34.0 and v1.34.11 have both been built and run, and a cluster moved
-  between them in both directions. The patches
-  in `patches/` are written against a particular tree; `build-kubelet.sh`
-  verifies every seam it edits and fails loudly when one has moved, so a drifted
-  version fails at build time rather than at runtime, which is the best that can
-  be said for it.
+- **SCTP at the edge.** A NodePort, LoadBalancer or hostPort cannot carry SCTP:
+  - macOS answers an SCTP socket with `EPROTONOSUPPORT` and a raw protocol-132 socket with `EPERM`;
+  - `/dev/bpf*` is root-only.
 
-## Upgrades, and what an upgrade does not cover
+  The Service now records `SCTPNotServed` rather than silently getting no listener. The first SCTP association to a new peer on the same node waits one 3 s INIT retransmit while the switch resolves the neighbour.
+- **RWX `chown`, and volumes that span Macs.** A ReadWriteMany claim, and the default `ferry-local` class in mode 2, are virtiofs directories served as the Mac user. `chown` there does not fail, but it is not kept: each caller sees its own uid as the owner.
 
-**Cluster upgrades work** -- `ferry upgrade plan|apply|node|nodes|rollback|
-status`, documented in [UPGRADES.md](UPGRADES.md) -- and were run on a real
-cluster rather than reasoned about. v1.34.0 up to v1.34.11, back down, and up
-again:
+  A spike with an NFSv3 server running as the user mounted from both kinds of pod and kept `chown` in an xattr, at virtiofs speed. Before it can ship it needs three things:
+  - a server that passes the caller's identity through for permission checks;
+  - real syncs;
+  - scoped exports.
 
-- the control plane restarted against the same etcd data directory and the
-  workload did not notice. Same pods, same names, same IPs, **zero restarts**,
-  and their ages carried straight through the switch;
-- the node drained with eviction, its kubelet was replaced while `ferry-cri`
-  kept running, and it came back Ready at the new version and uncordoned;
-- rollback took the cluster back to v1.34.0 -- same etcd minor, so nothing was
-  restored from the snapshot and nothing written since was lost, which is what
-  it says it will do;
-- restarting with the checkout built at a *different* version started the
-  cluster at its own recorded version and said so, which is the guard against a
-  build quietly becoming an upgrade.
-
-Underneath that, 100 assertions in `tests/` cover the store, the skew rules and
-the cluster-version bookkeeping, and a separate suite does a real etcd
-snapshot-and-restore round trip with the flags ferry passes.
-
-Three bugs were found by running it, which is the argument for running it:
-
-- the node upgrade read the kubelet's version as soon as the node went Ready,
-  but a node object keeps the old kubelet's status until the new one posts its
-  own -- so a node that had upgraded correctly was reported as not having;
-- the summary afterwards listed local nodes under "nodes on other Macs",
-  contradicting the line above it, because it filtered by version and not by
-  which Mac runs them;
-- the restart guard pointed at `ferry upgrade apply <older>`, a command that
-  correctly refuses, instead of at `rollback`.
-
-What is still only reasoned about is a **minor** bump *on a running cluster*.
-Everything above is within v1.34, which drives every path except patch drift.
-Building across minors is no longer reasoned about: v1.34, v1.35, v1.36 and
-v1.37 kubelets all build, from one shared overlay plus a per-minor
-`patches/kubelet-vX.Y/` carrying the constructors whose signatures move --
-cadvisor's, the container manager's, and `nftables.NewProxier`, which v1.37
-changed from positional arguments to a `KubeProxyConfiguration`. v1.37 has been
-run on a cluster as well as built: node Ready, pods scheduled and networked,
-CoreDNS resolving, `ferry-proxyd` rendering Service rules, pods reaching a
-ClusterIP by address and by name across both endpoints with no host proxy and
-no root, and the twelve assertions in `experiments/23-pod-cpu-limits` passing.
-v1.37 also carries whole copies of `cadvisor_darwin.go` and
-`container_manager_darwin.go`: cadvisor merged `info/v1` and `info/v2` into one
-`lib/model` package, and an import path is not something a second file can
-override.
-What has not been done is draining a node and flipping a control plane across
-that boundary, and `build-kubelet.sh` failing loudly on a moved seam -- during
-the build, before anything is switched -- remains the best that can be said for
-that half.
-
-Known limits, which are not bugs:
-
-- **There is no zero-downtime control plane upgrade**, and there cannot be with
-  one etcd member and one API server. The API is unreachable for a few seconds.
-  Running pods are not touched.
-- **A checkout has one `bin/`**, so every node on one Mac moves together. The
-  roll is per Mac, not per node.
-- ~~**Nothing distributes binaries to another Mac.**~~ **Closed.** A release
-  tarball is what a Mac installs, and `ferry token create` prints the installer
-  line for the second Mac. Upgrading a *cluster* across Macs is still per Mac —
-  each runs `ferry upgrade nodes` — but nobody copies `bin/` by hand any more.
-  See [INSTALL.md](INSTALL.md).
-- **A minor bump is a different problem** -- porting `patches/` -- and this
-  machinery does not claim to solve it.
-- ~~**More of `helpers_unsupported.go` leaks into Linux-guest decisions.**~~
-  **Closed**, and smaller than it looked. `kubelet_pods.go` carries no build
-  tag, so it compiles on darwin as written and reads `cm.MinShares` and
-  `cm.MinMilliCPULimit` -- Linux floors that file declares as `0` -- to decide
-  what a container's status reports, plus `cm.MilliCPUToShares` from v1.37.
-  `lib/overlay.sh` now rewrites it in place from the same rule table as the
-  derived files, so the same assertion covers it. Separately, the pod container
-  manager's `GetPodCgroupConfig` reported `not implemented`, which
-  `convertToAPIPodLevelResourcesStatus` logged as an error twice per pod per
-  sync; darwin answers *no configuration, no error* instead, which is the truth
-  here and what every caller already handles. Measured in
-  [experiments/23-pod-cpu-limits](../experiments/23-pod-cpu-limits/FINDINGS.md).
-
-  What is left of it is not a leak. `ResourceConfigForPod` returns `nil` on
-  darwin and upstream expects that on any platform without pod cgroups: it makes
-  in-place pod resize fail with a message naming the reason, which is the right
-  answer for a machine that cannot be resized after it boots, and it makes an
-  `emptyDir` memory volume fall back to node allocatable. `CPURequestsFromConfig`,
-  `CPULimitsFromConfig`, `MemoryLimitsFromConfig` and v1.37's
-  `CPUSharesEqualAfterV2RoundTrip` are only ever reached with the config that
-  `GetPodCgroupConfig` returns, so on darwin they are dead rather than wrong.
+  See experiment 33.
+- **About twenty fewer addons than minikube.** The mechanism now makes adding one cheap: pinned remote sources, kustomize, hooks, readiness checks and an arm64 check. What cannot come over is anything that is a node agent: node-exporter, CSI node plugins, eBPF tools, GPU device plugins. A pod here is its own VM, with no host PID, network or `/proc` to share.
+- **A second physical Mac is simulated, not measured.** Joined-Mac policy, peer registries and upgrades were each run against a second profile on the same Mac, which shares its loopback address and its LAN IP.
 
 ## Known, and deliberate
 
-- **A LoadBalancer below port 1024 needs `ferry-proxy` running as root** --
-  which is every ingress controller's 80 and 443. Ports at or above 1024 are
-  served unprivileged. The Service still shows `<pending>` for its external
-  address, but the reason is now recorded on the Service itself and shows up in
-  `kubectl describe`, and the NodePorts work either way.
-- **Ingress policies do not filter traffic from the node**, which is the same
-  bargain most CNI plugins strike; dropping a health probe does not isolate a
-  pod, it restarts it. Written down in `docs/NETWORK-POLICY.md`.
+- **A container joins a running pod only with an image the pod already runs.** Images are disks attached at boot, and the pod kernel is given no USB controller for a late one. A regular container with any other image has the pod recreated around it; a `kubectl debug` container with one is refused, so debugging never restarts a pod. A block volume that arrives after boot costs one VM rebuild. `kubectl debug --target` does not join the target's PID namespace.
+- **The pod's own node is exempt from its ingress policy,** for the traffic the node originates: kubelet probes, the API server reaching webhooks, `curl` from the Mac. Cilium and Calico strike the same bargain. Traffic that ferry-proxy forwards in from outside is checked against the client's own address. Written down in [NETWORK-POLICY.md](NETWORK-POLICY.md).
+- **Nodes can read every NetworkPolicy, pod, namespace and node.** A joined Mac runs its own ferry-netpol, which needs to know which pods a policy selects anywhere in the cluster. That is wider than the Node authorizer grants. It is read-only, bound to `system:nodes` through `ferry-node-netpol`, and the same trust Calico's and Cilium's node agents are given.
+- **UDP 53 cannot be a LoadBalancer on this Mac:** a root process already holds it. It is reported on the Service as `PortInUse`. TCP 80 and 443 and UDP 853 were served. A port that another program holds on the wildcard, such as AirPlay's 5000, is served beside it on each address.
+- **Memory emptyDirs are bounded by ENOSPC, not eviction.** They are lost if the VM crashes outright, and a carried tmpfs loses its sticky bit (1777 → 0777) through vminitd's extractor.
+- **A block claim's synced writes are slower:** about 0.5 ms for a 4 KiB write, against 0.15 ms on virtiofs. That is why `ferry-local-block` is a class of its own rather than the default.
+- **Cold sequential reads of one large file are slower** since read-ahead was cut: 4.9 → 3.0 GB/s. That cut is most of the 94 MiB saved per pod. A privileged pod can raise `read_ahead_kb` for itself.
+- **A control plane rollback that restores a snapshot is an outage** (2.8 s measured), and it loses what was written since the snapshot. It says when the snapshot was taken and asks first.
 
 ## Architectural, not oversights
 
-- **macOS on Apple silicon only.** kind and minikube run on Linux, Windows and
-  Intel Macs. ferry's premise is `Virtualization.framework`.
-- **One container runtime.** No containerd/CRI-O/docker choice; `ferry-cri` is
-  the runtime.
-- **Memory bounds the pod count before the 128-VM ceiling does.** A pod is a
-  VM, and an idle one costs 226 MiB of host memory whatever the workload does,
-  so `maxPods` is derived from the machine rather than left at Kubernetes' 110 —
-  72 on a 32 GiB Mac. The hypervisor ceiling is still shared with every other VM
-  on the Mac. Measured in
-  [experiments/13-shared-kernel-cost](../experiments/13-shared-kernel-cost/FINDINGS.md).
-- **An image is loaded per node**, not cluster-wide. minikube has the same
-  property per profile.
-- **A volume is local to one Mac.** The PersistentVolume says so through node
-  affinity, and a pod that comes back is sent to the node holding its data --
-  which is correct, and still not the same as network storage.
-- **A ReadWriteOnce volume is mounted by one pod at a time**, where Kubernetes
-  allows every pod on the node. It is a disk attached to one pod's VM, so a
-  second pod waits in CreateContainerError until the first has stopped; a
-  rolling update of a Deployment with a claim gets there, a little slower. Its
-  contents are not browsable from Finder, being inside an ext4 image. Kubernetes
-  scopes ReadWriteOnce to a node and ferry's pods are each a machine, so for
-  pods that must share a volume on one Mac, ask for ReadWriteMany: that is
-  still a shared directory, with the `chown` limit below.
-- **A container that crashes in a multi-container pod restarts the whole
-  pod**, not only itself. Virtualization.framework cannot add a device to a
-  running VM, and Containerization's pod will not start a container again
-  once it has stopped (upstream `main` still refuses), so the replacement has
-  nowhere to go but a new VM. The pod reports NOTREADY and the kubelet builds
-  it again. A restart in place needs that changed in Containerization.
-- **`kubectl logs --previous` fails for a few seconds after each crash.** The
-  kubelet removes the second-newest dead container, log and all, when the
-  newest dies, while the pod's status still names it until the next sync.
-  Upstream kubelet on containerd has the same window.
-- **A subPath added to a volume after its first pod is `0755 root`.** Every
-  subPath the first pod's spec names is made with the volume root's mode when
-  the image is formatted; the guest agent's mkdir ignores the mode it is asked
-  for, so one that appears later is not. On Linux a late subPath is root-owned
-  too, though with the volume root's mode.
-- **An emptyDir is an ext4 image too**, in the kubelet's directory for the
-  volume, made when the pod's first container starts. `chown` works on it and
-  it survives container restarts, but its contents are not browsable from the
-  Mac, and `medium: Memory` is disk like the rest. It is sparse and 16 GiB at
-  most, since CRI does not carry `sizeLimit`; the kubelet still enforces
-  `sizeLimit` against what the image actually holds.
-- **`chown` is refused on ReadWriteMany volumes, and on every volume in
-  mode 2.** They are directories shared over virtiofs, which runs as the Mac
-  user. A machine cannot take a disk after it has booted, so a mode 2 claim is
-  a directory in the Mac's volumes folder, which every machine mounts at boot
-  at the same path. The upside is that such a volume follows its pod: it is
-  pinned to `ferry.dev/host`, which the Mac and all of its machines carry, so
-  a pod can come back on a replacement machine, or on the Mac, and find its
-  data. Karpenter replacing a machine does not strand it.
+- **macOS on Apple silicon only.** kind and minikube run on Linux, Windows and Intel Macs. ferry's premise is `Virtualization.framework`, and Containerization is arm64 only.
+- **One container runtime.** ferry-cri is a standard CRI, and the kubelet is pointed at it through a socket and nothing else. But no other runtime runs Linux pods on darwin behind a CRI socket.
+- **The 128-VM ceiling is shared** with every other VM on the Mac. At 133 MiB a pod, memory no longer binds first on a 32 GiB Mac. What is left of the 133 MiB cannot be given back once touched: the balloon returns nothing, even under pressure (experiments 14 and 32). The rest is:
+  - the guest agent's page cache, about 45 MiB;
+  - the kernel image: about 21 MiB in the guest, plus 19.5 MiB the framework keeps on the host;
+  - slab 12 MiB, page map 8 MiB, and the framework itself about 8 MiB.
+
+  Mode 2 is the dense alternative that is already built: one kernel per machine, about 17 MiB a container.
+- **A volume is local to one Mac.** The PersistentVolume says so through node affinity, and a pod that comes back is sent to the node holding its data. Images now move between Macs; volumes do not.
+- **A ReadWriteOnce volume is mounted by one pod at a time in mode 1**, where Kubernetes allows every pod on the node. ferry's pods are each a machine, so this is ReadWriteOncePod, and a rolling update gets there a little slower. For several pods on one Mac, ask for ReadWriteMany. In mode 2, `ferry-local-block` gives real per-node ReadWriteOnce.
+- **An emptyDir or a block claim is an ext4 image**, so its contents are not browsable from Finder. The exception is a memory emptyDir. An emptyDir is sparse and at most 16 GiB, since CRI does not carry `sizeLimit`; the kubelet still enforces `sizeLimit` against what the image holds.
+- **There is no zero-downtime etcd.** A control plane switch keeps etcd running whenever its version is unchanged, which is every minor from v1.34 to v1.37. A minor that pairs with a new etcd would stop it for the switch; none has been run.
+- **A minor bump is a port of `patches/`.** The build now refuses to go on when a seam's file has moved or a constructor's signature has changed, and shows the diff. The port is still done by hand.
 
 ## Works, and worth saying so
 
-Verified on the running cluster:
+This was verified on a running cluster:
 
-- **NetworkPolicy**, on the same node and across machines. With `deny-all` a pod
-  refuses its neighbour on the same Mac and a pod on the other Mac; with an
-  `ingress.from.podSelector` it accepts the peer that policy names and refuses
-  the rest, either side of the network. Policy changes reach pods that are
-  already running.
-- **Ingress.** `ferry addons enable ingress-nginx`, an `Ingress` with a host
-  rule, and `curl -H 'Host: web.ferry.test' http://<mac>:<nodeport>/` answers
-  HTTP 200 from the backend.
-- **`kubectl top pods` and `kubectl top nodes`**, without
-  `FERRY_HOST_CLUSTER_IPS=1`. The aggregated API is reachable because the Mac is
-  on the pod network, and the node's CPU now comes from the Mach host port
-  rather than being reported as zero.
-- **Real CNI plugins**, on the Mac and inside the pod VM, through libcni's own
-  `invoke.Exec` seam.
-- **GPU.** Both nodes advertise `ferry.dev/gpu: 1`, the scheduler rations it,
-  and a pod that asks gets Metal work done on the Mac's own GPU.
-- **More than one cluster at a time.** Profiles derive from the checkout, so a
-  second worktree runs a second cluster with its own state, ports and pod CIDR.
-- **More than one node per Mac, and more than one Mac**, with pod-to-pod traffic
-  keeping its source address across machines.
-- **NodePort**, **LoadBalancer** above port 1024, **PersistentVolumeClaims**
-  provisioned and reclaimed, **`ferry image load`** (on machines too, with
-  `FERRY_MACHINE_REGISTRY=1`), **UDP Services**.
-- `kubectl exec`, `attach`, `port-forward`, `logs`, `cp` · Services with
-  kube-proxy's own rules, including reject and hairpin · cluster DNS · sidecars
-  and init containers · ConfigMaps, Secrets, projected ServiceAccount tokens,
-  emptyDir, hostPath, subPath · resource limits and securityContext
-  capabilities · RBAC and ServiceAccount token auth, since the control plane is
-  upstream.
+- **NetworkPolicy**, on the same node, across nodes and at the edge.
+  - With `deny-all`, a pod refuses its neighbour, a pod on another node, the LAN, `localhost` and its own NodePort, and stays Ready.
+  - `ipBlock` with `except` admits exactly the addresses it names.
+- **Restarts in place.** A crashing container restarts in about 45 ms, and its siblings keep running. Exec probes, graceful stop, termination messages, native sidecars and `kubectl debug` all work.
+- **Upgrades** without a failed request, per-node versions, and a live minor bump with rollback. See [UPGRADES.md](UPGRADES.md).
+- **Ingress** and **Gateway API** on ports 80 and 443, with no root.
+- **`kubectl top pods`** and **`kubectl top nodes`**, through the metrics-server addon.
+- **A registry you can push to**, with pods pulling from `localhost:5001`, and every loaded image available cluster-wide.
+- **Real CNI plugins** on the Mac and inside the pod VM, portmap included.
+- **GPU.** Nodes advertise `ferry.dev/gpu: 1`, the scheduler rations it, and a pod that asks for it gets Metal work done on the Mac's own GPU.
+- **More than one cluster at a time**, **more than one node per Mac**, and **more than one Mac**, with pod-to-pod traffic keeping its source address across machines.
+- **Services and networking:**
+  - NodePort, LoadBalancer, hostPort (including a different containerPort), and TCP, UDP and in-cluster SCTP Services;
+  - kube-proxy's own rules, including reject and hairpin;
+  - cluster DNS.
+- **kubectl:** `exec`, `attach`, `port-forward`, `logs` (including `--previous`) and `cp`.
+- **Pods:**
+  - sidecars and init containers;
+  - ConfigMaps, Secrets and projected ServiceAccount tokens;
+  - emptyDir on disk or in memory, hostPath and subPath;
+  - resource limits and securityContext capabilities.
+- **Volumes and images:** PersistentVolumeClaims provisioned and reclaimed, and `ferry image load` and `ferry image build`.
+- **Access control:** RBAC and ServiceAccount token auth, since the control plane is upstream.

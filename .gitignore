@@ -9,6 +9,7 @@ experiments/03-vm-ceiling/build/
 experiments/03-vm-ceiling/assets/vmlinux-arm64
 kernel/.build/
 kernel/vmlinux-arm64
+kernel/vmlinux-arm64.inputs
 guest/nft/
 ferry-proxy/ferry-proxy
 ferry-netpol/ferry-netpol
@@ -18,3 +19,6 @@ ferry-machined/ferry-machined
 experiments/24-benchmark-harness/.footprint-missed
 experiments/25-build-without-docker/.footprint-missed
 experiments/26-usb-hotplug/vmlinux-usb
+ferry-registry/ferry-registry
+ferry-storage/ferry-storage
+experiments/33-cluster-images-and-volumes/nfsspike/nfsspike

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // The emptyDir half of volumeSubPaths: keyed by the pod volume's own name,
@@ -81,5 +82,41 @@ func TestVolumeSubPathsEmptyDir(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// Only medium: Memory counts, and a missing sizeLimit is reported as 0 rather
+// than left out: the volume is still memory, only unbounded by the spec.
+func TestMemoryVolumes(t *testing.T) {
+	limit := resource.MustParse("64Mi")
+	pod := &v1.Pod{Spec: v1.PodSpec{Volumes: []v1.Volume{
+		{Name: "disk", VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}},
+		{Name: "ram", VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{
+			Medium: v1.StorageMediumMemory, SizeLimit: &limit}}},
+		{Name: "unbounded", VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{
+			Medium: v1.StorageMediumMemory}}},
+		{Name: "secret", VolumeSource: v1.VolumeSource{Secret: &v1.SecretVolumeSource{SecretName: "s"}}},
+	}}}
+	want := map[string]int64{"ram": 64 << 20, "unbounded": 0}
+	if got := memoryVolumes(pod); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if got := memoryVolumes(&v1.Pod{}); got != nil {
+		t.Fatalf("got %v, want nil", got)
+	}
+}
+
+// Init containers first, then the rest, each image once.
+func TestPodImages(t *testing.T) {
+	pod := &v1.Pod{Spec: v1.PodSpec{
+		InitContainers: []v1.Container{{Name: "migrate", Image: "app:1"}, {Name: "proxy", Image: "envoy:1"}},
+		Containers:     []v1.Container{{Name: "app", Image: "app:1"}, {Name: "log", Image: "busybox"}, {Name: "blank"}},
+	}}
+	want := []string{"app:1", "envoy:1", "busybox"}
+	if got := podImages(pod); !reflect.DeepEqual(got, want) {
+		t.Fatalf("podImages = %v, want %v", got, want)
+	}
+	if got := podImages(&v1.Pod{}); got != nil {
+		t.Fatalf("podImages of an empty pod = %v, want nil", got)
 	}
 }

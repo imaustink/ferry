@@ -86,10 +86,103 @@ quiet, and the actor has pods to start and stop in the meantime.
 A newly created Service is reachable from inside a pod in about a second, most
 of which is `kubectl exec` starting a process in a VM.
 
+## The outside edge: NodePort, LoadBalancer, hostPort
+
+These are listeners on the Mac, in `ferry-proxy`, forwarding to a ready pod. None
+of them needs root, **80 and 443 included**. macOS has not reserved ports below
+1024 on the wildcard address since Mojave -- only on a particular one. Measured
+as uid 501: `0.0.0.0:80` and `[::]:80` bind, TCP and UDP; `192.168.1.29:80` is
+`EACCES`. So a LoadBalancer listens on the wildcard and answers only
+connections that arrived at the Mac's LAN address or at loopback, and refuses
+the rest (the vmnet gateway, say) with a reset. A UDP LoadBalancer reads each
+datagram's destination (`IP_RECVDSTADDR`) to do the same, and replies from it.
+
+```
+ingress-nginx-controller   LoadBalancer   192.168.1.29   80:34280/TCP,443:34370/TCP
+  curl -H 'Host: web.ferry.test' http://192.168.1.29/   200
+  curl -H 'Host: web.ferry.test' http://localhost/      200
+  https://web.ferry.test/ via 127.0.0.1:443             200
+ferry-proxy: uid 501
+```
+
+`localhost:80` works the way it does under Docker Desktop, which it did not
+before: a LoadBalancer bound the LAN address alone.
+
+Two collisions are handled rather than hit:
+
+- **Something else holds the wildcard.** macOS's AirPlay Receiver has `*:5000`
+  and `*:7000`. A particular address is still free beside it, and the more
+  specific listener wins the connection, so at 1024 and above ferry falls back
+  to binding the LAN address and loopback one by one, and says so on the
+  Service (`PortShared`). Measured on port 5000 with AirPlay on: LAN, `127.0.0.1`
+  and `localhost` all reach the Service. Below 1024 there is no fallback, since
+  a particular address is root's; UDP 53 is held by a root process on macOS, so
+  a DNS LoadBalancer on 53 reports `PortInUse` -- 853 works.
+- **Two of ferry's own Services on one port.** The second is refused
+  (`PortInUse`) before the kernel is asked, so it cannot fall back onto the
+  first one's addresses and quietly take its traffic.
+
+A hostPort with an empty hostIP is a wildcard listener as before; one with a
+particular hostIP below 1024 is the narrowed wildcard. It forwards to the pod at
+the **container** port. It used to forward at the host port and rely on the
+pod's own `portmap` rule to rewrite it, which only worked when the two were
+equal: `portmap` runs `nft` by PATH, the `nft` ferry ships needs its own loader
+and library path, and the rule was never written -- so hostPort 5001 for
+containerPort 80 arrived at 5001 and was reset.
+
+The `nft` itself was also fixed, because `portmap` needs it for the pod's own
+addresses. `guest/build-nft.sh` has always meant to bake the loader's path into
+the binary, but it kept any bundle that existed, and bundles packaged before
+that step still named `/lib/ld-musl-aarch64.so.1`: in-pod `portmap` failed on
+every pod with `fork/exec /.ferry/nft: no such file or directory`. The script
+now repackages such a bundle and `release/build.sh` refuses one. Measured
+with `experiments/11-cni-on-macos/try-hostport.sh`: before, no chain and no
+answer at the pod's address; after, `tcp dport 18134 dnat to <pod>:80` and
+`hello from a pod VM` at both the pod's address and the Mac's.
+
+A NodePort whose pod is on **another node on this Mac** is dialled directly. It
+used to be handed to that node's node port -- which, on the same Mac, is this
+process's own listener -- and forwarded to itself until it ran out of file
+descriptors: 850 MB resident and an empty reply, measured.
+
+The edge also holds its clients to NetworkPolicy by their real address, because
+the pod only ever sees the Mac; see [NETWORK-POLICY.md](NETWORK-POLICY.md).
+
+## SCTP
+
+The guest kernel has SCTP (`CONFIG_IP_SCTP=y`, conntrack and NAT for it), and
+kube-proxy's rules carry it, so SCTP works **inside the cluster** -- between pods
+and through a ClusterIP, with the client's address preserved:
+
+```
+                         same node              across nodes
+pod IP                   0.5-0.6 ms             1.0-1.4 ms
+ClusterIP                0.5-0.6 ms             1.0-1.1 ms
+by name                  18 ms (DNS)            18 ms
+ClusterIP, wrong port    refused                refused
+```
+
+Same node needed one rule. vmnet does not carry IP protocol 132: two pods on one
+node timed out on the same association that crossed nodes in a millisecond, and
+worked over loopback and over `eth1`. So `ferry-cri` gives every pod a netdev
+egress rule that hands SCTP for the cluster network from `eth0` to `eth1`,
+ferry's own switch, which never looks above the Ethernet header. The first
+association to a peer on the same node waits one INIT retransmission (3 s,
+`net.sctp.rto_initial`) while `eth1` resolves the neighbour; after that it is
+the half millisecond above. The rule costs TCP nothing measurable: pod-to-pod
+throughput on `eth0` was 4.0-5.7 GB/s with it and 4.1-5.7 GB/s without.
+
+There is **no SCTP at the edge**. macOS has no SCTP sockets (`socket(AF_INET,
+SOCK_STREAM, 132)` is `EPROTONOSUPPORT`), a raw socket for protocol 132 is
+`EPERM` without root, and `/dev/bpf*` is `root:wheel 0600` -- so there is no
+unprivileged way to receive an SCTP packet on the Mac at all. A NodePort or
+LoadBalancer for SCTP puts `SCTPNotServed` on the Service rather than being
+skipped in silence, and an SCTP hostPort is logged and not served.
+
 ## Known limits
 
-- **UDP and SCTP are rendered but not verified.** kube-proxy emits rules for
-  them; ferry has only tested TCP.
+- **UDP is verified at the edge and in the pods; SCTP inside the cluster
+  only.** See above.
 - **Conntrack is not reconciled.** kube-proxy clears stale entries against a live
   connection table; the host has none, and the entries that matter are in each
   pod's kernel. Traffic can keep flowing to a removed endpoint until entries age

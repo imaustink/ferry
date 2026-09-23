@@ -1,0 +1,6 @@
+#!/bin/sh
+# The sign-in token goes to a file, not the terminal; see addons/dashboard.
+umask 077
+kubectl -n kube-system get secret headlamp-admin -o jsonpath='{.data.token}' |
+  base64 -d > "$ADDON_STATE/token" || exit 1
+echo "sign-in token in $ADDON_STATE/token"

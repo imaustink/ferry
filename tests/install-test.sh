@@ -350,6 +350,7 @@ not_shipped="
   ferry-streamer                                go sources
   ferry-karpenter                               go sources
   ferry-registry                                go sources
+  ferry-handover                                go sources; only 'upgrade' runs it, which a release refuses
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
@@ -699,7 +700,7 @@ succeeds "  and a plain down still drains" \
 # ferry-proxy never exits on SIGTERM; waiting for it politely made teardown
 # four times worse than the `sleep 1` it replaced.
 succeeds "  and the service proxy is forced rather than waited out" \
-  grep -q 'sudo kill -KILL "$proxy_pid"' "$repo/ferry"
+  grep -q '$as kill -KILL "$proxy_pid"' "$repo/ferry"
 
 # Startup. The same tick problem as teardown: five steps of `ferry up` landed
 # within 43ms of each other at half a second, and the control plane polled

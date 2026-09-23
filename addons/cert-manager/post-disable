@@ -1,0 +1,5 @@
+#!/bin/sh
+# cert-manager elects its leaders in kube-system, with leases it creates itself
+# and so are not in the manifest that disabling deletes.
+kubectl -n kube-system delete lease cert-manager-controller cert-manager-cainjector-leader-election \
+  --ignore-not-found >/dev/null

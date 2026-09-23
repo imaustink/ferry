@@ -58,6 +58,39 @@ else
   git -C "$src" clean -fdq 2>/dev/null || true
 fi
 
+# Every seam below fails the build when the file it edits is not where it was.
+# They used to be skipped instead, each behind an `if [ -f ]`, which turned a
+# moved file into a kubelet built without that edit -- a node labelled darwin,
+# a pod admission that refuses linux, a ferry-proxyd with no nftables proxier
+# -- found at runtime or not at all.
+seam_file() { # path-in-tree what-it-is-for
+  [ -f "$src/$1" ] && return 0
+  echo "    !! $1 is not in the $K8S_VERSION tree; it carries $2" >&2
+  echo "       upstream moved or removed it, and build-kubelet.sh has to follow" >&2
+  exit 1
+}
+
+# The constructors this minor's shims are written against, checked before
+# anything is applied: see ferry_check_signatures in lib/overlay.sh.
+# FERRY_RECORD_SIGNATURES=1 writes what the tree has, once the shims are ported.
+signatures="$overlay/SIGNATURES"
+echo "==> checking the constructors $(basename "$overlay") is written against"
+if [ "${FERRY_RECORD_SIGNATURES:-}" = 1 ]; then
+  ferry_upstream_signatures "$src" > "$signatures"
+  echo "    recorded $signatures"
+elif [ ! -f "$signatures" ]; then
+  echo "    !! $signatures is missing. Once the shims in $(basename "$overlay") match" >&2
+  echo "       $K8S_VERSION, record what they were written against:" >&2
+  echo "         FERRY_RECORD_SIGNATURES=1 K8S_VERSION=$K8S_VERSION ./build-kubelet.sh" >&2
+  exit 1
+elif ! ferry_check_signatures "$src" "$signatures" >&2; then
+  echo >&2
+  echo "    !! upstream changed a constructor that $(basename "$overlay")/ stands in for." >&2
+  echo "       Update the shim to the new signature above, then record it:" >&2
+  echo "         FERRY_RECORD_SIGNATURES=1 K8S_VERSION=$K8S_VERSION ./build-kubelet.sh" >&2
+  exit 1
+fi
+
 echo "==> applying overlay"
 (cd "$here/patches/kubelet" && find . -name '*.go' -print0) \
   | while IFS= read -r -d '' f; do
@@ -85,17 +118,19 @@ for f in pkg/kubelet/cadvisor/cadvisor_unsupported.go \
          pkg/volume/util/hostutil/hostutil_unsupported.go \
          pkg/kubelet/cm/container_manager_unsupported.go \
          staging/src/k8s.io/mount-utils/mount_unsupported.go \
-         pkg/kubelet/config/file_unsupported.go \
          pkg/kubelet/kuberuntime/kuberuntime_container_unsupported.go \
          pkg/kubelet/kuberuntime/kuberuntime_sandbox_unsupported.go \
          pkg/volume/util/subpath/subpath_unsupported.go; do
-  if [ -f "$src/$f" ]; then
-    sed -i '' \
-      -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
-      -e 's|^// +build !linux,!windows$|// +build !linux,!windows,!darwin|' \
-      "$src/$f"
-    echo "    ~ $f"
-  fi
+  seam_file "$f" "the fallback a darwin file replaces"
+  sed -i '' \
+    -e 's|^//go:build !linux && !windows$|//go:build !linux \&\& !windows \&\& !darwin|' \
+    -e 's|^// +build !linux,!windows$|// +build !linux,!windows,!darwin|' \
+    "$src/$f"
+  # Two definitions of everything in it otherwise, which the compiler does
+  # report -- but as a redeclaration in ferry's file, not upstream's tag.
+  grep -q '^//go:build .*!darwin' "$src/$f" \
+    || { echo "    !! $f is not tagged the way it was; it still builds on darwin" >&2; exit 1; }
+  echo "    ~ $f"
 done
 
 # kube-proxy's nftables proxier is gated to linux by build tag, but what ferry
@@ -109,22 +144,23 @@ done
 # Without this ferry-proxyd cannot be built at all, and Services do not route.
 echo "==> widening kube-proxy's nftables proxier to darwin"
 proxier="$src/pkg/proxy/nftables/proxier.go"
-if [ -f "$proxier" ]; then
-  sed -i '' \
-    -e 's|^//go:build linux$|//go:build linux \|\| darwin|' \
-    -e 's|^// +build linux$|// +build linux darwin|' \
-    "$proxier"
-  # The one seam. Upstream reaches straight for the host's nft; ferry needs that
-  # choice to depend on the platform, so it goes through a build-tagged helper
-  # that returns the real kernel on Linux and knftables' recording Fake on
-  # darwin. Everything else in proxier.go is untouched.
-  sed -i '' \
-    -e 's|nft, err := getNFTablesInterface(ipFamily)|nft, err := ferryNFTablesInterface(ipFamily)|' \
-    "$proxier"
-  echo "    ~ pkg/proxy/nftables/proxier.go"
-  grep -q 'ferryNFTablesInterface(ipFamily)' "$proxier" \
-    || { echo "    !! the nftables seam did not apply; ferry-proxyd will not work" >&2; exit 1; }
-fi
+seam_file pkg/proxy/nftables/proxier.go "kube-proxy's nftables rules, which ferry-proxyd renders"
+sed -i '' \
+  -e 's|^//go:build linux$|//go:build linux \|\| darwin|' \
+  -e 's|^// +build linux$|// +build linux darwin|' \
+  "$proxier"
+grep -q '^//go:build linux || darwin$' "$proxier" \
+  || { echo "    !! proxier.go's build tag did not widen; ferry-proxyd will not build" >&2; exit 1; }
+# The one seam. Upstream reaches straight for the host's nft; ferry needs that
+# choice to depend on the platform, so it goes through a build-tagged helper
+# that returns the real kernel on Linux and knftables' recording Fake on
+# darwin. Everything else in proxier.go is untouched.
+sed -i '' \
+  -e 's|nft, err := getNFTablesInterface(ipFamily)|nft, err := ferryNFTablesInterface(ipFamily)|' \
+  "$proxier"
+echo "    ~ pkg/proxy/nftables/proxier.go"
+grep -q 'ferryNFTablesInterface(ipFamily)' "$proxier" \
+  || { echo "    !! the nftables seam did not apply; ferry-proxyd will not work" >&2; exit 1; }
 
 # knftables' netlink backend is not portable, and from v1.37 it is not tagged.
 #
@@ -162,47 +198,43 @@ fi
 # visible. This makes the label say the useful thing rather than the literal one.
 echo "==> labelling the node as running linux containers"
 node_status="$src/pkg/kubelet/kubelet_node_status.go"
-if [ -f "$node_status" ]; then
-  # Both the value and the comparison: leaving the comparison against GOOS makes
-  # the kubelet decide the label is wrong on every pass and rewrite it forever.
-  sed -i '' \
-    -e 's|v1.LabelOSStable:      goruntime.GOOS,|v1.LabelOSStable:      ferryContainerOS(),|' \
-    -e 's|node.Labels\[v1.LabelOSStable\] = goruntime.GOOS|node.Labels[v1.LabelOSStable] = ferryContainerOS()|' \
-    -e 's|osName != goruntime.GOOS|osName != ferryContainerOS()|' \
-    "$node_status"
-  grep -q 'ferryContainerOS()' "$node_status" \
-    || { echo "    !! the node OS label patch did not apply" >&2; exit 1; }
-  echo "    ~ pkg/kubelet/kubelet_node_status.go"
-fi
+seam_file pkg/kubelet/kubelet_node_status.go "the node's kubernetes.io/os label"
+# Both the value and the comparison: leaving the comparison against GOOS makes
+# the kubelet decide the label is wrong on every pass and rewrite it forever.
+sed -i '' \
+  -e 's|v1.LabelOSStable:      goruntime.GOOS,|v1.LabelOSStable:      ferryContainerOS(),|' \
+  -e 's|node.Labels\[v1.LabelOSStable\] = goruntime.GOOS|node.Labels[v1.LabelOSStable] = ferryContainerOS()|' \
+  -e 's|osName != goruntime.GOOS|osName != ferryContainerOS()|' \
+  "$node_status"
+# All three, not any one: a value that is ferry's compared against one that is
+# still GOOS is exactly the rewrite-forever case above.
+[ "$(grep -c 'ferryContainerOS()' "$node_status")" -ge 3 ] \
+  || { echo "    !! the node OS label patch did not apply in full" >&2; exit 1; }
+echo "    ~ pkg/kubelet/kubelet_node_status.go"
 
 # The same question is asked again when a pod is admitted, and answered there
 # from GOOS as well -- so a pod that asks for linux was rejected by the node it
 # had just been scheduled to, with the API and the scheduler both saying linux
 # and the kubelet overruling them.
 predicate="$src/pkg/kubelet/lifecycle/predicate.go"
-if [ -f "$predicate" ]; then
-  sed -i '' \
-    -e 's|if !osLabelExists \|\| osName != runtime.GOOS {|if !osLabelExists \|\| osName != ferryContainerOS() {|' \
-    -e 's|labels\[v1.LabelOSStable\] = runtime.GOOS|labels[v1.LabelOSStable] = ferryContainerOS()|' \
-    "$predicate"
-  grep -q 'ferryContainerOS()' "$predicate" \
-    || { echo "    !! the admission OS patch did not apply" >&2; exit 1; }
-  echo "    ~ pkg/kubelet/lifecycle/predicate.go"
-fi
+seam_file pkg/kubelet/lifecycle/predicate.go "pod admission's OS check"
+sed -i '' \
+  -e 's|if !osLabelExists \|\| osName != runtime.GOOS {|if !osLabelExists \|\| osName != ferryContainerOS() {|' \
+  -e 's|labels\[v1.LabelOSStable\] = runtime.GOOS|labels[v1.LabelOSStable] = ferryContainerOS()|' \
+  "$predicate"
+[ "$(grep -c 'ferryContainerOS()' "$predicate")" -ge 2 ] \
+  || { echo "    !! the admission OS patch did not apply in full" >&2; exit 1; }
+echo "    ~ pkg/kubelet/lifecycle/predicate.go"
 
-# Static pod file watching is gated to linux purely by build tag; the code
-# underneath is fsnotify, which supports darwin via kqueue and uses no
-# Linux-specific API. Widen the tag rather than fork the file.
-echo "==> widening portable fallbacks"
-for f in pkg/kubelet/config/file_linux.go; do
-  if [ -f "$src/$f" ]; then
-    sed -i '' \
-      -e 's|^//go:build linux$|//go:build linux \|\| darwin|' \
-      -e 's|^// +build linux$|// +build linux darwin|' \
-      "$src/$f"
-    echo "    ~ $f"
-  fi
-done
+# Static pod files are not watched on darwin, and never were. This script used
+# to widen pkg/kubelet/config/file_linux.go's tag to darwin and narrow
+# file_unsupported.go's away from it, and neither edit ever took: a _linux.go
+# name is a build constraint of its own, which no tag can widen, and
+# file_unsupported.go is tagged `!linux`, which the narrowing's pattern did not
+# match. The two silent skips cancelled out, so darwin compiled the stub
+# watcher. Nothing here sets staticPodPath, so nothing depends on it; were it
+# wanted, file_linux.go would be derived to a _darwin.go like the kuberuntime
+# files below. Found by making those seams fail loudly.
 
 # Upstream stamps the version through its own build machinery, which we are
 # bypassing. Without this the kubelet reports v0.0.0-master and the node shows a
@@ -234,8 +266,8 @@ ldflags="$(
 # lib/overlay.sh -- shared with tests/overlay-test.sh so the two cannot drift.
 echo "==> deriving darwin container config from the linux implementation"
 for f in kuberuntime_container helpers kuberuntime_sandbox; do
+  seam_file "pkg/kubelet/kuberuntime/${f}_linux.go" "the container config a darwin file is derived from"
   src_file="$src/pkg/kubelet/kuberuntime/${f}_linux.go"
-  [ -f "$src_file" ] || continue
   dst_file="$src/pkg/kubelet/kuberuntime/${f}_darwin.go"
   ferry_derive_darwin_from_linux "$src_file" "$dst_file"
   ferry_check_derived_darwin "$dst_file" >&2 \
@@ -250,13 +282,12 @@ done
 # lies. See lib/overlay.sh.
 echo "==> rewriting the cgroup constants kubelet_pods.go reads"
 pods_file="$src/pkg/kubelet/kubelet_pods.go"
-if [ -f "$pods_file" ]; then
-  ferry_rewrite_darwin_in_place "$pods_file"
-  ferry_check_derived_darwin "$pods_file" >&2 \
-    || { echo "    !! upstream moved a call this script rewrites; add a seam in lib/overlay.sh" >&2
-         exit 1; }
-  echo "    ~ pkg/kubelet/kubelet_pods.go"
-fi
+seam_file pkg/kubelet/kubelet_pods.go "the cgroup constants a container's status reports"
+ferry_rewrite_darwin_in_place "$pods_file"
+ferry_check_derived_darwin "$pods_file" >&2 \
+  || { echo "    !! upstream moved a call this script rewrites; add a seam in lib/overlay.sh" >&2
+       exit 1; }
+echo "    ~ pkg/kubelet/kubelet_pods.go"
 
 # The volume manager's poll intervals, which are upstream's pacing rather than
 # anything ferry chose. See ferry_shorten_volume_polls in lib/overlay.sh for

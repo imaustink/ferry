@@ -269,9 +269,17 @@ not in the installer.
 |---|---|---|
 | `FERRY_POD_CPUS` | `2` | cpus per pod VM |
 | `FERRY_POD_MEMORY_MIB` | `512` | memory per pod VM |
-| `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~226 MiB whatever the workload does, so half of memory is budgeted for that |
+| `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~133 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
+| `FERRY_INSECURE_REGISTRIES` | — | registries pods may pull from over plain HTTP, comma separated, `host` or `host:port`. Loopback and this Mac's own addresses always are, which is what makes `ferry addons enable registry`'s `localhost:5001` work; everything else is HTTPS. Read by `ferry-cri` when ferry starts |
+
+### Addons
+
+| | default | |
+|---|---|---|
+| `FERRY_ADDON_CACHE` | `$FERRY_HOME/cache/addons` | where pinned upstream manifests are kept, by sha256, so an addon enabled once enables again with no network |
+| `FERRY_ADDON_TIMEOUT` | the addon's own, else `300` | seconds `ferry addons enable` waits for rollouts and checks |
 
 ### Durability and speed
 
@@ -290,13 +298,15 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_BUILDER_NS` | `kube-system` | the namespace it runs in |
 | `FERRY_BUILDKIT_IMAGE` | `moby/buildkit:v0.29.0` | the buildkit image it runs |
 | `FERRY_BUILDER_CN` | `ferry-builder` | the name in the builder's TLS certificate, which `buildctl --tlsservername` verifies against |
-| `FERRY_NODE_USB` | unset | `1` boots machines with a USB controller and attaches the disk images listed in `<machines-dir>/<name>.usb`. Experimental, and needs a kernel with USB storage; see `experiments/26-usb-hotplug` |
+| `FERRY_NODE_USB` | set by ferry | `1` boots machines with a USB controller and attaches the disk images listed in `<machines-dir>/<name>.usb`, which `ferry-machined` writes for `ferry-local-block` claims. ferry sets it when the kernel carries usb-storage (every kernel `ferry kernel` builds now does); see `experiments/33-cluster-images-and-volumes` |
+| `FERRY_BLOCK_CLASS` | `ferry-local-block` | the StorageClass whose ReadWriteOnce claims are disks on machines too -- attached over USB after boot, so `chown` works -- rather than directories in the virtiofs share. Offered only when the kernel carries usb-storage, and needs a node image with its `ferry.dev/block` driver (`ferry node-image`). Synced small writes are about a third as fast as the share's |
 | `FERRY_KUBE_API_QPS` | `500` | how fast a kubelet may talk to the API server. Upstream's 50 paces a 20-pod burst at 40ms a pod, with every container already running |
 | `FERRY_KUBE_API_BURST` | `1000` | the burst that goes with it |
 | `FERRY_KUBELET_V` | `2` | klog level for both kubelets. At `4` the kubelet logs its own per-pod phase boundaries, which is what `experiments/24-benchmark-harness/syncphases.py` reads |
 | `FERRY_VOLUME_RECONCILE_MS` | `10` | the volume manager's reconciler period, patched into the kubelet at build time. Upstream is 100 |
 | `FERRY_VOLUME_POPULATE_MS` | `10` | its desired-state populator period. Upstream is 100 |
 | `FERRY_VOLUME_RETRY_MS` | `20` | how often `WaitForAttachAndMount` re-checks. Upstream is 300. Together these three were ~290ms of sleeping on the critical path of every pod start |
+| `FERRY_CRI_TRACE` | unset | `1` makes `ferry-cri` log how long each CreateContainer and StartContainer took, and each pod VM boot by phase, to the ferry-cri log. What `experiments/31-restart-in-place` measures with |
 
 ### Networking
 
@@ -333,8 +343,9 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_MACHINE_IMAGE` | — | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
 | `FERRY_NODE_VERBOSE` | — | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
 | `FERRY_NODE_NO_CONFIG` | — | set to boot a machine without its generated config disk. For debugging the image itself |
-| `FERRY_MACHINE_REGISTRY` | — | `1` to serve what `ferry image load` and `ferry image build` load to machines as well. A machine has its own containerd and otherwise never sees a locally loaded image: its pods fail with `ErrImageNeverPull`. With it on, `ferry-registry` keeps a copy in `$FERRY_HOME/registry` and serves it read-only to the machine network, which reaches it at its gateway; every machine's containerd tries it first for every registry and falls through to the real one for anything not stored. Set it for `ferry up` (or `ferry machines enable`), then load; images loaded before it was on have to be loaded again. Needs a node image built with it (`ferry node-image`) |
-| `FERRY_MACHINE_REGISTRY_PORT` | `5050` + profile shift | the port it serves on. Only used when the registry is on. Not 5000, which macOS's AirPlay receiver holds |
+| `FERRY_MACHINE_REGISTRY` | `1` | `0` to stop sharing loaded images between nodes. With it on, `ferry-registry` keeps what `ferry image load` and `ferry image build` load in `$FERRY_HOME/registry` and serves it read-only to every node that is not the one it was loaded on: `ferry-cri` on every node of this Mac asks it before the real registry, every machine's containerd does the same at the machine network's gateway, and it asks the other Macs' registries for any name it does not hold. Anything not stored falls through to the real registry. `ferry image load` also loads into the other nodes on this Mac, so `imagePullPolicy: Never` works on them; machines and other Macs need `IfNotPresent` |
+| `FERRY_MACHINE_REGISTRY_PORT` | `5050` + profile shift | the port it serves this Mac on: loopback and the machine network only. Not 5000, which macOS's AirPlay receiver holds |
+| `FERRY_REGISTRY_PEER_PORT` | `5051` + profile shift | the port it serves the cluster's other Macs on, over TLS. Both ends present their node's kubelet certificate, and only a certificate the cluster CA signed in group `system:nodes` is answered, so the LAN and pods are refused. The same number on every Mac of a cluster: each works out the others' from its own |
 | `FERRY_NODE_REGISTRY_PORT` | set by ferry | what `ferry-node` reads to put `ferry.registry=<port>` on a machine's command line. ferry sets it from the two above, and blanks it when the registry is off; not meant to be set by hand |
 
 The two `MIN`/`MAX` pairs bound one machine; the two `LIMIT`s bound all of them
@@ -372,6 +383,10 @@ an empty machine is reclaimed about a minute later.
 | `FERRY_KUBECONFIG` | the admin one | admin credentials, for upgrading a Mac that joined and so has only its kubelet's certificate |
 | `FERRY_DRAIN_TIMEOUT` | `300s` | how long to wait for a node to drain |
 | `FERRY_SKIP_SNAPSHOT` | — | `1` to skip the etcd snapshot an upgrade takes first. Do not |
+| `FERRY_ALLOW_REMOVED_APIS` | — | `1` to upgrade although something is still asking for an API the target removes |
+| `FERRY_RECORD_SIGNATURES` | — | `1` to have `build-kubelet.sh` record the constructors a newly ported `patches/kubelet-vX.Y/` is written against |
+| `FERRY_WATCH_GRACE` | `2s` | how long a stopping API server gives its watches to end before it exits |
+| `FERRY_KEEP_ETCD`, `FERRY_HANDOVER`, `FERRY_HANDOVER_BIN` | set by `upgrade` | how `control-plane/up.sh` replaces a running control plane: keep etcd, and hold the API server's port with `bin/ferry-handover` while one API server hands over to the next |
 | `FERRY_ALLOW_SSH_JOIN` | — | `1` to join over SSH, knowing the node loses the network when the session ends |
 | `FERRY_INSTALL_URL` | `https://get.ferry.kurpuis.com` | the installer URL ferry prints in `token create` |
 
@@ -391,7 +406,7 @@ to.
 
 These are not all read in the same place, which is why the list drifted before:
 most are read by `ferry` and `install.sh` in shell, `SERVICE_CIDR` and the etcd
-ports by `control-plane/up.sh`, and `FERRY_ALLOW_OFF_SLICE`,
+ports by `control-plane/up.sh`, and `FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`,
 `FERRY_NODE_VERBOSE` and `FERRY_NODE_NO_CONFIG` by the Swift binaries through
 `ProcessInfo.environment` — where no amount of grepping the shell finds them.
 

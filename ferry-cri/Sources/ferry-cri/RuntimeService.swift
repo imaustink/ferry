@@ -148,7 +148,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func createContainer(request: Runtime_V1_CreateContainerRequest, context: ServerContext) async throws -> Runtime_V1_CreateContainerResponse {
         do {
+            let began = ContinuousClock.now
             let id = try await runtime.createContainer(sandboxID: request.podSandboxID, config: request.config)
+            trace("create", request.config.metadata.name + " " + id, since: began)
             var response = Runtime_V1_CreateContainerResponse()
             response.containerID = id
             return response
@@ -157,7 +159,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func startContainer(request: Runtime_V1_StartContainerRequest, context: ServerContext) async throws -> Runtime_V1_StartContainerResponse {
         do {
+            let began = ContinuousClock.now
             try await runtime.startContainer(request.containerID)
+            trace("start", request.containerID, since: began)
             return Runtime_V1_StartContainerResponse()
         } catch { throw failed(error) }
     }
@@ -174,6 +178,17 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             try await runtime.removeContainer(request.containerID)
             return Runtime_V1_RemoveContainerResponse()
         } catch { throw failed(error) }
+    }
+
+    /// FERRY_CRI_TRACE=1 prints how long each container call took, which is
+    /// what the kubelet's own log cannot say to better than its 1s relist.
+    private static let tracing = ProcessInfo.processInfo.environment["FERRY_CRI_TRACE"] == "1"
+
+    private func trace(_ call: String, _ what: String, since began: ContinuousClock.Instant) {
+        guard Self.tracing else { return }
+        let ms = (ContinuousClock.now - began).components
+        let millis = ms.seconds * 1000 + ms.attoseconds / 1_000_000_000_000_000
+        print("    trace     \(call) \(what) \(millis)ms")
     }
 
     private func crioState(_ s: ContainerRunState) -> Runtime_V1_ContainerState {
@@ -210,6 +225,11 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             status.labels = record.labels
             status.annotations = record.annotations
             status.logPath = record.logPath
+            // The kubelet finds a container's termination message by looking
+            // here for the mount at its terminationMessagePath and reading the
+            // host side. Without them no pod ever had one, and a crash loop's
+            // own explanation of itself never reached `kubectl describe`.
+            status.mounts = record.mounts
 
             var response = Runtime_V1_ContainerStatusResponse()
             response.status = status
@@ -357,8 +377,44 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     // MARK: Not yet implemented
 
+    /// A command run to completion, its output collected: what an exec
+    /// probe is. Without it every exec liveness and readiness probe "errored
+    /// and resulted in unknown state", so a hung container was never restarted
+    /// and a pod gated on an exec readiness probe never became ready.
+    ///
+    /// A command that outlives the timeout is killed and reported as a
+    /// DeadlineExceeded, which the kubelet counts as the probe timing out.
     func execSync(request: Runtime_V1_ExecSyncRequest, context: ServerContext) async throws -> Runtime_V1_ExecSyncResponse {
-        throw unimplemented("ExecSync")
+        let stdout = CollectingWriter(), stderr = CollectingWriter()
+        let process: LinuxProcess
+        do {
+            process = try await runtime.exec(containerID: request.containerID, command: request.cmd, tty: false,
+                                             stdin: nil, stdout: stdout, stderr: stderr)
+        } catch { throw failed(error) }
+        do {
+            try await process.start()
+            let status: ExitStatus
+            do {
+                status = try await process.wait(timeoutInSeconds: request.timeout > 0 ? request.timeout : nil)
+            } catch {
+                try? await process.kill(.kill)
+                _ = try? await process.wait(timeoutInSeconds: 2)
+                try? await process.delete()
+                throw RPCError(code: .deadlineExceeded,
+                               message: "command \(request.cmd) timed out after \(request.timeout)s")
+            }
+            // Every exec holds a process in the guest agent and ports on the
+            // host until it is deleted; probes run every few seconds for ever.
+            try? await process.delete()
+            var response = Runtime_V1_ExecSyncResponse()
+            response.stdout = stdout.data
+            response.stderr = stderr.data
+            response.exitCode = status.exitCode
+            return response
+        } catch {
+            try? await process.delete()
+            throw failed(error)
+        }
     }
     /// CRI does not carry exec over gRPC: the runtime returns a URL and the
     /// kubelet proxies the client's upgraded connection to it, speaking

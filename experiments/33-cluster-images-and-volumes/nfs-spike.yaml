@@ -1,0 +1,43 @@
+# The NFS spike, from a pod on a machine: mount the Mac's unprivileged NFSv3
+# server, chown on it, and compare throughput with the virtiofs share. The
+# server is experiments/33-cluster-images-and-volumes/nfsspike, run on the Mac
+# as the user: `nfsspike DIR 0.0.0.0:27090`. SERVER is the Mac as a machine
+# sees it -- the machine network's gateway.
+apiVersion: v1
+kind: Pod
+metadata: {name: nfs}
+spec:
+  nodeSelector: {ferry.dev/mode: shared}
+  tolerations: [{operator: Exists}]
+  containers:
+    - name: nfs
+      image: public.ecr.aws/docker/library/debian:12-slim
+      securityContext: {privileged: true}
+      env: [{name: SERVER, value: "192.168.222.1"}, {name: PORT, value: "27090"}]
+      command:
+        - bash
+        - -c
+        - |
+          mkdir -p /nfs
+          # -i: no mount.nfs helper in the image; the kernel takes text options.
+          mount -i -t nfs -o vers=3,proto=tcp,nolock,port=$PORT,mountport=$PORT,mountproto=tcp,addr=$SERVER $SERVER:/ /nfs \
+            && echo mounted || { echo mount failed; sleep 3600; }
+          mkdir -p /nfs/data && chown 999:999 /nfs/data && chmod 700 /nfs/data && echo chown-ok
+          setpriv --reuid=999 --regid=999 --clear-groups sh -c 'echo mine > /nfs/data/f && id'
+          ls -lnd /nfs/data /nfs/data/f
+          for round in 1 2 3; do
+            for d in /nfs /shared; do
+              s=$(date +%s.%N)
+              dd if=/dev/zero of=$d/sync bs=4k count=2000 oflag=dsync status=none
+              e=$(date +%s.%N)
+              dd if=/dev/zero of=$d/big bs=1M count=256 conv=fsync status=none
+              f=$(date +%s.%N)
+              awk -v d=$d -v r=$round -v a=$s -v b=$e -v c=$f 'BEGIN {
+                printf "round %d %-7s dsync 4k: %6.1f MB/s %5.3f ms/write   256M+fsync: %6.1f MB/s\n",
+                  r, d, 8.192/(b-a), (b-a)*1000/2000, 268.4/(c-b) }'
+              rm -f $d/sync $d/big
+            done
+          done
+          sleep 3600
+      volumeMounts: [{name: shared, mountPath: /shared}]
+  volumes: [{name: shared, persistentVolumeClaim: {claimName: shared}}]

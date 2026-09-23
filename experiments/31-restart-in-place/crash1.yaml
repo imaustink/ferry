@@ -1,0 +1,10 @@
+# One container, crash-looping: the case every single-container pod hits.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash1
+spec:
+  containers:
+  - name: crasher
+    image: busybox:1.36
+    command: ["sh", "-c", "echo up $(date +%s); ls /; echo scribble > /scribble; sleep 5; exit 1"]

@@ -1,0 +1,76 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 1,
+  "create_seconds": 0.316168209,
+  "baseline": {
+    "at": "22:30:12",
+    "free_mib": 6021.109375,
+    "used_mib": 69154.59375,
+    "compressed_mib": 7933.328125,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "22:30:24",
+      "free_mib": 6372.046875,
+      "used_mib": 68683.453125,
+      "compressed_mib": 7933.3125,
+      "vms": 1,
+      "vm_resident_mib": 374.109375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:30:36",
+      "free_mib": 6058.078125,
+      "used_mib": 68791.703125,
+      "compressed_mib": 7933.296875,
+      "vms": 1,
+      "vm_resident_mib": 374.0625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:30:47",
+      "free_mib": 6724.359375,
+      "used_mib": 68485.765625,
+      "compressed_mib": 7933.296875,
+      "vms": 1,
+      "vm_resident_mib": 374.203125,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "22:30:47",
+    "free_mib": 6724.359375,
+    "used_mib": 68485.765625,
+    "compressed_mib": 7933.296875,
+    "vms": 1,
+    "vm_resident_mib": 374.203125,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 283.1,
+  "logs": [
+    "pod-00.log: 2026-09-23T05:30:17.731Z stdout F P| vda ra_kb=128 max_kb=4096 io_opt=0 bs=512",
+    "pod-00.log: 2026-09-23T05:30:17.773Z stdout F P| vdb ra_kb=128 max_kb=4096 io_opt=0 bs=512",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| MemFree:         3984560 kB",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| Cached:            48284 kB",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| Mapped:            24448 kB",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| vda read_MiB 45.7119 reads 470",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| vdb read_MiB 1.7041 reads 54",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| nullb0 read_MiB 0.00390625 reads 1",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| virtio0 dev=0x0001 features=11010101100110001000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| virtio1 dev=0x0003 features=00000000000000000000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| virtio2 dev=0x0002 features=00100110010000000000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:17.775Z stdout F P| virtio3 dev=0x0002 features=00100010010001100000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| virtio4 dev=0x001a features=00000000000000000000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| virtio5 dev=0x0013 features=00000000000000000000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| virtio6 dev=0x0004 features=00000000000000000000000000001100101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| mounted",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P|      RES PAGES     SIZE FILE",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| 27803648  6788 86875184 /mnt/init/sbin/vminitd",
+    "pod-00.log: 2026-09-23T05:30:19.008Z stdout F P| 19959808  4873 86928432 /mnt/init/sbin/vmexec"
+  ]
+}

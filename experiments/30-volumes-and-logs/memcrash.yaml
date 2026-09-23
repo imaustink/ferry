@@ -1,0 +1,21 @@
+# A memory emptyDir across container crashes, each of which is a new pod VM.
+# Every attempt appends a line and checks a 32 MiB file written by the first.
+apiVersion: v1
+kind: Pod
+metadata: {name: memcrash}
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: c
+    image: alpine:3.20
+    command:
+    - sh
+    - -c
+    - |
+      [ -f /mem/big ] || dd if=/dev/urandom of=/mem/big bs=1M count=32 2>/dev/null
+      echo "attempt $(wc -l < /mem/log 2>/dev/null || echo 0) big=$(md5sum /mem/big | cut -c1-8) mode=$(stat -c %a /mem)" | tee -a /mem/log
+      cat /mem/log | wc -l
+      sleep 3; exit 1
+    volumeMounts: [{name: mem, mountPath: /mem}]
+  volumes:
+  - {name: mem, emptyDir: {medium: Memory}}

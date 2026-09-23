@@ -1,0 +1,49 @@
+# A ReadWriteOnce claim on a mode 2 machine that chown works on, next to the
+# default class for comparison. `run.sh` applies this and reads the results.
+apiVersion: ferry.dev/v1alpha1
+kind: Machine
+metadata: {name: worker-0}
+spec: {cpus: 2, memory: 2Gi}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: block}
+spec:
+  storageClassName: ferry-local-block
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: shared}
+spec:
+  storageClassName: ferry-local
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: owner}
+spec:
+  nodeSelector: {ferry.dev/mode: shared}
+  securityContext: {runAsUser: 999, runAsGroup: 999}
+  initContainers:
+    # What a chart does before a database starts: make the data directory the
+    # workload's own. On the virtiofs directory this is EPERM even as root.
+    - name: chown
+      image: public.ecr.aws/docker/library/busybox:1.36
+      securityContext: {runAsUser: 0}
+      command: ["sh", "-c", "chown 999:999 /block && chmod 700 /block && echo block-chown-ok; chown 999:999 /shared 2>&1 && echo shared-chown-ok || echo shared-chown-refused"]
+      volumeMounts:
+        - {name: block, mountPath: /block}
+        - {name: shared, mountPath: /shared}
+  containers:
+    - name: app
+      image: public.ecr.aws/docker/library/busybox:1.36
+      command: ["sh", "-c", "echo hi > /block/mine && ls -lnd /block /block/mine && sleep 3600"]
+      volumeMounts:
+        - {name: block, mountPath: /block}
+        - {name: shared, mountPath: /shared}
+  volumes:
+    - {name: block, persistentVolumeClaim: {claimName: block}}
+    - {name: shared, persistentVolumeClaim: {claimName: shared}}

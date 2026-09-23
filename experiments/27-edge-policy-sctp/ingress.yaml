@@ -1,0 +1,15 @@
+# An Ingress for the ingress-nginx addon, in front of the second node's web
+# server, reached at the controller's LoadBalancer on 80.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: web.ferry.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: web2, port: {number: 80}}}

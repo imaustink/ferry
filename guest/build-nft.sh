@@ -18,9 +18,16 @@ here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/nft"
 ALPINE="${ALPINE:-alpine:3.20}"
 
+# A bundle packaged before the patchelf step below names /lib's loader, which
+# a pod does not have, so `nft` by PATH fails with ENOENT and portmap with it.
+# "Present" is not the same as "right": one of those is still on disk wherever
+# a checkout was built before the patch, and this used to keep it forever.
 if [ -x "$out/nft" ] && [ "${FORCE:-}" != "1" ]; then
-  echo "==> nft bundle present: $out (FORCE=1 to rebuild)"
-  exit 0
+  if grep -qa '/.ferry/lib/ld-musl-aarch64.so.1' "$out/nft"; then
+    echo "==> nft bundle present: $out (FORCE=1 to rebuild)"
+    exit 0
+  fi
+  echo "==> $out/nft wants /lib's loader, which pods do not have; repackaging"
 fi
 
 command -v docker >/dev/null || { echo "docker is required to package nft" >&2; exit 1; }

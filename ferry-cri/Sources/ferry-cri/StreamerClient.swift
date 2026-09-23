@@ -133,6 +133,13 @@ struct PodContainers: Decodable {
     /// made at a volume's first format can have the root's mode, and one made
     /// later cannot.
     let volumeSubPaths: [String: [String]]?
+    /// emptyDirs with `medium: Memory`, by volume name, and their sizeLimit in
+    /// bytes, 0 for none. CRI shows the runtime a host directory for these like
+    /// any other emptyDir, so the spec is the only place this is said.
+    let memoryVolumes: [String: Int64]?
+    /// Every image the pod's containers run, init containers included, so the
+    /// VM can attach them all when it boots -- see PodRootfs.swift.
+    let images: [String]?
 }
 
 extension StreamerClient {

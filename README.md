@@ -297,7 +297,11 @@ cost time.
   PersistentVolume and an emptyDir are each an ext4 disk image attached to the
   pod's VM instead, so `chown` works on them: virtiofs is served as the Mac user, which cannot give a
   file away, and an init container that chowns its data directory — most
-  stateful charts have one — crashlooped forever on a share.
+  stateful charts have one — crashlooped forever on a share. An emptyDir with
+  `medium: Memory` is a tmpfs inside the pod's VM, sized by its `sizeLimit`,
+  and carried across the VM rebuilds that container restarts and init
+  containers cause. See
+  [experiments/30-volumes-and-logs](experiments/30-volumes-and-logs/FINDINGS.md).
 - ✅ **Resource limits and securityContext work.** The kubelet does not send
   `ContainerConfig.Linux` on darwin, so every pod silently ran unbounded with
   default capabilities; ferry's kubelet derives that code path for darwin.
@@ -311,8 +315,15 @@ cost time.
   the pod directly.
 - ✅ **Sidecars work.** Containers in a pod share one VM, and therefore one
   network stack: a process in one reaches a listener in another over
-  `127.0.0.1`. The hypervisor cannot add a container to a running VM, so the
-  boot waits until the kubelet has created them all.
+  `127.0.0.1`. Native sidecars (`restartPolicy: Always` init containers) and
+  init containers share it too.
+- ✅ **A container restarts inside its running pod.** Each image a pod runs is
+  one read-only disk and a container's root is an overlay on it, so joining a
+  running VM needs no new device: a crashed container is back in **~45ms**,
+  its siblings keep their PIDs, and the pod keeps its address. The same path
+  runs `kubectl debug` containers and pods of 70 containers, and N containers
+  of one image cache it once. See
+  [experiments/31-restart-in-place](experiments/31-restart-in-place/).
 - ✅ **`kubectl exec` works** — stdin, stderr and exit codes included. CRI
   carries exec over SPDY rather than gRPC, so `ferry-streamer` terminates that
   using Kubernetes' own streaming server and hands the request to `ferry-cri`.
@@ -390,6 +401,8 @@ release/publish.sh                   put one on GitHub Releases
 ferry                                the CLI: doctor, build, up, down, status, logs,
                                      upgrade, machines, service, uninstall
 lib/versions.sh                      the version store, and what may follow what
+lib/addons.sh                        ferry addons: render, fetch, apply, wait, record
+addons/                              the addons, each an addon.conf and manifests
 build-kubelet.sh                     build darwin kubelet from upstream + overlay
 patches/kubelet/                     platform implementations, mirroring upstream paths
 patches/kubelet-vX.Y/                per-minor shims, laid over the shared tree
@@ -493,11 +506,14 @@ Kubernetes knows it by, because the Mac is on that subnet already: nothing is
 forwarded and nothing is proxied. The result goes straight into the image store
 pods are served from, so there is no registry in the loop.
 
-That store is the Mac's. A mode 2 machine runs its own containerd and cannot see
-it, so a pod scheduled onto one fails with `ErrImageNeverPull`. Start ferry with
-`FERRY_MACHINE_REGISTRY=1` and every image loaded or built afterwards is also
-served to machines, read-only, from the Mac; the image reference does not change.
-See `FERRY_MACHINE_REGISTRY` in [docs/INSTALL.md](docs/INSTALL.md).
+That store is one node's, so every image loaded or built is also kept by
+`ferry-registry` and served read-only to every other node in the cluster: the
+other nodes on this Mac ask it before the real registry, mode 2 machines ask it
+at their gateway, and it asks the other Macs' registries -- over TLS, where
+only the cluster's nodes are answered -- for anything it does not hold. The
+image reference does not change. Use `imagePullPolicy: IfNotPresent`; `Never`
+works on this Mac's nodes, which a load fills directly. See
+`FERRY_MACHINE_REGISTRY` in [docs/INSTALL.md](docs/INSTALL.md).
 
 It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
 does not have to be installed, let alone running.
@@ -527,13 +543,35 @@ keep — against the 1,741 MiB Docker Desktop's VM occupies before it has built
 anything. `ferry image build --stop` ends it. Measured in
 [experiment 25](experiments/25-build-without-docker/FINDINGS.md).
 
+### Addons
+
+```sh
+ferry addons list
+ferry addons enable registry          # localhost:5001, for the Mac and for pods
+crane copy busybox:1.36 localhost:5001/busybox:1.36
+kubectl run hi --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
+```
+
+Ten, each pinned to a version that has been run here and checked for what it is
+for, not only for its pods going Ready: metrics-server, ingress-nginx, a
+registry, the Kubernetes Dashboard and Headlamp, cert-manager, the Gateway API
+CRDs and Envoy Gateway, kube-state-metrics and a single Prometheus. `enable`
+waits until the addon works and says why when it does not; `disable` removes
+exactly what was applied. Upstream manifests are fetched by sha256 and cached,
+so a second enable needs no network. Every pod is a VM of roughly 300 MiB, so
+the addons are the lean variants, and [addons/README.md](addons/README.md) lists
+each one's pods and measured memory.
+
 ### Limits worth knowing
 
-- **A pod's containers are fixed at boot.** `Virtualization.framework` cannot
-  hotplug, so the VM does not start until the kubelet has created every container
-  in the pod. Sidecars work and share `127.0.0.1`; init containers work, each
-  exiting before the next is created, with shared volumes carrying state across.
-  What cannot happen is a container joining a pod whose VM is already running.
+- **A container can join a running pod only with an image the pod already
+  runs.** `Virtualization.framework` cannot attach a disk to a running VM, and
+  images are disks: the VM attaches every image the pod spec names that is
+  pulled when it boots. A restart, a sidecar, and a `kubectl debug` container
+  of one of those images join in place. A regular container with any other
+  image — one still pulling at boot — has the pod recreated around it; a
+  `kubectl debug` container with another image is refused rather than
+  restarting the pod. A block volume that arrives after the boot is the same.
 - **The cluster starts at login, not at boot.** `Virtualization.framework` will
   not make a VM from a process outside a user session, so the login agent is a
   LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
@@ -543,20 +581,23 @@ anything. `ferry image build --stop` ends it. Measured in
 - **Services** route inside each pod using kube-proxy's own rules and need no
   privilege on the Mac — the release ships the guest kernel that makes this
   work; a checkout has to `ferry kernel` first, or ferry falls back to a host
-  proxy that does need root. Conntrack is not reconciled, and only TCP has been
-  verified.
+  proxy that does need root. Conntrack is not reconciled. TCP and UDP are
+  verified end to end; SCTP inside the cluster only, since macOS has no SCTP
+  for a NodePort or LoadBalancer to be served with
+  ([experiment 27](experiments/27-edge-policy-sctp/FINDINGS.md)).
 - `logs`, `exec`, `port-forward` and `attach` all work. Attach needs the pod to
   set `stdin: true` to accept input, since the stream has to be wired in when
   the container is created.
-- **Memory decides how many pods fit, not the 128-VM ceiling.** An idle pod VM
-  costs **226 MiB** of host memory before its workload does anything — flat at
-  8, 20, 24 and 40 pods, and unmoved by `--pod-memory-mib`, so it is the price
-  of a kernel rather than a pod using its allowance. 110 of those is 24 GiB.
-  ferry therefore sets `maxPods` from the machine's memory, budgeting half of it
-  for that overhead: 72 on a 32 GiB Mac, 110 on a 64 GiB one, overridable with
+- **Memory can decide how many pods fit, before the 128-VM ceiling does.** An
+  idle pod VM costs **133 MiB** of host memory before its workload does
+  anything — flat at 20 and 60 pods. It was 226 MiB until
+  [experiment 32](experiments/32-pod-memory-footprint/FINDINGS.md) found most of
+  that was read-ahead into the guest agent's binaries and a kernel carrying
+  drivers no VM has. A bigger VM costs about 21 MiB more per GiB it is given.
+  ferry sets `maxPods` from the machine's memory, budgeting half of it for that
+  overhead: 110 from 32 GiB up, 61 on a 16 GiB Mac, overridable with
   `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared — every
-  other VM, Docker Desktop included, takes one of ferry's slots — but on most
-  Macs memory runs out first. See
+  other VM, Docker Desktop included, takes one of ferry's slots. See also
   [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
 - **Restarting in quick succession moves the pod network.** A vmnet subnet stays
   reserved for about a minute after the run using it stops, and there are 32

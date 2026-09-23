@@ -1,0 +1,34 @@
+# The same writes to a disk emptyDir and a memory one, in one pod. Times are
+# from /proc/uptime, 10 ms resolution; busybox date has no %N.
+apiVersion: v1
+kind: Pod
+metadata: {name: writebench}
+spec:
+  terminationGracePeriodSeconds: 0
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: alpine:3.20
+    command:
+    - sh
+    - -c
+    - |
+      t() { awk '{printf "%d", $1 * 100}' /proc/uptime; }
+      for d in /disk /mem; do
+        s=$(t); dd if=/dev/zero of=$d/big bs=1M count=256 conv=fsync 2>/dev/null; e=$(t)
+        echo "$d 256MiB+fsync $(( (e - s) * 10 )) ms"
+        rm $d/big
+        s=$(t); i=0; while [ $i -lt 2000 ]; do echo x > $d/f$i; i=$((i+1)); done; sync -f $d/f0; e=$(t)
+        echo "$d 2000-small-files+syncfs $(( (e - s) * 10 )) ms"
+        s=$(t); rm $d/f*; sync -f $d; e=$(t)
+        echo "$d rm-2000+syncfs $(( (e - s) * 10 )) ms"
+        s=$(t); i=0; while [ $i -lt 500 ]; do dd if=/dev/zero of=$d/j bs=4k count=1 conv=fsync,notrunc oflag=append 2>/dev/null; i=$((i+1)); done; e=$(t)
+        echo "$d 500x-4KiB-append+fsync $(( (e - s) * 10 )) ms"
+      done
+      grep -E ' /(disk|mem) ' /proc/mounts
+    volumeMounts:
+    - {name: disk, mountPath: /disk}
+    - {name: mem, mountPath: /mem}
+  volumes:
+  - {name: disk, emptyDir: {}}
+  - {name: mem, emptyDir: {medium: Memory, sizeLimit: 512Mi}}

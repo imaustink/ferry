@@ -28,13 +28,18 @@ mode 2   node = VM      many pods share a node's kernel  density
 ## Why a second mode
 
 [Experiment 13](../experiments/13-shared-kernel-cost/FINDINGS.md) priced the
-first one. A pod VM costs **225 MiB** of host memory before the workload does
-anything, flat across 8, 20 and 24 pods, and it cannot be tuned away — at
-`--pod-memory-mib` 256, 512 and 1024 the per-VM cost barely moves. At
-Kubernetes' default `maxPods` of 110 that is ~24 GiB spent on kernels — three
-quarters of the 32 GiB Mac it was measured on, before a single workload runs.
-Which means the real pod ceiling is memory rather than the hypervisor's 128-VM
-cap, and `maxPods: 110` is a promise the machine cannot keep.
+first one. A pod VM cost **225 MiB** of host memory before the workload did
+anything, flat across 8, 20 and 24 pods, and barely moved by `--pod-memory-mib`
+256, 512 or 1024. At Kubernetes' default `maxPods` of 110 that was ~24 GiB
+spent on kernels — three quarters of the 32 GiB Mac it was measured on, before
+a single workload runs. Which made the real pod ceiling memory rather than the
+hypervisor's 128-VM cap, and `maxPods: 110` a promise the machine could not
+keep.
+
+[Experiment 32](../experiments/32-pod-memory-footprint/FINDINGS.md) later took
+it to **133 MiB**, most of the difference being read-ahead rather than the
+kernel. The argument below was made at 225 and holds at 133: mode 2's marginal
+container is still an order of magnitude cheaper.
 
 [Experiment 16](../experiments/16-architecture-benchmark/FINDINGS.md) then built
 the other side for real — containerd on overlayfs in one VM — and measured the
@@ -44,7 +49,7 @@ stand-in for a shared kernel* rather than to shared kernels:
 
 | | vm-per-pod | node-vm |
 |---|---|---|
-| marginal pod/container, idle | 226 MiB | ~17 MiB |
+| marginal pod/container, idle | 226 MiB (133 since experiment 32) | ~17 MiB |
 | 8 containers of one 190 MiB image | 3078 MiB | **1229 MiB** |
 | ...and the slope per extra container | 384.8 MiB | **0** |
 | containers in one VM | n/a | 40, unbothered |
@@ -376,8 +381,8 @@ confidence — which, as of milestone 5, no longer applies. The rest of this
 section is the argument as it stood; what it asked for now exists.
 
 The case for making mode 2 the default is real and gets stronger the smaller
-the Mac. A pod VM costs 226 MiB idle whatever it runs, so `maxPods` is derived
-from memory and a 16 GiB Mac advertises around 36 pods; mode 2's marginal
+the Mac. A pod VM costs 133 MiB idle whatever it runs, so `maxPods` is derived
+from memory and a 16 GiB Mac advertises 61 pods (36 before experiment 32); mode 2's marginal
 container is ~17 MiB and eight containers of one image cost what one costs.
 Most people have less memory than the machine this was developed on, and for
 them mode 2 is the difference between running their stack and not.
@@ -451,9 +456,23 @@ to `ferry.dev/host` — set on the Mac's node by `ferry up` and on each machine
 by `ferry-machined` — rather than to one node, so a pod finds its data again on
 a replacement machine or on the Mac. Until this, `ferry-storage` served only
 claims scheduled to the Mac's node, and a mode 2 pod with a claim stayed
-Pending with no event. `chown` does not work on these (virtiofs is served as
-the Mac user); a Mac-node ReadWriteOnce claim is an ext4 disk instead, which
-a machine cannot attach after boot.
+Pending with no event. `chown` does not hold on these: virtiofs is served as
+the Mac user, and on macOS 26 it reports each caller's own uid as the owner,
+so a chown appears to succeed and nothing is kept
+([experiment 33](../experiments/33-cluster-images-and-volumes/FINDINGS.md)).
+
+A claim that needs real ownership asks for `storageClassName:
+ferry-local-block`. A ReadWriteOnce claim in that class, on a machine, is an
+ext4 image the machine takes over USB mass storage after it has booted -- the
+one device Virtualization.framework will attach to a running VM (experiment
+26). `ferry-machined` decides which machine holds each disk, one at a time,
+from the pods scheduled to them; `ferry-node` formats, labels and attaches
+it; the node image's `ferry.dev/block` FlexVolume driver finds it by label,
+mounts it once, and bind-mounts it into every pod on the machine that uses
+it. It follows its pod to a replacement machine like a directory does. The
+cost is synced small writes at about a third of the share's rate (0.43-0.64
+ms a commit against 0.13-0.16), which is why it is a class to ask for and not
+the default.
 
 ## Milestones
 

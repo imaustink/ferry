@@ -21,31 +21,62 @@ type provisioner struct {
 	node   string
 	root   string
 	class  string
-	claims corelisters.PersistentVolumeClaimLister
+	// The class whose single-writer claims are disks on machines too, not
+	// only on the Mac's node. Empty when this Mac's machines cannot take a
+	// disk after boot -- a kernel without usb-storage. See blockOnMachine.
+	blockClass string
+	claims     corelisters.PersistentVolumeClaimLister
 }
 
-// ensureClass offers the StorageClass. WaitForFirstConsumer is not a detail: a
+// ensureClass offers the StorageClasses. WaitForFirstConsumer is not a detail: a
 // volume here is a directory on one Mac, so the node has to be chosen before the
 // volume exists, not after.
 func (p *provisioner) ensureClass(ctx context.Context, makeDefault bool) {
 	binding := storagev1.VolumeBindingWaitForFirstConsumer
 	reclaim := corev1.PersistentVolumeReclaimDelete
-	class := &storagev1.StorageClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        p.class,
-			Annotations: map[string]string{},
-		},
-		Provisioner:       provisionerName,
-		VolumeBindingMode: &binding,
-		ReclaimPolicy:     &reclaim,
+	for _, name := range []string{p.class, p.blockClass} {
+		if name == "" {
+			continue
+		}
+		class := &storagev1.StorageClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name,
+				Annotations: map[string]string{},
+			},
+			Provisioner:       provisionerName,
+			VolumeBindingMode: &binding,
+			ReclaimPolicy:     &reclaim,
+		}
+		if makeDefault && name == p.class {
+			class.Annotations["storageclass.kubernetes.io/is-default-class"] = "true"
+		}
+		_, err := p.client.StorageV1().StorageClasses().Create(ctx, class, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			klog.ErrorS(err, "Could not offer the storage class", "class", name)
+		}
 	}
-	if makeDefault {
-		class.Annotations["storageclass.kubernetes.io/is-default-class"] = "true"
+}
+
+// The FlexVolume driver in the node image that mounts a USB-attached claim.
+const blockDriver = "ferry.dev/block"
+
+// diskLabel is the ext4 label a claim's disk is found by inside a machine: the
+// claim's UID without dashes, cut to the sixteen bytes a label holds.
+// ferry-node writes the same value into the filesystem before attaching it
+// (VolumeDisk.label), from the directory name this makes.
+func diskLabel(uid string) string {
+	s := strings.ReplaceAll(uid, "-", "")
+	if len(s) > 16 {
+		s = s[:16]
 	}
-	_, err := p.client.StorageV1().StorageClasses().Create(ctx, class, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		klog.ErrorS(err, "Could not offer the storage class", "class", p.class)
-	}
+	return s
+}
+
+// isMachine reports whether a node is a mode 2 machine: labelled so by
+// ferry-machined, or -- in the moment before that label lands -- carrying the
+// provider ID it sets.
+func isMachine(node *corev1.Node) bool {
+	return node.Labels["ferry.dev/mode"] == "shared" || strings.HasPrefix(node.Spec.ProviderID, "ferry://")
 }
 
 // consider provisions for a claim if it is this node's to serve.
@@ -54,7 +85,11 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	if !ok || claim.Status.Phase != corev1.ClaimPending || claim.Spec.VolumeName != "" {
 		return
 	}
-	if claim.Spec.StorageClassName == nil || *claim.Spec.StorageClassName != p.class {
+	if claim.Spec.StorageClassName == nil {
+		return
+	}
+	className := *claim.Spec.StorageClassName
+	if className != p.class && (p.blockClass == "" || className != p.blockClass) {
 		return
 	}
 	// Late binding means the scheduler names the node. Until it has, there is
@@ -72,13 +107,13 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	if selected == "" {
 		return
 	}
-	elsewhere := false
+	elsewhere, machine := false, false
 	if selected != p.node {
 		node, err := p.client.CoreV1().Nodes().Get(ctx, selected, metav1.GetOptions{})
 		if err != nil || node.Labels[hostLabel] != p.node {
 			return
 		}
-		elsewhere = true
+		elsewhere, machine = true, isMachine(node)
 	}
 
 	name := "pvc-" + string(claim.UID)
@@ -104,8 +139,13 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	// attaches it to the pod's VM and the volume is pinned to that node. A
 	// machine cannot attach one after it has booted, so a volume anywhere else
 	// is the directory, shared, with the chown limit that comes with virtiofs.
+	//
+	// Except in the block class, where a machine can: the image is attached to
+	// the running machine over USB when a pod using it is scheduled there, and
+	// mounted by the node image's volume driver. See blockOnMachine.
 	block := singleWriter(modes) && !elsewhere
-	if block {
+	onMachine := className == p.blockClass && singleWriter(modes) && machine
+	if block || onMachine {
 		if err := makeImage(filepath.Join(path, imageName), size.Value()); err != nil {
 			klog.ErrorS(err, "Could not create the volume's disk image", "path", path)
 			return
@@ -113,6 +153,13 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 	}
 	reclaim := corev1.PersistentVolumeReclaimDelete
 	hostPathType := corev1.HostPathDirectoryOrCreate
+	source := corev1.PersistentVolumeSource{
+		HostPath: &corev1.HostPathVolumeSource{Path: path, Type: &hostPathType},
+	}
+	affinity := p.affinity(block)
+	if onMachine {
+		source, affinity = p.blockOnMachine(path, string(claim.UID))
+	}
 
 	volume := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
@@ -125,17 +172,15 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: size},
 			AccessModes:                   modes,
 			PersistentVolumeReclaimPolicy: reclaim,
-			StorageClassName:              p.class,
-			PersistentVolumeSource: corev1.PersistentVolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{Path: path, Type: &hostPathType},
-			},
+			StorageClassName:              className,
+			PersistentVolumeSource:        source,
 			ClaimRef: &corev1.ObjectReference{
 				Kind:      "PersistentVolumeClaim",
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 				UID:       claim.UID,
 			},
-			NodeAffinity: p.affinity(block),
+			NodeAffinity: affinity,
 		},
 	}
 
@@ -146,7 +191,46 @@ func (p *provisioner) consider(ctx context.Context, obj any) {
 		return
 	}
 	klog.InfoS("Provisioned", "claim", claim.Namespace+"/"+claim.Name, "path", path,
-		"size", size.String(), "node", selected, "block", block)
+		"size", size.String(), "node", selected, "block", block, "machineDisk", onMachine)
+}
+
+// blockOnMachine is a single-writer claim of the block class on a machine: a
+// disk image the machine takes over USB after it has booted, rather than a
+// directory in the share it mounted at boot, so chown works on it.
+//
+// The volume is a FlexVolume because something in the machine has to find the
+// disk and mount it before the kubelet hands the directory to a pod, and the
+// FlexVolume driver in the node image is the smallest thing the kubelet will
+// call for that. Attaching is not its job: ferry-machined sees the pod
+// scheduled and lists the image in the machine's .usb file, and ferry-node
+// attaches it -- the Mac holds the disk, so the Mac decides where it goes, one
+// machine at a time.
+//
+// Pinned to this Mac's machines, any of them: the image stays on the Mac, so a
+// pod that comes back on a replacement machine finds its data there. Not to the
+// Mac's own node, where the same claim would need a hostPath instead.
+func (p *provisioner) blockOnMachine(path, uid string) (corev1.PersistentVolumeSource, *corev1.VolumeNodeAffinity) {
+	source := corev1.PersistentVolumeSource{
+		FlexVolume: &corev1.FlexPersistentVolumeSource{
+			Driver: blockDriver,
+			FSType: "ext4",
+			Options: map[string]string{
+				"image": filepath.Join(path, imageName),
+				"label": diskLabel(uid),
+			},
+		},
+	}
+	affinity := &corev1.VolumeNodeAffinity{
+		Required: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{
+					{Key: hostLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{p.node}},
+					{Key: "ferry.dev/mode", Operator: corev1.NodeSelectorOpIn, Values: []string{"shared"}},
+				},
+			}},
+		},
+	}
+	return source, affinity
 }
 
 // Which nodes can reach a volume's data.
@@ -234,16 +318,23 @@ func (p *provisioner) reclaim(ctx context.Context, obj any) {
 	if volume.Annotations["pv.kubernetes.io/provisioned-by"] != provisionerName {
 		return
 	}
-	if volume.Spec.HostPath == nil || !strings.HasPrefix(volume.Spec.HostPath.Path, p.root) {
+	var dir string
+	switch {
+	case volume.Spec.HostPath != nil:
+		dir = volume.Spec.HostPath.Path
+	case volume.Spec.FlexVolume != nil && volume.Spec.FlexVolume.Driver == blockDriver:
+		dir = filepath.Dir(volume.Spec.FlexVolume.Options["image"])
+	}
+	if dir == "" || !strings.HasPrefix(dir, p.root+string(filepath.Separator)) {
 		return
 	}
-	if err := os.RemoveAll(volume.Spec.HostPath.Path); err != nil {
-		klog.ErrorS(err, "Could not remove the volume directory", "path", volume.Spec.HostPath.Path)
+	if err := os.RemoveAll(dir); err != nil {
+		klog.ErrorS(err, "Could not remove the volume directory", "path", dir)
 		return
 	}
 	if err := p.client.CoreV1().PersistentVolumes().Delete(ctx, volume.Name, metav1.DeleteOptions{}); err != nil {
 		klog.ErrorS(err, "Could not delete the volume", "volume", volume.Name)
 		return
 	}
-	klog.InfoS("Reclaimed", "volume", volume.Name, "path", volume.Spec.HostPath.Path)
+	klog.InfoS("Reclaimed", "volume", volume.Name, "path", dir)
 }

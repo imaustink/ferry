@@ -18,7 +18,8 @@ is synced small writes at about a fifth of virtio's rate.
 
 ## What was changed to ask
 
-- `usb-storage.config`, appended to Apple's kernel configuration by
+- `usb-storage.config` (now `kernel/usb-storage.config`, part of every kernel
+  build -- see experiment 33), appended to Apple's kernel configuration by
   `CONFIG_FRAGMENT=... OUT=... kernel/build-kernel.sh`. Apple's configuration
   has neither USB nor SCSI disks (`# CONFIG_USB_SUPPORT is not set`,
   `# CONFIG_SCSI is not set`); nine symbols add xHCI, usb-storage, UAS and `sd`.

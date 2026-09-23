@@ -65,3 +65,42 @@ enum ImageReference {
         return "\(path):latest"
     }
 }
+
+// Which registries are spoken to over plain HTTP.
+//
+// The image store defaults to https, which is right for every registry on the
+// internet and wrong for the one a laptop runs for itself: the registry addon on
+// localhost:5001 serves plain HTTP, so a pod naming `localhost:5001/app` could
+// not be pulled. The pull happens here, on the Mac, so localhost is the Mac --
+// which is where that registry answers. Docker draws the same line: loopback is
+// trusted without TLS, anything else only when it is named.
+//
+// Plain HTTP is used for a loopback host, for any address this Mac itself holds
+// (a LoadBalancer on the LAN address is one), and for the hosts listed in
+// FERRY_INSECURE_REGISTRIES, comma separated, with or without a port.
+extension ImageReference {
+    static func insecure(_ canonical: String) -> Bool {
+        let domain = String(canonical.split(separator: "/", maxSplits: 1).first ?? "")
+        let host = hostPart(domain)
+        if host == "localhost" || host.hasPrefix("127.") || host == "::1" { return true }
+        let listed = (ProcessInfo.processInfo.environment["FERRY_INSECURE_REGISTRIES"] ?? "")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        if listed.contains(domain) || listed.contains(host) { return true }
+        // Only an address literal can be one of the Mac's, so a named registry
+        // -- nearly every pull -- costs nothing here. Read per pull otherwise,
+        // because a laptop's LAN address moves with the network.
+        guard host.allSatisfy({ $0.isNumber || $0 == "." }) else { return false }
+        return PodRuntime.localAddresses().contains(host)
+    }
+
+    /// `host:port`, `[v6]:port` or a bare host, without the port.
+    static func hostPart(_ domain: String) -> String {
+        if domain.hasPrefix("["), let close = domain.firstIndex(of: "]") {
+            return String(domain[domain.index(after: domain.startIndex)..<close])
+        }
+        if domain.filter({ $0 == ":" }).count == 1, let colon = domain.firstIndex(of: ":") {
+            return String(domain[..<colon])
+        }
+        return domain
+    }
+}

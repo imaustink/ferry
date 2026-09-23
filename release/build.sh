@@ -118,11 +118,19 @@ ok "cli, control plane scripts, manifests, addons and the Machine CRD"
 # 15MB spent on making the product worse.
 [ -f "$root/kernel/vmlinux-arm64" ] \
   || die "no guest kernel at kernel/vmlinux-arm64 -- run: ./ferry kernel (slow, needs docker)"
+# A kernel from before a patch boots and works, and quietly costs every pod what
+# the patch saved -- 75 MiB each, for the read-ahead one -- so it is not shipped.
+[ "$(FERRY_ROOT="$root" ferry_kernel_inputs)" = "$(cat "$root/kernel/vmlinux-arm64.inputs" 2>/dev/null)" ] \
+  || die "kernel/vmlinux-arm64 was built from other patches or configuration -- run: ./ferry kernel"
 mkdir -p "$dir/kernel"
 cp "$root/kernel/vmlinux-arm64" "$dir/kernel/"
 ok "guest kernel with NAT support"
 
 [ -x "$root/guest/nft/nft" ] || die "guest/nft is missing -- run: ./guest/build-nft.sh"
+# One packaged before its loader was baked in runs only through ferry-cri's
+# explicit loader call, and portmap, which runs it by PATH, fails in every pod.
+grep -qa '/.ferry/lib/ld-musl-aarch64.so.1' "$root/guest/nft/nft" \
+  || die "guest/nft/nft wants /lib's loader, which pods lack -- run: ./guest/build-nft.sh"
 mkdir -p "$dir/guest"
 cp -R "$root/guest/nft" "$dir/guest/nft"
 ok "nft, with its loader"

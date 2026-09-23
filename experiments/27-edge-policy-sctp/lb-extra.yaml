@@ -1,0 +1,30 @@
+# Two more LoadBalancers: web on 5000, which macOS's AirPlay Receiver holds on
+# the wildcard, and cluster DNS on 853/UDP (53 itself is held by a root process on macOS), a privileged UDP port through the
+# narrowed wildcard. Plus an SCTP LoadBalancer, which has no host edge.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-5000
+spec:
+  type: LoadBalancer
+  selector: {app: web}
+  ports: [{name: http, port: 5000, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-lb
+  namespace: kube-system
+spec:
+  type: LoadBalancer
+  selector: {k8s-app: kube-dns}
+  ports: [{name: dns, port: 853, targetPort: 53, protocol: UDP}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sctp-lb
+spec:
+  type: LoadBalancer
+  selector: {app: sctp-server}
+  ports: [{name: echo, port: 7777, targetPort: 9999, protocol: SCTP}]

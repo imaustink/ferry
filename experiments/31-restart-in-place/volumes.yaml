@@ -1,0 +1,21 @@
+# A root filesystem made read-only, an emptyDir, a projected token and a
+# subPath, in a pod whose second container crashes: its restart has to come
+# back with every one of them.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: volumes
+spec:
+  volumes:
+  - name: scratch
+    emptyDir: {}
+  containers:
+  - name: ro
+    image: busybox:1.36
+    securityContext: {readOnlyRootFilesystem: true}
+    command: ["sh", "-c", "touch /nope 2>&1; touch /data/ok && echo data-writable; exec sleep 36000"]
+    volumeMounts: [{name: scratch, mountPath: /data}]
+  - name: flaky
+    image: busybox:1.36
+    command: ["sh", "-c", "ls /var/run/secrets/kubernetes.io/serviceaccount/token && cat /sub/seen 2>/dev/null; date +%s >> /sub/seen; nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1 && echo dns-ok; sleep 4; exit 2"]
+    volumeMounts: [{name: scratch, mountPath: /sub}]

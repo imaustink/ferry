@@ -42,6 +42,10 @@ export FERRY_ROOT
 . "$here/lib/versions.sh"
 # shellcheck source=lib/ports.sh
 . "$here/lib/ports.sh"
+# Which version each node and this Mac's ferry-proxyd run, and the other
+# decisions an upgrade makes before it acts.
+# shellcheck source=lib/upgrade.sh
+. "$here/lib/upgrade.sh"
 # A checkout from before the store had bin/kubelet as a plain file and the
 # version in bin/.kubelet-version. That is a version directory with one binary
 # in it, so it is moved in rather than rebuilt.
@@ -193,16 +197,28 @@ SWIFT_RECOMMENDED=6.4
 #
 # The kubelet's default is 110 and the hypervisor stops at 128 virtual machines,
 # so the count looked like the binding limit. It is not: a pod here is a VM, and
-# an idle one costs 226 MiB of host memory before the workload does anything --
-# measured flat at 8, 20, 24 and 40 pods, and unmoved by --pod-memory-mib, so it
-# is the price of a kernel rather than a pod using its allowance. 110 of those is
-# 24 GiB, which is three quarters of a 32 GiB machine spent on kernels.
+# an idle one costs host memory before the workload does anything -- 226 MiB
+# until experiment 32, and 133 MiB since, measured flat at 20 and 60 pods. Most
+# of what went was the guest reading 8 MiB around every page fault into its two
+# 83 MiB agent binaries, which the host keeps once touched; the rest was a
+# kernel carrying a display stack and a hypervisor of its own.
 #
-# So memory decides, and advertising 110 on a machine that cannot hold 110 asks
-# the scheduler to place pods that will fail to start. Half of RAM is the budget
-# for that overhead, which leaves the other half for the workloads themselves.
-# FERRY_MAX_PODS overrides it for anyone who would rather find the wall.
-pod_overhead_mib=226
+# The figure is for the default 512 MiB VM. A bigger one costs about 21 MiB
+# more per GiB it is given, touched or not -- the kernel's page map, zeroed at
+# boot -- so a pod with a 4 GiB limit (a 4.25 GiB VM) is nearer 210 MiB.
+#
+# So memory can still decide, and advertising 110 on a machine that cannot hold
+# 110 asks the scheduler to place pods that will fail to start. Half of RAM is
+# the budget for that overhead, which leaves the other half for the workloads
+# themselves: 110 from 32 GiB up, 61 on a 16 GiB Mac. FERRY_MAX_PODS overrides
+# it for anyone who would rather find the wall.
+pod_overhead_mib=133
+# A checkout whose kernel predates that work still pays the old price, and
+# should not promise pods it cannot hold. A release ships a current kernel.
+if [ ! -f "$here/VERSION" ] \
+  && [ "$(ferry_kernel_inputs)" != "$(cat "$here/kernel/vmlinux-arm64.inputs" 2>/dev/null)" ]; then
+  pod_overhead_mib=226
+fi
 default_max_pods="$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 2 / pod_overhead_mib ))"
 [ "$default_max_pods" -gt 110 ] && default_max_pods=110
 [ "$default_max_pods" -lt 1 ] && default_max_pods=1
@@ -256,6 +272,14 @@ POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 NAT_KERNEL="$here/kernel/vmlinux-arm64"
 FALLBACK_KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
 if [ -f "$NAT_KERNEL" ]; then KERNEL="$NAT_KERNEL"; else KERNEL="$FALLBACK_KERNEL"; fi
+# Whether the kernel can take a disk after boot: USB mass storage, the one
+# device Virtualization.framework attaches to a running VM (experiment 26).
+# kernel/usb-storage.config puts it in every kernel 'ferry kernel' builds; one
+# built before that has none, and a machine given a disk it has no driver for
+# would leave its pod waiting on a mount that never comes. So the class that
+# needs it is offered only when the kernel carries it.
+kernel_attaches_disks() { grep -qa "usb-storage" "$KERNEL" 2>/dev/null; }
+BLOCK_CLASS="${FERRY_BLOCK_CLASS:-ferry-local-block}"
 CLUSTER_DOMAIN="${FERRY_CLUSTER_DOMAIN:-cluster.local}"
 COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 
@@ -359,13 +383,23 @@ MACHINE_SUBNET="${MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
 # Cross-mode resolution is MACHINES.md milestone 6.
 MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
 # The images `ferry image load` and `ferry image build` put into ferry-cri, also
-# kept here and served to machines, which have a containerd of their own and
-# could not see any of them. Off unless asked for: it is another listening
-# process, and a second copy of every image loaded. See start_machine_registry.
-MACHINE_REGISTRY="${FERRY_MACHINE_REGISTRY:-}"
+# kept here and served to every node that is not the one they were loaded on:
+# machines, which have a containerd of their own; nodes added with `ferry node
+# add`, which have a store of their own; and nodes on other Macs, whose
+# registries ask this one over the peer port. That is what makes a loaded image
+# cluster-wide rather than per node, so it is on by default -- it costs one
+# ~10 MiB process and nothing per image, since its blobs are hard links to the
+# load's. FERRY_MACHINE_REGISTRY=0 turns it off. See start_registry.
+MACHINE_REGISTRY="${FERRY_MACHINE_REGISTRY:-1}"
 MACHINE_REGISTRY_PORT="${FERRY_MACHINE_REGISTRY_PORT:-$(( 5050 + PORT_SHIFT ))}"
+# The other Macs', over TLS with the nodes' own certificates. The same number on
+# every Mac of a cluster, since each works out the others' from its own.
+REGISTRY_PEER_PORT="${FERRY_REGISTRY_PEER_PORT:-$(( 5051 + PORT_SHIFT ))}"
 REGISTRY_DIR="$FERRY_HOME/registry"
 machine_registry_enabled() { [ "$MACHINE_REGISTRY" = 1 ]; }
+# What ferry-cri is told to ask first, so every node on this Mac finds what was
+# loaded on any of them, or on another Mac.
+image_mirror_flag() { machine_registry_enabled && echo "--image-mirror 127.0.0.1:$MACHINE_REGISTRY_PORT"; }
 # What the Mac will commit to machines in total.
 #
 # A quarter of memory and half the cores by default. The provisioner will spend
@@ -451,8 +485,10 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
                           -t <name:tag>, -f <Dockerfile>, --stop to end the builder
   ferry image load <x>    run an image you built elsewhere, without a registry
   ferry profile           which cluster this checkout runs, and on what ports
-  ferry addons list       what can be turned on (metrics-server, ingress-nginx)
-  ferry addons enable <n> turn one on
+  ferry addons list       what can be turned on, and what is
+  ferry addons enable <n> turn one on and wait for it (--no-wait not to)
+  ferry addons disable <n> remove exactly what enable applied
+  ferry addons images <n> check an addon's images have linux/arm64 builds
   ferry token create      print a command another Mac can join with
   ferry join ...          join this Mac to a cluster on another
 
@@ -466,9 +502,10 @@ Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
   ferry upgrade plan <vX.Y.Z>   check an upgrade without doing any of it
   ferry upgrade apply <vX.Y.Z>  move the control plane, keeping the cluster's data
-  ferry upgrade nodes           drain and replace each kubelet on this Mac
-  ferry upgrade node <name>     just that one
+  ferry upgrade nodes [--to v]  drain and replace each kubelet on this Mac
+  ferry upgrade node <name>     just that one [--to vX.Y.Z]
   ferry upgrade rollback        back to the version before the last apply
+  ferry upgrade prune           remove store versions nothing uses [--yes]
 
 Environment:
   FERRY_HOME             cluster state, default ~/.ferry
@@ -669,6 +706,13 @@ cmd_doctor() {
 
   if [ -f "$NAT_KERNEL" ]; then
     ok "guest kernel with NAT support — Services route inside pods, no root needed"
+    # Only a checkout has the inputs to compare, and only a kernel from before
+    # the record lacks one.
+    local kinputs; kinputs="$(ferry_kernel_inputs)"
+    if [ -n "$kinputs" ] && [ "$kinputs" != "$(cat "$NAT_KERNEL.inputs" 2>/dev/null)" ]; then
+      warn "the guest kernel was built from other patches or configuration; every pod"
+      echo "      may be paying for what they fix. Rebuild with: ./ferry kernel"
+    fi
   else
     warn "guest kernel without NAT (kata); Services will route through the host,"
     echo "      which needs root. Build one with: ./kernel/build-kernel.sh"
@@ -795,6 +839,12 @@ cmd_build() {
   echo "==> ferry-netpol"
   ( cd "$here/ferry-netpol" && go build -o "$here/bin/ferry-netpol" . ) || return 1
   echo "==> $here/bin/ferry-netpol"
+  echo
+  # What holds the API server's port while 'ferry upgrade' replaces it, so that
+  # nothing is refused. Standard library only; a second to build.
+  echo "==> ferry-handover"
+  ( cd "$here/ferry-handover" && go build -o "$here/bin/ferry-handover" . ) || return 1
+  echo "==> $here/bin/ferry-handover"
   echo
   # ferry-cni and the upstream plugins it runs, in both architectures.
   "$here/ferry-cni/build.sh" || return 1
@@ -930,7 +980,10 @@ align_to_cluster_version() {
     echo "      Starting it at $want, because $have is older and a control plane"
     echo "      does not go backwards in place."
   fi
-  ferry_activate_version "$want"
+  # The control plane's links only. Each node starts at the version it last
+  # ran, recorded beside it, so bin/kubelet is not what decides that any more.
+  # shellcheck disable=SC2086 # a list of names
+  ferry_activate_version "$want" $FERRY_CONTROL_PLANE_BINARIES
 }
 
 # Start the four control plane processes at a named version.
@@ -968,8 +1021,17 @@ start_control_plane() { # version
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
     SERVICE_NODE_PORT_RANGE="$(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))" \
     FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
-    "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
-    || { bad "control plane failed"; tail -20 "$FERRY_RUN/logs/control-plane.log" | sed 's/^/    /'; return 1; }
+    FERRY_KEEP_ETCD="${FERRY_KEEP_ETCD:-}" FERRY_HANDOVER="${FERRY_HANDOVER:-}" \
+    FERRY_HANDOVER_BIN="$here/bin/ferry-handover" \
+    "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1
+  local rc=$?
+  # 3 is up.sh saying the new API server never started and the old one is
+  # still serving: nothing was switched, which the caller needs to tell apart
+  # from a control plane that is down.
+  if [ "$rc" -ne 0 ]; then
+    bad "control plane failed"; tail -20 "$FERRY_RUN/logs/control-plane.log" | sed 's/^/    /'
+    return "$rc"
+  fi
   # The address it actually advertises, which is the LAN address whenever
   # there is one. This used to print the gateway either way, so a cluster whose
   # kubernetes Service pointed at 192.168.1.29 said it was advertising
@@ -1040,6 +1102,7 @@ cmd_up() {
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1174,18 +1237,19 @@ EOF
   fi
 
   if [ -x "$here/bin/ferry-proxyd" ]; then
-    "$here/bin/ferry-proxyd" --kubeconfig "$FERRY_HOME/admin.conf" \
-      --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
-      >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
-    echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
-    [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
+    : > "$FERRY_RUN/logs/ferry-proxyd.log"
+    start_proxyd "$FERRY_HOME/admin.conf" "$gateway" \
+      && ok "Service rules rendered by kube-proxy $(ferry_proxyd_version 2>/dev/null)" \
       || warn "ferry-proxyd did not start; Services will not route"
   fi
 
   start_netpol
   start_proxy
   start_storage
+  # Before machines, so a cluster whose machines fail to start still shares
+  # its images between nodes; start_machines starts it again with the subnet
+  # ferry-node actually claimed.
+  start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
   advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
@@ -1211,16 +1275,44 @@ EOF
 # kernel, so the rules are worked out here and applied there -- the same way
 # Service rules already reach a pod. Without this, policies were accepted and
 # silently ignored, which is worse than not supporting them.
-start_netpol() {
+#
+# A Mac that joined runs its own, as the node: its pods and its edge ask a
+# socket on that Mac, and a socket cannot be reached across the network.
+start_netpol() { # [kubeconfig]
   [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
   rm -f "$FERRY_NETPOL_SOCK"
-  "$here/bin/ferry-netpol" --kubeconfig "$FERRY_HOME/admin.conf" \
+  "$here/bin/ferry-netpol" --kubeconfig "${1:-$FERRY_HOME/admin.conf}" \
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
   ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
   [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
     || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+}
+
+# What a node's certificate needs for ferry-netpol to run as it. Made by
+# 'ferry token create', since a Mac cannot join without one, and idempotent, so
+# a cluster made before this existed gets it from its next token.
+ferry_netpol_rbac() {
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: ferry-node-netpol}
+rules:
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [list, watch]
+- apiGroups: [""]
+  resources: [pods, namespaces, nodes]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: ferry-node-netpol}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ferry-node-netpol}
+subjects:
+- {apiGroup: rbac.authorization.k8s.io, kind: Group, name: system:nodes}
+EOF
 }
 
 # The Mac's GPU, offered to pods over a socket.
@@ -1396,6 +1488,7 @@ start_machines() {
   # machines at a registry that is not running.
   FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
   FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
+  FERRY_NODE_USB="$(kernel_attaches_disks && echo 1)" \
   "$here/bin/ferry-node" serve \
     --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
     --ca "$FERRY_HOME/pki/ca.crt" \
@@ -1439,7 +1532,7 @@ start_machines() {
   # Remembered so the next start asks for the one that worked, not the default.
   [ -n "$actual_subnet" ] && printf '%s' "$actual_subnet" > "$MACHINE_SUBNET_FILE"
 
-  machine_registry_enabled && start_machine_registry "${actual_subnet:-$MACHINE_SUBNET}"
+  start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
@@ -1461,30 +1554,50 @@ start_machines() {
   start_provisioner
 }
 
-# The images this Mac has, served to its machines. See ferry-registry/main.go.
+# The images this Mac has, served to its nodes, its machines and the other
+# Macs. See ferry-registry/main.go and peers.go.
 #
 # On every interface, answering only the machine subnet and loopback: the store
 # holds whatever was built here, and there is no reason to offer it to the LAN.
 # Not bound to the gateway, which machines reach it at, because vmnet only
 # gives the Mac that address while a machine is attached -- binding it failed
 # with "can't assign requested address" on every start, before the first
-# machine had booted. Not fatal: machines without it fall through to the real
-# registries, which is how they worked before it existed.
-start_machine_registry() { # subnet
+# machine had booted. Not fatal: nodes and machines without it fall through to
+# the real registries, which is how they worked before it existed.
+#
+# The other Macs get a port of their own, over TLS, and both ends present the
+# node's kubelet certificate: only a node of this cluster is answered there,
+# and a pod has no such certificate. Which Macs they are comes from the peers
+# file ferry-streamer already keeps.
+#
+# Started again when machines come up, to add their subnet, which is only known
+# once ferry-node has claimed one.
+start_registry() { # [machine-subnet]
+  machine_registry_enabled || return 0
   [ -x "$here/bin/ferry-registry" ] || {
-    warn "FERRY_MACHINE_REGISTRY is set but bin/ferry-registry is missing -- run 'ferry build'"
+    warn "bin/ferry-registry is missing -- run 'ferry build'; loaded images stay on the node they were loaded on"
     return 0; }
+  local kubeconfig="$FERRY_HOME/kubelet.conf"
+  [ -f "$FERRY_RUN/kubelet.conf" ] && kubeconfig="$FERRY_RUN/kubelet.conf"
+  if running ferry-registry; then
+    local pid; pid="$(cat "$FERRY_RUN/ferry-registry.pid")"
+    kill -TERM "$pid" 2>/dev/null
+    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
+    rm -f "$FERRY_RUN/ferry-registry.pid"
+  fi
   mkdir -p "$REGISTRY_DIR"
   "$here/bin/ferry-registry" serve --store "$REGISTRY_DIR" \
-    --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "$1" \
+    --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "${1:-}" \
+    --peer-listen "0.0.0.0:$REGISTRY_PEER_PORT" --kubeconfig "$kubeconfig" \
+    --peers-file "$PEERS_FILE" --peer-port "$REGISTRY_PEER_PORT" --self "$LAN_IP" \
     >>"$FERRY_RUN/logs/ferry-registry.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-registry.pid"
-  sleep 1
+  ferry_await 3 curl -sf "http://127.0.0.1:$MACHINE_REGISTRY_PORT/v2/"
   if running ferry-registry; then
-    ok "registry for machines on port $MACHINE_REGISTRY_PORT ($(machine_registry_count) images)"
+    ok "registry on port $MACHINE_REGISTRY_PORT, other Macs on $REGISTRY_PEER_PORT ($(machine_registry_count) images)"
   else
     rm -f "$FERRY_RUN/ferry-registry.pid"
-    warn "ferry-registry did not start; machines will not see locally loaded images"
+    warn "ferry-registry did not start; loaded images stay on the node they were loaded on"
     tail -2 "$FERRY_RUN/logs/ferry-registry.log" 2>/dev/null | sed 's/^/      /'
   fi
 }
@@ -1673,6 +1786,7 @@ start_storage() {
   [ -x "$here/bin/ferry-storage" ] || { warn "ferry-storage not built; PersistentVolumeClaims will stay Pending"; return 0; }
   "$here/bin/ferry-storage" --kubeconfig "$FERRY_HOME/admin.conf" \
     --node-name "$NODE_NAME" --root "$FERRY_HOME/volumes" \
+    $(kernel_attaches_disks && echo "--block-class $BLOCK_CLASS") \
     >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-storage.pid"
   for _ in $(seq 1 30); do
@@ -1681,6 +1795,8 @@ start_storage() {
   done
   if grep -q "serving" "$FERRY_RUN/logs/ferry-storage.log" 2>/dev/null; then
     ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
+    kernel_attaches_disks && machines_enabled \
+      && ok "$BLOCK_CLASS: ReadWriteOnce claims that are disks on machines too, chown and all"
   else
     warn "ferry-storage did not start; see $FERRY_RUN/logs/ferry-storage.log"
   fi
@@ -1712,6 +1828,7 @@ install_dns() { # gateway dns-address
       `# what every other client already uses.` \
       -e "s|__APISERVER_HOST__|$advertise|g" \
       -e "s|__APISERVER_PORT__|$(( 6443 + PORT_SHIFT ))|g" \
+      -e "s|__DNS_NODE__|$NODE_NAME|g" \
       "$here/manifests/coredns.yaml" > "$rendered"
 
   KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f "$rendered" >/dev/null 2>&1 \
@@ -1770,8 +1887,13 @@ start_proxy() {
   fi
 
   # NodePort and LoadBalancer are the outside edge of a Service and always live
-  # on the Mac, whichever way ClusterIPs are handled. Node ports need no
-  # privilege; a LoadBalancer port below 1024 does, and ferry-proxy says so.
+  # on the Mac, whichever way ClusterIPs are handled. Neither needs privilege,
+  # 80 and 443 included: a LoadBalancer listens on the wildcard, which macOS
+  # lets anyone bind below 1024, and answers only at $LAN_IP and loopback.
+  #
+  # The edge also holds outside clients to NetworkPolicy, by the address they
+  # connected from. A pod sees all of them arrive from this Mac, which it has to
+  # exempt for the kubelet's probes, so this is the only place that can.
   local lb="$LAN_IP"
   [ "$lb" = "127.0.0.1" ] && lb=""
 
@@ -1782,15 +1904,15 @@ start_proxy() {
     fi
     sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --cluster-ips --node-ports --node-name "$NODE_NAME" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
-    local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig" | head -1)"
+    local pid; pid="$(pgrep -f "$here/bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" | head -1)"
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-ports --node-name "$NODE_NAME" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     local pid=$!
@@ -1815,10 +1937,52 @@ start_proxy() {
 # of ports, and the pods it runs are virtual machines exactly like the first
 # node's. Their addresses come from this node's own /24 inside the cluster /16,
 # and they reach the first node's pods across ferry's switch.
+# Deletes the Node object called <name> if nothing is behind it: no kubelet
+# here by that name, and a lease nobody has renewed for its whole duration.
+# The Ready condition cannot say this -- it is written every five minutes and
+# stays True for 40s after a kubelet stops. A lease still fresh is waited out,
+# because 'ferry down' and 'ferry up' take less time than a lease lasts; one
+# that keeps being renewed is another Mac's live node, and is left alone.
+stale_node_gone() { # name
+  local name="$1" renewed duration age waited=0
+  kubectl get node "$name" >/dev/null 2>&1 || return 0
+  if pgrep -f -- "--hostname-override=$name( |$)" >/dev/null; then
+    bad "a node named $name is already running on this Mac"; return 1
+  fi
+  while :; do
+    read -r renewed duration <<<"$(kubectl -n kube-node-lease get lease "$name" \
+      -o jsonpath='{.spec.renewTime} {.spec.leaseDurationSeconds}' 2>/dev/null)"
+    [ -n "$renewed" ] || break
+    renewed="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${renewed%%[.Z]*}" +%s 2>/dev/null || echo 0)"
+    age=$(( $(date -u +%s) - renewed ))
+    [ "$age" -ge "${duration:-40}" ] && break
+    if [ "$waited" -gt $(( ${duration:-40} + 10 )) ]; then
+      bad "a node named $name is already in the cluster, and its kubelet is running"
+      return 1
+    fi
+    [ "$waited" = 0 ] && echo "  waiting for $name's lease to lapse, to tell a stale node from a live one"
+    sleep 2; waited=$(( waited + 2 ))
+  done
+  local old; old="$(kubectl get node "$name" -o jsonpath='{.spec.podCIDR}' 2>/dev/null)"
+  kubectl delete node "$name" --wait=true >/dev/null 2>&1 \
+    || { bad "could not delete the stale node object $name"; return 1; }
+  ok "deleted a stale node object named $name${old:+ (podCIDR $old)}"
+}
+
 cmd_node_add() {
   local name="${1:-}"
   [ -n "$name" ] || { bad "usage: ferry node add <name>"; return 2; }
   running ferry-cri || { bad "ferry is not up; run 'ferry up' first"; return 1; }
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+
+  # A Node object left by an earlier node of this name -- 'ferry down' keeps
+  # them, and so does a cluster that outlived the checkout that added it. The
+  # kubelet adopts an existing Node rather than making one, so it inherited that
+  # node's podCIDR and index label, and the stale label made the index below
+  # skip past its own slice: podCIDR 10.171.1.0/24 with pods on 10.171.2.x.
+  # Gone first, so the index is chosen without it. One whose lease is being
+  # renewed is somebody's live node, and is left alone.
+  stale_node_gone "$name" || return 1
 
   # Find the first free index. Node 0 is the one 'ferry up' started.
   #
@@ -1878,6 +2042,7 @@ cmd_node_add() {
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
   local ready= waited=0 limit=90
@@ -1888,7 +2053,7 @@ cmd_node_add() {
     waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
-  ok "runtime on 10.244.$index.0/24, switch udp/$relay"
+  ok "runtime on $(node_slice "$index"), switch udp/$relay"
 
   "$here/bin/ferry-streamer" --listen "$stream_addr" \
     --exec-socket "$exec_sock" --control "$streamer_sock" \
@@ -1907,6 +2072,22 @@ cmd_node_add() {
       -e "s|$FERRY_RUN/volume-plugins|$run/volume-plugins|" \
       -e "s|^readOnlyPort: 0|readOnlyPort: 0\nport: $kubelet_port\nhealthzPort: $healthz_port|" \
       "$FERRY_RUN/kubelet.yaml" > "$run/kubelet.yaml"
+
+  # The Node is made here, holding the slice this node's runtime is on, so its
+  # podCIDR is that slice by construction. Left to the controller manager it is
+  # the lowest free /24, which is the same number only while every node was
+  # added and removed in order. The controller keeps a podCIDR it finds set, and
+  # the kubelet adopts the object. Mode 2 and ferry-netpol read this field.
+  kubectl apply -f - >/dev/null <<EOF || warn "could not pre-register $name; its podCIDR is the controller's choice"
+apiVersion: v1
+kind: Node
+metadata:
+  name: $name
+  labels: {ferry.dev/mode: vm-per-pod, ferry.dev/node-index: "$index"}
+spec:
+  podCIDR: $(node_slice "$index")
+  podCIDRs: [$(node_slice "$index")]
+EOF
 
   start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf" \
     "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log" "" "$index"
@@ -1944,6 +2125,10 @@ cmd_node_rm() {
     [ -f "$pidfile" ] && { kill -TERM "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"; }
   done
   kubectl delete node "$name" >/dev/null 2>&1
+  # A node added again under this name is a new node, and starts at the
+  # cluster's version rather than whatever this one was left on. It also stops
+  # holding that version in the store.
+  ferry_forget_node_version "$name"
   ok "node $name removed"
 }
 
@@ -2038,6 +2223,12 @@ EOF
   kubectl create clusterrolebinding ferry-node-proxier \
     --clusterrole=system:node-proxier \
     --group=system:nodes >/dev/null 2>&1
+  # And its own NetworkPolicy rules, for the same reason: every Mac runs
+  # ferry-netpol for its own pods and its own edge. A policy selects peers
+  # anywhere in the cluster, so it reads every pod, namespace and node -- which
+  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
+  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
+  ferry_netpol_rbac
 
   # Let a node that has not joined yet read the node list.
   #
@@ -2320,6 +2511,7 @@ start_worker() {
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a
@@ -2333,7 +2525,7 @@ start_worker() {
     waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
-  ok "runtime on 10.244.$index.0/24, switch udp/$RELAY_PORT"
+  ok "runtime on $(node_slice "$index"), switch udp/$RELAY_PORT"
 
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -2403,17 +2595,17 @@ EOF
   # asking until this answers.
   if [ -x "$here/bin/ferry-proxyd" ]; then
     local gateway; gateway="$(cat "$FERRY_RUN/cri/gateway" 2>/dev/null || echo "$LAN_IP")"
-    rm -f "$FERRY_PROXYD_SOCK"
-    "$here/bin/ferry-proxyd" --kubeconfig "$FERRY_RUN/kubelet.conf" \
-      --node-name "$name" --node-ip "$gateway" --socket "$FERRY_PROXYD_SOCK" \
-      >"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
-    echo $! > "$FERRY_RUN/ferry-proxyd.pid"
-    ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
-    [ -S "$FERRY_PROXYD_SOCK" ] && ok "Service rules rendered by kube-proxy" \
+    : > "$FERRY_RUN/logs/ferry-proxyd.log"
+    start_proxyd "$FERRY_RUN/kubelet.conf" "$gateway" "$name" \
+      && ok "Service rules rendered by kube-proxy $(ferry_proxyd_version 2>/dev/null)" \
       || warn "ferry-proxyd did not start; Services will not route on this node"
   else
     warn "bin/ferry-proxyd is missing; Services will not route on this node"
   fi
+
+  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
+  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
+  start_netpol "$FERRY_RUN/kubelet.conf"
 
   # Node ports and claims are per node too: a pod scheduled here needs its
   # volume made here, and a connection arriving here needs forwarding here.
@@ -2421,7 +2613,7 @@ EOF
   if [ -x "$here/bin/ferry-proxy" ]; then
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
       --node-ports --node-name "$name" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxy.pid"
@@ -2430,14 +2622,17 @@ EOF
   if [ -x "$here/bin/ferry-storage" ]; then
     "$here/bin/ferry-storage" --kubeconfig "$FERRY_RUN/kubelet.conf" \
       --node-name "$name" --root "$FERRY_HOME/volumes" --default=false \
+      $(kernel_attaches_disks && echo "--block-class $BLOCK_CLASS") \
       >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-storage.pid"
     ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
   fi
+  # After the certificate, which is what the other Macs' registries check.
+  start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
 
   echo
   bold "joined as $name"
-  echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
+  echo "  its pods will be on $(node_slice "$index") and reach the other nodes' pods directly"
 }
 
 # --- upgrades -------------------------------------------------------------
@@ -2460,10 +2655,10 @@ EOF
 # own code -- so the kubelet can be replaced without stopping the runtime, and
 # the pod VMs that drain did not move stay up across it.
 #
-# One thing makes it harder: a checkout has one bin/. Every node on one Mac
-# shares a kubelet binary and therefore moves together. Rolling one node at a
-# time is still right -- drain, replace, wait, next -- but the roll is per Mac,
-# not per node, and a second Mac is a second checkout with its own store.
+# Each node runs its kubelet out of its own version in the store and records
+# which, so nodes on one Mac move one at a time like nodes anywhere else, and a
+# control plane upgrade touches no node at all -- 'apply' moves only the control
+# plane's links. ferry-proxyd, being one per Mac, moves with the Mac's own node.
 
 # kubectl, against whichever credentials this Mac has.
 #
@@ -2587,9 +2782,18 @@ wait_node_version() { # name version seconds
 # the config file. Written once here so that restarting a kubelet during an
 # upgrade brings back exactly the process that was there, rather than a fourth
 # transcription of the same argument list.
-start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfig] [node-index]
+#
+# The binary comes out of the node's own version in the store, not bin/kubelet.
+# With no version given it is the one the node last ran, so a restart is a
+# restart and never an upgrade; 'ferry upgrade node' is the only thing that
+# passes one. See lib/upgrade.sh.
+start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfig] [node-index] [version]
   local name="$1" run="$2" kubeconfig="$3" pidfile="$4" logfile="$5" bootstrap="${6:-}"
-  local index="${7:-}"
+  local index="${7:-}" version="${8:-}"
+  [ -n "$version" ] || version="$(ferry_node_start_version "$name")"
+  local kubelet="$here/bin/kubelet"
+  [ -n "$version" ] && [ -x "$(ferry_version_dir "$version")/kubelet" ] \
+    && kubelet="$(ferry_version_dir "$version")/kubelet"
   # The node publishes which /24 of the cluster CIDR it owns, so the next Mac to
   # join can pick one that is free instead of being told a number by hand. The
   # label is registered by the kubelet itself, at the moment the node object is
@@ -2601,7 +2805,7 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
   # because no node carried the label on either side. A Mac node is always
   # vm-per-pod: that is what ferry-cri does.
   FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
-  "$here/bin/kubelet" \
+  "$kubelet" \
     --config="$run/kubelet.yaml" \
     ${bootstrap:+--bootstrap-kubeconfig="$bootstrap"} \
     --kubeconfig="$kubeconfig" \
@@ -2610,6 +2814,42 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
     --cert-dir="$run/pki" --v="${FERRY_KUBELET_V:-2}" >"$logfile" 2>&1 &
   echo $! > "$pidfile"
   echo "$name" > "$run/node-name"
+  if [ -n "$version" ]; then
+    echo "$version" > "$run/kubelet-version"
+    ferry_record_node_version "$name" "$version"
+  fi
+}
+
+# kube-proxy's rule generation for this Mac's pods, at a version in the store.
+#
+# One per Mac, however many nodes it runs, so its version is the Mac's: the one
+# it last ran, or node 0's when it has none. It used to run bin/ferry-proxyd,
+# which nothing upgraded -- 'ferry upgrade nodes' replaced every kubelet and
+# left kube-proxy on the version the Mac first came up with, with no skew check
+# ever applied to it.
+start_proxyd() { # kubeconfig node-ip [node-name] [version]
+  local kubeconfig="$1" node_ip="$2" name="${3:-}" version="${4:-}"
+  if [ -z "$version" ]; then
+    version="$(ferry_proxyd_version 2>/dev/null)" \
+      && [ -x "$(ferry_version_dir "$version")/ferry-proxyd" ] || version=""
+  fi
+  if [ -z "$version" ]; then
+    local node0; node0="$(cat "$FERRY_RUN/node-name" 2>/dev/null || echo "$NODE_NAME")"
+    version="$(ferry_node_start_version "$node0" 2>/dev/null)"
+  fi
+  local proxyd
+  proxyd="$(ferry_version_dir "$version")/ferry-proxyd"
+  [ -x "$proxyd" ] || proxyd="$here/bin/ferry-proxyd"
+  [ -x "$proxyd" ] || return 1
+  rm -f "$FERRY_PROXYD_SOCK"
+  "$proxyd" --kubeconfig "$kubeconfig" ${name:+--node-name "$name"} \
+    --node-ip "$node_ip" --socket "$FERRY_PROXYD_SOCK" \
+    >>"$FERRY_RUN/logs/ferry-proxyd.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-proxyd.pid"
+  echo "$node_ip" > "$FERRY_RUN/ferry-proxyd.node-ip"
+  [ -n "$version" ] && ferry_record_proxyd_version "$version"
+  ferry_await 15 test -S "$FERRY_PROXYD_SOCK"
+  [ -S "$FERRY_PROXYD_SOCK" ]
 }
 
 # Where one node's kubelet keeps its things, as shell assignments to eval.
@@ -2668,10 +2908,24 @@ etcd_restore() { # snapshot
   [ -x "$tool" ] || tool="$here/bin/etcdctl"
   local peer="http://127.0.0.1:$(( 2380 + PORT_SHIFT ))"
   rm -rf "$FERRY_HOME/etcd.restoring"
+  # The revision moves forward, not back, and everything before it reads as
+  # compacted.
+  #
+  # A snapshot's revision is older than the one every watcher in the cluster
+  # last saw -- measured on a rollback here, 1338 against 1682 -- and a watch
+  # resumed from a revision etcd has not reached yet simply waits until it
+  # gets there, then carries on from there: every kubelet, every ferry-proxyd,
+  # every controller keeps the world as it was before the restore and never
+  # hears that it changed. Restored nodes showed pods Running that no longer
+  # existed and kept them that way. Bumped and compacted, every watch is told
+  # its revision is gone and lists again, which is what upstream documents
+  # for restoring a cluster that has clients. A billion is its figure: more
+  # writes than could have happened since any snapshot ferry keeps.
   "$tool" snapshot restore "$1" \
     --data-dir "$FERRY_HOME/etcd.restoring" \
     --name default --initial-cluster "default=$peer" \
-    --initial-advertise-peer-urls "$peer" >/dev/null 2>&1 || return 1
+    --initial-advertise-peer-urls "$peer" \
+    --bump-revision 1000000000 --mark-compacted >/dev/null 2>&1 || return 1
   # The directory being replaced is moved aside, not deleted. If the restore
   # turns out to be the wrong call there is still something to go back to.
   [ -d "$FERRY_HOME/etcd" ] \
@@ -2767,8 +3021,9 @@ upgrade_preflight() { # from to
   # seam it edits -- so a version whose source has drifted fails during the
   # build, before anything has been switched. Saying so is the honest answer.
   if [ "$(ferry_version_mm "$from")" != "$(ferry_version_mm "$to")" ]; then
-    warn "$to is a new minor, so patches/ has never been applied to it"
-    echo "      build-kubelet.sh verifies every seam it edits and fails if one has"
+    warn "$to is a new minor, so its kubelet is built from patches/kubelet-$(ferry_version_mm "$to")"
+    echo "      build-kubelet.sh checks the constructors that directory records in"
+    echo "      SIGNATURES against the tree, and fails on any seam whose file has"
     echo "      moved. That happens during the build, which runs before anything"
     echo "      is switched, so a drifted tree costs time and not a cluster."
   fi
@@ -2790,6 +3045,76 @@ upgrade_preflight() { # from to
   if [ "$free" -ge 25 ]; then ok "${free}G free disk"
   else warn "${free}G free disk; a kubernetes source tree and build want about 25G"; fi
 
+  # What the running cluster says, when there is one to ask. Last, because it is
+  # the only part that needs the cluster, and a plan against a cluster that is
+  # down still has everything above.
+  if have_cluster; then
+    upgrade_cluster_checks "$to" || fatal=1
+  fi
+
+  return "$fatal"
+}
+
+# Checks that need the live cluster: every node's kubelet and this Mac's
+# kube-proxy against the new API server, and whether anything is still asking
+# for an API the new one removes.
+#
+# The node check used to cover only the nodes this Mac runs, and only in
+# 'plan', as a warning -- so 'apply' would happily move the API server three
+# minors past a kubelet on another Mac, which then could not talk to it at all.
+# Every node is read from the API, which is the one place that knows all of
+# them, and a node that would fall outside the skew stops the upgrade.
+upgrade_cluster_checks() { # to
+  local to="$1" fatal=0
+  ok "cluster is up, API server reports $(apiserver_version)"
+
+  local name version reason count=0 bad_nodes=0
+  while read -r name version; do
+    [ -n "$name" ] || continue
+    count=$(( count + 1 ))
+    reason="$(ferry_kubelet_skew_reason "$version" "$to")"
+    if [ -n "$reason" ]; then
+      bad "node $name: $reason"
+      bad_nodes=$(( bad_nodes + 1 ))
+    fi
+  done <<< "$(kube get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' 2>/dev/null)"
+  if [ "$bad_nodes" -gt 0 ]; then
+    echo "      Upgrade those nodes first, each from the Mac that runs it:"
+    echo "        ferry upgrade node <name> --to <a version within three minors of $to>"
+    fatal=1
+  elif [ "$count" -gt 0 ]; then
+    ok "all $count nodes' kubelets stay inside the skew against $to"
+  fi
+
+  # kube-proxy has the kubelet's rule against the API server. It reports its
+  # version to nobody, so only this Mac's is known here.
+  local proxyd
+  if proxyd="$(ferry_proxyd_version 2>/dev/null)"; then
+    reason="$(ferry_kubelet_skew_reason "$proxyd" "$to")"
+    if [ -n "$reason" ]; then
+      bad "ferry-proxyd (kube-proxy) on this Mac: ${reason/a kubelet/kube-proxy}"
+      fatal=1
+    else
+      ok "ferry-proxyd $proxyd stays inside kube-proxy's skew against $to"
+    fi
+  fi
+
+  local metrics removed
+  if metrics="$(kube get --raw /metrics 2>/dev/null)"; then
+    removed="$(printf '%s\n' "$metrics" | ferry_removed_apis "$to")"
+    if [ -n "$removed" ]; then
+      bad "something is still asking for APIs that $to no longer serves:"
+      printf '%s\n' "$removed" | sed 's/^/        /'
+      echo "      The objects are safe -- the API server converts them -- but the"
+      echo "      clients asking will get 404s. 'kubectl get --raw /metrics | grep"
+      echo "      apiserver_requested_deprecated_apis' says which. Move them to the"
+      echo "      replacement first, or go ahead regardless:"
+      echo "        FERRY_ALLOW_REMOVED_APIS=1 ferry upgrade apply $to"
+      [ "${FERRY_ALLOW_REMOVED_APIS:-}" = 1 ] || fatal=1
+    else
+      ok "nothing has asked this API server for an API $to removes"
+    fi
+  fi
   return "$fatal"
 }
 
@@ -2806,41 +3131,37 @@ cmd_upgrade_plan() {
     2) return 0 ;;
     *) echo; bold "not ready"; return 1 ;;
   esac
+  have_cluster || warn "the cluster is not up; 'apply' will build and switch the binaries anyway"
 
-  echo
-  if have_cluster; then
-    local api; api="$(apiserver_version)"
-    ok "cluster is up, API server reports $api"
-    local index name version reason
-    while read -r index name; do
-      [ -n "$name" ] || continue
-      version="$(node_kubelet_version "$name")"
-      reason="$(ferry_kubelet_skew_reason "${version:-$from}" "$(ferry_control_plane_version "$to")")"
-      if [ -n "$reason" ]; then warn "node $name at $version: $reason"
-      else ok "node $name at $version, and $version against $to stays inside the skew"; fi
-    done <<< "$(local_nodes)"
-  else
-    warn "the cluster is not up; 'apply' will build and switch the binaries anyway"
-  fi
-
+  local etcd_from etcd_to
+  etcd_from="$(ferry_store_etcd "$from")"; etcd_to="$(ferry_etcd_version "$to")"
   echo
   bold "what apply would do"
   echo "  1. build the kubelet and ferry-proxyd for $to, and fetch its control"
   echo "     plane and etcd. Nothing running is touched; a failure here costs"
   echo "     time only."
   echo "  2. snapshot etcd to $FERRY_HOME/backups."
-  echo "  3. stop the four control plane processes. The kubelet and the runtime"
-  echo "     stay up, and running pods are not disturbed."
-  echo "  4. point bin/ at $to and start the control plane again on the same etcd"
-  echo "     data directory."
-  echo "  5. verify the API server answers at $to. If it does not, put $from back"
-  echo "     and restart it."
+  if [ "$etcd_from" = "$etcd_to" ]; then
+    echo "  3. leave etcd $etcd_to running, since $to pairs with the same one."
+    if [ -x "$here/bin/ferry-handover" ]; then
+      echo "  4. hand the API server's port from the $from API server to the $to one."
+      echo "     Connections made during the switch wait for it, for a second or"
+      echo "     so, rather than being refused. The controller manager and"
+      echo "     scheduler restart behind it."
+    else
+      echo "  4. stop the $from API server and start the $to one. Clients are"
+      echo "     refused for about two seconds. (Build ferry-handover to avoid"
+      echo "     that: ferry build.)"
+    fi
+  else
+    echo "  3. stop the control plane and etcd, since etcd moves from $etcd_from"
+    echo "     to $etcd_to, and start them again at $to. The API is unreachable"
+    echo "     for a few seconds."
+  fi
+  echo "  5. verify the API server answers at $to. If it does not, put $from back."
   echo
-  echo "  The API is unreachable for the few seconds in 3-4. There is one etcd"
-  echo "  member and one API server, so there is no version of this without an"
-  echo "  outage."
-  echo
-  echo "  Nodes keep their old kubelet until you roll them:"
+  echo "  No node is touched: kubelets and ferry-proxyd keep running $from, and"
+  echo "  running pods are not disturbed. Roll the nodes when you like:"
   echo "      ferry upgrade nodes"
   echo "  A kubelet may lag the API server by three minors, so there is no hurry"
   echo "  and no need to do it in one sitting."
@@ -2873,8 +3194,8 @@ cmd_upgrade_apply() {
   echo
 
   if [ -z "$assume_yes" ]; then
-    echo "  The API server will be unreachable for a few seconds. Running pods"
-    echo "  are not touched. Continue? [y/N] "
+    echo "  The control plane restarts at $to. Nodes and running pods are not"
+    echo "  touched. Continue? [y/N] "
     local answer; read -r answer
     case "$answer" in y|Y|yes) : ;; *) echo "  nothing done"; return 1 ;; esac
     echo
@@ -2889,12 +3210,15 @@ cmd_upgrade_apply() {
   echo
 
   # An upgrade of a cluster that is not running is just a build plus a note of
-  # where to start next time.
+  # where to start next time. Only the control plane's links move: each node
+  # starts at the version it last ran, and is moved by 'ferry upgrade node'.
   if ! running ferry-cri || ! have_cluster; then
-    ferry_activate_version "$to"
+    # shellcheck disable=SC2086 # a list of names
+    ferry_activate_version "$to" $FERRY_CONTROL_PLANE_BINARIES
     ferry_write_cluster_version "$to" "$(ferry_control_plane_version "$to")" "$(ferry_etcd_version "$to")"
     warn "the cluster is not up, so nothing was restarted"
-    echo "      bin/ now points at $to and 'ferry up' will start it there."
+    echo "      'ferry up' will start its control plane at $to, and each node at"
+    echo "      the version it last ran. Then: ferry upgrade nodes"
     return 0
   fi
 
@@ -2912,22 +3236,21 @@ cmd_upgrade_apply() {
   fi
   echo
 
-  # 3 and 4. Stop, flip, start. The kubelet and ferry-cri stay up throughout:
-  # a kubelet reconnects to an API server that went away, and the pods are VMs
-  # the runtime owns, not something the control plane holds open.
+  # 3 and 4. Switch. The kubelets and ferry-cri stay up throughout: a kubelet
+  # reconnects to an API server that went away, and the pods are VMs the
+  # runtime owns, not something the control plane holds open.
   bold "switching the control plane"
-  STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1
-  ok "stopped $from"
-  ferry_activate_version "$to"
-
-  if start_control_plane "$to"; then
+  upgrade_switch "$from" "$to"
+  local rc=$?
+  if [ "$rc" = 0 ]; then
     local api; api="$(apiserver_version)"
     if [ -n "$api" ] && [ "$(ferry_version_mm "$api")" = "$(ferry_version_mm "$to")" ]; then
       ferry_write_cluster_version "$to" "$(ferry_control_plane_version "$to")" "$(ferry_etcd_version "$to")"
       ok "API server answering at $api"
       echo
       bold "control plane is $to"
-      echo "  Nodes are still on $from, which is supported. Roll them when you like:"
+      echo "  Nodes are still on the kubelet they had, which is supported. Roll"
+      echo "  them when you like:"
       echo
       echo "      ferry upgrade nodes"
       echo
@@ -2935,35 +3258,80 @@ cmd_upgrade_apply() {
       return 0
     fi
     bad "the control plane started but reports ${api:-nothing}, not $to"
+  elif [ "$rc" = 3 ]; then
+    # The new API server never bound, and the old one never stopped serving.
+    # shellcheck disable=SC2086 # a list of names
+    ferry_activate_version "$from" $FERRY_CONTROL_PLANE_BINARIES
+    bad "the $to API server did not start; $from is still serving, and nothing was switched"
+    echo "    Its log: $FERRY_HOME/logs/kube-apiserver.log"
+    return 1
   fi
 
   # 5. It did not come up. Put back what was there.
   echo
   bold "rolling back to $from"
-  upgrade_restore "$from" "$snapshot" "$(ferry_etcd_version "$from")" "$(ferry_etcd_version "$to")"
+  upgrade_restore "$to" "$from" "$snapshot"
   return 1
 }
 
-# Put a version back: stop, flip the links, restore the snapshot if etcd moved
-# minors, start. Shared by the failure path of 'apply' and by 'rollback', which
-# are the same operation arrived at from different directions.
-upgrade_restore() { # version snapshot etcd-target etcd-current
-  local version="$1" snapshot="$2" etcd_target="$3" etcd_current="$4"
-
+# Move the running control plane from one version to another against the same
+# data directory. Only the control plane's links move; no node is touched.
+#
+# etcd restarts only when the version it pairs with changes -- MANIFEST's etcd
+# field, what the store actually fetched. Every minor from v1.34 to v1.37 pairs
+# with the same one, so for them this leaves it alone, which takes its restart
+# out of the outage and the API server's wait for it with it.
+#
+# With etcd left running and ferry-handover built, the API server is handed
+# over rather than stopped: see control-plane/up.sh.
+upgrade_switch() { # from to
+  local ef et
+  ef="$(ferry_store_etcd "$1")"; et="$(ferry_store_etcd "$2")"
+  # shellcheck disable=SC2086 # a list of names
+  ferry_activate_version "$2" $FERRY_CONTROL_PLANE_BINARIES
+  if [ "$ef" = "$et" ] && [ -f "$FERRY_HOME/etcd.pid" ] && kill -0 "$(cat "$FERRY_HOME/etcd.pid")" 2>/dev/null; then
+    ok "etcd $et is the same for $1 and $2; left running"
+    if [ -x "$here/bin/ferry-handover" ]; then
+      FERRY_KEEP_ETCD=1 FERRY_HANDOVER=1 start_control_plane "$2"
+    else
+      warn "ferry-handover is not built, so the API server stops before its replacement starts"
+      FERRY_KEEP_ETCD=1 start_control_plane "$2"
+    fi
+    return
+  fi
+  [ "$ef" != "$et" ] && ok "etcd $ef to $et, so etcd restarts too"
   STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1
+  ok "stopped $1"
+  start_control_plane "$2"
+}
+
+# Put the control plane back at an earlier version: the failure path of 'apply'
+# and the whole of 'rollback', which are the same operation arrived at from
+# different directions.
+#
+# Whether the data directory comes back from the snapshot is
+# ferry_rollback_restore_reason's call; see lib/upgrade.sh. When it does, etcd
+# stops too, since a data directory cannot be replaced under a running one.
+upgrade_restore() { # from to snapshot [keep-data]
+  local from="$1" version="$2" snapshot="$3" keep="${4:-}"
   ferry_version_complete "$version" || {
     bad "the store has no $version to go back to; nothing to restore"; return 1; }
-  ferry_activate_version "$version"
 
-  if [ -n "$snapshot" ] && [ -f "$snapshot" ] \
-     && [ "$(ferry_version_mm "$etcd_target")" != "$(ferry_version_mm "$etcd_current")" ]; then
-    warn "etcd moved from $etcd_target to $etcd_current, so the data directory"
-    echo "      is restored from the snapshot. Anything written since then is lost."
+  local reason
+  reason="$(ferry_rollback_restore_reason "$from" "$version" "$(ferry_store_etcd "$from")" "$(ferry_store_etcd "$version")")"
+  local started=1
+  if [ -n "$reason" ] && [ -n "$snapshot" ] && [ -f "$snapshot" ] && [ -z "$keep" ]; then
+    STATE="$FERRY_HOME" "$here/control-plane/down.sh" >/dev/null 2>&1
+    # shellcheck disable=SC2086 # a list of names
+    ferry_activate_version "$version" $FERRY_CONTROL_PLANE_BINARIES
     if etcd_restore "$snapshot"; then ok "restored $snapshot"
     else bad "could not restore $snapshot; the data directory is untouched"; fi
+    start_control_plane "$version" || started=""
+  else
+    upgrade_switch "$from" "$version" || started=""
   fi
 
-  if start_control_plane "$version"; then
+  if [ -n "$started" ]; then
     ferry_write_cluster_version "$version" "$(ferry_control_plane_version "$version")" \
       "$(ferry_etcd_version "$version")"
     ok "back on $version"
@@ -2976,11 +3344,27 @@ upgrade_restore() { # version snapshot etcd-target etcd-current
 }
 
 cmd_upgrade_rollback() {
+  local assume_yes="" keep=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) assume_yes=1; shift ;;
+      --keep-data) keep=1; shift ;;
+      *) bad "usage: ferry upgrade rollback [--yes] [--keep-data]"; return 2 ;;
+    esac
+  done
   local to; to="$(ferry_previous_field kubernetes 2>/dev/null)"
   local from; from="$(cluster_version)"
   [ -n "$to" ] || { bad "this cluster has not been upgraded, so there is nothing to roll back to"; return 1; }
 
   bold "rollback $from -> $to"
+  # version.previous is whatever the cluster was before its last change, and
+  # after a rollback that is the newer version. Going there is an upgrade, and
+  # has apply's checks; rollback would skip them.
+  if [ "$from" != "$to" ] && [ -z "$(ferry_skew_reason "$from" "$to")" ]; then
+    bad "$to is newer than $from, so going there is an upgrade, not a rollback"
+    echo "    ferry upgrade apply $to"
+    return 1
+  fi
   ferry_version_complete "$to" || {
     bad "the store no longer has $to"
     echo "    Build it back first: ferry build --kubernetes-version $to"
@@ -2990,12 +3374,50 @@ cmd_upgrade_rollback() {
   local snapshot
   snapshot="$(find "$FERRY_HOME/backups" -name "*-$to-to-$from.db" 2>/dev/null | sort | tail -1)"
   local etcd_to etcd_from
-  etcd_to="$(ferry_etcd_version "$to")"; etcd_from="$(ferry_etcd_version "$from")"
-  if [ "$(ferry_version_mm "$etcd_to")" != "$(ferry_version_mm "$etcd_from")" ] && [ -z "$snapshot" ]; then
-    bad "going back to $to means going back to etcd $etcd_to, which cannot read"
-    echo "    the data directory etcd $etcd_from migrated -- and the snapshot from"
-    echo "    the upgrade is gone. There is no way back that keeps the data."
-    return 1
+  etcd_to="$(ferry_store_etcd "$to")"; etcd_from="$(ferry_store_etcd "$from")"
+  local reason; reason="$(ferry_rollback_restore_reason "$from" "$to" "$etcd_from" "$etcd_to")"
+
+  if [ -n "$reason" ]; then
+    if [ -z "$snapshot" ]; then
+      if [ "$(ferry_version_mm "$etcd_to")" != "$(ferry_version_mm "$etcd_from")" ]; then
+        bad "going back to $to means going back to etcd $etcd_to, which cannot read"
+        echo "    the data directory etcd $etcd_from migrated -- and the snapshot from"
+        echo "    the upgrade is gone. There is no way back that keeps the data."
+        return 1
+      fi
+      if [ -z "$keep" ]; then
+        bad "$reason, and the snapshot from the upgrade is gone"
+        echo "    Starting $to on what $from has written may work and may not: it"
+        echo "    reads objects at the storage versions it knows and cannot read the"
+        echo "    rest. To try it anyway, keeping everything written since:"
+        echo "        ferry upgrade rollback --keep-data"
+        return 1
+      fi
+      warn "$reason; keeping the data directory, as asked"
+    elif [ -n "$keep" ]; then
+      if [ "$(ferry_version_mm "$etcd_to")" != "$(ferry_version_mm "$etcd_from")" ]; then
+        bad "--keep-data cannot apply across an etcd minor: etcd $etcd_to cannot read it"
+        return 1
+      fi
+      warn "$reason; keeping the data directory, as asked, rather than restoring"
+    else
+      local taken; taken="$(date -r "$snapshot" '+%Y-%m-%d %H:%M:%S')"
+      warn "$reason."
+      echo "      So the cluster goes back to the snapshot taken on the way up, at"
+      echo "      $taken. Everything written to the API since is lost: objects"
+      echo "      created, changed or deleted after that moment -- and a pod whose"
+      echo "      object is gone is stopped by its kubelet, then recreated by its"
+      echo "      controller if it has one. To keep what was written instead, and"
+      echo "      take the chance that $to reads it:"
+      echo "          ferry upgrade rollback --keep-data"
+      if [ -z "$assume_yes" ]; then
+        echo "  Restore it? [y/N] "
+        local answer; read -r answer
+        case "$answer" in y|Y|yes) : ;; *) echo "  nothing done"; return 1 ;; esac
+      fi
+    fi
+  else
+    ok "$from to $to stays inside $(ferry_version_mm "$to"), so the data directory is kept"
   fi
 
   # Rolling back is itself a change worth being able to undo.
@@ -3004,28 +3426,53 @@ cmd_upgrade_rollback() {
     now="$(etcd_snapshot "$from-before-rollback")" && ok "snapshotted $from at $now"
   fi
   echo
-  upgrade_restore "$to" "$snapshot" "$etcd_to" "$etcd_from" || return 1
+  upgrade_restore "$from" "$to" "$snapshot" "$keep" || return 1
   echo
-  echo "  Nodes are still running $from's kubelet, which is now newer than the"
-  echo "  API server. Roll them back too, and soon:"
+  echo "  Nodes that were moved to $from have a kubelet newer than the API"
+  echo "  server now, which is the one skew Kubernetes does not allow. Roll them"
+  echo "  back, and soon:"
   echo
   echo "      ferry upgrade nodes"
 }
 
 # --- nodes ----------------------------------------------------------------
 
+# Restart this Mac's ferry-proxyd at a version, on the same arguments it has.
+restart_proxyd() { # version
+  local version="$1"
+  [ -x "$(ferry_version_dir "$version")/ferry-proxyd" ] || {
+    warn "the store has no ferry-proxyd for $version; kube-proxy stays at $(ferry_proxyd_version 2>/dev/null || echo 'what it was')"
+    return 1; }
+  local node_ip conf name=""
+  node_ip="$(cat "$FERRY_RUN/ferry-proxyd.node-ip" 2>/dev/null || cat "$FERRY_RUN/cri/gateway" 2>/dev/null)"
+  if [ -f "$FERRY_RUN/kubelet.conf" ]; then
+    conf="$FERRY_RUN/kubelet.conf"; name="$(cat "$FERRY_RUN/node-name" 2>/dev/null)"
+  else
+    conf="$FERRY_HOME/admin.conf"
+  fi
+  # Pods keep the rules they were last given while it is gone, and ferry-cri
+  # asks again until the new one answers; nothing in the data path waits on it.
+  stop_kubelet "$FERRY_RUN/ferry-proxyd.pid"
+  start_proxyd "$conf" "$node_ip" "$name" "$version"
+}
+
 cmd_upgrade_node() {
   # Not seeded from $1, for the same reason 'apply' is not: 'node --force'
   # would otherwise try to drain a node called "--force".
-  local name="" force=""
+  local name="" force="" target=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift ;;
-      -*) bad "usage: ferry upgrade node <name> [--force]"; return 2 ;;
+      --to) [ -n "${2:-}" ] || { bad "--to needs a version"; return 2; }; target="$2"; shift 2 ;;
+      --to=*) target="${1#*=}"; shift ;;
+      -*) bad "usage: ferry upgrade node <name> [--to vX.Y.Z] [--force]"; return 2 ;;
       *) name="$1"; shift ;;
     esac
   done
-  [ -n "$name" ] || { bad "usage: ferry upgrade node <name> [--force]"; return 2; }
+  [ -n "$name" ] || { bad "usage: ferry upgrade node <name> [--to vX.Y.Z] [--force]"; return 2; }
+  if [ -n "$target" ] && ! ferry_version_valid "$target"; then
+    bad "--to $target is not a version like v1.34.0"; return 2
+  fi
   require_cluster || return 1
 
   local index
@@ -3039,23 +3486,55 @@ cmd_upgrade_node() {
     echo "    binaries there and run 'ferry upgrade node $name' on it."
     return 1; }
 
-  local target; target="$(ferry_active_version)"
+  # By default, to the cluster's own version: what 'apply' just moved the
+  # control plane to, or what 'rollback' just took it back to.
+  [ -n "$target" ] || target="$(ferry_default_node_version)"
   [ -n "$target" ] || { bad "nothing is built; run 'ferry build' first"; return 1; }
   local api; api="$(apiserver_version)"
   local current; current="$(node_kubelet_version "$name")"
 
   bold "upgrading node $name: ${current:-unknown} -> $target"
-  if [ "$current" = "$target" ]; then ok "already at $target"; return 0; fi
+  if [ "$current" = "$target" ]; then
+    # Recorded too, for a node started before nodes kept a record: it is
+    # running the right kubelet, and draining it to write that down would be
+    # an upgrade for the sake of bookkeeping.
+    ferry_record_node_version "$name" "$target"
+    ok "already at $target"
+    [ "$index" = 0 ] && upgrade_proxyd_to "$target" "$api"
+    return 0
+  fi
 
   local reason; reason="$(ferry_kubelet_skew_reason "$target" "$api")"
   [ -n "$reason" ] && { bad "$reason"; return 1; }
   ok "$target against an API server at $api is inside the supported skew"
 
+  # A version nothing has built yet is built now, before the node is drained,
+  # so a build that fails costs time and not a cordoned node.
+  if [ ! -x "$(ferry_version_dir "$target")/kubelet" ]; then
+    is_release && { bad "the store has no kubelet $target, and a release cannot build one"; return 1; }
+    echo "  building kubelet $target"
+    build_kubernetes_binaries "$target" || { bad "build failed; $name was not touched"; return 1; }
+  fi
+
   # Drain. Eviction rather than deletion, so PodDisruptionBudgets are honoured
   # -- which is upstream's machinery and works here unchanged, because the API
   # server is upstream's.
-  echo "  draining $name"
+  #
+  # Except CoreDNS, on the control plane Mac's own node. It claims the address
+  # ferry reserves for cluster DNS, which belongs to that node's pod subnet and
+  # no other, and every kubelet is told to use it -- so evicted, it comes back
+  # on another node at another address and cluster DNS is gone until something
+  # happens to put it back. Found by draining node 0 with a second node beside
+  # it. Left in place it keeps answering: the runtime holds its VM across the
+  # kubelet swap, as it does for anything the drain does not move.
+  local keep=""
+  [ "$index" = 0 ] && [ -f "$FERRY_HOME/admin.conf" ] && [ ! -f "$FERRY_RUN/kubelet.conf" ] \
+    && keep="k8s-app!=kube-dns"
+  local note=""
+  [ -n "$keep" ] && note=" (leaving CoreDNS, which holds the DNS address of this node)"
+  echo "  draining $name$note"
   if ! kube drain "$name" --ignore-daemonsets --delete-emptydir-data \
+        ${keep:+--pod-selector="$keep"} \
         ${force:+--force} --timeout="${FERRY_DRAIN_TIMEOUT:-300s}" 2>&1 | sed 's/^/    /'; then
     bad "drain failed"
     echo "    Pods with no controller are not evicted without --force, which"
@@ -3074,7 +3553,7 @@ cmd_upgrade_node() {
   stop_kubelet "$pidfile"
   ok "kubelet stopped, runtime left up"
 
-  start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap" "$index"
+  start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "$bootstrap" "$index" "$target"
   if wait_node_version "$name" "$target" 120; then
     ok "node Ready, kubelet $target"
   else
@@ -3089,11 +3568,35 @@ cmd_upgrade_node() {
   fi
 
   kube uncordon "$name" >/dev/null 2>&1 && ok "uncordoned"
+  # kube-proxy is per Mac and moves with the Mac's own node.
+  [ "$index" = 0 ] && upgrade_proxyd_to "$target" "$api"
+  return 0
+}
+
+# Move this Mac's ferry-proxyd to a version, if it is not there already and
+# kube-proxy's skew allows it -- the kubelet's rule, against the same API server.
+upgrade_proxyd_to() { # version apiserver-version
+  [ -f "$FERRY_RUN/ferry-proxyd.pid" ] || return 0
+  local have; have="$(ferry_proxyd_version 2>/dev/null)"
+  [ "$have" = "$1" ] && return 0
+  local reason; reason="$(ferry_kubelet_skew_reason "$1" "$2")"
+  if [ -n "$reason" ]; then warn "ferry-proxyd left at ${have:-its version}: ${reason/a kubelet/kube-proxy}"; return 0; fi
+  if restart_proxyd "$1"; then ok "ferry-proxyd (kube-proxy) ${have:-unknown} -> $1"
+  else warn "ferry-proxyd did not come back at $1; Services on this Mac stay on their last rules"; fi
 }
 
 cmd_upgrade_nodes() {
+  local args=() target="" a
+  for a in "$@"; do args+=("$a"); done
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) target="${2:-}"; shift 2 || shift ;;
+      --to=*) target="${1#*=}"; shift ;;
+      *) shift ;;
+    esac
+  done
   require_cluster || return 1
-  local target; target="$(ferry_active_version)"
+  [ -n "$target" ] || target="$(ferry_default_node_version)"
   bold "rolling every node on this Mac to $target"
   echo
 
@@ -3101,7 +3604,7 @@ cmd_upgrade_nodes() {
   while read -r index name; do
     [ -n "$name" ] || continue
     # </dev/null so nothing inside can eat the node list this loop is reading.
-    cmd_upgrade_node "$name" "$@" </dev/null || { failed=1; break; }
+    cmd_upgrade_node "$name" ${args[@]+"${args[@]}"} </dev/null || { failed=1; break; }
     echo
   done <<< "$(local_nodes)"
 
@@ -3141,13 +3644,26 @@ cmd_upgrade_status() {
   local previous; previous="$(ferry_previous_field kubernetes 2>/dev/null || echo "")"
   [ -n "$previous" ] && echo "  rollback to   $previous"
 
+  # What each node on this Mac was last started as, which is what it will be
+  # started as again.
+  local index name v nodes; nodes="$(local_nodes)"
+  if [ -n "$nodes" ]; then
+    while read -r index name; do
+      [ -n "$name" ] || continue
+      v="$(ferry_node_version "$name" 2>/dev/null || echo "-")"
+      printf '  node          %s kubelet %s\n' "$name" "$v"
+    done <<< "$nodes"
+  fi
+  v="$(ferry_proxyd_version 2>/dev/null)" && echo "  kube-proxy    ferry-proxyd $v"
+
   echo
   bold "in the store"
-  local version line
+  local version line refs; refs="$(ferry_store_referenced 2>/dev/null)"
   for version in $(ferry_version_list); do
     line="  $version"
     [ "$version" = "$active" ] && line="$line  <- bin/ points here"
     ferry_version_complete "$version" || line="$line  (incomplete)"
+    printf '%s\n' "$refs" | grep -qx "$version" || line="$line  (unused)"
     echo "$line"
   done
   [ -z "$(ferry_version_list)" ] && echo "  nothing; run 'ferry build'"
@@ -3167,6 +3683,39 @@ cmd_upgrade_status() {
   fi
 }
 
+# Remove the versions in the store that nothing uses.
+#
+# "Uses" is ferry_store_referenced: the cluster, where rollback would go, what
+# bin/ points at, the version every node on this Mac last ran and this Mac's
+# ferry-proxyd. Taking any of those breaks a restart or a rollback. A version a
+# process is running from right now is kept as well, whatever the records say.
+cmd_upgrade_prune() {
+  local yes=""
+  case "${1:-}" in
+    -y|--yes) yes=1 ;;
+    "") : ;;
+    *) bad "usage: ferry upgrade prune [--yes]"; return 2 ;;
+  esac
+  local running; running="$(ps -axo args= 2>/dev/null | grep -o "$(ferry_versions_dir)/v[^/]*/" | sort -u)"
+  local v candidates=()
+  for v in $(ferry_store_unreferenced); do
+    if printf '%s\n' "$running" | grep -qF "$(ferry_version_dir "$v")/"; then
+      warn "$v is unreferenced but a process is running from it; kept"
+      continue
+    fi
+    candidates+=("$v")
+  done
+  if [ "${#candidates[@]}" -eq 0 ]; then ok "every version in the store is in use"; return 0; fi
+  for v in "${candidates[@]}"; do
+    echo "  $v  $(du -sh "$(ferry_version_dir "$v")" 2>/dev/null | cut -f1)"
+  done
+  if [ -z "$yes" ]; then
+    echo "  Nothing removed. To remove these: ferry upgrade prune --yes"
+    return 0
+  fi
+  for v in "${candidates[@]}"; do rm -rf "$(ferry_version_dir "$v")" && ok "removed $v"; done
+}
+
 cmd_upgrade() {
   case "${1:-status}" in
     plan)     shift; cmd_upgrade_plan "$@" ;;
@@ -3175,70 +3724,38 @@ cmd_upgrade() {
     nodes)    shift; cmd_upgrade_nodes "$@" ;;
     rollback) shift; cmd_upgrade_rollback "$@" ;;
     status)   shift; cmd_upgrade_status "$@" ;;
-    *) bad "usage: ferry upgrade <plan|apply|node|nodes|rollback|status>"; return 2 ;;
+    prune)    shift; cmd_upgrade_prune "$@" ;;
+    *) bad "usage: ferry upgrade <plan|apply|node|nodes|rollback|status|prune>"; return 2 ;;
   esac
 }
 
-# Things everybody wants and nobody should have to hunt for.
-#
-# An addon is a directory of ordinary Kubernetes manifests under addons/. Nothing
-# about them is special to ferry; they are here so a laptop cluster can have
-# metrics and an ingress controller without a scavenger hunt, and so the versions
-# are pinned to ones that have actually been run.
+# Things everybody wants and nobody should have to hunt for. The mechanism is in
+# lib/addons.sh; this is only the verbs.
+# shellcheck source=lib/addons.sh
+. "$here/lib/addons.sh"
 cmd_addons() {
-  local action="${1:-list}" name="${2:-}"
-  export KUBECONFIG="$FERRY_HOME/admin.conf"
+  local action="${1:-list}"; shift 2>/dev/null || true
+  export KUBECONFIG="$FERRY_HOME/admin.conf" LAN_IP NODE_NAME FERRY_HOME
 
   case "$action" in
-    list|"")
-      bold "addons"
-      local dir
-      for dir in "$here"/addons/*/; do
-        [ -d "$dir" ] || continue
-        local addon; addon="$(basename "$dir")"
-        if kubectl get namespace "$addon" >/dev/null 2>&1 \
-           || kubectl -n kube-system get deployment "$addon" >/dev/null 2>&1; then
-          ok "$addon (enabled)"
-        else
-          echo "    $addon"
-        fi
+    list|ls) addon_list ;;
+    enable|disable)
+      local no_wait="" names=() arg
+      for arg in "$@"; do
+        case "$arg" in --no-wait) no_wait=--no-wait ;; *) names+=("$arg") ;; esac
       done
-      echo
-      echo "  ferry addons enable <name>"
-      ;;
-
-    enable)
-      [ -n "$name" ] || { bad "usage: ferry addons enable <name>"; return 2; }
-      local dir="$here/addons/$name"
-      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
-      kubectl get nodes >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
-
-      bold "enabling $name"
-      local dns; dns="$(cat "$FERRY_RUN/cri/dns" 2>/dev/null || echo "")"
-      local rendered; rendered="$(mktemp -d)"
-      # shellcheck disable=SC2064
-      trap "rm -rf '$rendered'" RETURN
-      local file
-      for file in "$dir"/*.yaml; do
-        [ -f "$file" ] || continue
-        sed -e "s|__CLUSTER_DNS__|$dns|g" -e "s|__NODE_NAME__|$NODE_NAME|g" \
-          "$file" > "$rendered/$(basename "$file")"
+      [ "${#names[@]}" -gt 0 ] || { bad "usage: ferry addons $action <name>... [--no-wait]"; return 2; }
+      kubectl get --raw /readyz >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+      local name failed=0
+      for name in "${names[@]}"; do
+        if [ "$action" = enable ]; then addon_enable "$name" $no_wait || failed=1
+        else addon_disable "$name" || failed=1; fi
       done
-      kubectl apply -f "$rendered" >/dev/null 2>&1 || { bad "could not apply $name"; return 1; }
-      ok "applied"
-      [ -f "$dir/NOTES" ] && { echo; sed 's/^/  /' "$dir/NOTES"; }
-      ;;
-
-    disable)
-      [ -n "$name" ] || { bad "usage: ferry addons disable <name>"; return 2; }
-      local dir="$here/addons/$name"
-      [ -d "$dir" ] || { bad "no addon called $name"; return 1; }
-      bold "disabling $name"
-      kubectl delete -f "$dir" --ignore-not-found >/dev/null 2>&1
-      ok "removed"
-      ;;
-
-    *) bad "usage: ferry addons [list|enable <name>|disable <name>]"; return 2 ;;
+      return "$failed" ;;
+    images)
+      [ -n "${1:-}" ] || { bad "usage: ferry addons images <name>"; return 2; }
+      bold "images in $1"; addon_images "$1" ;;
+    *) bad "usage: ferry addons [list|enable <name>...|disable <name>...|images <name>]"; return 2 ;;
   esac
 }
 
@@ -3439,11 +3956,12 @@ ferry_builder_up() {
 # is no proxy in between to say no.
 #
 # An ingress policy selecting nothing denies every pod. The Mac keeps working
-# without being named, because ferry-netpol exempts each node's own address on
-# the pod network from ingress policy before any rule is consulted
-# (ferry-netpol/compile.go:164) -- it has to, or a kubelet probe could not
-# reach a pod that denies ingress. So "deny all pods, allow the developer" is
-# the empty policy, and nothing here has to know the gateway's address.
+# without being named, because ferry-netpol exempts a pod's own node's address
+# on the pod network from ingress policy before any rule is consulted
+# (writeIngressGuards in ferry-netpol/compile.go) -- it has to, or a kubelet
+# probe could not reach a pod that denies ingress. So "deny all pods, allow the
+# developer" is the empty policy, and nothing here has to know the gateway's
+# address.
 #
 # This is enforcement in the builder's own kernel, not advice: ferry-netpol
 # compiles it to nftables and ferry-cri loads it into that pod
@@ -3619,23 +4137,46 @@ cmd_image_build() {
 # an image Docker or Podman is holding -- in the last case ferry asks that tool
 # to export it first. The image keeps the name it already has, so a manifest
 # saying `myapp:dev` still says that.
-# The same images for mode 2, when there is a registry to serve them.
+# The same images for every other node, through this Mac's registry: machines,
+# the other nodes on this Mac, and nodes on other Macs, which ask it over the
+# peer port. See start_registry.
 #
 # Also when the registry is running but the variable is not set in this shell:
 # the setting belongs to `ferry up`, and a load from another terminal that
-# quietly skipped the machines would be the bug this exists to fix, again.
+# quietly skipped the other nodes would be the bug this exists to fix, again.
 machine_registry_add() { # layout
   machine_registry_enabled || running ferry-registry || return 0
   [ -x "$here/bin/ferry-registry" ] || {
-    warn "not added for machines: bin/ferry-registry is missing -- run 'ferry build'"
+    warn "not shared with other nodes: bin/ferry-registry is missing -- run 'ferry build'"
     return 0; }
   local name out="$FERRY_RUN/registry-add.out" err="$FERRY_RUN/registry-add.err"
   if "$here/bin/ferry-registry" add --store "$REGISTRY_DIR" "$1" >"$out" 2>"$err"; then
-    while read -r name; do [ -n "$name" ] && ok "served to machines as $name"; done < "$out"
+    while read -r name; do [ -n "$name" ] && ok "shared with every node as $name"; done < "$out"
   else
-    warn "not added for machines: $(tail -1 "$err")"
+    warn "not shared with other nodes: $(tail -1 "$err")"
   fi
   rm -f "$out" "$err"
+}
+
+# The other nodes on this Mac, loaded directly.
+#
+# The registry would serve them on their first pull, but a pod that says
+# `imagePullPolicy: Never` never pulls, and on a node that had not loaded the
+# image that was ErrImageNeverPull. They are on this Mac and their stores are a
+# socket away, so each is handed the layout too: Never then works on every
+# node here, and the cost is one unpack per node, which a pull would pay anyway.
+load_into_added_nodes() { # layout
+  local index sock reply
+  for index in $(seq 1 "$FERRY_MAX_NODE_SCAN"); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    sock="/tmp/ferry-exec$SUFFIX-$index.sock"
+    [ -S "$sock" ] || continue
+    reply="$(printf '{"op":"loadimage","path":"%s"}\n' "$1" | nc -U "$sock" 2>/dev/null)"
+    case "$reply" in
+      *'"images"'*) ok "loaded into node $index too" ;;
+      *) warn "node $index did not take it; it will pull it from the registry instead" ;;
+    esac
+  done
 }
 
 cmd_image_load() {
@@ -3703,13 +4244,15 @@ cmd_image_load() {
       echo "$reply" \
         | sed -e 's/.*"images":\[//' -e 's/\].*//' -e 's/","/\n/g' -e 's/"//g' -e 's|\\/|/|g' \
         | while read -r name; do [ -n "$name" ] && ok "loaded $name"; done
+      load_into_added_nodes "$layout"
       machine_registry_add "$layout"
       echo
       echo "  Pods must not try to fetch it again: set"
       if machine_registry_enabled || running ferry-registry; then
-        # Never means a machine's kubelet does not ask its containerd to pull,
-        # and pulling from the Mac is the only way a machine gets the image.
-        echo "    imagePullPolicy: IfNotPresent   (not Never, which machines cannot satisfy)"
+        # Never means a kubelet does not pull, and pulling from a registry is
+        # how a machine, or a node on another Mac, gets the image.
+        echo "    imagePullPolicy: IfNotPresent   (Never works on this Mac's nodes only:"
+        echo "                                     machines and other Macs pull it from here)"
       else
         echo "    imagePullPolicy: IfNotPresent   (or Never)"
       fi
@@ -3821,10 +4364,13 @@ cmd_down() {
   # Written before anything is stopped, so the login agent's watch loop cannot
   # see the processes go and exit non-zero before it knows this was deliberate.
   mark_stopped
-  # ferry-proxy runs as root, so stopping it does too.
+  # ferry-proxy runs as root only when it binds ClusterIPs, so stopping it
+  # takes sudo only then. Always asking meant a 'ferry down' without sudo -- a
+  # worker's, which nothing else matches -- left an unprivileged one running.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
-    local proxy_pid; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
-    sudo kill -TERM "$proxy_pid" 2>/dev/null \
+    local proxy_pid as=""; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
+    ps -p "$proxy_pid" >/dev/null 2>&1 && ! kill -0 "$proxy_pid" 2>/dev/null && as=sudo
+    $as kill -TERM "$proxy_pid" 2>/dev/null \
       && ok "Service proxy stopped"
     rm -f "$FERRY_RUN/ferry-proxy.pid"
     # Waited for rather than slept through, but briefly and then forced.
@@ -3843,7 +4389,7 @@ cmd_down() {
     [ -n "$purge" ] || for _ in 1 2; do
       kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05
     done
-    sudo kill -KILL "$proxy_pid" 2>/dev/null
+    $as kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
   local index
@@ -3876,7 +4422,7 @@ cmd_down() {
   # ferry-cri must still finish releasing its vmnet network before another run
   # can claim the same subnet, so it is waited for -- just not on its own.
   local stopping=() stopnames=() component pidfile pid
-  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
+  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud ferry-registry; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"
@@ -3902,9 +4448,10 @@ cmd_down() {
   done
   # A listener that outlives its pid file holds the node port against the next
   # run, and the symptom -- "address already in use" buried in a log -- is a poor
-  # way to find that out.
-  pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
-  sudo pkill -f "bin/ferry-proxy --kubeconfig" 2>/dev/null
+  # way to find that out. Matched on this profile's kubeconfig: every checkout runs
+  # one, and a bare name here stopped every other profile's ferry-proxy too.
+  pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
+  sudo pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
 
   # After the streamer, which would otherwise put it straight back, and before
   # the control plane, which has to be up to accept the patch.
@@ -4094,7 +4641,7 @@ stop_machines() {
     fi
   fi
 
-  for component in ferry-karpenter ferry-machined ferry-registry ferry-node; do
+  for component in ferry-karpenter ferry-machined ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"; rm -f "$pidfile"
@@ -4129,11 +4676,11 @@ cmd_machines_status() {
     || echo "  node disk not unpacked yet; the first 'machines enable' does it"
   echo "  network   $MACHINE_SUBNET"
   if running ferry-registry; then
-    ok "registry for machines, $(machine_registry_count) images -- ferry logs ferry-registry"
+    ok "registry, $(machine_registry_count) images -- ferry logs ferry-registry"
   elif machine_registry_enabled; then
-    bad "FERRY_MACHINE_REGISTRY=1 but ferry-registry is not running"
+    bad "ferry-registry is not running; loaded images stay on the node they were loaded on"
   else
-    echo "  registry  off -- machines see only what registries serve (FERRY_MACHINE_REGISTRY=1)"
+    echo "  registry  off (FERRY_MACHINE_REGISTRY=0) -- machines see only what registries serve"
   fi
   if have_cluster; then
     echo
@@ -4656,10 +5203,10 @@ cmd_status() {
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
-    if machine_registry_enabled; then
-      if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
-      else bad "ferry-registry (FERRY_MACHINE_REGISTRY=1)"; fi
-    fi
+  fi
+  if machine_registry_enabled; then
+    if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
+    else bad "ferry-registry (loaded images stay on the node they were loaded on)"; fi
   fi
   # A dead runtime under a live kubelet is a node that reads NotReady and will
   # stay that way: the runtime took its pod VMs and its vmnet network with it,

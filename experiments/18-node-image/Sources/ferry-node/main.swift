@@ -177,8 +177,12 @@ func run() throws {
     while true { sleep(3600) }
 }
 
-/// Experiment 26's switch: machines boot with an xHCI controller, and
-/// `ferry-node serve` attaches the disk images listed in `<dir>/<name>.usb`.
+/// Machines boot with an xHCI controller, and `ferry-node serve` attaches the
+/// disk images listed in `<dir>/<name>.usb` -- the ferry-local-block claims of
+/// the pods ferry-machined sees scheduled there. `ferry` sets it when the
+/// kernel carries usb-storage (experiment 26's fragment, now part of the
+/// kernel build), since a controller the kernel has no driver for is a disk
+/// nobody will ever see.
 let usbHotplugEnabled = ProcessInfo.processInfo.environment["FERRY_NODE_USB"] == "1"
 
 /// The virtiofs tag init.sh mounts the volumes share by.
@@ -229,6 +233,13 @@ func machineConfiguration(
     // anywhere in between.
     if !taints.isEmpty {
         arguments.append("ferry.taints=\(taints.joined(separator: ","))")
+    }
+    // usb-storage waits a second after a disk appears before scanning it, for
+    // real hardware that needs to spin up. A virtual disk is ready at once,
+    // and that second was most of what experiment 26 measured between attach
+    // and the guest seeing sda -- time a pod with a claim spends waiting.
+    if usbHotplugEnabled {
+        arguments.append("usb-storage.delay_use=0")
     }
     // The kubelet's klog level, as an environment variable rather than a flag
     // because every caller that boots a machine would otherwise have to thread
@@ -352,10 +363,8 @@ func machineConfiguration(
     // it moves the whole early boot.
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
-    // Experiment 26: a USB controller, which is the one place
-    // Virtualization.framework can attach storage to a VM that is already
-    // running. Off unless asked for while the experiment decides whether it is
-    // worth keeping.
+    // A USB controller, which is the one place Virtualization.framework can
+    // attach storage to a VM that is already running (experiment 26).
     if usbHotplugEnabled {
         config.usbControllers = [VZXHCIControllerConfiguration()]
     }

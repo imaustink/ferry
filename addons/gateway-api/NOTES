@@ -1,0 +1,5 @@
+These are only the API types: a Gateway does nothing until a controller claims
+its GatewayClass. `ferry addons enable envoy-gateway` is one that has been run
+here.
+
+Disabling removes the CRDs, and with them every Gateway and Route.

@@ -1,0 +1,47 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "idle",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 4,
+  "create_seconds": 1.6450736670000001,
+  "baseline": {
+    "at": "22:04:12",
+    "free_mib": 4970.046875,
+    "used_mib": 69565.046875,
+    "compressed_mib": 7777.1875,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "22:04:26",
+      "free_mib": 3675.21875,
+      "used_mib": 70316.453125,
+      "compressed_mib": 7777.09375,
+      "vms": 4,
+      "vm_resident_mib": 859.859375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:04:38",
+      "free_mib": 4626.140625,
+      "used_mib": 69949.34375,
+      "compressed_mib": 7776.203125,
+      "vms": 4,
+      "vm_resident_mib": 860.40625,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "22:04:38",
+    "free_mib": 4626.140625,
+    "used_mib": 69949.34375,
+    "compressed_mib": 7776.203125,
+    "vms": 4,
+    "vm_resident_mib": 860.40625,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 600.7,
+  "logs": null
+}
