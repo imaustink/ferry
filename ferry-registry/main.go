@@ -24,7 +24,13 @@
 // provisioner does to every empty machine. Bound to the gateway, this could
 // not start before the first machine and would lose its address with the last.
 //
+// It is also what makes a loaded image cluster-wide rather than per node: every
+// node on this Mac pulls through it, and it asks the other Macs' registries for
+// what it does not hold. See peers.go.
+//
 //	ferry-registry serve --store DIR --listen ADDR --allow CIDR[,CIDR]
+//	                     [--peer-listen ADDR --kubeconfig FILE
+//	                      (--peers-file FILE --peer-port N --self IP[,IP] | --peers URL[,URL])]
 //	ferry-registry add   --store DIR LAYOUT
 //	ferry-registry list  --store DIR
 package main
@@ -52,6 +58,12 @@ func main() {
 	store := flags.String("store", "", "the OCI layout images are kept in")
 	listen := flags.String("listen", "", "address to serve on (serve)")
 	allow := flags.String("allow", "", "comma-separated CIDRs answered besides loopback (serve)")
+	peerListen := flags.String("peer-listen", "", "address to serve the other Macs on, over TLS (serve)")
+	kubeconfig := flags.String("kubeconfig", "", "the kubelet's kubeconfig, whose certificate peers present (serve)")
+	peersFile := flags.String("peers-file", "", "ferry's peers file, naming every node's host (serve)")
+	peerPort := flags.Int("peer-port", 0, "the port the other Macs' registries serve peers on (serve)")
+	self := flags.String("self", "", "this Mac's own addresses, left out of the peers (serve)")
+	peerList := flags.String("peers", "", "comma-separated peer registry URLs, instead of --peers-file (serve)")
 	flags.Parse(os.Args[2:])
 	if *store == "" {
 		usage()
@@ -73,7 +85,23 @@ func main() {
 			}
 			nets = append(nets, n)
 		}
-		serve(*store, *listen, nets)
+		var creds *credentials
+		var others *peers
+		if *kubeconfig != "" {
+			creds = &credentials{kubeconfig: *kubeconfig}
+			var list func() []string
+			switch {
+			case *peerList != "":
+				fixed := strings.Split(*peerList, ",")
+				list = func() []string { return fixed }
+			case *peersFile != "" && *peerPort > 0:
+				list = peersFromFile(*peersFile, *peerPort, strings.Split(*self, ","))
+			}
+			if list != nil {
+				others = newPeers(list, creds.client())
+			}
+		}
+		serve(*store, *listen, nets, *peerListen, creds, others)
 	case "add":
 		if flags.NArg() != 1 {
 			usage()
@@ -107,14 +135,27 @@ func usage() {
 	os.Exit(2)
 }
 
-func serve(store, listen string, allow []*net.IPNet) {
+func serve(store, listen string, allow []*net.IPNet, peerListen string, creds *credentials, others *peers) {
 	if err := os.MkdirAll(store, 0o755); err != nil {
 		log.Fatal(err)
 	}
 	server := &http.Server{
 		Addr:              listen,
-		Handler:           logged(only(allow, &registry{store: store})),
+		Handler:           logged(only(allow, &registry{store: store, peers: others})),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	servers := []*http.Server{server}
+	// The other Macs, over TLS, from this store alone: a peer's miss is not
+	// passed on, so two Macs without an image cannot ask each other in a circle.
+	var peerServer *http.Server
+	if peerListen != "" && creds != nil {
+		peerServer = &http.Server{
+			Addr:              peerListen,
+			Handler:           logged(&registry{store: store}),
+			TLSConfig:         creds.serverTLS(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		servers = append(servers, peerServer)
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
@@ -122,8 +163,21 @@ func serve(store, listen string, allow []*net.IPNet) {
 		<-stop
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		server.Shutdown(ctx)
+		for _, s := range servers {
+			s.Shutdown(ctx)
+		}
 	}()
+	if peerServer != nil {
+		go func() {
+			log.Printf("serving %s to the cluster's other Macs on %s", store, peerListen)
+			if err := peerServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("peer port: %v", err)
+			}
+		}()
+	}
+	if others != nil {
+		log.Printf("asking other Macs for what is not here: %v", others.list())
+	}
 	log.Printf("serving %s on %s to %v and loopback", store, listen, allow)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)

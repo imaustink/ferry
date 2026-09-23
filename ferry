@@ -359,13 +359,23 @@ MACHINE_SUBNET="${MACHINE_SUBNET:-192.168.$(( 200 + PROFILE_INDEX )).0/24}"
 # Cross-mode resolution is MACHINES.md milestone 6.
 MACHINE_DNS_IP="${FERRY_MACHINE_DNS_IP:-10.96.0.10}"
 # The images `ferry image load` and `ferry image build` put into ferry-cri, also
-# kept here and served to machines, which have a containerd of their own and
-# could not see any of them. Off unless asked for: it is another listening
-# process, and a second copy of every image loaded. See start_machine_registry.
-MACHINE_REGISTRY="${FERRY_MACHINE_REGISTRY:-}"
+# kept here and served to every node that is not the one they were loaded on:
+# machines, which have a containerd of their own; nodes added with `ferry node
+# add`, which have a store of their own; and nodes on other Macs, whose
+# registries ask this one over the peer port. That is what makes a loaded image
+# cluster-wide rather than per node, so it is on by default -- it costs one
+# ~10 MiB process and nothing per image, since its blobs are hard links to the
+# load's. FERRY_MACHINE_REGISTRY=0 turns it off. See start_registry.
+MACHINE_REGISTRY="${FERRY_MACHINE_REGISTRY:-1}"
 MACHINE_REGISTRY_PORT="${FERRY_MACHINE_REGISTRY_PORT:-$(( 5050 + PORT_SHIFT ))}"
+# The other Macs', over TLS with the nodes' own certificates. The same number on
+# every Mac of a cluster, since each works out the others' from its own.
+REGISTRY_PEER_PORT="${FERRY_REGISTRY_PEER_PORT:-$(( 5051 + PORT_SHIFT ))}"
 REGISTRY_DIR="$FERRY_HOME/registry"
 machine_registry_enabled() { [ "$MACHINE_REGISTRY" = 1 ]; }
+# What ferry-cri is told to ask first, so every node on this Mac finds what was
+# loaded on any of them, or on another Mac.
+image_mirror_flag() { machine_registry_enabled && echo "--image-mirror 127.0.0.1:$MACHINE_REGISTRY_PORT"; }
 # What the Mac will commit to machines in total.
 #
 # A quarter of memory and half the cores by default. The provisioner will spend
@@ -1040,6 +1050,7 @@ cmd_up() {
     --relay-port "$RELAY_PORT" --peers "$PEERS" \
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1186,6 +1197,10 @@ EOF
   start_netpol
   start_proxy
   start_storage
+  # Before machines, so a cluster whose machines fail to start still shares
+  # its images between nodes; start_machines starts it again with the subnet
+  # ferry-node actually claimed.
+  start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
   advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
@@ -1439,7 +1454,7 @@ start_machines() {
   # Remembered so the next start asks for the one that worked, not the default.
   [ -n "$actual_subnet" ] && printf '%s' "$actual_subnet" > "$MACHINE_SUBNET_FILE"
 
-  machine_registry_enabled && start_machine_registry "${actual_subnet:-$MACHINE_SUBNET}"
+  start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
@@ -1461,30 +1476,50 @@ start_machines() {
   start_provisioner
 }
 
-# The images this Mac has, served to its machines. See ferry-registry/main.go.
+# The images this Mac has, served to its nodes, its machines and the other
+# Macs. See ferry-registry/main.go and peers.go.
 #
 # On every interface, answering only the machine subnet and loopback: the store
 # holds whatever was built here, and there is no reason to offer it to the LAN.
 # Not bound to the gateway, which machines reach it at, because vmnet only
 # gives the Mac that address while a machine is attached -- binding it failed
 # with "can't assign requested address" on every start, before the first
-# machine had booted. Not fatal: machines without it fall through to the real
-# registries, which is how they worked before it existed.
-start_machine_registry() { # subnet
+# machine had booted. Not fatal: nodes and machines without it fall through to
+# the real registries, which is how they worked before it existed.
+#
+# The other Macs get a port of their own, over TLS, and both ends present the
+# node's kubelet certificate: only a node of this cluster is answered there,
+# and a pod has no such certificate. Which Macs they are comes from the peers
+# file ferry-streamer already keeps.
+#
+# Started again when machines come up, to add their subnet, which is only known
+# once ferry-node has claimed one.
+start_registry() { # [machine-subnet]
+  machine_registry_enabled || return 0
   [ -x "$here/bin/ferry-registry" ] || {
-    warn "FERRY_MACHINE_REGISTRY is set but bin/ferry-registry is missing -- run 'ferry build'"
+    warn "bin/ferry-registry is missing -- run 'ferry build'; loaded images stay on the node they were loaded on"
     return 0; }
+  local kubeconfig="$FERRY_HOME/kubelet.conf"
+  [ -f "$FERRY_RUN/kubelet.conf" ] && kubeconfig="$FERRY_RUN/kubelet.conf"
+  if running ferry-registry; then
+    local pid; pid="$(cat "$FERRY_RUN/ferry-registry.pid")"
+    kill -TERM "$pid" 2>/dev/null
+    ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
+    rm -f "$FERRY_RUN/ferry-registry.pid"
+  fi
   mkdir -p "$REGISTRY_DIR"
   "$here/bin/ferry-registry" serve --store "$REGISTRY_DIR" \
-    --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "$1" \
+    --listen "0.0.0.0:$MACHINE_REGISTRY_PORT" --allow "${1:-}" \
+    --peer-listen "0.0.0.0:$REGISTRY_PEER_PORT" --kubeconfig "$kubeconfig" \
+    --peers-file "$PEERS_FILE" --peer-port "$REGISTRY_PEER_PORT" --self "$LAN_IP" \
     >>"$FERRY_RUN/logs/ferry-registry.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-registry.pid"
-  sleep 1
+  ferry_await 3 curl -sf "http://127.0.0.1:$MACHINE_REGISTRY_PORT/v2/"
   if running ferry-registry; then
-    ok "registry for machines on port $MACHINE_REGISTRY_PORT ($(machine_registry_count) images)"
+    ok "registry on port $MACHINE_REGISTRY_PORT, other Macs on $REGISTRY_PEER_PORT ($(machine_registry_count) images)"
   else
     rm -f "$FERRY_RUN/ferry-registry.pid"
-    warn "ferry-registry did not start; machines will not see locally loaded images"
+    warn "ferry-registry did not start; loaded images stay on the node they were loaded on"
     tail -2 "$FERRY_RUN/logs/ferry-registry.log" 2>/dev/null | sed 's/^/      /'
   fi
 }
@@ -1878,6 +1913,7 @@ cmd_node_add() {
     --cluster-cidr "$CLUSTER_CIDR" --node-index "$index" \
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
   local ready= waited=0 limit=90
@@ -2320,6 +2356,7 @@ start_worker() {
     --relay-port "$RELAY_PORT" --peers-file "$PEERS_FILE" \
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
+    $(image_mirror_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a
@@ -2434,6 +2471,8 @@ EOF
     echo $! > "$FERRY_RUN/ferry-storage.pid"
     ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
   fi
+  # After the certificate, which is what the other Macs' registries check.
+  start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
 
   echo
   bold "joined as $name"
@@ -3619,23 +3658,46 @@ cmd_image_build() {
 # an image Docker or Podman is holding -- in the last case ferry asks that tool
 # to export it first. The image keeps the name it already has, so a manifest
 # saying `myapp:dev` still says that.
-# The same images for mode 2, when there is a registry to serve them.
+# The same images for every other node, through this Mac's registry: machines,
+# the other nodes on this Mac, and nodes on other Macs, which ask it over the
+# peer port. See start_registry.
 #
 # Also when the registry is running but the variable is not set in this shell:
 # the setting belongs to `ferry up`, and a load from another terminal that
-# quietly skipped the machines would be the bug this exists to fix, again.
+# quietly skipped the other nodes would be the bug this exists to fix, again.
 machine_registry_add() { # layout
   machine_registry_enabled || running ferry-registry || return 0
   [ -x "$here/bin/ferry-registry" ] || {
-    warn "not added for machines: bin/ferry-registry is missing -- run 'ferry build'"
+    warn "not shared with other nodes: bin/ferry-registry is missing -- run 'ferry build'"
     return 0; }
   local name out="$FERRY_RUN/registry-add.out" err="$FERRY_RUN/registry-add.err"
   if "$here/bin/ferry-registry" add --store "$REGISTRY_DIR" "$1" >"$out" 2>"$err"; then
-    while read -r name; do [ -n "$name" ] && ok "served to machines as $name"; done < "$out"
+    while read -r name; do [ -n "$name" ] && ok "shared with every node as $name"; done < "$out"
   else
-    warn "not added for machines: $(tail -1 "$err")"
+    warn "not shared with other nodes: $(tail -1 "$err")"
   fi
   rm -f "$out" "$err"
+}
+
+# The other nodes on this Mac, loaded directly.
+#
+# The registry would serve them on their first pull, but a pod that says
+# `imagePullPolicy: Never` never pulls, and on a node that had not loaded the
+# image that was ErrImageNeverPull. They are on this Mac and their stores are a
+# socket away, so each is handed the layout too: Never then works on every
+# node here, and the cost is one unpack per node, which a pull would pay anyway.
+load_into_added_nodes() { # layout
+  local index sock reply
+  for index in $(seq 1 "$FERRY_MAX_NODE_SCAN"); do
+    [ -f "$FERRY_RUN/node-$index.pid" ] || continue
+    sock="/tmp/ferry-exec$SUFFIX-$index.sock"
+    [ -S "$sock" ] || continue
+    reply="$(printf '{"op":"loadimage","path":"%s"}\n' "$1" | nc -U "$sock" 2>/dev/null)"
+    case "$reply" in
+      *'"images"'*) ok "loaded into node $index too" ;;
+      *) warn "node $index did not take it; it will pull it from the registry instead" ;;
+    esac
+  done
 }
 
 cmd_image_load() {
@@ -3703,13 +3765,15 @@ cmd_image_load() {
       echo "$reply" \
         | sed -e 's/.*"images":\[//' -e 's/\].*//' -e 's/","/\n/g' -e 's/"//g' -e 's|\\/|/|g' \
         | while read -r name; do [ -n "$name" ] && ok "loaded $name"; done
+      load_into_added_nodes "$layout"
       machine_registry_add "$layout"
       echo
       echo "  Pods must not try to fetch it again: set"
       if machine_registry_enabled || running ferry-registry; then
-        # Never means a machine's kubelet does not ask its containerd to pull,
-        # and pulling from the Mac is the only way a machine gets the image.
-        echo "    imagePullPolicy: IfNotPresent   (not Never, which machines cannot satisfy)"
+        # Never means a kubelet does not pull, and pulling from a registry is
+        # how a machine, or a node on another Mac, gets the image.
+        echo "    imagePullPolicy: IfNotPresent   (Never works on this Mac's nodes only:"
+        echo "                                     machines and other Macs pull it from here)"
       else
         echo "    imagePullPolicy: IfNotPresent   (or Never)"
       fi
@@ -3876,7 +3940,7 @@ cmd_down() {
   # ferry-cri must still finish releasing its vmnet network before another run
   # can claim the same subnet, so it is waited for -- just not on its own.
   local stopping=() stopnames=() component pidfile pid
-  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud; do
+  for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud ferry-registry; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"
@@ -4094,7 +4158,7 @@ stop_machines() {
     fi
   fi
 
-  for component in ferry-karpenter ferry-machined ferry-registry ferry-node; do
+  for component in ferry-karpenter ferry-machined ferry-node; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"; rm -f "$pidfile"
@@ -4129,11 +4193,11 @@ cmd_machines_status() {
     || echo "  node disk not unpacked yet; the first 'machines enable' does it"
   echo "  network   $MACHINE_SUBNET"
   if running ferry-registry; then
-    ok "registry for machines, $(machine_registry_count) images -- ferry logs ferry-registry"
+    ok "registry, $(machine_registry_count) images -- ferry logs ferry-registry"
   elif machine_registry_enabled; then
-    bad "FERRY_MACHINE_REGISTRY=1 but ferry-registry is not running"
+    bad "ferry-registry is not running; loaded images stay on the node they were loaded on"
   else
-    echo "  registry  off -- machines see only what registries serve (FERRY_MACHINE_REGISTRY=1)"
+    echo "  registry  off (FERRY_MACHINE_REGISTRY=0) -- machines see only what registries serve"
   fi
   if have_cluster; then
     echo
@@ -4656,10 +4720,10 @@ cmd_status() {
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
-    if machine_registry_enabled; then
-      if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
-      else bad "ferry-registry (FERRY_MACHINE_REGISTRY=1)"; fi
-    fi
+  fi
+  if machine_registry_enabled; then
+    if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
+    else bad "ferry-registry (loaded images stay on the node they were loaded on)"; fi
   fi
   # A dead runtime under a live kubelet is a node that reads NotReady and will
   # stay that way: the runtime took its pod VMs and its vmnet network with it,

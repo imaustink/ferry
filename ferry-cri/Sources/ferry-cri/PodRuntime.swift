@@ -2021,7 +2021,11 @@ actor PodRuntime {
         // keyed by both that and whatever the manifest actually said, so a pod
         // written as `busybox:1.36` finds the image it just pulled.
         let canonical = ImageReference.normalize(reference)
-        let image = try await store.pull(reference: canonical, platform: platform)
+        // This Mac's registry first, which is how a loaded image reaches every
+        // node in the cluster. See ImageMirror.swift.
+        var image = await ImageMirror.pull(canonical, platform: platform, into: store)
+        if image == nil { image = try await store.pull(reference: canonical, platform: platform) }
+        guard let image else { throw RuntimeFailure.invalid("pull \(canonical) produced no image") }
         return try await cache(image, as: Set([reference, canonical]), canonical: canonical,
                                platform: platform)
     }
