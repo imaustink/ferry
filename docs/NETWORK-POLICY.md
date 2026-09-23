@@ -121,10 +121,17 @@ Two things the edge cannot do, and does not pretend to:
   client. That is what `externalTrafficPolicy: Cluster` means on any cluster:
   the source is rewritten on the way through. A pod on another node *of the
   same Mac* is dialled directly and checked against the real client.
-- **A Mac that joined the cluster enforces nothing** -- neither in its pods nor
-  at its edge -- because `ferry-netpol` runs on the first Mac and the others do
-  not have its socket. This is from reading `ferry join`, not a two-Mac
-  measurement.
+- **A Mac that joined runs its own `ferry-netpol`**, as the node, for its own
+  pods and its own edge; a unix socket on the first Mac is not reachable from
+  another. The node's certificate reads policies, pods, namespaces and nodes
+  cluster-wide through the `ferry-node-netpol` ClusterRole, which
+  `ferry token create` makes -- the Node authorizer grants a kubelet only its
+  own pods. A cluster whose token predates this has no such role, and the
+  joined Mac warns that NetworkPolicies will be ignored until a new token is
+  made. Measured on a second profile joined to this Mac's cluster
+  (experiments/34-join-policy/policy.sh): before, a friends-only policy on the joined
+  node's pod let both a pod on the first node and an edge client through;
+  after, both are refused, and a labelled friend gets through in the pod.
 
 ## One deliberate difference
 
@@ -156,7 +163,10 @@ The address is worked out from the pod's own address rather than the node's
 podCIDR, because the two can disagree: a node re-added under an old name keeps
 the Node object and its podCIDR while its runtime takes a different slice.
 Measured -- podCIDR `10.171.1.0/24`, pods on `10.171.2.x` -- and every probe was
-dropped under `deny-all` until this changed.
+dropped under `deny-all` until this changed. `ferry node add` now deletes a
+stale Node of the same name and registers the new one with its runtime's slice
+as its podCIDR, so the two agree there as well; this is the belt to that one's
+braces, and still what holds on a joined Mac, whose podCIDR is the controller's.
 
 This exemption was first written as "anything that did not arrive on `eth1`",
 `eth1` being the cluster switch and `eth0` the vmnet interface the Mac is on.

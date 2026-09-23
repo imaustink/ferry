@@ -130,6 +130,16 @@ equal: `portmap` runs `nft` by PATH, the `nft` ferry ships needs its own loader
 and library path, and the rule was never written -- so hostPort 5001 for
 containerPort 80 arrived at 5001 and was reset.
 
+The `nft` itself was also fixed, because `portmap` needs it for the pod's own
+addresses. `guest/build-nft.sh` has always meant to bake the loader's path into
+the binary, but it kept any bundle that existed, and bundles packaged before
+that step still named `/lib/ld-musl-aarch64.so.1`: in-pod `portmap` failed on
+every pod with `fork/exec /.ferry/nft: no such file or directory`. The script
+now repackages such a bundle and `release/build.sh` refuses one. Measured
+with `experiments/11-cni-on-macos/try-hostport.sh`: before, no chain and no
+answer at the pod's address; after, `tcp dport 18134 dnat to <pod>:80` and
+`hello from a pod VM` at both the pod's address and the Mac's.
+
 A NodePort whose pod is on **another node on this Mac** is dialled directly. It
 used to be handed to that node's node port -- which, on the same Mac, is this
 process's own listener -- and forwarded to itself until it ran out of file
