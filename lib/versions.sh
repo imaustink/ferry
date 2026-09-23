@@ -149,6 +149,27 @@ ferry_versions_dir() { echo "$(ferry_root)/bin/versions"; }
 ferry_version_dir()  { echo "$(ferry_root)/bin/versions/$1"; }
 ferry_active_file()  { echo "$(ferry_root)/bin/.active-version"; }
 
+# One hash of everything the darwin kubelet for a version is built from, other
+# than upstream's tree: the overlays and the scripts that apply them.
+#
+# 'ferry build' used to rebuild the kubelet only when there was none, so a
+# change to patches/ reached nobody who had built before it. v0.4.0 shipped
+# that way -- stamped with a commit whose SafeMakeDir joins a relative subPath
+# to the volume, carrying a kubelet that did not, so every emptyDir subPath
+# failed with "escapes volume". build-kubelet.sh records this beside the binary
+# and the build compares it. Empty when the sources are not here, as in an
+# installed release, which has nothing to rebuild from.
+ferry_kubelet_inputs() { # version
+  local root; root="$(ferry_root)"
+  [ -f "$root/build-kubelet.sh" ] && [ -d "$root/patches/kubelet" ] || return 0
+  (
+    cd "$root" || exit 1
+    find patches/kubelet "patches/kubelet-$(ferry_version_mm "$1")" -type f -print0 2>/dev/null \
+      | LC_ALL=C sort -z | xargs -0 shasum -a 256
+    shasum -a 256 build-kubelet.sh lib/overlay.sh
+  ) | shasum -a 256 | cut -d' ' -f1
+}
+
 # Which version bin/ currently points at. Empty if nothing has been built.
 ferry_active_version() {
   local f; f="$(ferry_active_file)"

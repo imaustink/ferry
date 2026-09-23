@@ -61,7 +61,14 @@ reaches them, TCP included, while every node still reports `Ready`.
 So the two cases are treated differently:
 
 - **No other nodes:** fall back at once, and say the pods are off the pod network
-  and another Mac cannot join until this one starts on its slice.
+  and another Mac cannot join until this one starts on its slice. Pods started
+  off the slice get no `eth1` and the switch is off: everything they reach,
+  the API server included, goes through vmnet. They used to get an `eth1`
+  carrying their fallback address with the cluster's prefix -- `192.168.66.5/16`,
+  a route for all of `192.168.0.0/16` into a switch nothing answers on. That
+  took in the Mac's LAN address, which is what the kubernetes Service points
+  at, so CoreDNS could not reach the API server and every lookup in the
+  cluster failed, while the gateway, on the longer `/24` match, still answered.
 - **Other nodes:** wait for the slice, then refuse to start. A node that cannot
   hold its slice has nothing to offer a cluster it cannot talk to.
   `FERRY_ALLOW_OFF_SLICE=1` overrides this and starts anyway, with a warning.

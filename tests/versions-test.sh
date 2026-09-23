@@ -236,6 +236,36 @@ is "adopting twice is a no-op" \
    "$(readlink "$legacy_root/bin/kubelet")" "versions/v1.34.0/kubelet"
 rm -rf "$legacy_root" "$staging"
 
+printf '\033[1m%s\033[0m\n' "what a kubelet was built from"
+# A copy of just what the hash covers, so changing one file here cannot touch
+# the real tree.
+inputs_root="$(mktemp -d)"
+mkdir -p "$inputs_root/lib" "$inputs_root/patches/kubelet/pkg" "$inputs_root/patches/kubelet-v1.34/pkg"
+echo shared  > "$inputs_root/patches/kubelet/pkg/a.go"
+echo v134    > "$inputs_root/patches/kubelet-v1.34/pkg/b.go"
+echo build   > "$inputs_root/build-kubelet.sh"
+echo overlay > "$inputs_root/lib/overlay.sh"
+inputs() { FERRY_ROOT="$inputs_root" ferry_kubelet_inputs "$1"; }
+first="$(inputs v1.34.0)"
+contains "is a sha256"                       "$(printf '%s' "$first" | wc -c | tr -d ' ')" "64"
+is "is the same when nothing changed"        "$(inputs v1.34.0)" "$first"
+is "ignores the patch release"               "$(inputs v1.34.7)" "$first"
+is "and the working directory"               "$(cd / && inputs v1.34.0)" "$first"
+echo changed > "$inputs_root/patches/kubelet/pkg/a.go"
+second="$(inputs v1.34.0)"
+refuses "moves with a shared patch"          test "$second" = "$first"
+echo changed > "$inputs_root/patches/kubelet-v1.34/pkg/b.go"
+third="$(inputs v1.34.0)"
+refuses "moves with the minor's own overlay" test "$third" = "$second"
+mkdir -p "$inputs_root/patches/kubelet-v1.35"
+echo x > "$inputs_root/patches/kubelet-v1.35/x"
+is "not with another minor's"                "$(inputs v1.34.0)" "$third"
+echo changed > "$inputs_root/lib/overlay.sh"
+refuses "moves with the script that applies them" test "$(inputs v1.34.0)" = "$third"
+rm "$inputs_root/build-kubelet.sh"
+empty "is empty without sources, as in a release" "$(inputs v1.34.0)"
+rm -rf "$inputs_root"
+
 echo
 if [ "$fail" -eq 0 ]; then
   printf '\033[1m%s\033[0m\n' "$pass passed"

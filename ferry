@@ -708,7 +708,15 @@ build_kubernetes_binaries() { # version
   local version="$1"
   local dir; dir="$(ferry_version_dir "$version")"
 
+  # Rebuilt when its patches have changed as well as when it is missing. A
+  # kubelet with no record of its inputs predates the record, and so may
+  # predate any patch; it is rebuilt once to find out.
+  local inputs; inputs="$(ferry_kubelet_inputs "$version")"
+  local built; built="$(cat "$dir/kubelet.inputs" 2>/dev/null || true)"
   if [ ! -x "$dir/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
+    K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+  elif [ -n "$inputs" ] && [ "$inputs" != "$built" ]; then
+    echo "==> kubelet $version was built from other patches; rebuilding"
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
   else
     echo "==> kubelet present, $version (--rebuild to force)"
@@ -962,7 +970,11 @@ start_control_plane() { # version
     FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -20 "$FERRY_RUN/logs/control-plane.log" | sed 's/^/    /'; return 1; }
-  ok "control plane $version advertising $gateway"
+  # The address it actually advertises, which is the LAN address whenever
+  # there is one. This used to print the gateway either way, so a cluster whose
+  # kubernetes Service pointed at 192.168.1.29 said it was advertising
+  # 10.164.0.1, and that is where anyone debugging it would look first.
+  ok "control plane $version advertising $advertise"
 }
 
 cmd_up() {

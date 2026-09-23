@@ -294,8 +294,8 @@ cost time.
 - ✅ **Volumes work.** Mounts become virtiofs shares into the pod VM. Projected
   ServiceAccount tokens, ConfigMaps and emptyDir all verified — including a pod
   that authenticates to the API server with its own token. A ReadWriteOnce
-  PersistentVolume is an ext4 disk image attached to the pod's VM instead, so
-  `chown` works on it: virtiofs is served as the Mac user, which cannot give a
+  PersistentVolume and an emptyDir are each an ext4 disk image attached to the
+  pod's VM instead, so `chown` works on them: virtiofs is served as the Mac user, which cannot give a
   file away, and an init container that chowns its data directory — most
   stateful charts have one — crashlooped forever on a share.
 - ✅ **Resource limits and securityContext work.** The kubelet does not send

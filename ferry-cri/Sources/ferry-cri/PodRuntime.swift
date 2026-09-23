@@ -322,6 +322,7 @@ actor PodRuntime {
         let allowOffSlice = ProcessInfo.processInfo.environment["FERRY_ALLOW_OFF_SLICE"] == "1"
         let peers = allowOffSlice ? [] : Self.otherPeers(config: config)
         var chosen: PodNetwork?
+        var chosenSubnet = preferredSubnet
         var lastError: Error?
 
         if !peers.isEmpty {
@@ -381,6 +382,7 @@ actor PodRuntime {
             for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
                 do {
                     chosen = try PodNetwork(subnet: try CIDRv4(candidate))
+                    chosenSubnet = candidate
                     if candidate != preferredSubnet {
                         print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
                         if config.clusterCIDR != nil {
@@ -442,19 +444,37 @@ actor PodRuntime {
         // same address with a wider prefix. Longest match does the rest: the
         // local /24 leaves by eth0 on the kernel's own datapath, the rest of the
         // /16 leaves by eth1, and the source address is the same either way.
+        //
+        // Only on the slice, though. Off it, a pod's address is a fallback vmnet
+        // one like 192.168.66.5, and giving eth1 that address with the cluster's
+        // prefix routed all of 192.168.0.0/16 into the switch -- which is where
+        // most Macs' LAN address lives, and so where the API server's advertised
+        // endpoint went. The gateway still answered, because its /24 on eth0 is
+        // the longer match, so the API server looked reachable from the host and
+        // from `curl 192.168.66.1`, while the kubernetes Service, CoreDNS and
+        // with it every name lookup in the cluster failed. A pod off the slice
+        // is not on the cluster network in any case: nothing on the switch has
+        // a route back to its address. So it gets no eth1, and reaches
+        // everything -- the API server included -- through vmnet.
+        let onSlice = chosenSubnet == preferredSubnet
         if let cidr = config.clusterCIDR, let slice = Self.nodeSlice(of: cidr, node: config.nodeIndex) {
-            self.podSwitch = PodSwitch(
-                relayPort: config.relayPort,
-                peers: config.peers + (config.machineSwitch.map { [$0] } ?? []),
-                peersFile: config.peersFile,
-                self: config.relayEndpoint)
-            self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
             self.cni = try makeCNI()
-            print("    pod network \(cidr), this node is \(slice)")
+            if onSlice {
+                self.podSwitch = PodSwitch(
+                    relayPort: config.relayPort,
+                    peers: config.peers + (config.machineSwitch.map { [$0] } ?? []),
+                    peersFile: config.peersFile,
+                    self: config.relayEndpoint)
+                self.clusterPrefixLength = Self.prefixLength(of: cidr) ?? 16
+                print("    pod network \(cidr), this node is \(slice)")
+            } else {
+                self.clusterPrefixLength = Self.prefixLength(of: chosenSubnet) ?? 24
+                print("    pod network \(cidr), this node is off its slice \(slice); switch off")
+            }
             if cni != nil {
                 print("    cni       \(config.cniConflist ?? defaultConflistPath.path())")
             }
-            if config.relayPort > 0 {
+            if onSlice, config.relayPort > 0 {
                 print("    switch    udp/\(config.relayPort), peers: \(config.peers.isEmpty ? "none yet" : config.peers.joined(separator: ", "))")
             }
         }
@@ -522,6 +542,15 @@ actor PodRuntime {
     /// the moment this runs nothing has talked to the API server yet, so a file
     /// written by the previous run is the only evidence a second node exists.
     /// This node's own endpoint is not a peer.
+    ///
+    /// Nor is any endpoint on this node's relay port at one of this Mac's own
+    /// addresses. The file can hold this node under the address an earlier run
+    /// advertised -- its LAN address, when this run was started with
+    /// FERRY_LAN_IP=127.0.0.1 -- and matching only today's endpoint counted
+    /// that as a second node, so a Mac alone in its cluster waited out the
+    /// slice and then refused to start for the sake of a peer that was itself.
+    /// Another profile on this Mac has a relay port of its own, so it is not
+    /// caught by this.
     static func otherPeers(config: RuntimeConfig) -> [String] {
         var found = Set(config.peers)
         if let path = config.peersFile,
@@ -532,7 +561,33 @@ actor PodRuntime {
         }
         found.remove("")
         if let mine = config.relayEndpoint { found.remove(mine) }
+        let own = localAddresses()
+        found = found.filter { endpoint in
+            guard let colon = endpoint.lastIndex(of: ":"),
+                  UInt16(endpoint[endpoint.index(after: colon)...]) == config.relayPort else { return true }
+            return !own.contains(String(endpoint[..<colon]))
+        }
         return found.sorted()
+    }
+
+    /// Every IPv4 address this Mac has, loopback included.
+    static func localAddresses() -> Set<String> {
+        var addresses: Set<String> = ["127.0.0.1"]
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0 else { return addresses }
+        defer { freeifaddrs(head) }
+        var cursor = head
+        while let entry = cursor {
+            if let sa = entry.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                               nil, 0, NI_NUMERICHOST) == 0 {
+                    addresses.insert(String(cString: host))
+                }
+            }
+            cursor = entry.pointee.ifa_next
+        }
+        return addresses
     }
 
     /// This node's slice of the cluster network, as vmnet wants it: the gateway
@@ -853,7 +908,9 @@ actor PodRuntime {
     /// The CNI runtime that runs each pod's plugin chain.
     private var cni: CNIRuntime?
     /// The cluster network's prefix length, which eth1 carries so that anything
-    /// outside this node's own slice leaves by the switch.
+    /// outside this node's own slice leaves by the switch. Off the slice there
+    /// is no eth1, and this is the vmnet subnet's own prefix, so the address
+    /// CNI is handed is the one the pod actually has.
     private var clusterPrefixLength = 16
 
     private var lastRuleset: Data?
@@ -1577,8 +1634,13 @@ actor PodRuntime {
             // Off the actor: a large claim's journal is tens of megabytes of
             // zeroes to write, and every other CRI call would wait behind it.
             let image = volume.image
+            let emptyDir = volume.isEmptyDir
             let formatted = try await Task.detached {
-                try BlockVolume.formatIfNeeded(image: image, subPaths: subPaths)
+                try BlockVolume.formatIfNeeded(
+                    image: image, subPaths: subPaths,
+                    create: emptyDir ? BlockVolume.emptyDirCapacity : nil,
+                    journalBytes: emptyDir ? BlockVolume.emptyDirJournalBytes : nil,
+                    empty: emptyDir)
             }.value
             if formatted { print("    volume    formatted \(image)") }
         } catch {
