@@ -948,7 +948,11 @@ start_control_plane() { # version
     FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1 \
     || { bad "control plane failed"; tail -20 "$FERRY_RUN/logs/control-plane.log" | sed 's/^/    /'; return 1; }
-  ok "control plane $version advertising $gateway"
+  # The address it actually advertises, which is the LAN address whenever
+  # there is one. This used to print the gateway either way, so a cluster whose
+  # kubernetes Service pointed at 192.168.1.29 said it was advertising
+  # 10.164.0.1, and that is where anyone debugging it would look first.
+  ok "control plane $version advertising $advertise"
 }
 
 cmd_up() {
