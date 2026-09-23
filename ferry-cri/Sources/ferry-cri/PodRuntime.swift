@@ -2090,13 +2090,24 @@ actor PodRuntime {
         containers[id]?.finishedAt = Self.now()
     }
 
+    /// SIGTERM, then SIGKILL once the grace period is up, the way the kubelet
+    /// means `timeout`. LinuxPod's own stop sends SIGKILL at once, and this
+    /// used to be only that -- so no container was ever asked to shut down,
+    /// and a database lost whatever it had not flushed on every pod deletion.
+    /// Matters more now that containers restart inside a running pod, where
+    /// a liveness failure is a StopContainer and nothing else.
     func stopContainer(_ id: String, timeout: Int64) async throws {
         guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
         guard record.state == .running else { return }
+        var code: Int32 = 128 + 9
         if let sandbox = sandboxes[record.sandboxID] {
+            if timeout > 0, (try? await sandbox.pod.killContainer(id, signal: .term)) != nil,
+               let status = try? await sandbox.pod.waitContainer(id, timeoutInSeconds: timeout) {
+                code = status.exitCode
+            }
             try? await sandbox.pod.stopContainer(id)
         }
-        recordExit(id, code: 0)
+        recordExit(id, code: code)
     }
 
     func removeContainer(_ id: String) async throws {
