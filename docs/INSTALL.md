@@ -145,6 +145,25 @@ CIDR, and ports offset from the first node's. It is one Mac's memory either
 way, so this is for testing scheduling and multi-node behaviour rather than for
 capacity.
 
+**Each node has its own credential.** `ferry node add` signs the node a kubelet
+client certificate with the cluster CA, `CN=system:node:<name>` in
+`O=system:nodes`, kept in `~/.ferry/pki/nodes/<name>.{crt,key,conf}`. A Mac
+that joined gets its node's the Kubernetes way, a bootstrap token and a CSR
+the control plane approves. Either way the Node authorizer and the
+NodeRestriction admission plugin give a node its own Node, its own pods and
+what they mount, and nothing of anyone else's: as any node,
+`kubectl auth can-i list secrets -A` and `list pods -A` both say `no`, and
+changing another node or deleting its pods is refused. Nodes can read the Node
+list, Services and EndpointSlices (upstream's `system:node-proxier`, bound as
+`ferry-node-proxier`), which is how each Mac renders its own Service rules.
+
+A cluster made before this bound the whole `system:node` role to every node
+(`ferry:system-nodes`), because added nodes all ran on the first node's
+certificate. The next `ferry up` or `ferry upgrade apply` deletes that binding,
+and first restarts the kubelet of any added node still on the first node's
+certificate onto one of its own; its runtime and pods stay up. `ferry node rm`
+deletes the node's key.
+
 ### Another Mac
 
 On the Mac already running the cluster:

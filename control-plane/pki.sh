@@ -23,18 +23,7 @@ LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/nu
 mkdir -p "$PKI_DIR"
 cd "$PKI_DIR"
 
-if [ -f ca.crt ]; then
-  echo "==> reusing PKI in $PKI_DIR"
-  exit 0
-fi
-echo "==> generating PKI in $PKI_DIR (node=$NODE_NAME, vmnet=$VMNET_GW, lan=$LAN_IP)"
-
-newca() { # name CN
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$1.key" -out "$1.crt" \
-    -days 3650 -subj "/CN=$2" 2>/dev/null
-}
-
-client() { # name CN O
+client() { # name CN O [ca]
   local ext=$1.ext
   printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$ext"
   openssl req -newkey rsa:2048 -nodes -keyout "$1.key" -out "$1.csr" \
@@ -42,6 +31,25 @@ client() { # name CN O
   openssl x509 -req -in "$1.csr" -CA "${4:-ca}.crt" -CAkey "${4:-ca}.key" \
     -CAcreateserial -out "$1.crt" -days 3650 -extfile "$ext" 2>/dev/null
   rm -f "$1.csr" "$ext"
+}
+
+if [ -f ca.crt ]; then
+  echo "==> reusing PKI in $PKI_DIR"
+  # The kubelet's certificate names the node, and the Node authorizer grants a
+  # kubelet nothing for any other name. A cluster whose node was renamed since
+  # the PKI was made gets a certificate for the name it runs as now.
+  if [ -f ca.key ] && [ "$(openssl x509 -in kubelet.crt -noout -subject -nameopt RFC2253 2>/dev/null)" \
+       != "subject=O=system:nodes,CN=system:node:$NODE_NAME" ]; then
+    client kubelet "system:node:$NODE_NAME" "system:nodes"
+    echo "==> signed a kubelet certificate for $NODE_NAME"
+  fi
+  exit 0
+fi
+echo "==> generating PKI in $PKI_DIR (node=$NODE_NAME, vmnet=$VMNET_GW, lan=$LAN_IP)"
+
+newca() { # name CN
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$1.key" -out "$1.crt" \
+    -days 3650 -subj "/CN=$2" 2>/dev/null
 }
 
 newca ca "ferry-ca"
