@@ -542,6 +542,15 @@ actor PodRuntime {
     /// the moment this runs nothing has talked to the API server yet, so a file
     /// written by the previous run is the only evidence a second node exists.
     /// This node's own endpoint is not a peer.
+    ///
+    /// Nor is any endpoint on this node's relay port at one of this Mac's own
+    /// addresses. The file can hold this node under the address an earlier run
+    /// advertised -- its LAN address, when this run was started with
+    /// FERRY_LAN_IP=127.0.0.1 -- and matching only today's endpoint counted
+    /// that as a second node, so a Mac alone in its cluster waited out the
+    /// slice and then refused to start for the sake of a peer that was itself.
+    /// Another profile on this Mac has a relay port of its own, so it is not
+    /// caught by this.
     static func otherPeers(config: RuntimeConfig) -> [String] {
         var found = Set(config.peers)
         if let path = config.peersFile,
@@ -552,7 +561,33 @@ actor PodRuntime {
         }
         found.remove("")
         if let mine = config.relayEndpoint { found.remove(mine) }
+        let own = localAddresses()
+        found = found.filter { endpoint in
+            guard let colon = endpoint.lastIndex(of: ":"),
+                  UInt16(endpoint[endpoint.index(after: colon)...]) == config.relayPort else { return true }
+            return !own.contains(String(endpoint[..<colon]))
+        }
         return found.sorted()
+    }
+
+    /// Every IPv4 address this Mac has, loopback included.
+    static func localAddresses() -> Set<String> {
+        var addresses: Set<String> = ["127.0.0.1"]
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0 else { return addresses }
+        defer { freeifaddrs(head) }
+        var cursor = head
+        while let entry = cursor {
+            if let sa = entry.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                               nil, 0, NI_NUMERICHOST) == 0 {
+                    addresses.insert(String(cString: host))
+                }
+            }
+            cursor = entry.pointee.ifa_next
+        }
+        return addresses
     }
 
     /// This node's slice of the cluster network, as vmnet wants it: the gateway
