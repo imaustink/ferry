@@ -1,0 +1,20 @@
+# A liveness failure is a StopContainer and then a new container in the same
+# pod. The container traps SIGTERM, so the exit code says which signal came:
+# 3 is TERM handled, 137 is SIGKILL.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: graceful
+spec:
+  terminationGracePeriodSeconds: 10
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sh", "-c", "trap 'echo got TERM at $(date +%s); exit 3' TERM; echo up $(date +%s); (sleep 8; touch /tmp/sick) & while true; do sleep 1; done"]
+    livenessProbe:
+      exec: {command: ["sh", "-c", "test ! -f /tmp/sick"]}
+      periodSeconds: 2
+      failureThreshold: 1
+  - name: bystander
+    image: busybox:1.36
+    command: ["sh", "-c", "date +%s > /tmp/born; exec sleep 36000"]

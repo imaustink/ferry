@@ -311,8 +311,15 @@ cost time.
   the pod directly.
 - ✅ **Sidecars work.** Containers in a pod share one VM, and therefore one
   network stack: a process in one reaches a listener in another over
-  `127.0.0.1`. The hypervisor cannot add a container to a running VM, so the
-  boot waits until the kubelet has created them all.
+  `127.0.0.1`. Native sidecars (`restartPolicy: Always` init containers) and
+  init containers share it too.
+- ✅ **A container restarts inside its running pod.** Each image a pod runs is
+  one read-only disk and a container's root is an overlay on it, so joining a
+  running VM needs no new device: a crashed container is back in **~45ms**,
+  its siblings keep their PIDs, and the pod keeps its address. The same path
+  runs `kubectl debug` containers and pods of 70 containers, and N containers
+  of one image cache it once. See
+  [experiments/31-restart-in-place](experiments/31-restart-in-place/).
 - ✅ **`kubectl exec` works** — stdin, stderr and exit codes included. CRI
   carries exec over SPDY rather than gRPC, so `ferry-streamer` terminates that
   using Kubernetes' own streaming server and hands the request to `ferry-cri`.
@@ -529,11 +536,14 @@ anything. `ferry image build --stop` ends it. Measured in
 
 ### Limits worth knowing
 
-- **A pod's containers are fixed at boot.** `Virtualization.framework` cannot
-  hotplug, so the VM does not start until the kubelet has created every container
-  in the pod. Sidecars work and share `127.0.0.1`; init containers work, each
-  exiting before the next is created, with shared volumes carrying state across.
-  What cannot happen is a container joining a pod whose VM is already running.
+- **A container can join a running pod only with an image the pod already
+  runs.** `Virtualization.framework` cannot attach a disk to a running VM, and
+  images are disks: the VM attaches every image the pod spec names that is
+  pulled when it boots. A restart, a sidecar, and a `kubectl debug` container
+  of one of those images join in place. A regular container with any other
+  image — one still pulling at boot — has the pod recreated around it; a
+  `kubectl debug` container with another image is refused rather than
+  restarting the pod. A block volume that arrives after the boot is the same.
 - **The cluster starts at login, not at boot.** `Virtualization.framework` will
   not make a VM from a process outside a user session, so the login agent is a
   LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
