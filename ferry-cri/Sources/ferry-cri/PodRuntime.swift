@@ -203,6 +203,8 @@ struct ContainerRecord {
     /// What it is added to its LinuxPod with. A container created before the
     /// VM boots is added once the VM is up -- see bootPod.
     var registration: ContainerRegistration?
+    /// The kubelet's mounts, as it sent them, for ContainerStatus.
+    var mounts: [Runtime_V1_Mount] = []
 }
 
 struct ContainerRegistration: Sendable {
@@ -1559,7 +1561,8 @@ actor PodRuntime {
             labels: cfg.labels, annotations: cfg.annotations,
             logPath: absoluteLogPath, createdAt: Self.now(), tty: cfg.tty,
             logWriters: writers, logFile: logFile, stdinFeeder: stdinFeeder,
-            registration: ContainerRegistration(rootfs: rootfs, configure: configure)
+            registration: ContainerRegistration(rootfs: rootfs, configure: configure),
+            mounts: cfg.mounts
         )
         return id
     }

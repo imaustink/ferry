@@ -225,6 +225,11 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             status.labels = record.labels
             status.annotations = record.annotations
             status.logPath = record.logPath
+            // The kubelet finds a container's termination message by looking
+            // here for the mount at its terminationMessagePath and reading the
+            // host side. Without them no pod ever had one, and a crash loop's
+            // own explanation of itself never reached `kubectl describe`.
+            status.mounts = record.mounts
 
             var response = Runtime_V1_ContainerStatusResponse()
             response.status = status
