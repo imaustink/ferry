@@ -269,7 +269,7 @@ not in the installer.
 |---|---|---|
 | `FERRY_POD_CPUS` | `2` | cpus per pod VM |
 | `FERRY_POD_MEMORY_MIB` | `512` | memory per pod VM |
-| `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~226 MiB whatever the workload does, so half of memory is budgeted for that |
+| `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~133 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
 
