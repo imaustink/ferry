@@ -700,7 +700,7 @@ succeeds "  and a plain down still drains" \
 # ferry-proxy never exits on SIGTERM; waiting for it politely made teardown
 # four times worse than the `sleep 1` it replaced.
 succeeds "  and the service proxy is forced rather than waited out" \
-  grep -q 'sudo kill -KILL "$proxy_pid"' "$repo/ferry"
+  grep -q '$as kill -KILL "$proxy_pid"' "$repo/ferry"
 
 # Startup. The same tick problem as teardown: five steps of `ferry up` landed
 # within 43ms of each other at half a second, and the control plane polled

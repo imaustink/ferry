@@ -192,5 +192,47 @@ if ip_in_cidr 192.168.66.1 10.162.0.0/16; then bad "the vmnet fallback is not on
 if ip_in_cidr 10.163.0.1 10.162.0.0/16; then bad "nor is the next profile's"; else ok "nor is the next profile's"; fi
 echo
 
+# --- a Mac that joined, and nodes added to this one --------------------------
+
+printf '\033[1m%s\033[0m\n' "a joined Mac enforces NetworkPolicy in its pods and at its edge"
+# Measured before: a deny-all on a joined node's pod let every client through,
+# pod and edge alike, because nothing on that Mac served ferry-netpol's socket.
+worker="$(sed -n '/^start_worker()/,/^}/p' "$repo/ferry")"
+contains "start_worker runs ferry-netpol as the node" "$worker" 'start_netpol "$FERRY_RUN/kubelet.conf"'
+contains "and its ferry-proxy asks it" \
+  "$(echo "$worker" | sed -n '/bin\/ferry-proxy"/,/ferry-proxy.log/p')" '--netpol-socket "$FERRY_NETPOL_SOCK"'
+contains "and a token lets a node's certificate read what policy needs" \
+  "$(sed -n '/^cmd_token_create()/,/^}/p' "$repo/ferry")" 'ferry_netpol_rbac'
+echo
+
+printf '\033[1m%s\033[0m\n' "an added node's podCIDR is the slice its runtime is on"
+nodeadd="$(sed -n '/^cmd_node_add()/,/^}/p' "$repo/ferry")"
+contains "a stale Node of that name goes before the index is chosen" \
+  "$(echo "$nodeadd" | sed -n '1,/free_node_index/p')" 'stale_node_gone "$name"'
+contains "and the Node is made with the slice as its podCIDR" "$nodeadd" 'podCIDR: $(node_slice "$index")'
+lacks "and no slice is printed as 10.244 whatever the profile" "$(cat "$repo/ferry")" '10.244.$index'
+eval "$(sed -n '/^node_slice()/,/^}/p' "$repo/ferry")"
+is "node_slice follows the profile's network" "$(CLUSTER_CIDR=10.171.0.0/16 node_slice 2)" "10.171.2.0/24"
+echo
+
+printf '\033[1m%s\033[0m\n' "nft runs by PATH inside a pod, which is how portmap runs it"
+contains "a bundle wanting /lib's loader is repackaged, not kept" \
+  "$(cat "$repo/guest/build-nft.sh")" "grep -qa '/.ferry/lib/ld-musl-aarch64.so.1'"
+contains "and a release refuses one" \
+  "$(cat "$repo/release/build.sh")" "grep -qa '/.ferry/lib/ld-musl-aarch64.so.1'"
+if [ -f "$repo/guest/nft/nft" ]; then
+  if grep -qa '/.ferry/lib/ld-musl-aarch64.so.1' "$repo/guest/nft/nft"; then
+    ok "and this checkout's bundle names the loader it ships"
+  else
+    bad "and this checkout's bundle names the loader it ships"; echo "      run ./guest/build-nft.sh"
+  fi
+fi
+echo
+
+printf '\033[1m%s\033[0m\n' "CoreDNS stays on the address the kubelets were told"
+contains "it is pinned to the first node" "$(cat "$repo/manifests/coredns.yaml")" 'kubernetes.io/hostname: "__DNS_NODE__"'
+contains "and ferry says which node that is" "$(sed -n '/^install_dns()/,/^}/p' "$repo/ferry")" 's|__DNS_NODE__|$NODE_NAME|g'
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]
