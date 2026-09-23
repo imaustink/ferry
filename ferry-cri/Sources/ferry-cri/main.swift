@@ -96,7 +96,8 @@ let config = RuntimeConfig(
         return path.isEmpty ? nil : path
     }(),
     execSocket: execSocketPath,
-    extraKernelArgs: option("--kernel-args", "").split(separator: " ").map(String.init)
+    extraKernelArgs: option("--kernel-args", "").split(separator: " ").map(String.init),
+    podReadAheadKB: ReadAhead.parse(option("--pod-read-ahead-kb", "")) ?? ReadAhead.defaultKB
 )
 
 guard FileManager.default.fileExists(atPath: config.kernelPath) else {

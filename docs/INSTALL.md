@@ -269,6 +269,7 @@ not in the installer.
 |---|---|---|
 | `FERRY_POD_CPUS` | `2` | cpus per pod VM |
 | `FERRY_POD_MEMORY_MIB` | `512` | memory per pod VM |
+| `FERRY_POD_READAHEAD_KB` | `1024` | read-ahead, in KiB, of a pod's image disks, scratch disk, disk emptyDirs and block claims. The guest agent's own disk always stays at 128 KiB. A pod can ask for its own with the annotation `ferry.dev/read-ahead-kb`. Higher streams large files faster and costs a pod with one large binary more memory: node is 17 MiB more at 1024, 48 at 8192 ([experiment 36](../experiments/32-pod-memory-footprint/FINDINGS.md#read-ahead-on-the-pods-own-disks-experiment-36)) |
 | `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~133 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |

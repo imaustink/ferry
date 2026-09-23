@@ -1,0 +1,4 @@
+before: 378ms 288ms 279ms 290ms 309ms 294ms 315ms 286ms 282ms 272ms
+after:  290ms 295ms 288ms 287ms 307ms 301ms 285ms 298ms 310ms 307ms
+before median 289 ms  min 272  max 378
+after median 296 ms  min 285  max 310

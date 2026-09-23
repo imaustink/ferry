@@ -526,6 +526,7 @@ Environment:
                          these pods; without it ferry refuses rather than
                          partition a multi-node cluster silently
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
+  FERRY_POD_READAHEAD_KB read-ahead of a pod's image and volume disks, KiB
   K8S_VERSION            kubernetes to build, default $FERRY_DEFAULT_K8S_VERSION (same as
                          'ferry build --kubernetes-version')
   K8S_CONTROL_PLANE_VERSION  the darwin control plane build to use, when the
@@ -1109,6 +1110,7 @@ cmd_up() {
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
@@ -2100,6 +2102,7 @@ cmd_node_add() {
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
@@ -2570,6 +2573,7 @@ start_worker() { # name index server(host:port)
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \

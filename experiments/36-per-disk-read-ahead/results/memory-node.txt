@@ -1,0 +1,15 @@
+rep=1 ra=128 wl=node footprint 198.1 start 1.27s served 4/4
+rep=1 ra=1024 wl=node footprint 215.4 start 1.18s served 4/4
+rep=1 ra=2048 wl=node footprint 221.6 start 1.20s served 4/4
+rep=1 ra=4096 wl=node footprint 230.4 start 1.15s served 4/4
+rep=1 ra=8192 wl=node footprint 246.1 start 1.15s served 4/4
+rep=2 ra=128 wl=node footprint 198.6 start 1.14s served 4/4
+rep=2 ra=1024 wl=node footprint 215.4 start 1.21s served 4/4
+rep=2 ra=2048 wl=node footprint 222.2 start 1.12s served 4/4
+rep=2 ra=4096 wl=node footprint 231.0 start 1.15s served 4/4
+rep=2 ra=8192 wl=node footprint 246.7 start 1.17s served 4/4
+rep=3 ra=128 wl=node footprint 198.4 start 1.13s served 4/4
+rep=3 ra=1024 wl=node footprint 214.7 start 1.19s served 4/4
+rep=3 ra=2048 wl=node footprint 221.6 start 1.14s served 4/4
+rep=3 ra=4096 wl=node footprint 230.2 start 1.16s served 4/4
+rep=3 ra=8192 wl=node footprint 246.4 start 1.14s served 4/4
