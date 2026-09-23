@@ -91,6 +91,26 @@ ip addr add "$ADDRESS" dev eth0
 printf 'nameserver %s\n' "${DNS:-1.1.1.1}" > /etc/resolv.conf
 log "address $ADDRESS via ${GATEWAY:-none} ($(elapsed)ms)"
 
+# The images this Mac has loaded, served by ferry-registry on the gateway. The
+# Mac's own runtime has them and this containerd does not, so a pod whose image
+# was built or loaded locally could not start here: ErrImageNeverPull.
+#
+# _default makes it a mirror for every registry, tried first and passed over
+# when it answers 404 -- so a reference means the same image here as on the
+# Mac, and nothing that is not stored there changes. containerd names the
+# registry it is standing in for in each request, which is how the Mac tells
+# docker.io/foo/app from ghcr.io/foo/app. containerd reads this at each pull,
+# but only because config_path in containerd-config.toml names the directory.
+REGISTRY_PORT=$(param ferry.registry)
+if [ -n "$REGISTRY_PORT" ] && [ -n "$GATEWAY" ]; then
+  mkdir -p /etc/containerd/certs.d/_default
+  cat > /etc/containerd/certs.d/_default/hosts.toml <<EOF
+[host."http://$GATEWAY:$REGISTRY_PORT"]
+  capabilities = ["pull", "resolve"]
+EOF
+  log "registry mirror http://$GATEWAY:$REGISTRY_PORT"
+fi
+
 log "binaries: $(ls -l /usr/local/bin/containerd 2>&1 | awk '{print $1, $5}') kubelet $(ls -l /usr/local/bin/kubelet 2>&1 | awk '{print $5}')"
 log "starting containerd"
 /usr/local/bin/containerd > /var/log/containerd.log 2>&1 &

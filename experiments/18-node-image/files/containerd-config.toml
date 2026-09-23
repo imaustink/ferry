@@ -24,3 +24,11 @@ version = 3
 
   [plugins.'io.containerd.cri.v1.images'.pinned_images]
     sandbox = 'registry.k8s.io/pause:3.10.2'
+
+  # Where per-registry configuration is read from. containerd's default is
+  # empty, which means no directory at all -- so without this line a hosts.toml
+  # is ignored however it is written. init.sh writes one into _default when the
+  # Mac serves its loaded images (ferry.registry); with the directory empty,
+  # every pull goes straight to its registry as before.
+  [plugins.'io.containerd.cri.v1.images'.registry]
+    config_path = '/etc/containerd/certs.d'

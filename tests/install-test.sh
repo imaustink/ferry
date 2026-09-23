@@ -349,6 +349,7 @@ not_shipped="
   ferry-storage                                 go sources
   ferry-streamer                                go sources
   ferry-karpenter                               go sources
+  ferry-registry                                go sources
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
@@ -387,7 +388,7 @@ fi
 # shellcheck source=../lib/versions.sh
 . "$repo/lib/versions.sh"
 for binary in ferry-cri ferry-cni ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-proxy \
-              ferry-machined ferry-node; do
+              ferry-machined ferry-node ferry-registry; do
   if grep -q "$binary" "$repo/release/build.sh"; then ok "packages $binary"
   else bad "release/build.sh does not package $binary"; fi
 done

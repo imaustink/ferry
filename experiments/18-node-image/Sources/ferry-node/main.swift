@@ -256,6 +256,15 @@ func machineConfiguration(
             arguments.append("\(param)=\(v)")
         }
     }
+    // The port ferry-registry serves this Mac's loaded images on, at the
+    // gateway. Only the port: the guest already knows the gateway, and it is
+    // the one address of the Mac every machine can reach. ferry sets this only
+    // when FERRY_MACHINE_REGISTRY is on, so an unset or blank one leaves the
+    // guest pulling from registries alone.
+    if let port = ProcessInfo.processInfo.environment["FERRY_NODE_REGISTRY_PORT"],
+       !port.isEmpty, Int(port) != nil {
+        arguments.append("ferry.registry=\(port)")
+    }
     // Where this Mac keeps PersistentVolumes, mounted in the guest at the same
     // path it has on the Mac. A machine's pods had no storage at all:
     // ferry-storage made every volume a directory on the Mac and pinned it to

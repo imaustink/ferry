@@ -155,12 +155,12 @@ ok "kubernetes $k8s"
 # ferry's own binaries, which are this checkout's code rather than Kubernetes'
 # and so are not in the version store.
 for name in ferry-cri ferry-cni ferry-gpud ferry-netpol ferry-proxy ferry-storage ferry-streamer \
-            ferry-machined ferry-node ferry-karpenter; do
+            ferry-machined ferry-node ferry-karpenter ferry-registry; do
   [ -x "$root/bin/$name" ] || die "bin/$name is missing -- run: ./ferry build"
   cp "$root/bin/$name" "$dir/bin/$name"
   chmod +x "$dir/bin/$name"
 done
-ok "runtime, streamer, cni, proxy, netpol, storage, gpud, machined, node, karpenter"
+ok "runtime, streamer, cni, proxy, netpol, storage, gpud, machined, node, karpenter, registry"
 
 # The entitlement is the one thing in here that copying the file again cannot
 # repair, so it is checked rather than assumed.
