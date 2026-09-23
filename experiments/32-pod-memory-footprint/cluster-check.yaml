@@ -1,0 +1,31 @@
+# What the slimmed kernel and the new boot arguments have to keep working: a
+# Service reached by name (DNS, NAT in the pod's own kernel), a volume, and a
+# pod given more memory than 2304 MiB, which is where the bounce buffer used to
+# appear.
+apiVersion: v1
+kind: Pod
+metadata: {name: web, labels: {app: web}}
+spec:
+  containers:
+  - name: web
+    image: nginx:1.27-alpine
+    ports: [{containerPort: 80}]
+    resources: {limits: {memory: 3Gi}}
+    volumeMounts: [{name: scratch, mountPath: /scratch}]
+  volumes: [{name: scratch, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec:
+  selector: {app: web}
+  ports: [{port: 80, targetPort: 80}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client}
+spec:
+  containers:
+  - name: client
+    image: alpine:3.20
+    command: [sh, -c, "sleep 100000"]

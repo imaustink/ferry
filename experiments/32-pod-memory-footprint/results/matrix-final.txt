@@ -1,0 +1,8 @@
+final mem=256 cpu=2: VM footprint    502 MiB total, 125.5 MiB per container
+final mem=512 cpu=2: VM footprint    522 MiB total, 130.6 MiB per container
+final mem=1024 cpu=2: VM footprint    567 MiB total, 141.6 MiB per container
+final mem=2048 cpu=2: VM footprint    650 MiB total, 162.6 MiB per container
+final mem=3072 cpu=2: VM footprint    750 MiB total, 187.4 MiB per container
+final mem=4096 cpu=2: VM footprint    822 MiB total, 205.6 MiB per container
+final mem=8192 cpu=2: VM footprint    1163 MiB total, 290.7 MiB per container
+final mem=512 cpu=2: VM footprint    522 MiB total, 130.4 MiB per container

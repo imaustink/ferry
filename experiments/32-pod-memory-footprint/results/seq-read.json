@@ -1,0 +1,91 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 1,
+  "create_seconds": 0.6084825,
+  "baseline": {
+    "at": "22:57:33",
+    "free_mib": 12723.078125,
+    "used_mib": 68655.28125,
+    "compressed_mib": 12346.671875,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "22:57:45",
+      "free_mib": 11670.65625,
+      "used_mib": 68997.90625,
+      "compressed_mib": 12346.65625,
+      "vms": 1,
+      "vm_resident_mib": 1267.25,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:57:57",
+      "free_mib": 12555.921875,
+      "used_mib": 68660.140625,
+      "compressed_mib": 12346.65625,
+      "vms": 1,
+      "vm_resident_mib": 1267.421875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:58:09",
+      "free_mib": 13106.40625,
+      "used_mib": 68178.078125,
+      "compressed_mib": 12346.65625,
+      "vms": 1,
+      "vm_resident_mib": 1267.421875,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "22:58:21",
+      "free_mib": 13545.734375,
+      "used_mib": 67749.109375,
+      "compressed_mib": 12346.65625,
+      "vms": 1,
+      "vm_resident_mib": 1267.484375,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "22:58:21",
+    "free_mib": 13545.734375,
+    "used_mib": 67749.109375,
+    "compressed_mib": 12346.65625,
+    "vms": 1,
+    "vm_resident_mib": 1267.484375,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 674.8,
+  "logs": [
+    "pod-00.log: 2026-09-23T05:57:38.330Z stdout F P| ra=8192 536870912 bytes (512.0MB) copied, 0.102185 seconds, 4.9GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=1024 536870912 bytes (512.0MB) copied, 0.310512 seconds, 1.6GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=512 536870912 bytes (512.0MB) copied, 0.220224 seconds, 2.3GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=256 536870912 bytes (512.0MB) copied, 0.248888 seconds, 2.0GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=128 536870912 bytes (512.0MB) copied, 0.242548 seconds, 2.1GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=8192 536870912 bytes (512.0MB) copied, 0.131450 seconds, 3.8GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=1024 536870912 bytes (512.0MB) copied, 0.305273 seconds, 1.6GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=512 536870912 bytes (512.0MB) copied, 0.237797 seconds, 2.1GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=256 536870912 bytes (512.0MB) copied, 0.384973 seconds, 1.3GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=128 536870912 bytes (512.0MB) copied, 0.242486 seconds, 2.1GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=8192 536870912 bytes (512.0MB) copied, 0.199355 seconds, 2.5GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=1024 536870912 bytes (512.0MB) copied, 0.198333 seconds, 2.5GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=512 536870912 bytes (512.0MB) copied, 0.280928 seconds, 1.8GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=256 536870912 bytes (512.0MB) copied, 0.343016 seconds, 1.5GB/s",
+    "pod-00.log: 2026-09-23T05:57:41.861Z stdout F P| ra=128 536870912 bytes (512.0MB) copied, 0.148703 seconds, 3.4GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=8192 536870912 bytes (512.0MB) copied, 0.053588 seconds, 9.3GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=1024 536870912 bytes (512.0MB) copied, 0.197702 seconds, 2.5GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=512 536870912 bytes (512.0MB) copied, 0.168674 seconds, 3.0GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=256 536870912 bytes (512.0MB) copied, 0.167610 seconds, 3.0GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=128 536870912 bytes (512.0MB) copied, 0.161432 seconds, 3.1GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=8192 536870912 bytes (512.0MB) copied, 0.096346 seconds, 5.2GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=1024 536870912 bytes (512.0MB) copied, 0.148519 seconds, 3.4GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=512 536870912 bytes (512.0MB) copied, 0.175298 seconds, 2.9GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=256 536870912 bytes (512.0MB) copied, 0.188080 seconds, 2.7GB/s",
+    "pod-00.log: 2026-09-23T05:57:43.163Z stdout F P| ra=128 536870912 bytes (512.0MB) copied, 0.168587 seconds, 3.0GB/s"
+  ]
+}
