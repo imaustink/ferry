@@ -30,7 +30,9 @@
 //	SIGTERM  stop accepting, which hands new connections straight back to the
 //	         API server. A spliced connection is then closed the first time it
 //	         has been quiet for -quiet, which is between requests rather than
-//	         in the middle of one, and in any case after -drain.
+//	         in the middle of one. One that is never that quiet -- a client
+//	         asking twenty times a second -- is closed after -drain at the
+//	         first gap a tenth as long, and after twice -drain regardless.
 //
 //	ferry-handover --port 6443 [--hold 30s] [--quiet 250ms] [--drain 30s]
 package main
@@ -178,7 +180,8 @@ func main() {
 	finished := make(chan struct{})
 	go func() { wg.Wait(); close(finished) }()
 	deadline := time.Now().Add(*drain)
-	tick := time.NewTicker(*quiet / 5)
+	hard := deadline.Add(*drain)
+	tick := time.NewTicker(*quiet / 25)
 	defer tick.Stop()
 	for waiting := true; waiting; {
 		select {
@@ -187,11 +190,15 @@ func main() {
 		case now := <-tick.C:
 			mu.Lock()
 			for p := range live {
+				gap := *quiet
 				if now.After(deadline) {
+					gap = *quiet / 10
+				}
+				if now.After(hard) {
 					if p.close() {
 						forced.Add(1)
 					}
-				} else if p.idle() > *quiet && p.close() {
+				} else if p.idle() > gap && p.close() {
 					quietly.Add(1)
 				}
 			}
@@ -200,7 +207,7 @@ func main() {
 	}
 	fmt.Printf("accepted %d, %d waited for an API server (longest %dms), %d never found one; "+
 		"after letting go, %d closed between requests and %d still busy at %v\n",
-		accepted.Load(), held.Load(), maxWait.Load(), dropped.Load(), quietly.Load(), forced.Load(), *drain)
+		accepted.Load(), held.Load(), maxWait.Load(), dropped.Load(), quietly.Load(), forced.Load(), 2**drain)
 }
 
 // A spliced connection, and when it last carried a byte in either direction.
