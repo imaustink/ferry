@@ -948,6 +948,10 @@ actor PodRuntime {
             // cluster, is ferry's own segment.
             c.interfaces = clusterInterface.map { [interface, $0] } ?? [interface]
             c.hostname = cfg.hostname.isEmpty ? cfg.metadata.name : cfg.hostname
+            // shareProcessNamespace: kubelet asks for POD, and the framework
+            // then boots a pause process as PID 1 that every container joins,
+            // so a preStop that signals a sibling by PID can reach it.
+            c.shareProcessNamespace = cfg.linux.securityContext.namespaceOptions.pid == .pod
             if !cfg.dnsConfig.servers.isEmpty {
                 c.dns = DNS(nameservers: cfg.dnsConfig.servers,
                             domain: cfg.dnsConfig.searches.first,
