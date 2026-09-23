@@ -34,7 +34,13 @@ COPY stage/sandbox-image.tar /opt/ferry/sandbox-image.tar
 
 COPY init.sh /sbin/ferry-init
 
+# The volume driver for ferry-local-block claims: disks the Mac attaches over
+# USB after the machine has booted. At the kubelet's default FlexVolume path,
+# which it probes on its own.
+COPY files/ferry-block /usr/libexec/kubernetes/kubelet-plugins/volume/exec/ferry.dev~block/block
+
 RUN chmod +x /usr/local/bin/kubelet /usr/local/bin/runc /sbin/ferry-init \
+        /usr/libexec/kubernetes/kubelet-plugins/volume/exec/ferry.dev~block/block \
     && mkdir -p /etc/cni/net.d /etc/kubernetes /var/lib/kubelet /var/log /run
 
 # Not an ENTRYPOINT anyone will use -- the kernel is told init=/sbin/ferry-init.

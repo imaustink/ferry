@@ -185,22 +185,40 @@ final class RunningMachine {
     let console: Console
     let address: String
     let gateway: String
-    /// Experiment 26: USB disks attached to the running VM, by image path.
-    /// Touched only on `queue`, which is the VM's.
-    private var usb: [String: VZUSBMassStorageDevice] = [:]
+    /// USB disks attached to the running VM, by image path, each with the
+    /// lock on its volume directory (see VolumeDisk). Touched only on `queue`,
+    /// which is the VM's.
+    private var usb: [String: (device: VZUSBMassStorageDevice, lock: Int32)] = [:]
     private var usbPending: Set<String> = []
+    /// Images that could not be prepared, and the reason, so a claim held
+    /// elsewhere is reported once rather than twice a second.
+    private var usbRefused: [String: String] = [:]
 
     /// Attaches what is wanted and not attached, detaches what is attached and
     /// no longer wanted. Asynchronous: each call is reported in the log with
-    /// how long the framework took, which is half of what the experiment is
-    /// measuring.
+    /// how long the framework took.
     func reconcileUSB(wanted: [String]) {
         queue.async { [self] in
             guard let controller = vm.usbControllers.first else {
-                if !wanted.isEmpty { print("    usb: \(address) has no USB controller") }
+                if !wanted.isEmpty && usbRefused["controller"] == nil {
+                    usbRefused["controller"] = "none"
+                    print("    usb: \(address) has no USB controller; is FERRY_NODE_USB set?")
+                }
                 return
             }
             for path in wanted where usb[path] == nil && !usbPending.contains(path) {
+                let started = Date()
+                let lock: Int32
+                do {
+                    lock = try VolumeDisk.prepare(image: path)
+                } catch {
+                    if usbRefused[path] != "\(error)" {
+                        usbRefused[path] = "\(error)"
+                        print("    usb: not attaching \(path): \(error)")
+                    }
+                    continue
+                }
+                usbRefused.removeValue(forKey: path)
                 do {
                     let attachment = try VZDiskImageStorageDeviceAttachment(
                         url: URL(filePath: path), readOnly: false,
@@ -208,26 +226,30 @@ final class RunningMachine {
                     let device = VZUSBMassStorageDevice(
                         configuration: VZUSBMassStorageDeviceConfiguration(attachment: attachment))
                     usbPending.insert(path)
-                    let started = Date()
                     controller.attach(device: device) { error in
                         self.usbPending.remove(path)
                         let ms = Int(Date().timeIntervalSince(started) * 1000)
                         if let error {
+                            close(lock)
                             print("    usb: attach \(path) failed after \(ms)ms: \(error.localizedDescription)")
                         } else {
-                            self.usb[path] = device
-                            print("    usb: attached \(path) in \(ms)ms as \(device.uuid)")
+                            self.usb[path] = (device, lock)
+                            print("    usb: attached \(path) in \(ms)ms")
                         }
                     }
                 } catch {
+                    close(lock)
                     print("    usb: cannot open \(path): \(error.localizedDescription)")
                 }
             }
-            for (path, device) in usb where !wanted.contains(path) {
+            for (path, held) in usb where !wanted.contains(path) {
                 usb.removeValue(forKey: path)
                 let started = Date()
-                controller.detach(device: device) { error in
+                controller.detach(device: held.device) { error in
                     let ms = Int(Date().timeIntervalSince(started) * 1000)
+                    // Released either way: a detach that failed leaves the
+                    // disk with a machine that is about to be told again.
+                    close(held.lock)
                     if let error {
                         print("    usb: detach \(path) failed after \(ms)ms: \(error.localizedDescription)")
                     } else {
@@ -236,6 +258,13 @@ final class RunningMachine {
                 }
             }
         }
+    }
+
+    /// Lets go of every disk's lock once the VM is gone, so a replacement
+    /// machine can take the claim.
+    private func releaseUSB() {
+        for (_, held) in usb { close(held.lock) }
+        usb.removeAll()
     }
 
     init(vm: VZVirtualMachine, queue: DispatchQueue, console: Console, address: String, gateway: String) {
@@ -253,6 +282,7 @@ final class RunningMachine {
             vm.stop { _ in done.signal() }
         }
         _ = done.wait(timeout: .now() + 10)
+        queue.sync { releaseUSB() }
     }
 }
 

@@ -13,6 +13,9 @@ import (
 // manifest by tag or digest, and a blob -- from the store.
 type registry struct {
 	store string
+	// The other Macs' registries, asked for what this one does not hold. Nil
+	// on the port the peers themselves use, so a miss there is a miss.
+	peers *peers
 }
 
 func (reg *registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +84,9 @@ func (reg *registry) manifest(w http.ResponseWriter, r *http.Request, repo, ref 
 		fail(w, http.StatusInternalServerError, "UNKNOWN", err.Error())
 		return
 	}
+	if !ok && reg.peers != nil {
+		d, ok = reg.peers.resolve(reg.store, name)
+	}
 	if !ok {
 		fail(w, http.StatusNotFound, "MANIFEST_UNKNOWN", fmt.Sprintf("%s is not stored here", name))
 		return
@@ -97,6 +103,9 @@ func (reg *registry) manifest(w http.ResponseWriter, r *http.Request, repo, ref 
 // resumed layer download works.
 func (reg *registry) send(w http.ResponseWriter, r *http.Request, digest, mediaType string) {
 	f, err := os.Open(blobPath(reg.store, digest))
+	if err != nil && reg.peers != nil && reg.peers.blob(w, r, reg.store, digest) {
+		return
+	}
 	if err != nil {
 		fail(w, http.StatusNotFound, "BLOB_UNKNOWN", "no such blob")
 		return

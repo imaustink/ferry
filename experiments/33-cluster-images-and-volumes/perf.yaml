@@ -1,0 +1,40 @@
+# Synced small writes, and a large write, on the three places a machine's pod
+# can put data: a ferry-local-block claim (USB mass storage), a ferry-local
+# claim (the virtiofs volumes share) and an emptyDir (the machine's own virtio
+# disk). 2000 writes of 4 KiB with oflag=dsync -- each one a commit -- then
+# 256 MiB with one fsync at the end. Three rounds.
+apiVersion: v1
+kind: Pod
+metadata: {name: perf}
+spec:
+  nodeSelector: {ferry.dev/mode: shared}
+  tolerations: [{operator: Exists}]
+  containers:
+    - name: perf
+      image: public.ecr.aws/docker/library/debian:12-slim
+      command:
+        - bash
+        - -c
+        - |
+          for round in 1 2 3; do
+            for d in /block /shared /local; do
+              s=$(date +%s.%N)
+              dd if=/dev/zero of=$d/sync bs=4k count=2000 oflag=dsync status=none
+              e=$(date +%s.%N)
+              dd if=/dev/zero of=$d/big bs=1M count=256 conv=fsync status=none
+              f=$(date +%s.%N)
+              awk -v d=$d -v r=$round -v a=$s -v b=$e -v c=$f 'BEGIN {
+                printf "round %d %-7s dsync 4k: %6.1f MB/s %5.3f ms/write   256M+fsync: %6.1f MB/s\n",
+                  r, d, 8.192/(b-a), (b-a)*1000/2000, 268.4/(c-b) }'
+              rm -f $d/sync $d/big
+            done
+          done
+          sleep 3600
+      volumeMounts:
+        - {name: block, mountPath: /block}
+        - {name: shared, mountPath: /shared}
+        - {name: local, mountPath: /local}
+  volumes:
+    - {name: block, persistentVolumeClaim: {claimName: block}}
+    - {name: shared, persistentVolumeClaim: {claimName: shared}}
+    - {name: local, emptyDir: {}}
