@@ -165,6 +165,10 @@ FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer$SUFFIX.sock}"
 FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:$(( 10350 + PORT_SHIFT ))}"
 FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd$SUFFIX.sock}"
 FERRY_NETPOL_SOCK="${FERRY_NETPOL_SOCK:-/tmp/ferry-netpol$SUFFIX.sock}"
+# Where the control plane's ferry-netpol serves the other Macs their own nodes'
+# rules, over TLS. One above the API server's port, so a joining Mac works it
+# out from the address it was given to join at. See start_netpol.
+NETPOL_PEER_PORT="${FERRY_NETPOL_PEER_PORT:-$(( 6444 + PORT_SHIFT ))}"
 FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud$SUFFIX.sock}"
 # Pod sockets are named by pod uid, and macOS caps a unix socket path near 104
 # bytes, so this directory is deliberately short.
@@ -1290,16 +1294,60 @@ EOF
 # Service rules already reach a pod. Without this, policies were accepted and
 # silently ignored, which is worse than not supporting them.
 #
-# A Mac that joined runs its own, as the node: its pods and its edge ask a
-# socket on that Mac, and a socket cannot be reached across the network.
-start_netpol() { # [kubeconfig]
+# Compiled here and only here, with the cluster's own credentials. The other
+# Macs' nodes are served their own pods' rules on NETPOL_PEER_PORT, over TLS:
+# they present their kubelet's certificate and get what that node's pods need
+# and nothing else (ferry-netpol/serve.go). The port presents the API server's
+# certificate, which a joined Mac already trusts for this address. A joined
+# Mac runs start_netpol_follower instead.
+start_netpol() {
   [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
   rm -f "$FERRY_NETPOL_SOCK"
-  "$here/bin/ferry-netpol" --kubeconfig "${1:-$FERRY_HOME/admin.conf}" \
+  "$here/bin/ferry-netpol" --kubeconfig "$FERRY_HOME/admin.conf" \
+    --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
+    --listen "0.0.0.0:$NETPOL_PEER_PORT" --client-ca "$FERRY_HOME/pki/ca.crt" \
+    --tls-cert "$FERRY_HOME/pki/apiserver.crt" --tls-key "$FERRY_HOME/pki/apiserver.key" \
+    >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-netpol.pid"
+  ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
+  netpol_verdict
+  # A cluster that handed its nodes the old grant loses it here, in the
+  # background because it changes nothing this start waits on.
+  ferry_netpol_rbac_remove &
+}
+
+# A Mac that joined asks the control plane's ferry-netpol for its node's rules
+# and serves them on the same socket, so ferry-cri and ferry-proxy here are
+# unchanged. It used to run a ferry-netpol of its own as the node, which needed
+# every kubelet in the cluster to be able to read every pod.
+#
+# The peer port is one above the API server's on the control plane's Mac, so
+# it is worked out from the address this Mac joined at. A control plane older
+# than this has no peer port, and is said so rather than left to look enforced.
+start_netpol_follower() { # server(host:port) kubeconfig...
+  [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
+  local server="$1"; shift
+  local upstream="${FERRY_NETPOL_UPSTREAM:-${server%:*}:$(( ${server##*:} + 1 ))}" flags=() conf
+  for conf in "$@"; do flags+=(--node-kubeconfig "$conf"); done
+  rm -f "$FERRY_NETPOL_SOCK"
+  "$here/bin/ferry-netpol" --upstream "$upstream" "${flags[@]}" \
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
   ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
+  # Answered only once the control plane has been heard from for every node;
+  # before that the socket holds and refuses, which is what keeps ferry-proxy
+  # from mistaking "not known yet" for "no policies".
+  if [ -S "$FERRY_NETPOL_SOCK" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+       --unix-socket "$FERRY_NETPOL_SOCK" http://ferry-netpol/rules)" != 200 ]; then
+    warn "NetworkPolicies NOT enforced yet: the control plane's ferry-netpol at $upstream is not answering"
+    echo "      The control plane needs a ferry newer than 0.6.0 for this; this Mac keeps asking."
+    return 0
+  fi
+  netpol_verdict "following $upstream"
+}
+
+netpol_verdict() { # [how]
   if [ ! -S "$FERRY_NETPOL_SOCK" ]; then
     warn "ferry-netpol did not start; NetworkPolicies will be ignored"
   elif [ "$KERNEL" != "$NAT_KERNEL" ]; then
@@ -1310,33 +1358,19 @@ start_netpol() { # [kubeconfig]
     warn "NetworkPolicies NOT enforced: the guest kernel has no nf_tables"
     echo "      Build one with: ferry kernel"
   else
-    ok "NetworkPolicies enforced in the pods"
+    ok "NetworkPolicies enforced in the pods${1:+, $1}"
   fi
 }
 
-# What a node's certificate needs for ferry-netpol to run as it. Made by
-# 'ferry token create', since a Mac cannot join without one, and idempotent, so
-# a cluster made before this existed gets it from its next token.
-ferry_netpol_rbac() {
-  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f - >/dev/null 2>&1 <<'EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata: {name: ferry-node-netpol}
-rules:
-- apiGroups: [networking.k8s.io]
-  resources: [networkpolicies]
-  verbs: [list, watch]
-- apiGroups: [""]
-  resources: [pods, namespaces, nodes]
-  verbs: [list, watch]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata: {name: ferry-node-netpol}
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ferry-node-netpol}
-subjects:
-- {apiGroup: rbac.authorization.k8s.io, kind: Group, name: system:nodes}
-EOF
+# The grant joined Macs' ferry-netpol used to run under: list and watch on
+# every NetworkPolicy, pod, namespace and node, for all of system:nodes. That
+# is wider than the Node authorizer gives a kubelet, and nothing needs it now,
+# so 'ferry up' and 'ferry token create' take it off any cluster that has it.
+# A joined Mac still running the old ferry-netpol stops getting rules, and
+# says so in its log; 'ferry join' from this version is the way back.
+ferry_netpol_rbac_remove() {
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl delete --ignore-not-found \
+    clusterrolebinding/ferry-node-netpol clusterrole/ferry-node-netpol >/dev/null 2>&1
 }
 
 # The Mac's GPU, offered to pods over a socket.
@@ -2257,12 +2291,14 @@ EOF
   kubectl create clusterrolebinding ferry-node-proxier \
     --clusterrole=system:node-proxier \
     --group=system:nodes >/dev/null 2>&1
-  # And its own NetworkPolicy rules, for the same reason: every Mac runs
-  # ferry-netpol for its own pods and its own edge. A policy selects peers
-  # anywhere in the cluster, so it reads every pod, namespace and node -- which
-  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
-  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
-  ferry_netpol_rbac
+  # NetworkPolicy rules are not read the same way. A policy selects peers
+  # anywhere in the cluster, so compiling one reads every pod, namespace and
+  # node, which the Node authorizer does not grant a kubelet -- and a grant
+  # that did is what this used to make. The control plane compiles instead and
+  # serves each node its own part (start_netpol), so a node needs nothing
+  # beyond what its kubelet has; a cluster that still has the old grant loses
+  # it here.
+  ferry_netpol_rbac_remove
 
   # Let a node that has not joined yet read the node list.
   #
@@ -2460,7 +2496,7 @@ EOF
   RELAY_PORT=$((RELAY_PORT))
   clear_stopped
   echo worker > "$FERRY_HOME/role"
-  start_worker "$node_name" "$index" || return 1
+  start_worker "$node_name" "$index" "$server" || return 1
 }
 
 # The /24 of the cluster CIDR an index owns. For saying so out loud; ferry-cri
@@ -2522,8 +2558,8 @@ free_node_index() { # [kubeconfig]
 # The parts of a node that are not the control plane: a runtime, a streamer and
 # a kubelet. Used by 'ferry join'; 'ferry up' starts these itself because it has
 # a control plane to start first.
-start_worker() {
-  local name="$1" index="$2"
+start_worker() { # name index server(host:port)
+  local name="$1" index="$2" server="$3"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 
   # A joining Mac has its own GPU, so it runs its own daemon and advertises its
@@ -2637,9 +2673,10 @@ EOF
     warn "bin/ferry-proxyd is missing; Services will not route on this node"
   fi
 
-  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
-  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
-  start_netpol "$FERRY_RUN/kubelet.conf"
+  # NetworkPolicy, for this Mac's pods and this Mac's edge: fetched from the
+  # control plane as the node. ferry-cri is already asking its socket and keeps
+  # asking.
+  start_netpol_follower "$server" "$FERRY_RUN/kubelet.conf"
 
   # Node ports and claims are per node too: a pod scheduled here needs its
   # volume made here, and a connection arriving here needs forwarding here.
