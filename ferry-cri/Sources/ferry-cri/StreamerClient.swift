@@ -137,6 +137,9 @@ struct PodContainers: Decodable {
     /// bytes, 0 for none. CRI shows the runtime a host directory for these like
     /// any other emptyDir, so the spec is the only place this is said.
     let memoryVolumes: [String: Int64]?
+    /// Every image the pod's containers run, init containers included, so the
+    /// VM can attach them all when it boots -- see PodRootfs.swift.
+    let images: [String]?
 }
 
 extension StreamerClient {

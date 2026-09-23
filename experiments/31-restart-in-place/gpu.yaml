@@ -1,0 +1,17 @@
+# The GPU socket is relayed into the one container that asked for it, and a
+# container now reaches its VM after the boot: both at once, through a restart.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-restart
+spec:
+  containers:
+  - name: gpu
+    image: busybox:1.36
+    command: ["sh", "-c", "ls -l /run/ferry/gpu.sock; sleep 4; exit 1"]
+    resources:
+      limits:
+        ferry.dev/gpu: 1
+  - name: side
+    image: busybox:1.36
+    command: ["sh", "-c", "ls /run/ferry 2>&1; exec sleep 36000"]

@@ -1,0 +1,17 @@
+# The init container boots the VM alone, so `main` joins it afterwards with a
+# directory the VM was not sharing: its termination log's. The message only
+# reaches the pod's status if that share was added to the running VM.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: termlog
+spec:
+  restartPolicy: Never
+  initContainers:
+  - name: first
+    image: busybox:1.36
+    command: ["true"]
+  containers:
+  - name: main
+    image: busybox:1.36
+    command: ["sh", "-c", "echo written-after-boot > /dev/termination-log; exit 7"]

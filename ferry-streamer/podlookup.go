@@ -1,12 +1,14 @@
 package main
 
-// Which containers a pod has, for ferry-cri.
+// Which containers a pod has, and what they run, for ferry-cri.
 //
-// Virtualization.framework cannot add a container to a running VM, and the
-// kubelet creates containers one at a time -- create(main), start(main),
-// create(sidecar) -- so by the time a sidecar arrives the VM has already
-// booted. CRI never tells a runtime how many containers to expect, so ferry-cri
-// asks here and holds the boot until they have all been created.
+// Virtualization.framework cannot add a disk to a running VM, and a pod's
+// images and volumes are disks, while the kubelet creates containers one at a
+// time -- create(main), start(main), create(sidecar). A container can join a
+// running pod VM only if the VM already has its image. CRI never tells a
+// runtime how many containers to expect or what they run, so ferry-cri asks
+// here, holds the boot until they have all been created, and attaches every
+// image the spec names.
 
 import (
 	"context"
@@ -90,6 +92,12 @@ type podContainers struct {
 	// projected tokens take the same tmpfs path in the kubelet, so tagging it
 	// there would catch them too. The spec says exactly which volumes asked.
 	MemoryVolumes map[string]int64 `json:"memoryVolumes,omitempty"`
+	// Every image the pod's containers run, init containers included, once
+	// each. A pod VM attaches each image it runs as a read-only disk and
+	// overlays its containers on it, and a disk cannot be added once the VM
+	// is running -- so a VM booted for an init container or a native sidecar
+	// attaches the images of what comes after it too, when they are pulled.
+	Images []string `json:"images,omitempty"`
 }
 
 // memoryVolumes maps each emptyDir the pod asked to keep in memory to its
@@ -108,6 +116,21 @@ func memoryVolumes(pod *v1.Pod) map[string]int64 {
 			size = volume.EmptyDir.SizeLimit.Value()
 		}
 		out[volume.Name] = size
+	}
+	return out
+}
+
+// podImages lists the images a pod's containers run, in spec order, once each.
+func podImages(pod *v1.Pod) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, list := range [][]v1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for _, c := range list {
+			if c.Image != "" && !seen[c.Image] {
+				seen[c.Image] = true
+				out = append(out, c.Image)
+			}
+		}
 	}
 	return out
 }
@@ -219,6 +242,7 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 		out.MemoryLimitBytes, out.CPULimit = podResources(pod)
 		out.VolumeSubPaths = pods.volumeSubPaths(r.Context(), pod)
 		out.MemoryVolumes = memoryVolumes(pod)
+		out.Images = podImages(pod)
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}
