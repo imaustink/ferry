@@ -72,6 +72,8 @@ struct RuntimeConfig: Sendable {
     /// This process's own exec socket. ferry-cni dials back to it to run a
     /// plugin inside a pod, because only this process owns the VMs.
     var execSocket: String?
+    /// Appended to every pod VM's kernel command line, after ferry's own.
+    var extraKernelArgs: [String] = []
 }
 
 enum RuntimeFailure: Error, CustomStringConvertible {
@@ -276,8 +278,33 @@ actor PodRuntime {
         self.config = config
         try FileManager.default.createDirectory(at: config.stateDir, withIntermediateDirectories: true)
         self.store = try ImageStore(path: config.stateDir)
-        self.kernel = Kernel(path: URL(filePath: config.kernelPath), platform: .linuxArm)
+        var commandLine = Kernel.CommandLine(debug: false, panic: 0)
+        commandLine.kernelArgs += Self.podKernelArgs + config.extraKernelArgs
+        self.kernel = Kernel(path: URL(filePath: config.kernelPath), platform: .linuxArm,
+                             commandline: commandLine)
     }
+
+    /// What every pod's kernel is booted with beyond Containerization's
+    /// defaults. Both are memory the guest touches at boot for nothing, and
+    /// the host keeps every page a guest has touched -- the balloon does not
+    /// give them back (experiments 14 and 32).
+    ///
+    /// No bounce buffer. Guest memory starts at 1.75 GiB, so any VM over
+    /// 2304 MiB reaches past 4 GiB and the kernel sets aside 64 MiB for devices
+    /// that can only address below it -- zeroed at boot, so paid for in full.
+    /// A VM has no such device: its virtio devices do not negotiate
+    /// ACCESS_PLATFORM, so they bypass the DMA API and the buffer is never
+    /// used. 271 MiB to 206 for an idle 4 GiB pod.
+    ///
+    /// Transparent huge pages are off. A guest with more than 512 MiB turns
+    /// them on for regions that ask, something in the guest's own boot path
+    /// asks, and each one is 2 MiB of memory the host backs whole for what
+    /// would otherwise have been a few 4 KiB pages: 24 MiB of every idle pod
+    /// VM of 2 GiB, and nothing below 512 MiB, where the kernel leaves THP
+    /// off by itself (experiments/32-pod-memory-footprint). The host backs
+    /// guest memory in its own pages whatever the guest does, so a huge page
+    /// in the guest buys a shorter guest page walk and nothing more.
+    static let podKernelArgs = ["swiotlb=noforce", "transparent_hugepage=never"]
 
     /// Pulls the guest agent image and creates the pod network. Kept out of
     /// init so failures surface with context before the server starts serving.
@@ -802,8 +829,8 @@ actor PodRuntime {
     }
 
     /// What the guest kernel, vminitd and the pod's own page cache need beyond
-    /// the workload's limits. Experiment 13 measured an idle pod VM at 226 MiB
-    /// of host memory with nothing running in it.
+    /// the workload's limits. An idle pod VM touches about 103 MiB of its own
+    /// memory with nothing running in it (experiment 32; 194 before it).
     static let guestMemoryHeadroom: UInt64 = 256 * 1024 * 1024
 
     private func makePod(id: String, interface: any Interface,
