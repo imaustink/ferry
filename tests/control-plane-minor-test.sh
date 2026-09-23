@@ -181,8 +181,11 @@ for i in 1 2 3; do
     || bad "the API server reports minor '$got', not $to"
   readyz="$(awk '$1 == "readyz" {print $4 "/" $2}' "$work/probe.out")"
   get="$(awk '$1 == "get" {print $4 "/" $2}' "$work/probe.out")"
+  # A request the bridge held while the new one got ready is slow, not failed.
+  slowest="$(awk '$1 == "get" || $1 == "readyz" { for (i = 1; i < NF; i++) if ($i == "slowest") print $(i + 1) }' \
+    "$work/probe.out" | sort -n | tail -1)"
   if [ -n "$keep" ] && [ "${readyz%%/*}" = 0 ] && [ "${get%%/*}" = 0 ]; then
-    ok "handed over with no failed request (readyz $readyz, pooled get $get failed)"
+    ok "handed over with no failed request (readyz $readyz, pooled get $get failed; slowest $slowest)"
   elif [ -z "$keep" ]; then
     ok "etcd changed, so a restart: readyz $readyz, pooled get $get failed"
   else

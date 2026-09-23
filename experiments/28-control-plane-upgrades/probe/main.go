@@ -37,9 +37,10 @@ import (
 )
 
 type sample struct {
-	at  time.Time
-	ok  bool
-	why string
+	at   time.Time
+	ok   bool
+	why  string
+	took time.Duration
 }
 
 type series struct {
@@ -48,9 +49,13 @@ type series struct {
 	s    []sample
 }
 
-func (r *series) add(ok bool, why string) {
+func (r *series) add(ok bool, why string, took ...time.Duration) {
 	r.mu.Lock()
-	r.s = append(r.s, sample{time.Now(), ok, why})
+	x := sample{at: time.Now(), ok: ok, why: why}
+	if len(took) > 0 {
+		x.took = took[0]
+	}
+	r.s = append(r.s, x)
 	r.mu.Unlock()
 }
 
@@ -64,7 +69,11 @@ func (r *series) report(start time.Time) string {
 	var longest, cur time.Duration
 	var runStart time.Time
 	var firstFail, lastFail time.Time
+	var slowest time.Duration
 	for _, x := range r.s {
+		if x.took > slowest {
+			slowest = x.took
+		}
 		if !x.ok {
 			fails++
 			whys[x.why]++
@@ -90,7 +99,8 @@ func (r *series) report(start time.Time) string {
 			longest = cur // still failing when the probe stopped
 		}
 	}
-	out := fmt.Sprintf("%-7s %5d requests  %4d failed  longest outage %v", r.name, len(r.s), fails, longest.Round(time.Millisecond))
+	out := fmt.Sprintf("%-7s %5d requests  %4d failed  longest outage %v  slowest %dms", r.name, len(r.s), fails,
+		longest.Round(time.Millisecond), slowest.Milliseconds())
 	if fails > 0 {
 		out += fmt.Sprintf("  (first at +%v, last at +%v)", firstFail.Sub(start).Round(time.Millisecond), lastFail.Sub(start).Round(time.Millisecond))
 		keys := make([]string, 0, len(whys))
@@ -139,9 +149,12 @@ func main() {
 	tlsc := &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool}
 	base := fmt.Sprintf("https://127.0.0.1:%d", *port)
 
-	fresh := &http.Client{Timeout: 2 * time.Second,
+	// Ten seconds, not two: a request the handover holds for a moment is slow,
+	// not failed, and client-go and kubectl wait longer than either. How slow is
+	// reported separately, as "slowest".
+	fresh := &http.Client{Timeout: 10 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tlsc, DisableKeepAlives: true}}
-	pooled := &http.Client{Timeout: 2 * time.Second,
+	pooled := &http.Client{Timeout: 10 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tlsc.Clone(), ForceAttemptHTTP2: true}}
 	watcher := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsc.Clone(), ForceAttemptHTTP2: true}}
 
@@ -184,30 +197,22 @@ func main() {
 	var wg sync.WaitGroup
 	run := func(fn func()) { wg.Add(1); go func() { defer wg.Done(); loop(fn) }() }
 
-	run(func() {
-		code, _, err := get(fresh, "/readyz")
+	record := func(s *series, c *http.Client, path string) {
+		t0 := time.Now()
+		code, _, err := get(c, path)
+		took := time.Since(t0)
 		switch {
 		case ctx.Err() != nil:
 		case err != nil:
-			readyz.add(false, short(err))
+			s.add(false, short(err), took)
 		case code != 200:
-			readyz.add(false, fmt.Sprintf("HTTP %d", code))
+			s.add(false, fmt.Sprintf("HTTP %d", code), took)
 		default:
-			readyz.add(true, "")
+			s.add(true, "", took)
 		}
-	})
-	run(func() {
-		code, _, err := get(pooled, "/api/v1/namespaces/default")
-		switch {
-		case ctx.Err() != nil:
-		case err != nil:
-			getS.add(false, short(err))
-		case code != 200:
-			getS.add(false, fmt.Sprintf("HTTP %d", code))
-		default:
-			getS.add(true, "")
-		}
-	})
+	}
+	run(func() { record(readyz, fresh, "/readyz") })
+	run(func() { record(getS, pooled, "/api/v1/namespaces/default") })
 	run(func() {
 		code, b, err := get(pooled, "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes")
 		if ctx.Err() != nil {
