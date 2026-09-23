@@ -89,7 +89,7 @@ for ref in $refs; do
     experiments/*) continue ;;
     # The Go and Swift source trees, each reached as '( cd "$here/<x>" && build )'.
     # bin/<x> is the shipped half and is checked above.
-    ferry-cri|ferry-gpud|ferry-karpenter|ferry-netpol|ferry-proxy|ferry-storage|ferry-streamer) continue ;;
+    ferry-cri|ferry-gpud|ferry-karpenter|ferry-netpol|ferry-proxy|ferry-registry|ferry-storage|ferry-streamer) continue ;;
     # Written at runtime from node-image/oci, not carried. Shipping it would add
     # ~400MB of mostly-zero sparse file for something ferry makes in seconds.
     node-image/node.ext4) continue ;;
@@ -108,6 +108,21 @@ if [ -n "$missing" ]; then
   echo "      Either copy it in release/build.sh, or -- if it is only for"
   echo "      building -- add it to the case block in this file and make sure"
   echo "      ferry guards it with is_release."
+fi
+
+printf '\033[1m%s\033[0m\n' "the Kubernetes it ships"
+# v0.5.0 went out at v1.34.0 with a source that defaults to v1.37.0: build.sh
+# packaged the checkout's active version, which the last cluster started there
+# had switched to v1.34. A release at anything but its own default has to have
+# been asked for with --kubernetes-version, and then this is the reminder.
+prefix="$(tar -tzf "$tarball" | head -1 | cut -d/ -f1)"
+shipped_k8s="$(tar -xOzf "$tarball" "$prefix/VERSION" 2>/dev/null | sed -n 's/^kubernetes=//p')"
+default_k8s="$(tar -xOzf "$tarball" "$prefix/lib/versions.sh" 2>/dev/null \
+  | sed -n 's/^FERRY_DEFAULT_K8S_VERSION="\(.*\)"/\1/p')"
+if [ -n "$shipped_k8s" ] && [ "$shipped_k8s" = "$default_k8s" ]; then
+  ok "kubernetes $shipped_k8s, the default its source is written for"
+else
+  bad "ships kubernetes ${shipped_k8s:-?}, but its source defaults to ${default_k8s:-?}"
 fi
 
 echo
