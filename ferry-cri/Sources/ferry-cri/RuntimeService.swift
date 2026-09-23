@@ -148,7 +148,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func createContainer(request: Runtime_V1_CreateContainerRequest, context: ServerContext) async throws -> Runtime_V1_CreateContainerResponse {
         do {
+            let began = ContinuousClock.now
             let id = try await runtime.createContainer(sandboxID: request.podSandboxID, config: request.config)
+            trace("create", request.config.metadata.name + " " + id, since: began)
             var response = Runtime_V1_CreateContainerResponse()
             response.containerID = id
             return response
@@ -157,7 +159,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func startContainer(request: Runtime_V1_StartContainerRequest, context: ServerContext) async throws -> Runtime_V1_StartContainerResponse {
         do {
+            let began = ContinuousClock.now
             try await runtime.startContainer(request.containerID)
+            trace("start", request.containerID, since: began)
             return Runtime_V1_StartContainerResponse()
         } catch { throw failed(error) }
     }
@@ -174,6 +178,17 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             try await runtime.removeContainer(request.containerID)
             return Runtime_V1_RemoveContainerResponse()
         } catch { throw failed(error) }
+    }
+
+    /// FERRY_CRI_TRACE=1 prints how long each container call took, which is
+    /// what the kubelet's own log cannot say to better than its 1s relist.
+    private static let tracing = ProcessInfo.processInfo.environment["FERRY_CRI_TRACE"] == "1"
+
+    private func trace(_ call: String, _ what: String, since began: ContinuousClock.Instant) {
+        guard Self.tracing else { return }
+        let ms = (ContinuousClock.now - began).components
+        let millis = ms.seconds * 1000 + ms.attoseconds / 1_000_000_000_000_000
+        print("    trace     \(call) \(what) \(millis)ms")
     }
 
     private func crioState(_ s: ContainerRunState) -> Runtime_V1_ContainerState {

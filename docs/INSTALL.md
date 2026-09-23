@@ -297,6 +297,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_VOLUME_RECONCILE_MS` | `10` | the volume manager's reconciler period, patched into the kubelet at build time. Upstream is 100 |
 | `FERRY_VOLUME_POPULATE_MS` | `10` | its desired-state populator period. Upstream is 100 |
 | `FERRY_VOLUME_RETRY_MS` | `20` | how often `WaitForAttachAndMount` re-checks. Upstream is 300. Together these three were ~290ms of sleeping on the critical path of every pod start |
+| `FERRY_CRI_TRACE` | unset | `1` makes `ferry-cri` log how long each CreateContainer and StartContainer took, and each pod VM boot by phase, to the ferry-cri log. What `experiments/31-restart-in-place` measures with |
 
 ### Networking
 
@@ -391,7 +392,7 @@ to.
 
 These are not all read in the same place, which is why the list drifted before:
 most are read by `ferry` and `install.sh` in shell, `SERVICE_CIDR` and the etcd
-ports by `control-plane/up.sh`, and `FERRY_ALLOW_OFF_SLICE`,
+ports by `control-plane/up.sh`, and `FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`,
 `FERRY_NODE_VERBOSE` and `FERRY_NODE_NO_CONFIG` by the Swift binaries through
 `ProcessInfo.environment` — where no amount of grepping the shell finds them.
 
