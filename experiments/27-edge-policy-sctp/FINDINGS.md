@@ -40,14 +40,13 @@ The alternative was to exempt the node only on each pod's probe ports. That was 
 
 After the change (`policy.sh`):
 
-| policy | LAN:80 | localhost:80 | node port | pod → node port | pod Ready |
-|---|---|---|---|---|---|
-| none | served | served | served | served | yes |
-| `deny-all` | refused | refused | refused | refused | yes, 0 restarts over 24 s |
-| `ipBlock <lan>/32`, port 80 | served | refused | served | refused | yes |
-| `ipBlock 0.0.0.0/0 except <lan>/32` | refused | served | refused | served | yes |
-| `podSelector` naming the client pod | refused | refused | refused | served | yes |
-| a rule for port 81 only | refused | refused | refused | refused | yes |
+| policy | result |
+|---|---|
+| `deny-all` | LAN:80, localhost:80, the node port and pod → node port all refused; the pod stays Ready, 0 new restarts over 24 s |
+| `ipBlock <lan>/32`, port 80 | LAN served, localhost refused |
+| `ipBlock 0.0.0.0/0 except <lan>/32` | the reverse: LAN refused, localhost served |
+| `podSelector` naming one pod | only that pod served |
+| a rule for port 81 only | everything on 80 refused |
 
 - A pod on the second node gave the same results.
 - With ingress-nginx under `deny-all`, the controller stays Ready and its admission webhook still answers the API server; the LoadBalancer is refused.
