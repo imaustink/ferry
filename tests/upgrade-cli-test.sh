@@ -129,7 +129,51 @@ says "rollback to a version no longer in the store explains itself" \
 says "and says how to get it back" \
      "$(ferry upgrade rollback)" "ferry build --kubernetes-version v1.34.0"
 
+printf '\033[1m%s\033[0m\n' "rollback across a minor"
+store v1.34.0
+store v1.35.0
+cluster_at v1.35.0 v1.34.0
+out="$(ferry upgrade rollback --yes)"
+says "with no snapshot it refuses, rather than starting v1.34 on v1.35's data" \
+     "$out" "crosses a Kubernetes minor"
+says "and names the way to try regardless" "$out" "rollback --keep-data"
+exits "exiting non-zero" 1 ferry upgrade rollback --yes
+says "an unknown flag is refused" "$(ferry upgrade rollback --nonsense)" "usage: ferry upgrade rollback"
+cluster_at v1.34.0 v1.35.0
+out="$(ferry upgrade rollback --yes)"
+says "going to a newer version is called an upgrade" "$out" "is an upgrade, not a rollback"
+says "and pointed at apply" "$out" "ferry upgrade apply v1.35.0"
+
+printf '\033[1m%s\033[0m\n' "prune"
+store v1.33.0
+store v1.36.0
+activate v1.35.0
+cluster_at v1.35.0 v1.34.0
+mkdir -p "$sandbox/home/node-versions"
+echo v1.36.0 > "$sandbox/home/node-versions/somenode"
+out="$(ferry upgrade prune)"
+says "lists what nothing uses" "$out" "v1.33.0"
+case "$out" in *v1.34.0*|*v1.35.0*|*v1.36.0*)
+  bad "and nothing that is used -- the cluster, rollback, bin/, a node"; echo "$out" | sed 's/^/        /' ;;
+  *) ok "and nothing that is used -- the cluster, rollback, bin/, a node" ;; esac
+[ -d "$sandbox/bin/versions/v1.33.0" ] && ok "without --yes it removes nothing" || bad "without --yes it removes nothing"
+ferry upgrade prune --yes >/dev/null
+[ ! -d "$sandbox/bin/versions/v1.33.0" ] && ok "with --yes it removes it" || bad "with --yes it removes it"
+[ -d "$sandbox/bin/versions/v1.36.0" ] && ok "and keeps the version a node runs" || bad "and keeps the version a node runs"
+says "the dispatcher knows it" "$(ferry upgrade nonsense)" "prune"
+
+printf '\033[1m%s\033[0m\n' "status on this Mac's nodes"
+echo mac-node > "$sandbox/run/node-name"
+echo v1.34.0 > "$sandbox/home/node-versions/mac-node"
+echo v1.34.0 > "$sandbox/home/proxyd-version"
+out="$(ferry upgrade status)"
+says "shows the version each local node will start at" "$out" "mac-node kubelet v1.34.0"
+says "and this Mac's kube-proxy" "$out" "ferry-proxyd v1.34.0"
+rm -f "$sandbox/run/node-name"
+
 printf '\033[1m%s\033[0m\n' "a node upgrade with no credentials"
+says "--to must be a version" "$(ferry upgrade node somenode --to v1.35)" "is not a version like"
+exits "and exits 2" 2 ferry upgrade node somenode --to v1.35
 out="$(ferry upgrade node somenode)"
 says "it says there is no kubeconfig"  "$out" "no kubeconfig on this Mac"
 says "and names the way to give it one" "$out" "FERRY_KUBECONFIG="
