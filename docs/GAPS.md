@@ -193,6 +193,12 @@ Known limits, which are not bugs:
   the image is formatted; the guest agent's mkdir ignores the mode it is asked
   for, so one that appears later is not. On Linux a late subPath is root-owned
   too, though with the volume root's mode.
+- **An emptyDir is an ext4 image too**, in the kubelet's directory for the
+  volume, made when the pod's first container starts. `chown` works on it and
+  it survives container restarts, but its contents are not browsable from the
+  Mac, and `medium: Memory` is disk like the rest. It is sparse and 16 GiB at
+  most, since CRI does not carry `sizeLimit`; the kubelet still enforces
+  `sizeLimit` against what the image actually holds.
 - **`chown` is refused on ReadWriteMany volumes, and on every volume in
   mode 2.** They are directories shared over virtiofs, which runs as the Mac
   user. A machine cannot take a disk after it has booted, so a mode 2 claim is

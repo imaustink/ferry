@@ -21,6 +21,15 @@
 // volume, and each container that uses it gets a bind mount of it: two
 // containers of one pod, or two subPaths of one claim, share one device rather
 // than each mounting a device of their own onto the same file.
+//
+// emptyDir volumes are the same problem with no ferry-storage in front of them:
+// qdrant's init container chowns its snapshots emptyDir as well as its claim,
+// and fixing only the claim left it crashlooping on the other. So an emptyDir
+// gets an image too, made here the first time a container of the pod uses it
+// and kept inside the kubelet's own directory for the volume. It lives exactly
+// as long as the emptyDir should: past container restarts and VM rebuilds,
+// which is why it cannot be a directory inside the guest, and gone when the
+// kubelet tears the volume down with the pod.
 
 import Containerization
 import ContainerizationEXT4
@@ -35,7 +44,33 @@ struct BlockVolume: Sendable, Equatable {
     /// Unique within a pod, since one claim is attached to a pod at most once,
     /// and stable across rebuilds of the pod's LinuxPod.
     var name: String { (directory as NSString).lastPathComponent }
-    var image: String { (directory as NSString).appendingPathComponent(Self.imageName) }
+    var image: String {
+        (directory as NSString).appendingPathComponent(isEmptyDir ? Self.emptyDirImageName : Self.imageName)
+    }
+
+    /// Whether this is a pod's emptyDir rather than a PersistentVolume: the
+    /// kubelet keeps those at pods/<uid>/volumes/kubernetes.io~empty-dir/<name>.
+    var isEmptyDir: Bool { Self.isEmptyDir(directory) }
+
+    static func isEmptyDir(_ directory: String) -> Bool {
+        ((directory as NSString).deletingLastPathComponent as NSString).lastPathComponent
+            == "kubernetes.io~empty-dir"
+    }
+
+    /// Dotted, so it cannot be the name of a subPath the kubelet makes beside it.
+    static let emptyDirImageName = ".ferry-disk.ext4"
+
+    /// How large an emptyDir's filesystem is. CRI does not carry sizeLimit, and
+    /// the image is sparse, so this is a ceiling rather than a cost: the Mac
+    /// spends only what the pod writes, which is also what the kubelet measures
+    /// when it enforces sizeLimit and ephemeral-storage on the directory.
+    static let emptyDirCapacity: UInt64 = 16 * 1024 * 1024 * 1024
+
+    /// An emptyDir's journal, smaller than the default. The default scales with
+    /// the filesystem and would be 128 MiB of zeroes written before every pod
+    /// with an emptyDir could start; this is enough for a scratch volume and
+    /// still survives a VM that stops without unmounting.
+    static let emptyDirJournalBytes: UInt64 = 16 * 1024 * 1024
 
     /// Where LinuxPod mounts a pod-level volume inside the VM. It is the
     /// framework's private guestVolumePath, repeated here because a subPath has
@@ -63,11 +98,17 @@ struct BlockVolume: Sendable, Equatable {
     /// Only a directory named the way ferry-storage names volumes counts, so a
     /// hostPath volume that happens to sit beside a file of the same name is
     /// never mistaken for one and attached as a disk.
+    ///
+    /// An emptyDir counts whether or not its image exists yet, since making
+    /// it is this runtime's job.
     static func locate(hostPath: String) -> (volume: BlockVolume, subPath: String)? {
         var current = (hostPath as NSString).standardizingPath
         var below: [String] = []
         while current != "/" && !current.isEmpty {
             let name = (current as NSString).lastPathComponent
+            if isEmptyDir(current) {
+                return (BlockVolume(directory: current), below.reversed().joined(separator: "/"))
+            }
             if name.hasPrefix("pvc-") {
                 var isDirectory: ObjCBool = false
                 let image = (current as NSString).appendingPathComponent(imageName)
@@ -110,7 +151,30 @@ struct BlockVolume: Sendable, Equatable {
     ///
     /// `subPaths` are made at the same mode, for the same reason: a subPath the
     /// first pod names is a directory it expects to write to.
-    static func formatIfNeeded(image: String, subPaths: [String] = []) throws -> Bool {
+    ///
+    /// `create` makes the image first, sparse and at that size, when there is
+    /// none: an emptyDir's, which nothing else makes.
+    ///
+    /// `empty` leaves out lost+found. An emptyDir is empty on Linux, and a
+    /// database that initialises into one -- postgres, mysql -- refuses a
+    /// directory with anything in it. A claim keeps it, as a cloud block
+    /// volume would have it, and charts that use one already allow for it.
+    static func formatIfNeeded(image: String, subPaths: [String] = [],
+                               create capacity: UInt64? = nil,
+                               journalBytes: UInt64? = nil,
+                               empty: Bool = false) throws -> Bool {
+        if let capacity, !FileManager.default.fileExists(atPath: image) {
+            let made = open(image, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            guard made >= 0 else {
+                throw RuntimeFailure.invalid("cannot create volume image \(image): \(String(cString: strerror(errno)))")
+            }
+            let sized = ftruncate(made, off_t(capacity)) == 0
+            close(made)
+            guard sized else {
+                unlink(image)
+                throw RuntimeFailure.invalid("cannot size volume image \(image): \(String(cString: strerror(errno)))")
+            }
+        }
         let fd = open(image, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else {
             throw RuntimeFailure.invalid("cannot open volume image \(image): \(String(cString: strerror(errno)))")
@@ -131,9 +195,11 @@ struct BlockVolume: Sendable, Equatable {
                 """)
         }
 
-        let capacity = max(UInt64(max(st.st_size, 0)), minimumCapacity)
-        let formatter = try EXT4.Formatter(FilePath(image), minDiskSize: capacity, journal: .default)
+        let size = max(UInt64(max(st.st_size, 0)), minimumCapacity)
+        let journal = journalBytes.map { EXT4.JournalConfig(size: $0) } ?? .default
+        let formatter = try EXT4.Formatter(FilePath(image), minDiskSize: size, journal: journal)
         try formatter.create(path: FilePath("/"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o777))
+        if empty { try formatter.unlink(path: FilePath("/lost+found")) }
         var made: Set<String> = ["/"]
         for subPath in subPaths {
             // Parents first, each at the same mode; the formatter does not make

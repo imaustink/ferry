@@ -1634,8 +1634,13 @@ actor PodRuntime {
             // Off the actor: a large claim's journal is tens of megabytes of
             // zeroes to write, and every other CRI call would wait behind it.
             let image = volume.image
+            let emptyDir = volume.isEmptyDir
             let formatted = try await Task.detached {
-                try BlockVolume.formatIfNeeded(image: image, subPaths: subPaths)
+                try BlockVolume.formatIfNeeded(
+                    image: image, subPaths: subPaths,
+                    create: emptyDir ? BlockVolume.emptyDirCapacity : nil,
+                    journalBytes: emptyDir ? BlockVolume.emptyDirJournalBytes : nil,
+                    empty: emptyDir)
             }.value
             if formatted { print("    volume    formatted \(image)") }
         } catch {

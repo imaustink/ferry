@@ -88,26 +88,40 @@ type podContainers struct {
 // left out: the runtime then falls back to the subPaths CRI shows it.
 // subPathExpr is left out too -- it expands per container from the downward
 // API, which this does not evaluate.
+//
+// An emptyDir is an ext4 image too, formatted the same way, and is keyed by its
+// own name: that is the name of the kubelet's directory for it, which is what
+// the runtime calls the volume.
 func (p *podLookup) volumeSubPaths(ctx context.Context, pod *v1.Pod) map[string][]string {
 	claims := map[string]string{} // pod volume name -> claim name
+	emptyDirs := map[string]bool{}
 	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim != nil {
 			claims[volume.Name] = volume.PersistentVolumeClaim.ClaimName
 		}
+		if volume.EmptyDir != nil {
+			emptyDirs[volume.Name] = true
+		}
 	}
-	if len(claims) == 0 {
+	if len(claims) == 0 && len(emptyDirs) == 0 {
 		return nil
 	}
 	subPaths := map[string][]string{} // pod volume name -> subPaths
+	out := map[string][]string{}
 	all := append(append([]v1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
 	for _, c := range all {
 		for _, mount := range c.VolumeMounts {
-			if _, ok := claims[mount.Name]; ok && mount.SubPath != "" {
+			if mount.SubPath == "" {
+				continue
+			}
+			if _, ok := claims[mount.Name]; ok {
 				subPaths[mount.Name] = append(subPaths[mount.Name], mount.SubPath)
+			}
+			if emptyDirs[mount.Name] {
+				out[mount.Name] = append(out[mount.Name], mount.SubPath)
 			}
 		}
 	}
-	out := map[string][]string{}
 	for volume, paths := range subPaths {
 		claim, err := p.client.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, claims[volume], metav1.GetOptions{})
 		if err != nil || claim.Spec.VolumeName == "" {
