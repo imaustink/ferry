@@ -133,6 +133,9 @@ struct PodContainers: Decodable {
     /// made at a volume's first format can have the root's mode, and one made
     /// later cannot.
     let volumeSubPaths: [String: [String]]?
+    /// Every image the pod's containers run, init containers included, so the
+    /// VM can attach them all when it boots -- see PodRootfs.swift.
+    let images: [String]?
 }
 
 extension StreamerClient {
