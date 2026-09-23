@@ -62,9 +62,18 @@ contains "the unpack guard asks about the identity" "$runtime" \
 lacks "the unpack guard no longer asks about the name" "$runtime" \
   'if rootfsCache[canonical] == nil {'
 
-# The file name, which collided for the same reason the key did.
-contains "the ext4 path is derived from the identity" "$runtime" \
+# The file name, which collided for the same reason the key did. It is the
+# platform manifest's digest rather than the image's: an index records the name
+# it was tagged as, so one build under two tags is two identities over one
+# filesystem, and naming the file by the index unpacked it twice.
+contains "the ext4 path is derived from the platform manifest" "$runtime" \
+  'let content = (try? await image.descriptor(for: platform).digest) ?? identity'
+contains "the ext4 path is derived from that content digest" "$runtime" \
+  'let path = imageDisk(content)'
+lacks "the ext4 path is no longer derived from the index" "$runtime" \
   'let safe = identity.replacingOccurrences'
+contains "a second identity over the same content reuses the disk" "$runtime" \
+  'rootfsCache[identity] = shared'
 
 # Names are aliases for the identity, never the other way round.
 contains "names resolve to the identity" "$runtime" \
@@ -89,8 +98,14 @@ echo "removing an image removes all of it"
 # and took the next image apart. That is what made this bug look recurrent.
 contains "removal resolves the reference to a root filesystem" "$runtime" \
   'guard let mount = direct.compactMap({ rootfsCache[$0] }).first else {'
-contains "removal drops every name the rootfs is known by" "$runtime" \
+contains "removal drops every name the image is known by" "$runtime" \
+  'let aliases = id.map { id in pulledImages.filter { $0.value.id == id }.map(\.key) } ?? []'
+# But not every name on the disk: two tags of one build share it, and removing
+# the unused one must not take the names of the one a pod is running.
+lacks "removal does not drop another image's names that share the disk" "$runtime" \
   'let aliases = rootfsCache.filter { $0.value.source == mount.source }.map(\.key)'
+contains "removal gives the disk back once nothing unpacks to it" "$runtime" \
+  'if !rootfsCache.values.contains(where: { $0.source == mount.source }) {'
 contains "removal gives the disk back" "$runtime" \
   'try? FileManager.default.removeItem(atPath: mount.source)'
 
@@ -183,6 +198,72 @@ YAML
   fi
 
   k delete pod "$pod" --ignore-not-found >/dev/null 2>&1
+
+  echo
+  echo "end to end: two tags of one build share a disk, and lose it together"
+
+  # skaffold's shape: one build tagged twice is two index digests over one
+  # manifest. They share a disk, so removing one tag must leave the other
+  # runnable -- the rule that removed every name on the disk would have taken
+  # the other tag's too -- and the disk goes only with the last of them.
+  #
+  # RemoveImage is only reachable through CRI, and the kubelet's collector
+  # cannot be made to call it on demand, so this needs crictl.
+  suffix="${runtime_dir##*/ferry-run}"
+  sock="/tmp/ferry-cri$suffix.sock"
+  if ! command -v crictl >/dev/null 2>&1; then
+    note "crictl not installed; skipped (brew install cri-tools)"
+  elif [ -z "$runtime_dir" ] || [ ! -d "$state" ] || [ ! -S "$sock" ]; then
+    note "could not find the image store or the runtime socket; skipped"
+  else
+    cri() { crictl --runtime-endpoint "unix://$sock" --image-endpoint "unix://$sock" "$@" 2>/dev/null; }
+    first="ferry-image-identity-test:shared-a"
+    second="ferry-image-identity-test:shared-b"
+    user="ferry-image-identity-shared"
+    printf 'FROM ghcr.io/linuxcontainers/alpine:3.20\nRUN echo SHARED > /marker\n' > "$work/Dockerfile"
+
+    before="$(count)"
+    "$ferry" image build -q -t "$first" "$work" >/dev/null 2>&1
+    "$ferry" image build -q -t "$second" "$work" >/dev/null 2>&1
+    shared="$(count)"
+    [ "$shared" -eq $((before + 1)) ] && ok "both tags are backed by one disk" \
+      || bad "both tags are backed by one disk ($before -> $shared)"
+
+    # Exits every few seconds, so the kubelet has to resolve the image again
+    # after the other tag is gone -- that restart is what the old rule broke.
+    k delete pod "$user" --ignore-not-found --wait=true >/dev/null 2>&1
+    k run "$user" --image="$second" --image-pull-policy=Never --restart=Always \
+      --command -- sh -c 'cat /marker; sleep 5; exit 1' >/dev/null 2>&1
+    if ! k wait --for=condition=Ready "pod/$user" --timeout=120s >/dev/null 2>&1; then
+      bad "a pod runs the second tag"
+    else
+      restarts="$(k get pod "$user" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+      cri rmi "docker.io/library/$first" >/dev/null
+      [ "$(count)" -eq "$shared" ] && ok "removing one tag keeps the disk the other uses" \
+        || bad "removing one tag keeps the disk the other uses"
+
+      i=0
+      while [ "$i" -lt 60 ]; do
+        [ "$(k get pod "$user" -o jsonpath='{.status.containerStatuses[0].restartCount}')" -gt "$restarts" ] && break
+        sleep 1; i=$((i + 1))
+      done
+      k wait --for=condition=Ready "pod/$user" --timeout=60s >/dev/null 2>&1
+      now="$(k get pod "$user" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+      printed="$(k logs "$user" 2>/dev/null | tr -d '\r\n')"
+      if [ "$now" -gt "$restarts" ] && [ "$printed" = SHARED ]; then
+        ok "the other tag's pod restarts after the removal"
+      else
+        bad "the other tag's pod restarts after the removal (restarts $restarts -> $now, printed '$printed')"
+        k get events --field-selector "involvedObject.name=$user" -o custom-columns=R:.reason,M:.message \
+          --no-headers 2>/dev/null | grep -i -E 'ErrImage|not been pulled|Failed' | sed 's/^/      /'
+      fi
+    fi
+
+    k delete pod "$user" --ignore-not-found --wait=true >/dev/null 2>&1
+    cri rmi "docker.io/library/$second" >/dev/null
+    [ "$(count)" -eq "$before" ] && ok "the disk goes with the last tag" \
+      || bad "the disk goes with the last tag ($(count), expected $before)"
+  fi
 fi
 
 echo
