@@ -1873,13 +1873,13 @@ actor PodRuntime {
         config.stateDir.appending(component: "\(sandboxID)-scratch.ext4").path()
     }
 
-    /// A formatted, empty scratch disk made once per process and cloned for
-    /// every pod, which on APFS is a clonefile: formatting one per pod would
-    /// put the journal's megabytes of zeroes in front of every boot.
+    /// A formatted, empty scratch disk made once and cloned for every pod,
+    /// which on APFS is a clonefile and costs nothing measurable: formatting
+    /// one per pod would put the formatter in front of every boot.
     private var scratchTemplate: Task<String, Error>?
     /// Kept across restarts; named for what is in it, so a template of another
     /// shape is never cloned for this one.
-    static let scratchTemplateName = "scratch-template-\(scratchCapacity >> 30)g-\(PodRootfsLayout.scratchSlots).ext4"
+    static let scratchTemplateName = "scratch-template-\(scratchCapacity >> 30)g-\(PodRootfsLayout.scratchSlots)-nojournal.ext4"
 
     /// How much a pod's containers may write outside their volumes, between
     /// them. Sparse: the Mac spends what they write, not this.
@@ -1916,8 +1916,7 @@ actor PodRuntime {
         if FileManager.default.fileExists(atPath: path) { return path }
         let partial = path + ".partial"
         try? FileManager.default.removeItem(atPath: partial)
-        try PodRootfsLayout.formatScratch(at: partial, capacity: scratchCapacity,
-                                          journalBytes: BlockVolume.emptyDirJournalBytes)
+        try PodRootfsLayout.formatScratch(at: partial, capacity: scratchCapacity)
         try FileManager.default.moveItem(atPath: partial, toPath: path)
         return path
     }

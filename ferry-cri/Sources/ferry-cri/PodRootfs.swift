@@ -68,7 +68,12 @@ struct PodRootfsLayout: Sendable {
 
     /// Formats a sparse scratch filesystem at `path`, with its slots. Written
     /// with the same ext4 writer the images are, since a Mac has no mkfs.
-    static func formatScratch(at path: String, capacity: UInt64, journalBytes: UInt64) throws {
+    ///
+    /// No journal. A journal is for a filesystem that must survive a machine
+    /// stopping under it, and this one never outlives its machine: every VM
+    /// boots on a fresh clone of the template. Without one there is no
+    /// journal to load at mount and nothing written twice.
+    static func formatScratch(at path: String, capacity: UInt64) throws {
         let fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             throw RuntimeFailure.invalid("cannot create \(path): \(String(cString: strerror(errno)))")
@@ -76,8 +81,7 @@ struct PodRootfsLayout: Sendable {
         let sized = ftruncate(fd, off_t(capacity)) == 0
         close(fd)
         guard sized else { throw RuntimeFailure.invalid("cannot size \(path): \(String(cString: strerror(errno)))") }
-        let formatter = try EXT4.Formatter(FilePath(path), minDiskSize: capacity,
-                                           journal: EXT4.JournalConfig(size: journalBytes))
+        let formatter = try EXT4.Formatter(FilePath(path), minDiskSize: capacity, journal: nil)
         let directory = EXT4.Inode.Mode(.S_IFDIR, 0o755)
         try formatter.create(path: FilePath("/"), mode: directory)
         try formatter.unlink(path: FilePath("/lost+found"))
