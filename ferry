@@ -1936,22 +1936,32 @@ start_proxy() {
 # of ports, and the pods it runs are virtual machines exactly like the first
 # node's. Their addresses come from this node's own /24 inside the cluster /16,
 # and they reach the first node's pods across ferry's switch.
-# Deletes the Node object called <name> if nothing is behind it. A kubelet
-# renews its lease every 10s; one untouched for a minute has no kubelet. The
-# Ready condition cannot say this -- it is written every five minutes, and
-# stays True for 40s after a kubelet stops.
+# Deletes the Node object called <name> if nothing is behind it: no kubelet
+# here by that name, and a lease nobody has renewed for its whole duration.
+# The Ready condition cannot say this -- it is written every five minutes and
+# stays True for 40s after a kubelet stops. A lease still fresh is waited out,
+# because 'ferry down' and 'ferry up' take less time than a lease lasts; one
+# that keeps being renewed is another Mac's live node, and is left alone.
 stale_node_gone() { # name
-  local name="$1" renewed now
+  local name="$1" renewed duration age waited=0
   kubectl get node "$name" >/dev/null 2>&1 || return 0
-  renewed="$(kubectl -n kube-node-lease get lease "$name" -o jsonpath='{.spec.renewTime}' 2>/dev/null)"
-  if [ -n "$renewed" ]; then
+  if pgrep -f -- "--hostname-override=$name( |$)" >/dev/null; then
+    bad "a node named $name is already running on this Mac"; return 1
+  fi
+  while :; do
+    read -r renewed duration <<<"$(kubectl -n kube-node-lease get lease "$name" \
+      -o jsonpath='{.spec.renewTime} {.spec.leaseDurationSeconds}' 2>/dev/null)"
+    [ -n "$renewed" ] || break
     renewed="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${renewed%%[.Z]*}" +%s 2>/dev/null || echo 0)"
-    now="$(date -u +%s)"
-    if [ $(( now - renewed )) -lt 60 ]; then
+    age=$(( $(date -u +%s) - renewed ))
+    [ "$age" -ge "${duration:-40}" ] && break
+    if [ "$waited" -gt $(( ${duration:-40} + 10 )) ]; then
       bad "a node named $name is already in the cluster, and its kubelet is running"
       return 1
     fi
-  fi
+    [ "$waited" = 0 ] && echo "  waiting for $name's lease to lapse, to tell a stale node from a live one"
+    sleep 2; waited=$(( waited + 2 ))
+  done
   local old; old="$(kubectl get node "$name" -o jsonpath='{.spec.podCIDR}' 2>/dev/null)"
   kubectl delete node "$name" --wait=true >/dev/null 2>&1 \
     || { bad "could not delete the stale node object $name"; return 1; }
