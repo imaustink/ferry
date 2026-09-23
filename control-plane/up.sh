@@ -92,6 +92,37 @@ start() { # name cmd...
   echo "    + $name (pid $!)"
 }
 
+# The pid a component is running as now, if it is running at all.
+running_pid() { # name
+  local pid
+  pid="$(cat "$STATE/$1.pid" 2>/dev/null)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+# SIGTERM, ten seconds of patience, then SIGKILL -- down.sh's contract.
+stop_pid() { # name pid
+  kill -TERM "$2" 2>/dev/null || return 0
+  local i=0
+  while [ "$i" -lt 200 ] && kill -0 "$2" 2>/dev/null; do sleep 0.05; i=$((i + 1)); done
+  if kill -0 "$2" 2>/dev/null; then
+    kill -KILL "$2" 2>/dev/null
+    echo "    - $1 (pid $2, forced)"
+  else
+    echo "    - $1 (pid $2)"
+  fi
+}
+
+# Anything already running is being replaced, which is what an upgrade is. A
+# plain 'ferry up' finds nothing running and starts everything.
+#
+#   FERRY_KEEP_ETCD=1   leave a running etcd alone. The caller sets it when the
+#                       version being started pairs with the etcd that is
+#                       running: restarting it would add its own startup to the
+#                       outage and take the API server down with it.
+#   FERRY_HANDOVER=1    replace a running API server without refusing a
+#                       connection, holding its port with the bridge at
+#   FERRY_HANDOVER_BIN  while one hands over to the other. See below.
+
 echo "==> starting control plane (advertise=$ADVERTISE)"
 
 # etcd's durability barrier, which on macOS is not the same bargain it is on
@@ -121,14 +152,20 @@ if [ -n "${FERRY_ETCD_NO_FSYNC:-}" ]; then
   echo "    ! etcd --unsafe-no-fsync (FERRY_ETCD_NO_FSYNC)"
 fi
 
-start etcd "$bin/etcd" \
-  --data-dir="$STATE/etcd" \
-  ${etcd_fsync_args[@]+"${etcd_fsync_args[@]}"} \
-  --listen-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
-  --advertise-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
-  --listen-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
-  --initial-advertise-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
-  --initial-cluster=default=http://127.0.0.1:$ETCD_PEER_PORT
+if [ -n "${FERRY_KEEP_ETCD:-}" ] && pid="$(running_pid etcd)" \
+   && "$bin/etcdctl" --endpoints=127.0.0.1:$ETCD_CLIENT_PORT endpoint health >/dev/null 2>&1; then
+  echo "    = etcd (pid $pid, kept)"
+else
+  if pid="$(running_pid etcd)"; then stop_pid etcd "$pid"; fi
+  start etcd "$bin/etcd" \
+    --data-dir="$STATE/etcd" \
+    ${etcd_fsync_args[@]+"${etcd_fsync_args[@]}"} \
+    --listen-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
+    --advertise-client-urls=http://127.0.0.1:$ETCD_CLIENT_PORT \
+    --listen-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
+    --initial-advertise-peer-urls=http://127.0.0.1:$ETCD_PEER_PORT \
+    --initial-cluster=default=http://127.0.0.1:$ETCD_PEER_PORT
+fi
 
 # 0.1s, not 1s, and the same thirty seconds of patience. etcd answers in about
 # a fifth of a second; at one-second granularity that cost a whole one, and
@@ -139,7 +176,7 @@ for i in $(seq 1 300); do
   sleep 0.1
 done
 
-start kube-apiserver "$bin/kube-apiserver" \
+api_cmd=("$bin/kube-apiserver" \
   --etcd-servers=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --secure-port=$API_PORT --bind-address=0.0.0.0 --advertise-address="$ADVERTISE" \
   --service-cluster-ip-range="$SERVICE_CIDR" \
@@ -169,13 +206,159 @@ start kube-apiserver "$bin/kube-apiserver" \
   `# on this node's vmnet subnet and so reachable from the Mac.` \
   --enable-aggregator-routing=true \
   `# Node ports are bound on the Mac, so two profiles need separate ranges.` \
-  --service-node-port-range="${SERVICE_NODE_PORT_RANGE:-30000-32767}"
+  --service-node-port-range="${SERVICE_NODE_PORT_RANGE:-30000-32767}" \
+  `# End watches when told to stop, rather than waiting on them. Without this` \
+  `# the HTTP server's shutdown waits the full 60s request timeout for the` \
+  `# kubelet's, ferry-proxyd's and every controller's watch streams to end on` \
+  `# their own, which they never do -- so SIGTERM took 60.2s, measured, and` \
+  `# down.sh killed it at ten. Ended watches are re-established by the client` \
+  `# from the resourceVersion it had, which is what they are built to do.` \
+  --shutdown-watch-termination-grace-period="${FERRY_WATCH_GRACE:-2s}")
+
+api_readyz() { # host
+  curl -sgk --max-time 1 --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
+    "https://$1:$API_PORT/readyz" 2>/dev/null | grep -qx ok
+}
+# kubectl as admin, normally through 127.0.0.1. During a handover kubectl_at
+# points it at [::1] instead, which reaches the new API server directly rather
+# than waiting in the bridge behind everyone else.
+kubectl_at=()
+kube() { kubectl --kubeconfig "$STATE/admin.conf" ${kubectl_at[@]+"${kubectl_at[@]}"} "$@"; }
+kubernetes_endpoint() {
+  kube -n default get endpoints kubernetes -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true
+}
+# Put this API server back in the kubernetes Service. An API server leaving
+# removes its address from it as the first thing it does, and the old and new
+# one advertise the same address -- so the old one's departure empties the
+# Service, and every in-cluster client of 10.96.0.1 is refused until the new
+# one's reconciler puts it back, a second or more after it starts. Writing back
+# exactly what the reconciler would write closes the gap, and the reconciler
+# agrees with it on its next pass.
+restore_kubernetes_endpoint() {
+  kube -n default patch endpoints kubernetes --type=merge -p \
+    "{\"subsets\":[{\"addresses\":[{\"ip\":\"$ADVERTISE\"}],\"ports\":[{\"name\":\"https\",\"port\":$API_PORT,\"protocol\":\"TCP\"}]}]}" \
+    >/dev/null 2>&1 \
+  && kube -n default patch endpointslice kubernetes --type=merge -p \
+    "{\"endpoints\":[{\"addresses\":[\"$ADVERTISE\"],\"conditions\":{\"ready\":true}}]}" \
+    >/dev/null 2>&1
+}
+listening() { # host -- is anything accepting on the API port there
+  nc -z -G 1 "$1" "$API_PORT" >/dev/null 2>&1
+}
+
+# Replacing a running API server.
+#
+# The obvious way is stop, then start, and every client is refused from the one
+# to the other: 1.9s for a pooled client and 2.9s before /readyz answers, on
+# this Mac with etcd left running.
+#
+# Two API servers cannot overlap on macOS. The port can be shared with
+# SO_REUSEPORT, but macOS does not balance a shared port -- every connection
+# goes to whichever listener bound *first* -- and an API server has to reach
+# itself during its own start: its post-start hooks run through a loopback
+# client that dials [::1]:port with a certificate it generated a moment before.
+# Beside the old one, those dials reach the old one and fail verification, and
+# the node port repair hook does not try again for three minutes, which is two
+# after the process has given up and exited. Measured, both halves, in
+# experiments/28-control-plane-upgrades.
+#
+# So they do not overlap; the port is held instead. ferry-handover binds every
+# IPv4 address on this port -- a more specific listener than the API server's
+# wildcard, which macOS always prefers, and a different address family, so it
+# binds beside one started with no socket options at all -- and splices what
+# arrives through to [::1], retrying while nothing is there. Every client
+# arrives over IPv4, so nothing is refused; a connection made during the switch
+# waits. [::1] stays the API server's own, which is what its loopback client
+# needs. Once the new one is ready the bridge lets go, and new connections go
+# straight to it again.
+#
+# Without the bridge built, this is stop then start.
+old_api=""
+if pid="$(running_pid kube-apiserver)"; then
+  if [ -n "${FERRY_HANDOVER:-}" ] && [ -x "${FERRY_HANDOVER_BIN:-}" ]; then
+    old_api="$pid"
+  else
+    stop_pid kube-apiserver "$pid"
+  fi
+fi
+
+if [ -n "$old_api" ]; then
+  "$FERRY_HANDOVER_BIN" --port "$API_PORT" >"$STATE/logs/handover.log" 2>&1 &
+  bridge=$!
+  for i in $(seq 1 100); do
+    grep -q '^bridging' "$STATE/logs/handover.log" 2>/dev/null && break
+    kill -0 "$bridge" 2>/dev/null || break
+    sleep 0.02
+  done
+  if ! grep -q '^bridging' "$STATE/logs/handover.log" 2>/dev/null; then
+    kill "$bridge" 2>/dev/null || true
+    echo "    ! the bridge did not start ($(tail -1 "$STATE/logs/handover.log")); stopping first instead"
+    stop_pid kube-apiserver "$old_api"
+    old_api=""
+  else
+    echo "    . $(head -1 "$STATE/logs/handover.log")"
+  fi
+fi
+
+if [ -n "$old_api" ]; then
+  # Hold first, so nothing that arrives from here on reaches the new one before
+  # it is ready.
+  kill -USR1 "$bridge" 2>/dev/null || true
+  kill -TERM "$old_api" 2>/dev/null || true
+  # Its listener goes a few milliseconds after the signal, once it has taken
+  # itself out of the kubernetes Service; the drain of what it was already
+  # serving carries on regardless. The new one must not bind before then, or
+  # it is the one that cannot reach itself.
+  for i in $(seq 1 500); do listening ::1 || break; sleep 0.01; done
+  # The old process keeps its descriptor, so its last lines land here rather
+  # than interleaved into the new one's log.
+  [ -f "$STATE/logs/kube-apiserver.log" ] \
+    && mv "$STATE/logs/kube-apiserver.log" "$STATE/logs/kube-apiserver.previous.log"
+  start kube-apiserver "${api_cmd[@]}"
+  new_api="$(cat "$STATE/kube-apiserver.pid")"
+  kubectl_at=(--server "https://[::1]:$API_PORT" --tls-server-name localhost)
+  # The Service back the moment the new one takes a write, rather than when its
+  # reconciler gets round to it.
+  ( for i in $(seq 1 300); do restore_kubernetes_endpoint && break; sleep 0.05; done ) &
+  restoring=$!
+  for i in $(seq 1 600); do
+    api_readyz "[::1]" && break
+    kill -0 "$new_api" 2>/dev/null || break
+    sleep 0.05
+  done
+  wait "$restoring" 2>/dev/null || true
+  if api_readyz "[::1]"; then
+    echo "    - kube-apiserver (pid $old_api, handed over)"
+  else
+    echo "    !! the new API server did not become ready" >&2
+    tail -15 "$STATE/logs/kube-apiserver.log" | sed 's/^/       /' >&2
+  fi
+  # Let go. New connections reach the API server directly again; the ones the
+  # bridge spliced are closed as each falls quiet, and their clients reconnect.
+  kill -TERM "$bridge" 2>/dev/null || true
+  kubectl_at=()
+  i=0
+  while [ "$i" -lt 300 ] && kill -0 "$old_api" 2>/dev/null; do sleep 0.05; i=$((i + 1)); done
+  kill -KILL "$old_api" 2>/dev/null || true
+  [ -n "$(kubernetes_endpoint)" ] || restore_kubernetes_endpoint || true
+  kill -0 "$new_api" 2>/dev/null || { echo "    !! the new API server exited" >&2; exit 1; }
+else
+  start kube-apiserver "${api_cmd[@]}"
+fi
 
 echo "    . waiting for /livez"
 for i in $(seq 1 600); do
   curl -sk --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
     https://127.0.0.1:$API_PORT/livez 2>/dev/null | grep -q ok && break
   sleep 0.1
+done
+
+# These two stop before their replacements start, never beside them: both run
+# with --leader-elect=false, so two of either would each act on the cluster as
+# if it were the only one. Neither serves the API, so the gap between them is
+# a pause in reconciling rather than an outage.
+for name in kube-controller-manager kube-scheduler; do
+  if pid="$(running_pid "$name")"; then stop_pid "$name" "$pid"; fi
 done
 
 start kube-controller-manager "$bin/kube-controller-manager" \

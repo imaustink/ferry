@@ -21,7 +21,8 @@ STATE="${STATE:-/tmp/ferry}"
 PURGE=""
 [ "${1:-}" = "--purge" ] && PURGE=1
 
-for name in kube-scheduler kube-controller-manager kube-apiserver etcd; do
+# COMPONENTS narrows it, for an upgrade that is keeping etcd running.
+for name in ${COMPONENTS:-kube-scheduler kube-controller-manager kube-apiserver etcd}; do
   pidfile="$STATE/$name.pid"
   [ -f "$pidfile" ] || continue
   pid="$(cat "$pidfile")"
