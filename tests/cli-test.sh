@@ -252,6 +252,12 @@ follower="$(sed -n '/^start_netpol_follower()/,/^}/p' "$repo/ferry")"
 server="192.168.1.29:$(( 6443 + PORT_SHIFT ))"
 eval "$(echo "$follower" | grep -m1 'local upstream=' | sed 's/^ *local //; s/ flags=() conf$//')"
 is "a joined Mac finds the peer port one above the API server's" "$upstream" "192.168.1.29:$NETPOL_PEER_PORT"
+# Measured before: pods on a Mac joined to a cluster on 10.182.0.0/16 were told
+# DNS was at 10.244.0.2, and resolved nothing.
+lacks "a joined Mac's DNS is not the default CIDR's whatever the cluster's" "$worker" 'clusterDNS: [10.244.0.2]'
+dns_line="$(echo "$worker" | grep -m1 'dns="${CLUSTER_CIDR')"
+CLUSTER_CIDR=10.182.0.0/16; dns=10.244.0.2; eval "$dns_line"
+is "  it is .2 of the first node's slice of the cluster's" "$dns" 10.182.0.2
 # Measured before: every kubelet credential in the cluster could list every
 # pod, which is wider than the Node authorizer allows. Nothing grants it now,
 # and a cluster that has it loses it.

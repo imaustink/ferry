@@ -2610,6 +2610,11 @@ start_worker() { # name index server(host:port)
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
   ok "runtime on $(node_slice "$index"), switch udp/$RELAY_PORT"
 
+  # The address the control plane's node reserves for CoreDNS: .2 of index 0's
+  # slice of the cluster CIDR. It was written as 10.244.0.2, which is right only
+  # for the default CIDR, so a Mac joined to any other had no DNS in its pods.
+  local dns=10.244.0.2
+  case "$CLUSTER_CIDR" in *.*.*.*/*) dns="${CLUSTER_CIDR%.*.*}.0.2" ;; esac
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -2634,7 +2639,7 @@ enforceNodeAllocatable: []
 failSwapOn: false
 readOnlyPort: 0
 clusterDomain: $CLUSTER_DOMAIN
-clusterDNS: [10.244.0.2]
+clusterDNS: [$dns]
 runtimeRequestTimeout: 10m
 authentication:
   x509: {clientCAFile: $FERRY_HOME/pki/ca.crt}
