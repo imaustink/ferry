@@ -52,6 +52,12 @@ final class AttachSink: OutputSink, @unchecked Sendable {
     func receive(_ data: Data, stream: LogStream) {
         socket.writeFrame(stream == .stderr ? .stderr : .stdout, data)
     }
+
+    /// The exit frame ends the client's session; ferry-streamer then closes
+    /// the connection, which ends the read loop in attach.
+    func ended(exitCode: Int32) {
+        socket.writeFrame(.exit, Data([UInt8(clamping: Int(exitCode))]))
+    }
 }
 
 /// Writes framed data to a socket. One instance per stream, sharing the

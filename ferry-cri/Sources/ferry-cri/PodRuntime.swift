@@ -2085,6 +2085,7 @@ actor PodRuntime {
         // Flush whatever the container wrote without a trailing newline.
         for writer in containers[id]?.logWriters ?? [] { try? writer.close() }
         containers[id]?.logFile?.close()
+        containers[id]?.logFile?.ended(exitCode: code)
         containers[id]?.state = .exited
         containers[id]?.exitCode = code
         containers[id]?.finishedAt = Self.now()
