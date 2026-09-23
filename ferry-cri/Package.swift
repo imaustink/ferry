@@ -24,6 +24,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationOCI", package: "containerization"),
+                .product(name: "ContainerizationArchive", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationExtras", package: "containerization"),
                 .product(name: "ContainerizationOS", package: "containerization"),

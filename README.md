@@ -297,7 +297,11 @@ cost time.
   PersistentVolume and an emptyDir are each an ext4 disk image attached to the
   pod's VM instead, so `chown` works on them: virtiofs is served as the Mac user, which cannot give a
   file away, and an init container that chowns its data directory — most
-  stateful charts have one — crashlooped forever on a share.
+  stateful charts have one — crashlooped forever on a share. An emptyDir with
+  `medium: Memory` is a tmpfs inside the pod's VM, sized by its `sizeLimit`,
+  and carried across the VM rebuilds that container restarts and init
+  containers cause. See
+  [experiments/30-volumes-and-logs](experiments/30-volumes-and-logs/FINDINGS.md).
 - ✅ **Resource limits and securityContext work.** The kubelet does not send
   `ContainerConfig.Linux` on darwin, so every pod silently ran unbounded with
   default capabilities; ferry's kubelet derives that code path for darwin.

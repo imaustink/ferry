@@ -81,6 +81,35 @@ type podContainers struct {
 	// with that one alone, so the main container's subPaths would only arrive
 	// after the format. The spec has them all at once.
 	VolumeSubPaths map[string][]string `json:"volumeSubPaths,omitempty"`
+	// Every emptyDir with medium: Memory, by volume name, and its sizeLimit in
+	// bytes -- 0 when it set none.
+	//
+	// The kubelet cannot say so itself: macOS has no tmpfs, so ferry's kubelet
+	// makes a memory-backed emptyDir a plain directory, and CRI then shows the
+	// runtime a host path like any other emptyDir's. Secrets, ConfigMaps and
+	// projected tokens take the same tmpfs path in the kubelet, so tagging it
+	// there would catch them too. The spec says exactly which volumes asked.
+	MemoryVolumes map[string]int64 `json:"memoryVolumes,omitempty"`
+}
+
+// memoryVolumes maps each emptyDir the pod asked to keep in memory to its
+// sizeLimit in bytes, 0 for none. Nil when there are none.
+func memoryVolumes(pod *v1.Pod) map[string]int64 {
+	var out map[string]int64
+	for _, volume := range pod.Spec.Volumes {
+		if volume.EmptyDir == nil || volume.EmptyDir.Medium != v1.StorageMediumMemory {
+			continue
+		}
+		if out == nil {
+			out = map[string]int64{}
+		}
+		var size int64
+		if volume.EmptyDir.SizeLimit != nil {
+			size = volume.EmptyDir.SizeLimit.Value()
+		}
+		out[volume.Name] = size
+	}
+	return out
 }
 
 // volumeSubPaths maps each PersistentVolume the pod mounts to the subPaths its
@@ -189,6 +218,7 @@ func servePodLookup(mux *http.ServeMux, pods *podLookup) {
 		}
 		out.MemoryLimitBytes, out.CPULimit = podResources(pod)
 		out.VolumeSubPaths = pods.volumeSubPaths(r.Context(), pod)
+		out.MemoryVolumes = memoryVolumes(pod)
 		for _, c := range pod.Spec.InitContainers {
 			out.InitContainers = append(out.InitContainers, c.Name)
 		}

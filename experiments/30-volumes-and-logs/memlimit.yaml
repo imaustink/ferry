@@ -1,0 +1,22 @@
+# A memory emptyDir with no sizeLimit in a pod with a memory limit: the tmpfs
+# is the limit's size, and the writes count against the container's cgroup.
+apiVersion: v1
+kind: Pod
+metadata: {name: memlimit}
+spec:
+  terminationGracePeriodSeconds: 0
+  restartPolicy: Never
+  containers:
+  - name: c
+    image: alpine:3.20
+    resources: {limits: {memory: 256Mi}}
+    command:
+    - sh
+    - -c
+    - |
+      df -h /mem | tail -1; free -m | sed -n 2p
+      dd if=/dev/zero of=/mem/a bs=1M count=128 2>/dev/null
+      echo "cgroup after 128MiB in tmpfs: $(( $(cat /sys/fs/cgroup/memory.current) / 1048576 )) MiB of $(( $(cat /sys/fs/cgroup/memory.max) / 1048576 ))"
+    volumeMounts: [{name: mem, mountPath: /mem}]
+  volumes:
+  - {name: mem, emptyDir: {medium: Memory}}
