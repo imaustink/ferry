@@ -95,7 +95,8 @@ let config = RuntimeConfig(
         let path = option("--cni-guest-plugins", "")
         return path.isEmpty ? nil : path
     }(),
-    execSocket: execSocketPath
+    execSocket: execSocketPath,
+    extraKernelArgs: option("--kernel-args", "").split(separator: " ").map(String.init)
 )
 
 guard FileManager.default.fileExists(atPath: config.kernelPath) else {

@@ -164,9 +164,27 @@ ferry_kubelet_inputs() { # version
   [ -f "$root/build-kubelet.sh" ] && [ -d "$root/patches/kubelet" ] || return 0
   (
     cd "$root" || exit 1
-    find patches/kubelet "patches/kubelet-$(ferry_version_mm "$1")" -type f -print0 2>/dev/null \
+    # SIGNATURES is what the build checks upstream against, not an input to
+    # the binary; recording it should not rebuild every kubelet.
+    find patches/kubelet "patches/kubelet-$(ferry_version_mm "$1")" -type f ! -name SIGNATURES -print0 2>/dev/null \
       | LC_ALL=C sort -z | xargs -0 shasum -a 256
     shasum -a 256 build-kubelet.sh lib/overlay.sh
+  ) | shasum -a 256 | cut -d' ' -f1
+}
+
+# The same for the guest kernel: ferry's patches and configuration and the
+# script that applies them, plus the upstream versions it names. A kernel that
+# predates a patch is not wrong in a way anything reports -- it boots, and the
+# pods it runs cost what the patch was written to save -- so this is the only
+# way to tell. Empty without the sources, as in an installed release.
+ferry_kernel_inputs() {
+  local root; root="$(ferry_root)"
+  [ -f "$root/kernel/build-kernel.sh" ] || return 0
+  (
+    cd "$root" || exit 1
+    find kernel/patches -type f -name '*.patch' -print0 2>/dev/null \
+      | LC_ALL=C sort -z | xargs -0 shasum -a 256
+    shasum -a 256 kernel/build-kernel.sh kernel/slim.config kernel/usb-storage.config
   ) | shasum -a 256 | cut -d' ' -f1
 }
 
