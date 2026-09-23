@@ -1455,11 +1455,18 @@ advertise_gpu() { # node-name [kubeconfig]
     return 0
   fi
 
-  local code
-  code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
-    -X PATCH -H "Content-Type: application/merge-patch+json" \
-    -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
-    "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+  # A joined kubelet has its certificate a moment before it has registered its
+  # Node, and a patch in between is a 404 (measured on a rejoin), so that one
+  # answer is waited out.
+  local code _
+  for _ in $(seq 1 30); do
+    code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
+      -X PATCH -H "Content-Type: application/merge-patch+json" \
+      -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
+      "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+    [ "$code" = 404 ] || break
+    sleep 1
+  done
   if [ "$code" = "200" ]; then
     ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
   else
