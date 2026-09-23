@@ -118,6 +118,10 @@ ok "cli, control plane scripts, manifests, addons and the Machine CRD"
 # 15MB spent on making the product worse.
 [ -f "$root/kernel/vmlinux-arm64" ] \
   || die "no guest kernel at kernel/vmlinux-arm64 -- run: ./ferry kernel (slow, needs docker)"
+# A kernel from before a patch boots and works, and quietly costs every pod what
+# the patch saved -- 75 MiB each, for the read-ahead one -- so it is not shipped.
+[ "$(FERRY_ROOT="$root" ferry_kernel_inputs)" = "$(cat "$root/kernel/vmlinux-arm64.inputs" 2>/dev/null)" ] \
+  || die "kernel/vmlinux-arm64 was built from other patches or configuration -- run: ./ferry kernel"
 mkdir -p "$dir/kernel"
 cp "$root/kernel/vmlinux-arm64" "$dir/kernel/"
 ok "guest kernel with NAT support"

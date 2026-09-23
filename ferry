@@ -193,16 +193,28 @@ SWIFT_RECOMMENDED=6.4
 #
 # The kubelet's default is 110 and the hypervisor stops at 128 virtual machines,
 # so the count looked like the binding limit. It is not: a pod here is a VM, and
-# an idle one costs 226 MiB of host memory before the workload does anything --
-# measured flat at 8, 20, 24 and 40 pods, and unmoved by --pod-memory-mib, so it
-# is the price of a kernel rather than a pod using its allowance. 110 of those is
-# 24 GiB, which is three quarters of a 32 GiB machine spent on kernels.
+# an idle one costs host memory before the workload does anything -- 226 MiB
+# until experiment 32, and 133 MiB since, measured flat at 20 and 60 pods. Most
+# of what went was the guest reading 8 MiB around every page fault into its two
+# 83 MiB agent binaries, which the host keeps once touched; the rest was a
+# kernel carrying a display stack and a hypervisor of its own.
 #
-# So memory decides, and advertising 110 on a machine that cannot hold 110 asks
-# the scheduler to place pods that will fail to start. Half of RAM is the budget
-# for that overhead, which leaves the other half for the workloads themselves.
-# FERRY_MAX_PODS overrides it for anyone who would rather find the wall.
-pod_overhead_mib=226
+# The figure is for the default 512 MiB VM. A bigger one costs about 21 MiB
+# more per GiB it is given, touched or not -- the kernel's page map, zeroed at
+# boot -- so a pod with a 4 GiB limit (a 4.25 GiB VM) is nearer 210 MiB.
+#
+# So memory can still decide, and advertising 110 on a machine that cannot hold
+# 110 asks the scheduler to place pods that will fail to start. Half of RAM is
+# the budget for that overhead, which leaves the other half for the workloads
+# themselves: 110 from 32 GiB up, 61 on a 16 GiB Mac. FERRY_MAX_PODS overrides
+# it for anyone who would rather find the wall.
+pod_overhead_mib=133
+# A checkout whose kernel predates that work still pays the old price, and
+# should not promise pods it cannot hold. A release ships a current kernel.
+if [ ! -f "$here/VERSION" ] \
+  && [ "$(ferry_kernel_inputs)" != "$(cat "$here/kernel/vmlinux-arm64.inputs" 2>/dev/null)" ]; then
+  pod_overhead_mib=226
+fi
 default_max_pods="$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 2 / pod_overhead_mib ))"
 [ "$default_max_pods" -gt 110 ] && default_max_pods=110
 [ "$default_max_pods" -lt 1 ] && default_max_pods=1
@@ -689,6 +701,13 @@ cmd_doctor() {
 
   if [ -f "$NAT_KERNEL" ]; then
     ok "guest kernel with NAT support — Services route inside pods, no root needed"
+    # Only a checkout has the inputs to compare, and only a kernel from before
+    # the record lacks one.
+    local kinputs; kinputs="$(ferry_kernel_inputs)"
+    if [ -n "$kinputs" ] && [ "$kinputs" != "$(cat "$NAT_KERNEL.inputs" 2>/dev/null)" ]; then
+      warn "the guest kernel was built from other patches or configuration; every pod"
+      echo "      may be paying for what they fix. Rebuild with: ./ferry kernel"
+    fi
   else
     warn "guest kernel without NAT (kata); Services will route through the host,"
     echo "      which needs root. Build one with: ./kernel/build-kernel.sh"

@@ -1,0 +1,26 @@
+virtio-blk: do not call every virtual disk a spinning one
+
+A virtio disk that reports no optimal I/O size is marked rotational, and the
+block layer then sets read-ahead to twice the largest request: 8 MiB here.
+Page faults on a mapped file read around by the same window, so vminitd and
+vmexec -- 83 MiB static binaries that need 20-25 MiB each -- arrived in the
+guest's page cache at 60 MiB each. 120 MiB of every idle pod VM's 226 MiB was
+that cache (experiments/32-pod-memory-footprint), and the host keeps every
+guest page it has backed, reclaimable or not.
+
+Without the flag read-ahead is the kernel's 128 KiB default. The disks are
+files on the Mac's SSD, so the flag's other meanings (seek-avoiding I/O
+scheduling, entropy from disk timing) never applied either. What it costs is
+a cold sequential read of a large file, measured at about 3.0 GB/s against
+4.9; a privileged pod that wants the rest can raise read_ahead_kb itself.
+
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -1431,7 +1431,6 @@
+ {
+ 	struct virtio_blk *vblk;
+ 	struct queue_limits lim = {
+-		.features		= BLK_FEAT_ROTATIONAL,
+ 		.logical_block_size	= SECTOR_SIZE,
+ 	};
+ 	int err, index;
