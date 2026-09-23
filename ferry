@@ -1819,8 +1819,13 @@ start_proxy() {
   fi
 
   # NodePort and LoadBalancer are the outside edge of a Service and always live
-  # on the Mac, whichever way ClusterIPs are handled. Node ports need no
-  # privilege; a LoadBalancer port below 1024 does, and ferry-proxy says so.
+  # on the Mac, whichever way ClusterIPs are handled. Neither needs privilege,
+  # 80 and 443 included: a LoadBalancer listens on the wildcard, which macOS
+  # lets anyone bind below 1024, and answers only at $LAN_IP and loopback.
+  #
+  # The edge also holds outside clients to NetworkPolicy, by the address they
+  # connected from. A pod sees all of them arrive from this Mac, which it has to
+  # exempt for the kubelet's probes, so this is the only place that can.
   local lb="$LAN_IP"
   [ "$lb" = "127.0.0.1" ] && lb=""
 
@@ -1831,15 +1836,15 @@ start_proxy() {
     fi
     sudo "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --cluster-ips --node-ports --node-name "$NODE_NAME" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     sleep 2
-    local pid; pid="$(pgrep -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" | head -1)"
+    local pid; pid="$(pgrep -f "$here/bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" | head -1)"
   else
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_HOME/admin.conf" \
       --node-ports --node-name "$NODE_NAME" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     local pid=$!
@@ -3460,11 +3465,12 @@ ferry_builder_up() {
 # is no proxy in between to say no.
 #
 # An ingress policy selecting nothing denies every pod. The Mac keeps working
-# without being named, because ferry-netpol exempts each node's own address on
-# the pod network from ingress policy before any rule is consulted
-# (ferry-netpol/compile.go:164) -- it has to, or a kubelet probe could not
-# reach a pod that denies ingress. So "deny all pods, allow the developer" is
-# the empty policy, and nothing here has to know the gateway's address.
+# without being named, because ferry-netpol exempts a pod's own node's address
+# on the pod network from ingress policy before any rule is consulted
+# (writeIngressGuards in ferry-netpol/compile.go) -- it has to, or a kubelet
+# probe could not reach a pod that denies ingress. So "deny all pods, allow the
+# developer" is the empty policy, and nothing here has to know the gateway's
+# address.
 #
 # This is enforcement in the builder's own kernel, not advice: ferry-netpol
 # compiles it to nftables and ferry-cri loads it into that pod

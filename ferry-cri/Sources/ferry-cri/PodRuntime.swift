@@ -1004,6 +1004,31 @@ actor PodRuntime {
         """
     }
 
+    /// SCTP between two pods on one node, which vmnet does not carry.
+    ///
+    /// Same-node traffic leaves by eth0, and vmnet drops IP protocol 132:
+    /// measured, an SCTP association between two pods on one node timed out
+    /// while the same pods reached each other across nodes, over eth1, in about
+    /// a millisecond. eth1 is ferry's own switch, which never looks above the
+    /// Ethernet header, and every pod on the node is on it too. So SCTP bound
+    /// for the cluster network is handed to eth1 on its way out of eth0. A rule
+    /// in every pod covers both directions, and the ClusterIP path, because
+    /// the egress hook runs after the Service's DNAT has chosen the pod.
+    ///
+    /// Kept out of the Service ruleset so that a kernel without the egress hook
+    /// costs SCTP and nothing else. Only with a switch, since eth1 is named.
+    private func sctpDetourRule() -> String? {
+        guard podSwitch != nil, let cidr = config.clusterCIDR else { return nil }
+        return """
+        add table netdev ferry-sctp
+        delete table netdev ferry-sctp
+        add table netdev ferry-sctp
+        add chain netdev ferry-sctp egress { type filter hook egress device "eth0" priority 0 ; }
+        add rule netdev ferry-sctp egress meta l4proto sctp ip daddr \(cidr) fwd ip to ip daddr device "eth1"
+
+        """
+    }
+
     /// Applies the current ruleset to one pod. Quiet on failure: a pod that
     /// cannot reach Services is worth a log line, not a failed start.
     func applyServiceRules(sandboxID: String, ruleset: Data) async {
@@ -1088,14 +1113,16 @@ actor PodRuntime {
         }) else { return }
 
         // A host port of 0 is explicitly "do not expose this", not "pick one",
-        // and portmap has no SCTP backend -- so both are dropped here rather
-        // than turned into a rule that means something else.
+        // so it is dropped here rather than turned into a rule that means
+        // something else. SCTP is passed through: portmap's nftables backend
+        // writes "sctp dport", and the guest kernel has SCTP. (Whether portmap
+        // gets as far as writing anything is another matter; see hostPortMap.)
         let mappings = sandbox.config.portMappings
-            .filter { $0.hostPort > 0 && $0.protocol != .sctp }
+            .filter { $0.hostPort > 0 }
             .map {
                 CNIPortMapping(hostPort: $0.hostPort,
                                containerPort: $0.containerPort,
-                               protocol: $0.protocol == .udp ? "udp" : "tcp",
+                               protocol: Self.portProtocol($0.protocol),
                                hostIP: $0.hostIp.isEmpty ? nil : $0.hostIp)
             }
         switch verb {
@@ -1202,6 +1229,14 @@ actor PodRuntime {
     /// node's vmnet subnet is its slice of the pod network, and the Mac is on it.
     func sandboxAddress(_ id: String) -> String? { sandboxes[id]?.ip }
 
+    static func portProtocol(_ p: Runtime_V1_Protocol) -> String {
+        switch p {
+        case .udp: "udp"
+        case .sctp: "sctp"
+        default: "tcp"
+        }
+    }
+
     private func publishHostPorts() {
         try? hostPortMap().write(
             to: config.stateDir.appending(component: "hostports"),
@@ -1209,21 +1244,28 @@ actor PodRuntime {
     }
 
     /// Every hostPort a pod on this node asked for, as
-    /// "<host address> <port> <protocol> <the pod's address>".
+    /// "<host address> <port> <protocol> <the pod's address> <container port>".
     ///
     /// This is the other half of hostPort. portmap puts the mapping inside the
     /// pod, which makes it real on the pod's own addresses; Kubernetes means
     /// the *node's* address, and the node here is the Mac. So ferry-proxy
-    /// listens and forwards to the pod at the same port, where portmap's rule
-    /// is waiting to rewrite it to the container port.
+    /// listens there and forwards to the pod.
+    ///
+    /// It forwards to the container port, not the host port. It used to send
+    /// the host port on for portmap's rule to rewrite, which only worked when
+    /// the two were equal: portmap runs nft by PATH, and /.ferry/nft needs the
+    /// loader and library path ferry passes when it runs nft itself, so the
+    /// rule was never written and 5001->5000 arrived at 5001.
     func hostPortMap() -> String {
         var lines: [String] = []
         for sandbox in sandboxes.values where sandbox.ready && !sandbox.ip.isEmpty {
             for mapping in sandbox.config.portMappings
-            where mapping.hostPort > 0 && mapping.protocol != .sctp {
+            where mapping.hostPort > 0 {
+                // ferry-proxy cannot serve an sctp line -- macOS has no SCTP
+                // sockets -- and says so, rather than it vanishing here.
                 let host = mapping.hostIp.isEmpty ? "*" : mapping.hostIp
-                let proto = mapping.protocol == .udp ? "udp" : "tcp"
-                lines.append("\(host) \(mapping.hostPort) \(proto) \(sandbox.ip)")
+                let proto = Self.portProtocol(mapping.protocol)
+                lines.append("\(host) \(mapping.hostPort) \(proto) \(sandbox.ip) \(mapping.containerPort)")
             }
         }
         return lines.sorted().joined(separator: "\n") + "\n"
@@ -1914,6 +1956,9 @@ actor PodRuntime {
             Task { [weak self] in
                 await self?.applyNftables(sandboxID: sandboxID, text: policy, label: "policy")
             }
+        }
+        if let detour = sctpDetourRule() {
+            Task { [weak self] in await self?.applyNftables(sandboxID: sandboxID, text: detour, label: "SCTP") }
         }
         // And the rest of the pod's CNI chain, which needed a booted kernel.
         // Detached for the same reason the rules are: it dials back into this

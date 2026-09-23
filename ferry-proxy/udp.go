@@ -10,12 +10,20 @@ package main
 // UDP has no connections, so "which reply belongs to whom" has to be kept here:
 // each client address gets a socket to the backend, and whatever comes back on
 // it goes to that client. Sessions expire, because nothing closes them.
+//
+// A listener narrowed to some addresses (see newServiceProxy) is a wildcard
+// socket, which UDP cannot filter at accept time because there is no accept.
+// So each datagram says where it was sent, and the reply goes out from that
+// same address -- a client that asked 192.168.1.20 must hear back from it, not
+// from whichever address the route would have picked.
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
+	"golang.org/x/net/ipv4"
 	"k8s.io/klog/v2"
 )
 
@@ -25,6 +33,8 @@ type udpProxy struct {
 	key      string
 	listen   string
 	conn     *net.UDPConn
+	narrowed *ipv4.PacketConn // set when only is: carries each datagram's destination
+	only     localAddresses
 	backends *serviceProxy // reuses the same backend list and round-robin
 
 	mu       sync.Mutex
@@ -33,22 +43,34 @@ type udpProxy struct {
 }
 
 type udpSession struct {
-	out  *net.UDPConn
-	seen time.Time
+	out   *net.UDPConn
+	seen  time.Time
+	local net.IP // where the client sent to, and so where replies come from
 }
 
-func newUDPProxy(key, address string, port int32, backends *serviceProxy) (*udpProxy, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(address, itoa(port)))
+func newUDPProxy(key, address string, port int32, backends *serviceProxy, only localAddresses) (*udpProxy, error) {
+	network := "udp"
+	if only != nil {
+		network = "udp4" // IP_RECVDSTADDR is an IPv4 option
+	}
+	addr, err := net.ResolveUDPAddr(network, net.JoinHostPort(address, itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP(network, addr)
 	if err != nil {
 		return nil, err
 	}
 	p := &udpProxy{
-		key: key, listen: conn.LocalAddr().String(), conn: conn,
+		key: key, listen: conn.LocalAddr().String(), conn: conn, only: only,
 		backends: backends, sessions: map[string]*udpSession{},
+	}
+	if only != nil {
+		p.narrowed = ipv4.NewPacketConn(conn)
+		if err := p.narrowed.SetControlMessage(ipv4.FlagDst, true); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	go p.serve()
 	go p.expire()
@@ -58,11 +80,26 @@ func newUDPProxy(key, address string, port int32, backends *serviceProxy) (*udpP
 func (p *udpProxy) serve() {
 	buffer := make([]byte, 64*1024)
 	for {
-		n, from, err := p.conn.ReadFromUDP(buffer)
-		if err != nil {
-			return
+		var n int
+		var from *net.UDPAddr
+		var local net.IP
+		if p.narrowed != nil {
+			count, cm, source, err := p.narrowed.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			if cm == nil || !p.only.hasIP(netipFrom(cm.Dst)) {
+				continue // sent to an address this Service is not published on
+			}
+			n, from, local = count, source.(*net.UDPAddr), cm.Dst
+		} else {
+			count, source, err := p.conn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			n, from = count, source
 		}
-		session, err := p.sessionFor(from)
+		session, err := p.sessionFor(from, local)
 		if err != nil {
 			continue
 		}
@@ -74,8 +111,9 @@ func (p *udpProxy) serve() {
 
 // sessionFor gives each client its own socket to a backend, so replies can be
 // told apart. Choosing the backend once per client also keeps a conversation
-// with one of them rather than spreading it across several.
-func (p *udpProxy) sessionFor(client *net.UDPAddr) (*udpSession, error) {
+// with one of them rather than spreading it across several -- and means policy
+// is checked once per conversation, not once per datagram.
+func (p *udpProxy) sessionFor(client *net.UDPAddr, local net.IP) (*udpSession, error) {
 	key := client.String()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -87,6 +125,11 @@ func (p *udpProxy) sessionFor(client *net.UDPAddr) (*udpSession, error) {
 	if !ok {
 		return nil, errNoBackends
 	}
+	if !admits(backend.pod, "udp", clientAddr(client), backend.hostPort) {
+		klog.V(2).InfoS("Refused by NetworkPolicy", "service", p.key,
+			"client", key, "endpoint", backend.address)
+		return nil, errRefused
+	}
 	addr, err := net.ResolveUDPAddr("udp", backend.address)
 	if err != nil {
 		return nil, err
@@ -95,7 +138,7 @@ func (p *udpProxy) sessionFor(client *net.UDPAddr) (*udpSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	session := &udpSession{out: out, seen: time.Now()}
+	session := &udpSession{out: out, seen: time.Now(), local: local}
 	p.sessions[key] = session
 	go p.relay(client, session)
 	return session, nil
@@ -103,13 +146,22 @@ func (p *udpProxy) sessionFor(client *net.UDPAddr) (*udpSession, error) {
 
 func (p *udpProxy) relay(client *net.UDPAddr, session *udpSession) {
 	buffer := make([]byte, 64*1024)
+	var reply *ipv4.ControlMessage
+	if session.local != nil {
+		reply = &ipv4.ControlMessage{Src: session.local}
+	}
 	for {
 		_ = session.out.SetReadDeadline(time.Now().Add(udpSessionIdle))
 		n, err := session.out.Read(buffer)
 		if err != nil {
 			return
 		}
-		if _, err := p.conn.WriteToUDP(buffer[:n], client); err != nil {
+		if reply != nil {
+			_, err = p.narrowed.WriteTo(buffer[:n], reply, client)
+		} else {
+			_, err = p.conn.WriteToUDP(buffer[:n], client)
+		}
+		if err != nil {
 			return
 		}
 	}
@@ -141,4 +193,9 @@ func (p *udpProxy) close() {
 		session.out.Close()
 		delete(p.sessions, key)
 	}
+}
+
+func netipFrom(ip net.IP) netip.Addr {
+	a, _ := netip.AddrFromSlice(ip)
+	return a.Unmap()
 }
