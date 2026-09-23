@@ -1,0 +1,90 @@
+#!/bin/bash
+# FlexVolume driver ferry.dev/block: a ferry-local-block claim, mounted.
+#
+# A machine's devices are fixed at boot, except a USB disk. When a pod with a
+# ferry-local-block claim is scheduled here, ferry-machined on the Mac lists the
+# claim's image for this machine and ferry-node attaches it over USB, labelled
+# with the claim. This finds that disk by its label, mounts it once under
+# /var/lib/ferry-block/<label>, and bind-mounts it into each pod that uses the
+# claim -- so every pod on this node shares one mount of one filesystem, which
+# is ReadWriteOnce as Kubernetes defines it, and ownership is real because the
+# filesystem is this kernel's rather than a virtiofs share served as the Mac
+# user.
+#
+# Attaching is not this driver's job ("attach": false): the disk lives on the
+# Mac and the Mac decides which machine has it. So mount waits for the disk to
+# appear, and says why when it does not.
+#
+#   init
+#   mount   <mount-dir> <json-options>
+#   unmount <mount-dir>
+set -u
+STAGE=/var/lib/ferry-block
+
+reply() { printf '%s\n' "$1"; exit "${2:-0}"; }
+fail() { reply "{\"status\":\"Failure\",\"message\":\"ferry.dev/block: $1\"}" 1; }
+
+case "${1:-}" in
+init)
+  reply '{"status":"Success","capabilities":{"attach":false,"selinuxRelabel":false}}' ;;
+
+mount)
+  dir="${2:-}" opts="${3:-}"
+  [ -n "$dir" ] || fail "no mount directory"
+  label="$(printf '%s' "$opts" | jq -r '.label // empty')"
+  [ -n "$label" ] || fail "the volume names no disk label"
+  mode="$(printf '%s' "$opts" | jq -r '."kubernetes.io/readwrite" // "rw"')"
+  stage="$STAGE/$label"
+  if ! mountpoint -q "$stage"; then
+    # About one second after ferry-node attaches it; up to a minute here for
+    # the Mac to decide, which covers a first attach that formats the image.
+    dev=""
+    for _ in $(seq 1 600); do
+      dev="$(blkid -c /dev/null -o device -t LABEL="$label" 2>/dev/null | head -1)"
+      [ -n "$dev" ] && break
+      sleep 0.1
+    done
+    [ -n "$dev" ] || fail "disk $label is not attached to this machine; if another machine's pod has this claim, this one waits for it to stop"
+    mkdir -p "$stage"
+    out="$(mount -t ext4 "$dev" "$stage" 2>&1)" || fail "cannot mount $dev: $out"
+    # A lease beside the image, in the volumes share the Mac sees too: this
+    # machine has the filesystem mounted. ferry-machined does not detach a
+    # disk while its lease names the machine holding it, so a pod deleted
+    # with --force -- gone from the API while its kubelet has not yet
+    # unmounted -- cannot have its disk pulled out from under a mount.
+    image="$(printf '%s' "$opts" | jq -r '.image // empty')"
+    if [ -n "$image" ]; then
+      printf '%s\n' "$image" > "$stage.image"
+      hostname > "$(dirname "$image")/.ferry-mounted"
+    fi
+  fi
+  mkdir -p "$dir"
+  out="$(mount --bind "$stage" "$dir" 2>&1)" || fail "cannot bind $stage: $out"
+  if [ "$mode" = ro ]; then mount -o remount,bind,ro "$dir" 2>/dev/null; fi
+  reply '{"status":"Success"}' ;;
+
+unmount)
+  dir="${2:-}"
+  [ -n "$dir" ] || fail "no mount directory"
+  if mountpoint -q "$dir"; then
+    dev="$(findmnt -n -o SOURCE --target "$dir" | sed 's/\[.*//')"
+    out="$(umount "$dir" 2>&1)" || fail "cannot unmount $dir: $out"
+    # The last pod on this node to let go unmounts the filesystem itself, so
+    # the disk is clean before ferry-machined asks for it to be detached.
+    if [ -n "$dev" ] && [ "$(findmnt -n -o TARGET -S "$dev" | grep -vc "^$STAGE/")" = 0 ]; then
+      for stage in $(findmnt -n -o TARGET -S "$dev" | grep "^$STAGE/"); do
+        umount "$stage" 2>/dev/null || continue
+        rmdir "$stage" 2>/dev/null
+        # Clean, so the lease goes and the Mac may take the disk away.
+        if [ -f "$stage.image" ]; then
+          rm -f "$(dirname "$(cat "$stage.image")")/.ferry-mounted" "$stage.image"
+        fi
+      done
+    fi
+  fi
+  rmdir "$dir" 2>/dev/null
+  reply '{"status":"Success"}' ;;
+
+*)
+  reply '{"status":"Not supported"}' ;;
+esac

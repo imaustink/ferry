@@ -71,6 +71,13 @@ echo "==> compiling (this takes a while)"
 stage="$work/stage"
 rm -rf "$stage"; mkdir -p "$stage"
 cp "$src/config-arm64" "$src/build.sh" "$stage/"
+# USB mass storage, always: the one way a disk reaches a VM that is already
+# running, which is how a ferry-local-block claim reaches a machine. Nine
+# symbols, and they cost a pod VM nothing measurable -- the drivers probe only
+# when there is a USB controller, and only machines are given one (experiment
+# 33).
+echo "==> adding usb-storage.config"
+{ echo; cat "$here/usb-storage.config"; } >> "$stage/config-arm64"
 if [ -n "${CONFIG_FRAGMENT:-}" ]; then
   echo "==> adding $(basename "$CONFIG_FRAGMENT")"
   { echo; cat "$CONFIG_FRAGMENT"; } >> "$stage/config-arm64"

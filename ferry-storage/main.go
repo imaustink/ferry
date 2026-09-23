@@ -45,6 +45,7 @@ func main() {
 	root := flag.String("root", "", "directory on this Mac to keep volumes in")
 	className := flag.String("class", "ferry-local", "name of the StorageClass to offer")
 	makeDefault := flag.Bool("default", true, "mark that class default, so a claim without one still binds")
+	blockClass := flag.String("block-class", "", "also offer this class, whose single-writer claims are disks on machines too")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -71,7 +72,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := &provisioner{client: client, node: *nodeName, root: *root, class: *className}
+	p := &provisioner{client: client, node: *nodeName, root: *root, class: *className, blockClass: *blockClass}
 	p.ensureClass(ctx, *makeDefault)
 
 	factory := informers.NewSharedInformerFactory(client, 5*time.Minute)

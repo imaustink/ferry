@@ -23,7 +23,9 @@ import (
 	"time"
 
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -107,6 +109,36 @@ func main() {
 	log.Printf("    state   %s", *stateDir)
 	log.Printf("    machines %s", *machinesDir)
 
+	// Pods, claims and volumes from a cache rather than listed every tick:
+	// deciding which machine holds which disk reads all three, twice a second
+	// would be a list of every pod in the cluster.
+	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
+	disks := &attacher{
+		pods:    factory.Core().V1().Pods().Lister(),
+		claims:  factory.Core().V1().PersistentVolumeClaims().Lister(),
+		volumes: factory.Core().V1().PersistentVolumes().Lister(),
+	}
+	// A pod scheduled onto a machine is waiting on its disk from that moment,
+	// so a pod or claim change reconciles the disks at once rather than at the
+	// next tick: the tick alone was a second on average added to every pod
+	// start with a block claim.
+	kick := make(chan struct{}, 1)
+	poke := func() {
+		select {
+		case kick <- struct{}{}:
+		default:
+		}
+	}
+	handler := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { poke() },
+		UpdateFunc: func(_, _ any) { poke() },
+		DeleteFunc: func(any) { poke() },
+	}
+	factory.Core().V1().Pods().Informer().AddEventHandler(handler)
+	factory.Core().V1().PersistentVolumeClaims().Informer().AddEventHandler(handler)
+	factory.Start(ctx.Done())
+	factory.WaitForCacheSync(ctx.Done())
+
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {
@@ -116,10 +148,21 @@ func main() {
 			// life should depend on, and the next one adopts them.
 			log.Printf("exiting; %d machine(s) keep running", len(controller.machines))
 			return
+		case <-kick:
+			names := map[string]bool{}
+			for name := range controller.machines {
+				names[name] = true
+			}
+			disks.reconcile(names)
 		case <-ticker.C:
 			if err := controller.reconcileAll(ctx); err != nil {
 				log.Printf("reconcile: %v", err)
 			}
+			names := map[string]bool{}
+			for name := range controller.machines {
+				names[name] = true
+			}
+			disks.reconcile(names)
 		}
 	}
 }

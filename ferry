@@ -256,6 +256,14 @@ POD_MEMORY_MIB="${FERRY_POD_MEMORY_MIB:-512}"
 NAT_KERNEL="$here/kernel/vmlinux-arm64"
 FALLBACK_KERNEL="$here/experiments/03-vm-ceiling/assets/vmlinux-arm64"
 if [ -f "$NAT_KERNEL" ]; then KERNEL="$NAT_KERNEL"; else KERNEL="$FALLBACK_KERNEL"; fi
+# Whether the kernel can take a disk after boot: USB mass storage, the one
+# device Virtualization.framework attaches to a running VM (experiment 26).
+# kernel/usb-storage.config puts it in every kernel 'ferry kernel' builds; one
+# built before that has none, and a machine given a disk it has no driver for
+# would leave its pod waiting on a mount that never comes. So the class that
+# needs it is offered only when the kernel carries it.
+kernel_attaches_disks() { grep -qa "usb-storage" "$KERNEL" 2>/dev/null; }
+BLOCK_CLASS="${FERRY_BLOCK_CLASS:-ferry-local-block}"
 CLUSTER_DOMAIN="${FERRY_CLUSTER_DOMAIN:-cluster.local}"
 COREDNS_IMAGE="${FERRY_COREDNS_IMAGE:-docker.io/coredns/coredns:1.11.3}"
 
@@ -1411,6 +1419,7 @@ start_machines() {
   # machines at a registry that is not running.
   FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
   FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
+  FERRY_NODE_USB="$(kernel_attaches_disks && echo 1)" \
   "$here/bin/ferry-node" serve \
     --dir "$FERRY_RUN/machines" --kernel "$KERNEL" \
     --ca "$FERRY_HOME/pki/ca.crt" \
@@ -1708,6 +1717,7 @@ start_storage() {
   [ -x "$here/bin/ferry-storage" ] || { warn "ferry-storage not built; PersistentVolumeClaims will stay Pending"; return 0; }
   "$here/bin/ferry-storage" --kubeconfig "$FERRY_HOME/admin.conf" \
     --node-name "$NODE_NAME" --root "$FERRY_HOME/volumes" \
+    $(kernel_attaches_disks && echo "--block-class $BLOCK_CLASS") \
     >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-storage.pid"
   for _ in $(seq 1 30); do
@@ -1716,6 +1726,8 @@ start_storage() {
   done
   if grep -q "serving" "$FERRY_RUN/logs/ferry-storage.log" 2>/dev/null; then
     ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
+    kernel_attaches_disks && machines_enabled \
+      && ok "$BLOCK_CLASS: ReadWriteOnce claims that are disks on machines too, chown and all"
   else
     warn "ferry-storage did not start; see $FERRY_RUN/logs/ferry-storage.log"
   fi
@@ -2467,6 +2479,7 @@ EOF
   if [ -x "$here/bin/ferry-storage" ]; then
     "$here/bin/ferry-storage" --kubeconfig "$FERRY_RUN/kubelet.conf" \
       --node-name "$name" --root "$FERRY_HOME/volumes" --default=false \
+      $(kernel_attaches_disks && echo "--block-class $BLOCK_CLASS") \
       >"$FERRY_RUN/logs/ferry-storage.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-storage.pid"
     ok "PersistentVolumeClaims bind to $FERRY_HOME/volumes"
