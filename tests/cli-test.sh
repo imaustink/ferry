@@ -183,6 +183,16 @@ contains "and ferry build builds the registry" \
   "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-registry"'
 echo
 
+# --- NetworkPolicy on a kernel without nf_tables ------------------------------
+
+printf '\033[1m%s\033[0m\n' "NetworkPolicies are only called enforced where they can be"
+# The fallback kernel has no nf_tables, and 'ferry up' said "enforced" on it
+# while every rule apply in every pod failed.
+netpol="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+contains "the fallback kernel is told apart" "$netpol" '[ "$KERNEL" != "$NAT_KERNEL" ]'
+contains "  and said out loud" "$netpol" "NetworkPolicies NOT enforced"
+echo
+
 # --- ferry up on a running cluster -------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "ferry up on a cluster that is already up"

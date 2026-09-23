@@ -1300,8 +1300,18 @@ start_netpol() { # [kubeconfig]
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
   ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
-  [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
-    || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+  if [ ! -S "$FERRY_NETPOL_SOCK" ]; then
+    warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+  elif [ "$KERNEL" != "$NAT_KERNEL" ]; then
+    # The rules are rendered and sent either way; what enforces them is nft in
+    # the pod's kernel, and the fallback kernel has no nf_tables -- every apply
+    # fails with "cache initialization failed" in ferry-cri's log. This said
+    # "enforced" regardless, which is the silent-ignore it exists to prevent.
+    warn "NetworkPolicies NOT enforced: the guest kernel has no nf_tables"
+    echo "      Build one with: ferry kernel"
+  else
+    ok "NetworkPolicies enforced in the pods"
+  fi
 }
 
 # What a node's certificate needs for ferry-netpol to run as it. Made by
