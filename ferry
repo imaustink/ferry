@@ -4363,10 +4363,13 @@ cmd_down() {
   # Written before anything is stopped, so the login agent's watch loop cannot
   # see the processes go and exit non-zero before it knows this was deliberate.
   mark_stopped
-  # ferry-proxy runs as root, so stopping it does too.
+  # ferry-proxy runs as root only when it binds ClusterIPs, so stopping it
+  # takes sudo only then. Always asking meant a 'ferry down' without sudo -- a
+  # worker's, which nothing else matches -- left an unprivileged one running.
   if [ -f "$FERRY_RUN/ferry-proxy.pid" ]; then
-    local proxy_pid; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
-    sudo kill -TERM "$proxy_pid" 2>/dev/null \
+    local proxy_pid as=""; proxy_pid="$(cat "$FERRY_RUN/ferry-proxy.pid")"
+    ps -p "$proxy_pid" >/dev/null 2>&1 && ! kill -0 "$proxy_pid" 2>/dev/null && as=sudo
+    $as kill -TERM "$proxy_pid" 2>/dev/null \
       && ok "Service proxy stopped"
     rm -f "$FERRY_RUN/ferry-proxy.pid"
     # Waited for rather than slept through, but briefly and then forced.
@@ -4385,7 +4388,7 @@ cmd_down() {
     [ -n "$purge" ] || for _ in 1 2; do
       kill -0 "$proxy_pid" 2>/dev/null || break; sleep 0.05
     done
-    sudo kill -KILL "$proxy_pid" 2>/dev/null
+    $as kill -KILL "$proxy_pid" 2>/dev/null
   fi
   # Extra nodes first: each is a kubelet, a runtime and a streamer of its own.
   local index
