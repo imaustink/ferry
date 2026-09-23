@@ -100,33 +100,81 @@ func (c *compiler) slicePrefixes() map[string]int {
 // It also produces the edge document ferry-proxy polices connections from
 // outside the cluster with. Both come from the same resolved rules, so the pod
 // and the edge cannot disagree about what a policy means.
+//
+// This is the whole cluster's, which is what this Mac's own nodes are served.
+// Another Mac is served its own nodes' part of the same compilation.
 func (c *compiler) render() (string, []byte) {
-	pods, err := c.pods.List(labels.Everything())
+	r, err := c.compile()
 	if err != nil {
 		return "", nil
+	}
+	return r.rules(nil), r.edge(nil)
+}
+
+// compiled is one pod's part of a compilation.
+type compiled struct {
+	node    string
+	address string
+	nft     string
+	edge    *edgePod // nil: nothing isolates it for ingress
+}
+
+// rendered is a compilation, in address order, split by pod so that it can be
+// served a node at a time.
+type rendered []compiled
+
+// rules is the pod rules for the nodes keep accepts, or for every node.
+func (r rendered) rules(keep func(node string) bool) string {
+	var out strings.Builder
+	for _, p := range r {
+		if keep == nil || keep(p.node) {
+			fmt.Fprintf(&out, "## %s\n%s\n", p.address, p.nft)
+		}
+	}
+	return out.String()
+}
+
+// edge is the edge document for the nodes keep accepts, or for every node.
+func (r rendered) edge(keep func(node string) bool) []byte {
+	document := edgeDocument{Pods: map[string]edgePod{}}
+	for _, p := range r {
+		if p.edge != nil && (keep == nil || keep(p.node)) {
+			document.Pods[p.address] = *p.edge
+		}
+	}
+	out, _ := json.Marshal(document) // map keys are sorted, so equal input is equal output
+	return out
+}
+
+// compile fails rather than returning less: an empty compilation is a cluster
+// with no policies, and publishing one opens every pod.
+func (c *compiler) compile() (rendered, error) {
+	pods, err := c.pods.List(labels.Everything())
+	if err != nil {
+		return nil, err
 	}
 	policies, err := c.policies.List(labels.Everything())
 	if err != nil {
-		return "", nil
+		return nil, err
 	}
 	prefixes := c.slicePrefixes()
 
-	var out strings.Builder
-	edge := edgeDocument{Pods: map[string]edgePod{}}
+	var out rendered
 	sort.Slice(pods, func(i, j int) bool { return pods[i].Status.PodIP < pods[j].Status.PodIP })
 	for _, pod := range pods {
 		if pod.Status.PodIP == "" || pod.Spec.HostNetwork {
 			continue
 		}
 		ingress, egress, isolated := c.rulesFor(pod, policies)
-		fmt.Fprintf(&out, "## %s\n%s\n", pod.Status.PodIP,
-			c.nftFor(pod, prefixes, ingress, egress, isolated))
+		p := compiled{node: pod.Spec.NodeName, address: pod.Status.PodIP,
+			nft: c.nftFor(pod, prefixes, ingress, egress, isolated)}
 		if isolated.ingress {
-			edge.Pods[pod.Status.PodIP] = edgeFor(pod, ingress)
+			e := edgeFor(pod, ingress)
+			p.edge = &e
 		}
+		out = append(out, p)
 	}
-	document, _ := json.Marshal(edge) // map keys are sorted, so equal input is equal output
-	return out.String(), document
+	return out, nil
 }
 
 type isolation struct{ ingress, egress bool }
