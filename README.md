@@ -593,7 +593,13 @@ each one's pods and measured memory.
   anything — flat at 20 and 60 pods. It was 226 MiB until
   [experiment 32](experiments/32-pod-memory-footprint/FINDINGS.md) found most of
   that was read-ahead into the guest agent's binaries and a kernel carrying
-  drivers no VM has. A bigger VM costs about 21 MiB more per GiB it is given.
+  drivers no VM has. Only the guest agent's own disk keeps the small
+  read-ahead that saving came from. A pod's image and volume disks read ahead
+  1 MiB, which triples a 64 KiB-block read of a large file (4.8 → 14.4 GB/s)
+  for 0-4 MiB on alpine, nginx or python, and 17 MiB on node, whose 120 MiB
+  binary is paged in by the window. Set `FERRY_POD_READAHEAD_KB` for the node,
+  or the `ferry.dev/read-ahead-kb` annotation for one pod. A bigger VM costs
+  about 21 MiB more per GiB it is given.
   ferry sets `maxPods` from the machine's memory, budgeting half of it for that
   overhead: 110 from 32 GiB up, 61 on a 16 GiB Mac, overridable with
   `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared — every

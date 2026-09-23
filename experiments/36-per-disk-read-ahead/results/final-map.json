@@ -1,0 +1,47 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "ghcr.io/linuxcontainers/alpine:3.20",
+  "count": 2,
+  "create_seconds": 0.651157708,
+  "baseline": {
+    "at": "08:01:19",
+    "free_mib": 12792.390625,
+    "used_mib": 63966.90625,
+    "compressed_mib": 5835.453125,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "08:01:31",
+      "free_mib": 12579.015625,
+      "used_mib": 64127.546875,
+      "compressed_mib": 5835.453125,
+      "vms": 2,
+      "vm_resident_mib": 402.5,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "08:01:31",
+    "free_mib": 12579.015625,
+    "used_mib": 64127.546875,
+    "compressed_mib": 5835.453125,
+    "vms": 2,
+    "vm_resident_mib": 402.5,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 272,
+  "logs": [
+    "pod-00.log: 2026-09-23T15:01:22.351Z stdout F P| vda ro=1 MiB=512 ra=128 rot=0 serial=",
+    "pod-00.log: 2026-09-23T15:01:22.352Z stdout F P| vdb ro=1 MiB=2176 ra=1024 rot=0 serial=",
+    "pod-00.log: 2026-09-23T15:01:22.352Z stdout F P| vdc ro=0 MiB=16384 ra=1024 rot=0 serial=",
+    "pod-00.log: 2026-09-23T15:01:22.353Z stdout F P| overlay / overlay rw,relatime,lowerdir=/run/volumes/ferry_image_0,upperdir=/run/volumes/ferry_scratch/0/upper,workdir=/run/volumes/ferry_scratch/0/work,uuid=on 0 0",
+    "pod-01.log: 2026-09-23T15:01:22.626Z stdout F P| vda ro=1 MiB=512 ra=128 rot=0 serial=",
+    "pod-01.log: 2026-09-23T15:01:22.630Z stdout F P| vdb ro=1 MiB=2176 ra=1024 rot=0 serial=",
+    "pod-01.log: 2026-09-23T15:01:22.630Z stdout F P| vdc ro=0 MiB=16384 ra=1024 rot=0 serial=",
+    "pod-01.log: 2026-09-23T15:01:22.630Z stdout F P| overlay / overlay rw,relatime,lowerdir=/run/volumes/ferry_image_0,upperdir=/run/volumes/ferry_scratch/0/upper,workdir=/run/volumes/ferry_scratch/0/work,uuid=on 0 0"
+  ]
+}

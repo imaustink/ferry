@@ -1,0 +1,63 @@
+# Against a running `ferry up`: every kind of disk a pod has, and what its
+# read-ahead is. `ra-default` takes the node's value; `ra-annotated` asks for
+# its own. Each prints its disks, then reads a 256 MiB file on its emptyDir
+# with the guest's cache dropped, at 64 KiB a read.
+#   kubectl apply -f cluster-check.yaml; kubectl logs ra-default; kubectl logs ra-annotated
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: ra-claim}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ra-default}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: ghcr.io/linuxcontainers/alpine:3.20
+    securityContext: {privileged: true}
+    command: [/bin/sh, -c]
+    args:
+    - |
+      for d in /sys/block/vd*; do echo "$(basename $d) ro=$(cat $d/ro) MiB=$(( $(cat $d/size) / 2048 )) ra=$(cat $d/queue/read_ahead_kb)"; done
+      grep -E " /(data|scratch|mem) " /proc/mounts
+      dd if=/dev/urandom of=/scratch/blob bs=1M count=256 2>/dev/null; sync
+      mkdir -p /mnt/proc && mount -t proc proc /mnt/proc
+      for i in 1 2 3; do echo 3 > /mnt/proc/sys/vm/drop_caches; dd if=/scratch/blob of=/dev/null bs=64k 2>&1 | tail -1; done
+      sleep 3600
+    volumeMounts:
+    - {name: scratch, mountPath: /scratch}
+    - {name: mem, mountPath: /mem}
+    - {name: data, mountPath: /data}
+  volumes:
+  - {name: scratch, emptyDir: {}}
+  - {name: mem, emptyDir: {medium: Memory, sizeLimit: 16Mi}}
+  - {name: data, persistentVolumeClaim: {claimName: ra-claim}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ra-annotated
+  annotations: {ferry.dev/read-ahead-kb: "4096"}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: ghcr.io/linuxcontainers/alpine:3.20
+    securityContext: {privileged: true}
+    command: [/bin/sh, -c]
+    args:
+    - |
+      for d in /sys/block/vd*; do echo "$(basename $d) ro=$(cat $d/ro) MiB=$(( $(cat $d/size) / 2048 )) ra=$(cat $d/queue/read_ahead_kb)"; done
+      grep -E " /(data|scratch|mem) " /proc/mounts
+      dd if=/dev/urandom of=/scratch/blob bs=1M count=256 2>/dev/null; sync
+      mkdir -p /mnt/proc && mount -t proc proc /mnt/proc
+      for i in 1 2 3; do echo 3 > /mnt/proc/sys/vm/drop_caches; dd if=/scratch/blob of=/dev/null bs=64k 2>&1 | tail -1; done
+      sleep 3600
+    volumeMounts:
+    - {name: scratch, mountPath: /scratch}
+  volumes:
+  - {name: scratch, emptyDir: {}}

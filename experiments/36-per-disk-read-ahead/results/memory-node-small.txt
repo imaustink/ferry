@@ -1,0 +1,4 @@
+rep=1 ra=256 wl=node footprint 202.6 start 1.09s served 4/4
+rep=1 ra=512 wl=node footprint 209.8 start 1.07s served 4/4
+rep=2 ra=256 wl=node footprint 202.9 start 1.15s served 4/4
+rep=2 ra=512 wl=node footprint 209.8 start 1.15s served 4/4

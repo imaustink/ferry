@@ -1,0 +1,77 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "127.0.0.1:25136/e36/big:2",
+  "count": 1,
+  "create_seconds": 0.280295,
+  "baseline": {
+    "at": "08:14:01",
+    "free_mib": 12792.703125,
+    "used_mib": 64042.40625,
+    "compressed_mib": 5809.5625,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "08:14:11",
+      "free_mib": 10752.953125,
+      "used_mib": 64064.609375,
+      "compressed_mib": 5809.5625,
+      "vms": 1,
+      "vm_resident_mib": 594.65625,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "08:14:22",
+      "free_mib": 10755.703125,
+      "used_mib": 64058.265625,
+      "compressed_mib": 5809.5625,
+      "vms": 1,
+      "vm_resident_mib": 594.75,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "08:14:32",
+      "free_mib": 10303.75,
+      "used_mib": 64527.109375,
+      "compressed_mib": 5809.5625,
+      "vms": 1,
+      "vm_resident_mib": 594.71875,
+      "vm_cpu_percent": 0
+    }
+  ],
+  "peak": {
+    "at": "08:14:22",
+    "free_mib": 10755.703125,
+    "used_mib": 64058.265625,
+    "compressed_mib": 5809.5625,
+    "vms": 1,
+    "vm_resident_mib": 594.75,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 327.8,
+  "logs": [
+    "pod-00.log: 2026-09-23T15:14:03.514Z stdout F P| pass=cold ra=2048 bs=1024k 201326592 bytes (192.0MB) copied, 0.062153 seconds, 3.0GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=2048 bs=64k 201326592 bytes (192.0MB) copied, 0.031826 seconds, 5.9GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=4096 bs=1024k 201326592 bytes (192.0MB) copied, 0.034155 seconds, 5.5GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=4096 bs=64k 201326592 bytes (192.0MB) copied, 0.033772 seconds, 5.6GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=8192 bs=1024k 201326592 bytes (192.0MB) copied, 0.034805 seconds, 5.4GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=8192 bs=64k 201326592 bytes (192.0MB) copied, 0.033272 seconds, 5.6GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=128 bs=1024k 201326592 bytes (192.0MB) copied, 0.033838 seconds, 5.5GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=128 bs=64k 201326592 bytes (192.0MB) copied, 0.067196 seconds, 2.8GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=1024 bs=1024k 201326592 bytes (192.0MB) copied, 0.035644 seconds, 5.3GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=cold ra=1024 bs=64k 201326592 bytes (192.0MB) copied, 0.041828 seconds, 4.5GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=warm ra=2048 bs=1024k 201326592 bytes (192.0MB) copied, 0.011328 seconds, 16.6GB/s",
+    "pod-00.log: 2026-09-23T15:14:03.891Z stdout F P| pass=warm ra=2048 bs=64k 201326592 bytes (192.0MB) copied, 0.011111 seconds, 16.9GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.003Z stdout F P| pass=warm ra=4096 bs=1024k 201326592 bytes (192.0MB) copied, 0.011202 seconds, 16.7GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.003Z stdout F P| pass=warm ra=4096 bs=64k 201326592 bytes (192.0MB) copied, 0.010693 seconds, 17.5GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.003Z stdout F P| pass=warm ra=8192 bs=1024k 201326592 bytes (192.0MB) copied, 0.011130 seconds, 16.8GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.004Z stdout F P| pass=warm ra=8192 bs=64k 201326592 bytes (192.0MB) copied, 0.010867 seconds, 17.3GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.004Z stdout F P| pass=warm ra=128 bs=1024k 201326592 bytes (192.0MB) copied, 0.011660 seconds, 16.1GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.004Z stdout F P| pass=warm ra=128 bs=64k 201326592 bytes (192.0MB) copied, 0.043639 seconds, 4.3GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.004Z stdout F P| pass=warm ra=1024 bs=1024k 201326592 bytes (192.0MB) copied, 0.012896 seconds, 14.5GB/s",
+    "pod-00.log: 2026-09-23T15:14:04.004Z stdout F P| pass=warm ra=1024 bs=64k 201326592 bytes (192.0MB) copied, 0.013096 seconds, 14.3GB/s"
+  ]
+}
