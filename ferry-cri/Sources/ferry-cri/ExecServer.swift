@@ -370,6 +370,25 @@ final class DataReaderStream: ReaderStream, @unchecked Sendable {
     }
 }
 
+/// Keeps a process's output for ExecSync, up to the 16 MiB the kubelet
+/// itself caps a probe's output at.
+final class CollectingWriter: Writer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    static let limit = 16 * 1024 * 1024
+
+    var data: Data { lock.withLock { buffer } }
+
+    func write(_ data: Data) throws {
+        lock.withLock {
+            let room = Self.limit - buffer.count
+            if room > 0 { buffer.append(data.prefix(room)) }
+        }
+    }
+
+    func close() throws {}
+}
+
 /// Swallows output from processes ferry runs for its own purposes.
 final class DiscardWriter: Writer, @unchecked Sendable {
     func write(_ data: Data) throws {}
