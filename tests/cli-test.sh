@@ -183,6 +183,47 @@ contains "and ferry build builds the registry" \
   "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-registry"'
 echo
 
+# --- NetworkPolicy on a kernel without nf_tables ------------------------------
+
+printf '\033[1m%s\033[0m\n' "NetworkPolicies are only called enforced where they can be"
+# The fallback kernel has no nf_tables, and 'ferry up' said "enforced" on it
+# while every rule apply in every pod failed.
+netpol="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+contains "the fallback kernel is told apart" "$netpol" '[ "$KERNEL" != "$NAT_KERNEL" ]'
+contains "  and said out loud" "$netpol" "NetworkPolicies NOT enforced"
+echo
+
+# --- ferry up on a running cluster -------------------------------------------
+
+printf '\033[1m%s\033[0m\n' "ferry up on a cluster that is already up"
+up_scratch="$(mktemp -d)"
+# cmd_up alone, in a subshell, against a fake checkout and a process table of
+# our choosing. It returns before starting anything in every case but the last,
+# and align_to_cluster_version is where it would go on.
+up_with() { # running-processes recorded-durability [args...]
+  (
+    up="$1"; printf '%s\n' "$2" > "$up_scratch/durability"; shift 2
+    here="$up_scratch"; KERNEL="$up_scratch/vmlinux"; mkdir -p "$here/bin"
+    touch "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"
+    DURABILITY_MARKER="$up_scratch/durability"; unset FERRY_DURABILITY
+    eval "$(sed -n '/^ferry_durability()/,/^}/p' "$repo/ferry")"
+    eval "$(sed -n '/^cmd_up()/,/^}/p' "$repo/ferry")"
+    align_to_cluster_version() { echo STARTING; return 1; }
+    warn() { echo "$*"; }; bad() { echo "$*"; }; ok() { echo "$*"; }
+    running() { case " $up " in *" $1 "*) return 0 ;; esac; return 1; }
+    cmd_up "$@"
+  )
+}
+out="$(up_with "ferry-cri kubelet" full)"; is "exits 0 when it is already up" "$?" 0
+lacks "  and starts nothing" "$out" STARTING
+up_with "ferry-cri kubelet" full --fast >/dev/null; is "refuses a durability it was not started with" "$?" 1
+up_with "ferry-cri kubelet" relaxed --fast >/dev/null; is "and accepts the one it was" "$?" 0
+out="$(up_with kubelet full)"; is "a half-up cluster still refuses" "$?" 1
+contains "  and says which half" "$out" "kubelet alone"
+contains "a stopped cluster is started" "$(up_with "" full)" STARTING
+rm -rf "$up_scratch"
+echo
+
 # --- small helpers -----------------------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "telling whether a gateway is on the profile's pod network"

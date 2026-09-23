@@ -14,6 +14,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"path"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,7 +74,8 @@ type podContainers struct {
 	MemoryLimitBytes int64 `json:"memoryLimitBytes"`
 	CPULimit         int32 `json:"cpuLimit"`
 	// Every subPath the pod's containers mount of each PersistentVolume, keyed
-	// by the volume's name, init containers included.
+	// by the volume's name, init containers included -- or, for one an init
+	// container may write first, its parent. See volumeSubPaths.
 	//
 	// A ReadWriteOnce volume is an ext4 image that ferry-cri formats the first
 	// time a pod uses it, and a subPath made then can be given the volume
@@ -144,6 +147,16 @@ func podImages(pod *v1.Pod) []string {
 // An emptyDir is an ext4 image too, formatted the same way, and is keyed by its
 // own name: that is the name of the kubelet's directory for it, which is what
 // the runtime calls the volume.
+//
+// What is reported is what the runtime may make as a directory, which is not
+// always the subPath itself. The kubelet makes a missing subPath when the
+// container that mounts it starts, so an init container that mounts the volume
+// above it -- the whole volume, or a subPath the other lies beneath -- may write
+// it first, and often writes a file: the rendered config a main container then
+// mounts as a single file. Made as a directory at the format, before the init
+// container runs, that path could never be a file. So such a subPath is
+// reported by its parent alone, and the leaf is left to whoever writes it, or
+// to the runtime when its container starts.
 func (p *podLookup) volumeSubPaths(ctx context.Context, pod *v1.Pod) map[string][]string {
 	claims := map[string]string{} // pod volume name -> claim name
 	emptyDirs := map[string]bool{}
@@ -160,17 +173,31 @@ func (p *podLookup) volumeSubPaths(ctx context.Context, pod *v1.Pod) map[string]
 	}
 	subPaths := map[string][]string{} // pod volume name -> subPaths
 	out := map[string][]string{}
+	inits := len(pod.Spec.InitContainers)
 	all := append(append([]v1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
-	for _, c := range all {
+	for i, c := range all {
 		for _, mount := range c.VolumeMounts {
 			if mount.SubPath == "" {
 				continue
 			}
-			if _, ok := claims[mount.Name]; ok {
-				subPaths[mount.Name] = append(subPaths[mount.Name], mount.SubPath)
+			_, isClaim := claims[mount.Name]
+			if !isClaim && !emptyDirs[mount.Name] {
+				continue
 			}
-			if emptyDirs[mount.Name] {
-				out[mount.Name] = append(out[mount.Name], mount.SubPath)
+			// Init containers run in order and all before the rest, so the ones
+			// that run before this container are those ahead of it among them.
+			earlier := min(i, inits)
+			made := mount.SubPath
+			if writtenAbove(pod.Spec.InitContainers[:earlier], mount.Name, mount.SubPath) {
+				made = path.Dir(path.Clean(mount.SubPath))
+				if made == "." || made == "/" {
+					continue
+				}
+			}
+			if isClaim {
+				subPaths[mount.Name] = append(subPaths[mount.Name], made)
+			} else {
+				out[mount.Name] = append(out[mount.Name], made)
 			}
 		}
 	}
@@ -182,6 +209,30 @@ func (p *podLookup) volumeSubPaths(ctx context.Context, pod *v1.Pod) map[string]
 		out[claim.Spec.VolumeName] = append(out[claim.Spec.VolumeName], paths...)
 	}
 	return out
+}
+
+// writtenAbove reports whether any of these containers mounts the volume above
+// subPath, and so may be the one that makes it. One that mounts subPath itself
+// needs it made first, so it does not count. A subPathExpr is not
+// evaluated here, and leaves SubPath empty, so it counts as above anything: it
+// could expand to anything.
+func writtenAbove(containers []v1.Container, volume, subPath string) bool {
+	below := path.Clean(subPath)
+	for _, c := range containers {
+		for _, mount := range c.VolumeMounts {
+			if mount.Name != volume {
+				continue
+			}
+			if mount.SubPath == "" {
+				return true
+			}
+			above := path.Clean(mount.SubPath)
+			if strings.HasPrefix(below, above+"/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // podResources aggregates what a pod's containers are allowed to use.

@@ -59,6 +59,51 @@ func TestVolumeSubPathsEmptyDir(t *testing.T) {
 			want: map[string][]string{},
 		},
 		{
+			// searxng: the init container renders settings.yml into the whole
+			// volume and the main container mounts it as a file. Made as a
+			// directory at the format, the init container could not write it.
+			name: "a file an init container writes is not made",
+			spec: v1.PodSpec{
+				Volumes:        []v1.Volume{emptyDir("config")},
+				InitContainers: []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("config", "")}}},
+				Containers:     []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("config", "settings.yml")}}},
+			},
+			want: map[string][]string{},
+		},
+		{
+			name: "only the parent of one beneath an init container's subPath",
+			spec: v1.PodSpec{
+				Volumes:        []v1.Volume{emptyDir("config")},
+				InitContainers: []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("config", "etc")}}},
+				Containers:     []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("config", "etc/app/app.conf"), mount("config", "etcetera")}}},
+			},
+			want: map[string][]string{"config": {"etc", "etc/app", "etcetera"}},
+		},
+		{
+			name: "a subPathExpr in an init container is above everything",
+			spec: v1.PodSpec{
+				Volumes: []v1.Volume{emptyDir("config")},
+				InitContainers: []v1.Container{{VolumeMounts: []v1.VolumeMount{
+					{Name: "config", MountPath: "/c", SubPathExpr: "$(POD_NAME)"}}}},
+				Containers: []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("config", "a/b")}}},
+			},
+			want: map[string][]string{"config": {"a"}},
+		},
+		{
+			// Only the ones that run before it: a later init container, or a
+			// main container beside it, cannot have written it yet.
+			name: "a later container's whole-volume mount does not count",
+			spec: v1.PodSpec{
+				Volumes: []v1.Volume{emptyDir("scratch")},
+				InitContainers: []v1.Container{
+					{VolumeMounts: []v1.VolumeMount{mount("scratch", "first")}},
+					{VolumeMounts: []v1.VolumeMount{mount("scratch", "")}},
+				},
+				Containers: []v1.Container{{VolumeMounts: []v1.VolumeMount{mount("scratch", ""), mount("scratch", "data")}}},
+			},
+			want: map[string][]string{"scratch": {"first"}},
+		},
+		{
 			name: "mixed with a claim and a configMap",
 			spec: v1.PodSpec{
 				Volumes: []v1.Volume{emptyDir("snapshots"), claim("data"), configMap("cfg")},

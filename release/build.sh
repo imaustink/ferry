@@ -13,7 +13,7 @@
 # copied below, and tests/release-test.sh fails if ferry grows a reference to
 # something this does not ship.
 #
-#   ./release/build.sh [--version vX.Y.Z] [--out dist]
+#   ./release/build.sh [--version vX.Y.Z] [--kubernetes-version vX.Y.Z] [--out dist]
 #
 # The binaries are copied, never rebuilt or stripped. Two reasons, both already
 # paid for elsewhere in this tree: `strip` invalidates the ad-hoc signature the
@@ -37,12 +37,15 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 die()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 
 version=""
+k8s=""
 out="$root/dist"
 node_image=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) version="${2:-}"; shift 2 ;;
     --version=*) version="${1#*=}"; shift ;;
+    --kubernetes-version) k8s="${2:-}"; shift 2 ;;
+    --kubernetes-version=*) k8s="${1#*=}"; shift ;;
     --out) out="${2:-}"; shift 2 ;;
     --out=*) out="${1#*=}"; shift ;;
     # Mode 2 is opt-in on the Mac that installs this, but the image it needs
@@ -51,7 +54,7 @@ while [ $# -gt 0 ]; do
     # lacks it is not, so this is a flag rather than a silent skip, and VERSION
     # records the answer for 'ferry machines' to read.
     --without-node-image) node_image=""; shift ;;
-    *) die "usage: release/build.sh [--version vX.Y.Z] [--out <dir>] [--without-node-image]" ;;
+    *) die "usage: release/build.sh [--version vX.Y.Z] [--kubernetes-version vX.Y.Z] [--out <dir>] [--without-node-image]" ;;
   esac
 done
 
@@ -72,9 +75,17 @@ case "$out" in
   *)  out="$(pwd)/$out" ;;
 esac
 
-k8s="$(ferry_active_version)"
-[ -n "$k8s" ] || die "this checkout has not been built -- run: ./ferry build"
-ferry_version_complete "$k8s" || die "the version store has no complete $k8s -- run: ./ferry build"
+# The Kubernetes this release ships: the one this source is written for, unless
+# asked for another. Not the checkout's active version. That is whatever the
+# last cluster started from this checkout ran -- starting one at an older
+# version activates it -- and v0.5.0 went out at v1.34.0, its source defaulting
+# to v1.37.0, because a v1.34 cluster had been started here last.
+[ -n "$k8s" ] || k8s="$FERRY_DEFAULT_K8S_VERSION"
+ferry_version_complete "$k8s" \
+  || die "the version store has no complete $k8s -- run: ./ferry build --kubernetes-version $k8s"
+active="$(ferry_active_version)"
+[ -z "$active" ] || [ "$active" = "$k8s" ] \
+  || echo "  note: this checkout is running $active; packaging $k8s, not that"
 
 bold "packaging ferry $version"
 echo "  kubernetes  $k8s (control plane $(ferry_manifest_field "$k8s" control-plane 2>/dev/null || echo '?'), etcd $(ferry_manifest_field "$k8s" etcd 2>/dev/null || echo '?'))"

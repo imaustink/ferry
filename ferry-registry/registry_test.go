@@ -168,3 +168,62 @@ func TestAnswersOnlyTheMachineNetwork(t *testing.T) {
 		}
 	}
 }
+
+// criStore lays out what ferry-cri keeps: its blobs under content/, a
+// state.json of descriptors by reference, and the names it was loaded with.
+func criStore(t *testing.T, loaded string, images map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "content", "blobs", "sha256"), 0o755)
+	state := map[string]descriptor{}
+	for reference, content := range images {
+		src, digest := layout(t, reference, content)
+		blobs, _ := os.ReadDir(filepath.Join(src, "blobs", "sha256"))
+		for _, b := range blobs {
+			data, _ := os.ReadFile(filepath.Join(src, "blobs", "sha256", b.Name()))
+			os.WriteFile(filepath.Join(dir, "content", "blobs", "sha256", b.Name()), data, 0o644)
+		}
+		state[reference] = descriptor{MediaType: mediaOCIManifest, Digest: digest}
+	}
+	data, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(dir, "state.json"), data, 0o644)
+	if loaded != "" {
+		os.WriteFile(filepath.Join(dir, "loaded-images"), []byte(loaded), 0o644)
+	}
+	return dir
+}
+
+func TestImportsWhatFerryCRIWasLoadedWith(t *testing.T) {
+	store := t.TempDir()
+	cri := criStore(t, "docker.io/library/app:dev\nquay.io/x/gone:1\n", map[string]string{
+		"docker.io/library/app:dev":      "app",
+		"docker.io/library/busybox:1.36": "pulled",
+	})
+	added, err := importCRI(store, cri)
+	if err != nil || len(added) != 1 || added[0] != "docker.io/library/app:dev" {
+		t.Fatalf("import = %v, %v", added, err)
+	}
+	srv := httptest.NewServer(&registry{store: store})
+	defer srv.Close()
+	if resp, body := get(t, srv.URL+"/v2/library/app/manifests/dev?ns=docker.io"); resp.StatusCode != 200 {
+		t.Fatalf("imported manifest = %d %s", resp.StatusCode, body)
+	}
+	// Pulled, so the machine pulls it too.
+	if resp, _ := get(t, srv.URL+"/v2/library/busybox/manifests/1.36?ns=docker.io"); resp.StatusCode != 404 {
+		t.Errorf("pulled image = %d, want 404", resp.StatusCode)
+	}
+	// Already held at that digest: nothing to do.
+	if again, err := importCRI(store, cri); err != nil || len(again) != 0 {
+		t.Errorf("second import = %v, %v", again, err)
+	}
+}
+
+func TestImportsNothingFromAStoreThatWasNeverLoaded(t *testing.T) {
+	cri := criStore(t, "", map[string]string{"docker.io/library/busybox:1.36": "pulled"})
+	if added, err := importCRI(t.TempDir(), cri); err != nil || len(added) != 0 {
+		t.Fatalf("import = %v, %v", added, err)
+	}
+	if added, err := importCRI(t.TempDir(), t.TempDir()); err != nil || len(added) != 0 {
+		t.Fatalf("import of an empty directory = %v, %v", added, err)
+	}
+}

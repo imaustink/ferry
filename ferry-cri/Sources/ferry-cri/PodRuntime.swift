@@ -2532,7 +2532,28 @@ actor PodRuntime {
         guard !loaded.isEmpty else {
             throw RuntimeFailure.invalid("no images found in \(directory)")
         }
+        recordLoaded(adding: loaded.map(ImageReference.normalize), removing: [])
         return loaded
+    }
+
+    /// The names that came from a load rather than a registry, kept beside the
+    /// store as loaded-images, one a line.
+    ///
+    /// For ferry-registry, which serves them to machines. It is started only
+    /// when FERRY_MACHINE_REGISTRY is set, and an image loaded before then has
+    /// to be found in this store once it is -- but only a loaded one: an image
+    /// this runtime pulled, served from the Mac, would keep a machine on
+    /// whatever this Mac last saw of a mutable tag. See ferry-registry's
+    /// importCRI.
+    private func recordLoaded(adding: [String], removing: [String]) {
+        let path = config.stateDir.appending(component: "loaded-images")
+        let current = ((try? String(contentsOf: path, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+        var names = current.filter { !removing.contains($0) && !adding.contains($0) }
+        names += adding
+        guard names != current else { return }
+        try? (names.joined(separator: "\n") + (names.isEmpty ? "" : "\n"))
+            .write(to: path, atomically: true, encoding: .utf8)
     }
 
     /// Puts back what the kubelet was told about images before a restart.
@@ -2559,6 +2580,38 @@ actor PodRuntime {
             }
         }
         if restored > 0 { print("    images    \(restored) restored from the image store") }
+        sweepImageDisks()
+    }
+
+    /// Removes every unpacked root filesystem that no image in the store
+    /// resolves to, once they have all been restored.
+    ///
+    /// cache() collects the disk an image leaves behind when it is replaced,
+    /// but only while this process is running. What it cannot see is what an
+    /// older ferry-cri left: root filesystems used to be named after the image
+    /// rather than its digest, so an upgrade unpacked every image again as
+    /// image-sha256_<digest>.ext4 and left the old image-<name>.ext4 beside it
+    /// -- measured at 29 of them, 15 GiB, on a Mac with 32 images. A disk is
+    /// only ever reached through rootfsCache, so one it does not name is
+    /// garbage: nothing can clone it.
+    private func sweepImageDisks() {
+        // By name: every one of them is made in the state directory.
+        let live = Set(rootfsCache.values.map { ($0.source as NSString).lastPathComponent })
+        let directory = config.stateDir.path(percentEncoded: false)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+        var freed: UInt64 = 0
+        var removed = 0
+        for name in names where name.hasPrefix("image-") && name.hasSuffix(".ext4") && !live.contains(name) {
+            let path = (directory as NSString).appendingPathComponent(name)
+            let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? UInt64) ?? 0
+            if (try? FileManager.default.removeItem(atPath: path)) != nil {
+                freed += size
+                removed += 1
+            }
+        }
+        if removed > 0 {
+            print("    images    \(removed) unused root filesystems removed (\(freed / 1_048_576) MiB apparent)")
+        }
     }
 
     func pullImage(_ reference: String) async throws -> String {
@@ -2573,6 +2626,10 @@ actor PodRuntime {
         if image == nil {
             image = try await store.pull(reference: canonical, platform: platform,
                                          insecure: ImageReference.insecure(canonical))
+            // From a real registry, so the name is that registry's now, whatever
+            // it was loaded as before. One from the mirror above was loaded on
+            // some node, and stays a loaded image.
+            recordLoaded(adding: [], removing: [canonical])
         }
         guard let image else { throw RuntimeFailure.invalid("pull \(canonical) produced no image") }
         return try await cache(image, as: Set([reference, canonical]), canonical: canonical,
