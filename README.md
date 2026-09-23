@@ -581,8 +581,10 @@ each one's pods and measured memory.
 - **Services** route inside each pod using kube-proxy's own rules and need no
   privilege on the Mac — the release ships the guest kernel that makes this
   work; a checkout has to `ferry kernel` first, or ferry falls back to a host
-  proxy that does need root. Conntrack is not reconciled, and only TCP has been
-  verified.
+  proxy that does need root. Conntrack is not reconciled. TCP and UDP are
+  verified end to end; SCTP inside the cluster only, since macOS has no SCTP
+  for a NodePort or LoadBalancer to be served with
+  ([experiment 27](experiments/27-edge-policy-sctp/FINDINGS.md)).
 - `logs`, `exec`, `port-forward` and `attach` all work. Attach needs the pod to
   set `stdin: true` to accept input, since the stream has to be wired in when
   the container is created.
