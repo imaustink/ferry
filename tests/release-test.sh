@@ -89,10 +89,14 @@ for ref in $refs; do
     experiments/*) continue ;;
     # The Go and Swift source trees, each reached as '( cd "$here/<x>" && build )'.
     # bin/<x> is the shipped half and is checked above.
-    ferry-cri|ferry-gpud|ferry-karpenter|ferry-netpol|ferry-proxy|ferry-registry|ferry-storage|ferry-streamer) continue ;;
+    ferry-cri|ferry-gpud|ferry-handover|ferry-karpenter|ferry-netpol|ferry-proxy|ferry-registry|ferry-storage|ferry-streamer) continue ;;
     # Written at runtime from node-image/oci, not carried. Shipping it would add
     # ~400MB of mostly-zero sparse file for something ferry makes in seconds.
     node-image/node.ext4) continue ;;
+    # What a checkout's kernel was built from, to tell a stale one. ferry reads
+    # it only when there is no VERSION; build.sh refuses a stale kernel, so a
+    # release's is current by construction.
+    kernel/vmlinux-arm64.inputs) continue ;;
   esac
 
   if shipped "$ref"; then
