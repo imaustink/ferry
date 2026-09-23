@@ -62,7 +62,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server := &ruleServer{changed: make(chan struct{})}
+	server := &ruleServer{changed: make(chan struct{}), contentType: "text/plain"}
+	// The same rules, for ferry-proxy to hold connections from outside the
+	// cluster to. A pod sees every such connection arrive from its node, so the
+	// only place the real client is known is the edge that accepted it.
+	edge := &ruleServer{changed: make(chan struct{}), contentType: "application/json"}
 	compiler := &compiler{clusterCIDR: *clusterCIDR}
 
 	factory := informers.NewSharedInformerFactory(client, *resync)
@@ -71,7 +75,11 @@ func main() {
 	compiler.namespaces = factory.Core().V1().Namespaces().Lister()
 	compiler.nodes = factory.Core().V1().Nodes().Lister()
 
-	rebuild := func() { server.publish(compiler.render()) }
+	rebuild := func() {
+		rules, document := compiler.render()
+		server.publish(rules)
+		edge.publish(string(document))
+	}
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { rebuild() },
 		UpdateFunc: func(any, any) { rebuild() },
@@ -80,8 +88,8 @@ func main() {
 	factory.Networking().V1().NetworkPolicies().Informer().AddEventHandler(handler)
 	factory.Core().V1().Pods().Informer().AddEventHandler(handler)
 	factory.Core().V1().Namespaces().Informer().AddEventHandler(handler)
-	// Nodes matter because a node's own address on the pod network is exempt
-	// from ingress policy, and that address comes from its podCIDR.
+	// Nodes matter because a pod's own node's address on the pod network is
+	// exempt from ingress policy, and that address comes from its podCIDR.
 	factory.Core().V1().Nodes().Informer().AddEventHandler(handler)
 
 	factory.Start(ctx.Done())
@@ -96,6 +104,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rules", server.serve)
+	mux.HandleFunc("/edge", edge.serve)
 	go http.Serve(listener, mux)
 
 	fmt.Printf("==> ferry-netpol\n    rules     unix://%s\n    network   %s\n    serving\n",
@@ -110,6 +119,8 @@ func main() {
 // ruleServer hands out the current rules and holds a caller that already has
 // them until they change, the same bargain ferry-proxyd offers for Services.
 type ruleServer struct {
+	contentType string
+
 	mu         sync.RWMutex
 	rules      string
 	generation uint64
@@ -151,6 +162,6 @@ func (s *ruleServer) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("X-Ferry-Generation", strconv.FormatUint(generation, 10))
-	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Type", s.contentType)
 	fmt.Fprint(w, rules)
 }
