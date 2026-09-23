@@ -97,6 +97,13 @@ else bad "snapshot save failed"; fi
 # is the loss 'ferry upgrade rollback' warns about, and the warning is only
 # honest if it is true.
 "$dir/etcdctl" --endpoints="127.0.0.1:$client" put /ferry/after "written later" >/dev/null 2>&1
+# The last revision anything could have seen. A watcher holding it must not be
+# able to resume against the restored data as if nothing had happened.
+revision() {
+  "$dir/etcdctl" --endpoints="127.0.0.1:$client" endpoint status -w json 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*"revision":\([0-9]*\).*/\1/p' | head -1
+}
+seen="$(revision)"
 stop_etcd
 ok "etcd stopped"
 
@@ -106,12 +113,23 @@ tool="$dir/etcdutl"
 if "$tool" snapshot restore "$work/snapshot.db" \
      --data-dir "$work/restored" --name default \
      --initial-cluster "default=http://127.0.0.1:$peer" \
-     --initial-advertise-peer-urls "http://127.0.0.1:$peer" >/dev/null 2>&1
+     --initial-advertise-peer-urls "http://127.0.0.1:$peer" \
+     --bump-revision 1000000000 --mark-compacted >/dev/null 2>&1
 then ok "restored with $(basename "$tool")"
 else bad "snapshot restore failed"; fi
 
 if start_etcd "$work/restored"; then ok "etcd started on the restored directory"
 else bad "etcd would not start on the restored directory"; tail -5 "$work/etcd.log"; fi
+
+now="$(revision)"
+if [ -n "$seen" ] && [ -n "$now" ] && [ "$now" -gt "$seen" ]; then
+  ok "the revision moved forward ($seen before, $now after), not back"
+else bad "the revision went back ($seen before, ${now:-?} after): every watcher would miss the restore"; fi
+# And a watch from what a client last saw is refused rather than resumed.
+out="$("$dir/etcdctl" --endpoints="127.0.0.1:$client" watch /ferry/before --rev="$seen" 2>&1 &
+       wpid=$!; sleep 1; kill "$wpid" 2>/dev/null)"
+case "$out" in *compacted*) ok "a watch from before the restore is told it was compacted, so it lists again" ;;
+  *) bad "a watch from before the restore is told it was compacted"; echo "      got: $out" ;; esac
 
 got="$("$dir/etcdctl" --endpoints="127.0.0.1:$client" get /ferry/before --print-value-only 2>/dev/null)"
 if [ "$got" = "the upgrade" ]; then ok "the key from before the snapshot is there"

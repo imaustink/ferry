@@ -158,8 +158,19 @@ type rulesetServer struct {
 	changed chan struct{}
 }
 
+// Generations count up from the moment this process started, not from zero.
+//
+// ferry-cri holds its last generation across a ferry-proxyd restart -- which
+// 'ferry upgrade node' now does, to move kube-proxy with the node -- and asks
+// the new process for anything after it. Counting from zero, the new one's
+// generations were all older than that, so the question was held for the whole
+// long-poll timeout: 25 seconds in which a pod started meanwhile reached a
+// Service through the endpoints it had before the restart. Measured on a node
+// roll here, a fresh client pod could not reach a ClusterIP whose pods had just
+// moved. Nanoseconds since the epoch start later than any count an earlier
+// process could have reached.
 func newRulesetServer() *rulesetServer {
-	return &rulesetServer{changed: make(chan struct{})}
+	return &rulesetServer{changed: make(chan struct{}), generation: uint64(time.Now().UnixNano())}
 }
 
 func (s *rulesetServer) current() (string, uint64, chan struct{}) {

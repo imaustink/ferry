@@ -382,6 +382,10 @@ an empty machine is reclaimed about a minute later.
 | `FERRY_KUBECONFIG` | the admin one | admin credentials, for upgrading a Mac that joined and so has only its kubelet's certificate |
 | `FERRY_DRAIN_TIMEOUT` | `300s` | how long to wait for a node to drain |
 | `FERRY_SKIP_SNAPSHOT` | — | `1` to skip the etcd snapshot an upgrade takes first. Do not |
+| `FERRY_ALLOW_REMOVED_APIS` | — | `1` to upgrade although something is still asking for an API the target removes |
+| `FERRY_RECORD_SIGNATURES` | — | `1` to have `build-kubelet.sh` record the constructors a newly ported `patches/kubelet-vX.Y/` is written against |
+| `FERRY_WATCH_GRACE` | `2s` | how long a stopping API server gives its watches to end before it exits |
+| `FERRY_KEEP_ETCD`, `FERRY_HANDOVER`, `FERRY_HANDOVER_BIN` | set by `upgrade` | how `control-plane/up.sh` replaces a running control plane: keep etcd, and hold the API server's port with `bin/ferry-handover` while one API server hands over to the next |
 | `FERRY_ALLOW_SSH_JOIN` | — | `1` to join over SSH, knowing the node loses the network when the session ends |
 | `FERRY_INSTALL_URL` | `https://get.ferry.kurpuis.com` | the installer URL ferry prints in `token create` |
 

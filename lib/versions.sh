@@ -164,7 +164,9 @@ ferry_kubelet_inputs() { # version
   [ -f "$root/build-kubelet.sh" ] && [ -d "$root/patches/kubelet" ] || return 0
   (
     cd "$root" || exit 1
-    find patches/kubelet "patches/kubelet-$(ferry_version_mm "$1")" -type f -print0 2>/dev/null \
+    # SIGNATURES is what the build checks upstream against, not an input to
+    # the binary; recording it should not rebuild every kubelet.
+    find patches/kubelet "patches/kubelet-$(ferry_version_mm "$1")" -type f ! -name SIGNATURES -print0 2>/dev/null \
       | LC_ALL=C sort -z | xargs -0 shasum -a 256
     shasum -a 256 build-kubelet.sh lib/overlay.sh
   ) | shasum -a 256 | cut -d' ' -f1

@@ -194,3 +194,47 @@ ferry_shorten_volume_polls() { # kubernetes-source-dir
       return 1; }
   done
 }
+
+# --- the constructors the per-minor shims call -----------------------------
+#
+# patches/kubelet-vX.Y/ exists because three upstream constructors change
+# signature between minors, and the darwin stand-ins have to match them
+# exactly: cadvisor.New, cm.NewContainerManager and nftables.NewProxier. When
+# one moved in a minor nobody had ported yet, the build found out at the very
+# end, as "not enough arguments" from the compiler minutes after cloning, and
+# pointing at ferry's file rather than at upstream's change.
+#
+# So each minor's directory records the signatures its shims were written
+# against, in SIGNATURES, and build-kubelet.sh compares them with the tree
+# before it applies anything. A moved constructor then fails in a second, with
+# the old and the new signature side by side, which is most of the port.
+
+# Where each lives upstream, as file:function.
+FERRY_SIGNATURE_SEAMS="pkg/kubelet/cadvisor/cadvisor_linux.go:New pkg/kubelet/cm/container_manager_linux.go:NewContainerManager pkg/proxy/nftables/proxier.go:NewProxier"
+
+# One function's signature, from "func Name(" to its opening brace, on one line
+# with the whitespace squeezed -- so a reflowed argument list is not a change,
+# and a changed one is.
+ferry_signature() { # file function
+  awk -v fn="$2" '
+    !on && index($0, "func " fn "(") == 1 { on = 1 }
+    on { line = line " " $0; if ($0 ~ /\{[[:space:]]*$/) { print line; exit } }
+  ' "$1" | tr -s ' \t' '  ' | sed -e 's/^ //' -e 's/( /(/g' -e 's/ )/)/g' -e 's/,)/)/g'
+}
+
+ferry_upstream_signatures() { # kubernetes-source-dir
+  local seam file fn sig
+  for seam in $FERRY_SIGNATURE_SEAMS; do
+    file="${seam%%:*}"; fn="${seam##*:}"
+    sig=""
+    [ -f "$1/$file" ] && sig="$(ferry_signature "$1/$file" "$fn")"
+    printf '%s %s\n' "$seam" "${sig:-MISSING}"
+  done
+}
+
+# Nothing when the tree matches what was recorded; otherwise a unified diff,
+# recorded against found, and a failure.
+ferry_check_signatures() { # kubernetes-source-dir SIGNATURES-file
+  ferry_upstream_signatures "$1" \
+    | diff -u --label "recorded in $2" --label "upstream in $1" "$2" -
+}
