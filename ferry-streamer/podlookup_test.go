@@ -83,3 +83,18 @@ func TestVolumeSubPathsEmptyDir(t *testing.T) {
 		})
 	}
 }
+
+// Init containers first, then the rest, each image once.
+func TestPodImages(t *testing.T) {
+	pod := &v1.Pod{Spec: v1.PodSpec{
+		InitContainers: []v1.Container{{Name: "migrate", Image: "app:1"}, {Name: "proxy", Image: "envoy:1"}},
+		Containers:     []v1.Container{{Name: "app", Image: "app:1"}, {Name: "log", Image: "busybox"}, {Name: "blank"}},
+	}}
+	want := []string{"app:1", "envoy:1", "busybox"}
+	if got := podImages(pod); !reflect.DeepEqual(got, want) {
+		t.Fatalf("podImages = %v, want %v", got, want)
+	}
+	if got := podImages(&v1.Pod{}); got != nil {
+		t.Fatalf("podImages of an empty pod = %v, want nil", got)
+	}
+}
