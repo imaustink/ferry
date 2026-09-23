@@ -271,6 +271,70 @@ eval "$(sed -n '/^node_slice()/,/^}/p' "$repo/ferry")"
 is "node_slice follows the profile's network" "$(CLUSTER_CIDR=10.171.0.0/16 node_slice 2)" "10.171.2.0/24"
 echo
 
+printf '\033[1m%s\033[0m\n' "every node presents a certificate of its own"
+# Measured before: added nodes ran on the first node's certificate, which the
+# Node authorizer refuses for any other name, so the whole system:node role was
+# bound to every node and any kubelet credential could list every pod and
+# Secret. With the binding gone and no certificate of its own, an added node
+# went NotReady in 46 s (experiments/37-node-credentials).
+up="$(cat "$repo/control-plane/up.sh")"
+contains "starting the control plane deletes the old binding" "$up" \
+  'kubectl delete clusterrolebinding ferry:system-nodes --ignore-not-found'
+lacks "and nothing binds system:node any more" "$up" 'name: system:node
+'
+contains "NodeRestriction keeps a node's writes to its own objects" "$up" '--enable-admission-plugins=NodeRestriction'
+contains "and a node can still read the cluster's shape" "$up" '--clusterrole=system:node-proxier'
+contains "node add starts the kubelet on its own credential" "$nodeadd" 'kubeconfig="$(node_credential "$name")"'
+lacks "  never on the first node's" "$nodeadd" 'start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf"'
+contains "a restart or upgrade of an added node signs one if it has none" \
+  "$(sed -n '/^node_layout()/,/^}/p' "$repo/ferry")" 'node_credential "$name"'
+contains "and a running one is moved onto its own before the binding goes" \
+  "$(sed -n '/^start_control_plane()/,/^}/p' "$repo/ferry" | sed -n '1,/up.sh/p')" 'migrate_node_credentials'
+if command -v openssl >/dev/null 2>&1; then
+  FERRY_HOME="$sandbox/nodecred"; mkdir -p "$FERRY_HOME/pki"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$FERRY_HOME/pki/ca.key" \
+    -out "$FERRY_HOME/pki/ca.crt" -days 1 -subj /CN=test-ca 2>/dev/null
+  printf 'users:\n- name: kubelet\n  user:\n    client-certificate: %s\n    client-key: %s\n' \
+    "$FERRY_HOME/pki/kubelet.crt" "$FERRY_HOME/pki/kubelet.key" > "$FERRY_HOME/kubelet.conf"
+  eval "$(sed -n '/^node_credential()/,/^}/p' "$repo/ferry")"
+  conf="$(node_credential worker-1 2>&1)"
+  crt="$FERRY_HOME/pki/nodes/worker-1.crt"
+  is "node_credential names the node's kubeconfig" "$conf" "$FERRY_HOME/pki/nodes/worker-1.conf"
+  is "  whose certificate is system:node:worker-1 in system:nodes" \
+    "$(openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:worker-1"
+  if openssl verify -CAfile "$FERRY_HOME/pki/ca.crt" "$crt" >/dev/null 2>&1; then
+    ok "  signed by the cluster CA"; else bad "  signed by the cluster CA"; fi
+  contains "  for client auth only" "$(openssl x509 -in "$crt" -noout -ext extendedKeyUsage 2>/dev/null)" \
+    "TLS Web Client Authentication"
+  is "  with a key only its owner reads" "$(stat -f %Lp "$FERRY_HOME/pki/nodes/worker-1.key")" 600
+  contains "  and the kubeconfig presents it" "$(cat "$conf")" "client-certificate: $crt"
+  lacks "  not the first node's" "$(cat "$conf")" "pki/kubelet.crt"
+  before="$(cat "$crt")"; node_credential worker-1 >/dev/null
+  is "a second start keeps the same certificate" "$(cat "$crt")" "$before"
+  cp "$FERRY_HOME/pki/nodes/worker-1.crt" "$FERRY_HOME/pki/nodes/worker-2.crt"
+  cp "$FERRY_HOME/pki/nodes/worker-1.key" "$FERRY_HOME/pki/nodes/worker-2.key"
+  node_credential worker-2 >/dev/null
+  is "one named for another node is signed again" \
+    "$(openssl x509 -in "$FERRY_HOME/pki/nodes/worker-2.crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:worker-2"
+  rm "$FERRY_HOME/pki/ca.key"
+  # A subshell: node_credential says so with bad, which here is the counter.
+  if (node_credential worker-3) >/dev/null 2>&1; then bad "no CA key, no certificate"
+  else ok "no CA key, no certificate"; fi
+  unset FERRY_HOME
+  # The first node's is control-plane/pki.sh's, made once with the CA. A node
+  # renamed since would present a name the Node authorizer grants nothing.
+  PKI_DIR="$sandbox/pki" NODE_NAME=mac-a "$repo/control-plane/pki.sh" >/dev/null 2>&1
+  admin="$(cat "$sandbox/pki/admin.crt")"
+  PKI_DIR="$sandbox/pki" NODE_NAME=mac-b "$repo/control-plane/pki.sh" >/dev/null 2>&1
+  is "pki.sh signs the first node's again for its new name" \
+    "$(openssl x509 -in "$sandbox/pki/kubelet.crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:mac-b"
+  is "  and leaves everything else it made" "$(cat "$sandbox/pki/admin.crt")" "$admin"
+fi
+echo
+
 printf '\033[1m%s\033[0m\n' "nft runs by PATH inside a pod, which is how portmap runs it"
 contains "a bundle wanting /lib's loader is repackaged, not kept" \
   "$(cat "$repo/guest/build-nft.sh")" "grep -qa '/.ferry/lib/ld-musl-aarch64.so.1'"

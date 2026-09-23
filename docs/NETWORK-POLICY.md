@@ -212,15 +212,14 @@ handshake. With the control plane's `ferry-netpol` stopped and a deny-all
 deleted while it was down, the joined pod and its edge stayed closed for 40 s;
 started again, the edge opened 0.64 s later and the pod 0.73 s later.
 
-`kubectl auth can-i list pods --all-namespaces` as the joined node still says
-**yes**, and not because of this: `control-plane/up.sh` binds the whole
-`system:node` ClusterRole to `system:nodes` (`ferry:system-nodes`), which also
-lets every node list every Secret. With that binding deleted by hand the
-answers were `no` for pods, secrets, namespaces and NetworkPolicies, and policy
-on the joined node still passed the checks above, so the follower needs nothing
-from it. Removing the binding itself is a separate change: `ferry node add`
-runs its kubelets with the first node's certificate, which the Node authorizer
-alone would refuse.
+`kubectl auth can-i list pods --all-namespaces` and `list secrets
+--all-namespaces` as any node, joined or not, now say **no**. They used to say
+yes through a binding of the whole `system:node` ClusterRole to `system:nodes`
+(`ferry:system-nodes`), which existed because `ferry node add` ran its kubelets
+on the first node's certificate. Each node now has a certificate of its own,
+the binding is deleted at `ferry up`, and the policy checks above passed again
+without it, on a joined node and an added one
+([experiments/37-node-credentials](../experiments/37-node-credentials/)).
 
 In the same-Mac simulation both profiles' nodes have the Mac's LAN address, so
 the joined profile's `ferry-proxy` counts the first node's pods as its own and

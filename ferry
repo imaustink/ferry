@@ -1018,6 +1018,7 @@ start_control_plane() { # version
   # that field -- so the first machine in a worktree cluster came up with pods
   # on 10.244.1.x while the Mac's pods were on 10.156.0.x, and kube-proxy was
   # told a third answer.
+  migrate_node_credentials
   K8S_VERSION="$version" \
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
     CLUSTER_CIDR="$CLUSTER_CIDR" \
@@ -2054,6 +2055,11 @@ cmd_node_add() {
   # renewed is somebody's live node, and is left alone.
   stale_node_gone "$name" || return 1
 
+  # A certificate of its own, not the first node's: the Node authorizer gives a
+  # kubelet only what belongs to the node its certificate names.
+  local kubeconfig
+  kubeconfig="$(node_credential "$name")" || return 1
+
   # Find the first free index. Node 0 is the one 'ferry up' started.
   #
   # Free across the whole cluster, not just this Mac: an index is a /24 of the
@@ -2160,7 +2166,7 @@ spec:
   podCIDRs: [$(node_slice "$index")]
 EOF
 
-  start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf" \
+  start_kubelet "$name" "$run" "$kubeconfig" \
     "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log" "" "$index"
 
   export KUBECONFIG="$FERRY_HOME/admin.conf"
@@ -2196,6 +2202,9 @@ cmd_node_rm() {
     [ -f "$pidfile" ] && { kill -TERM "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"; }
   done
   kubectl delete node "$name" >/dev/null 2>&1
+  # Its certificate stays valid until it expires -- nothing revokes one -- but
+  # a node added again under this name gets a new key.
+  rm -f "$FERRY_HOME/pki/nodes/$name".{crt,key,conf}
   # A node added again under this name is a new node, and starts at the
   # cluster's version rather than whatever this one was left on. It also stops
   # holding that version in the store.
@@ -2850,6 +2859,67 @@ wait_node_version() { # name version seconds
   return 1
 }
 
+# The kubeconfig of a node 'ferry node add' runs on this Mac, holding a client
+# certificate of that node's own: CN=system:node:<name>, O=system:nodes.
+#
+# That name is the only thing the Node authorizer scopes a kubelet by. Added
+# nodes used to present the first node's certificate, which it refuses for any
+# other node, and that was papered over by binding the whole system:node role
+# to every node -- so every kubelet credential could list every pod and read
+# every Secret in the cluster. Signed here with the cluster CA, as
+# control-plane/pki.sh signs the first node's: this Mac holds the CA key, and a
+# CSR through the API server would need a bootstrap token and an approver to
+# arrive at the same certificate. A Mac that joined has its own kubelet's CSR.
+#
+# Kept beside the CA in FERRY_HOME, which outlives /tmp, and signed again only
+# when missing or not for this name. The kubeconfig is rewritten each time from
+# the first node's, so it points wherever that one does.
+node_credential() { # name -> the node's kubeconfig
+  local name="$1" dir="$FERRY_HOME/pki/nodes"
+  local crt="$dir/$name.crt" key="$dir/$name.key" conf="$dir/$name.conf"
+  local pki="$FERRY_HOME/pki"
+  [ -f "$pki/ca.key" ] && [ -f "$FERRY_HOME/kubelet.conf" ] || {
+    bad "no cluster CA key on this Mac to sign $name's certificate with" >&2; return 1; }
+  if [ ! -f "$key" ] || [ "$(openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+       != "subject=O=system:nodes,CN=system:node:$name" ]; then
+    mkdir -p "$dir" && chmod 700 "$dir"
+    openssl req -newkey rsa:2048 -nodes -keyout "$key" -out "$dir/$name.csr" \
+      -subj "/CN=system:node:$name/O=system:nodes" 2>/dev/null \
+      && printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$dir/$name.ext" \
+      && openssl x509 -req -in "$dir/$name.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+           -CAcreateserial -CAserial "$pki/ca.srl" -out "$crt" -days 3650 \
+           -extfile "$dir/$name.ext" 2>/dev/null
+    local rc=$?
+    rm -f "$dir/$name.csr" "$dir/$name.ext"
+    [ "$rc" = 0 ] || { rm -f "$crt" "$key"; bad "could not sign a certificate for $name" >&2; return 1; }
+    chmod 600 "$key"
+  fi
+  sed -e "s|client-certificate: .*|client-certificate: $crt|" \
+      -e "s|client-key: .*|client-key: $key|" \
+      "$FERRY_HOME/kubelet.conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+  echo "$conf"
+}
+
+# Restart onto its own certificate any added node still running on the first
+# node's. control-plane/up.sh deletes the binding that let those work, so this
+# runs before it, while the old API server still answers them. The kubelet only:
+# the runtime holds the pod VMs and stays up, as in 'ferry upgrade node'.
+migrate_node_credentials() {
+  local pidfile pid index run kubeconfig bootstrap logfile name
+  for pidfile in "$FERRY_RUN"/node-*-kubelet.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile")"
+    ps -o args= -p "$pid" 2>/dev/null | grep -qF -- "--kubeconfig=$FERRY_HOME/kubelet.conf " || continue
+    index="${pidfile##*/node-}"; index="${index%-kubelet.pid}"
+    eval "$(node_layout "$index")"
+    name="$(cat "$run/node-name" 2>/dev/null)"
+    [ -n "$name" ] && [ "$kubeconfig" != "$FERRY_HOME/kubelet.conf" ] || continue
+    stop_kubelet "$pidfile"
+    start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "" "$index"
+    ok "node $name restarted on a certificate of its own"
+  done
+}
+
 # Start the kubelet for one node, wherever that node's state lives.
 #
 # Node 0 and the extra nodes differ only in which directory they keep and which
@@ -2947,7 +3017,12 @@ node_layout() { # index
     printf 'run=%q\n' "$FERRY_RUN/node-$1"
     printf 'pidfile=%q\n' "$FERRY_RUN/node-$1-kubelet.pid"
     printf 'logfile=%q\n' "$FERRY_RUN/logs/node-$1-kubelet.log"
-    printf 'kubeconfig=%q\n' "$FERRY_HOME/kubelet.conf"
+    # Its own certificate, signed now if it has none: a node added before
+    # nodes had one gets it at its next start.
+    local name conf
+    name="$(cat "$FERRY_RUN/node-$1/node-name" 2>/dev/null)"
+    conf="$([ -n "$name" ] && node_credential "$name")" || conf="$FERRY_HOME/kubelet.conf"
+    printf 'kubeconfig=%q\n' "$conf"
     printf 'bootstrap=\n'
   fi
 }
