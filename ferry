@@ -1897,10 +1897,42 @@ start_proxy() {
 # of ports, and the pods it runs are virtual machines exactly like the first
 # node's. Their addresses come from this node's own /24 inside the cluster /16,
 # and they reach the first node's pods across ferry's switch.
+# Deletes the Node object called <name> if nothing is behind it. A kubelet
+# renews its lease every 10s; one untouched for a minute has no kubelet. The
+# Ready condition cannot say this -- it is written every five minutes, and
+# stays True for 40s after a kubelet stops.
+stale_node_gone() { # name
+  local name="$1" renewed now
+  kubectl get node "$name" >/dev/null 2>&1 || return 0
+  renewed="$(kubectl -n kube-node-lease get lease "$name" -o jsonpath='{.spec.renewTime}' 2>/dev/null)"
+  if [ -n "$renewed" ]; then
+    renewed="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${renewed%%[.Z]*}" +%s 2>/dev/null || echo 0)"
+    now="$(date -u +%s)"
+    if [ $(( now - renewed )) -lt 60 ]; then
+      bad "a node named $name is already in the cluster, and its kubelet is running"
+      return 1
+    fi
+  fi
+  local old; old="$(kubectl get node "$name" -o jsonpath='{.spec.podCIDR}' 2>/dev/null)"
+  kubectl delete node "$name" --wait=true >/dev/null 2>&1 \
+    || { bad "could not delete the stale node object $name"; return 1; }
+  ok "deleted a stale node object named $name${old:+ (podCIDR $old)}"
+}
+
 cmd_node_add() {
   local name="${1:-}"
   [ -n "$name" ] || { bad "usage: ferry node add <name>"; return 2; }
   running ferry-cri || { bad "ferry is not up; run 'ferry up' first"; return 1; }
+  export KUBECONFIG="$FERRY_HOME/admin.conf"
+
+  # A Node object left by an earlier node of this name -- 'ferry down' keeps
+  # them, and so does a cluster that outlived the checkout that added it. The
+  # kubelet adopts an existing Node rather than making one, so it inherited that
+  # node's podCIDR and index label, and the stale label made the index below
+  # skip past its own slice: podCIDR 10.171.1.0/24 with pods on 10.171.2.x.
+  # Gone first, so the index is chosen without it. One whose lease is being
+  # renewed is somebody's live node, and is left alone.
+  stale_node_gone "$name" || return 1
 
   # Find the first free index. Node 0 is the one 'ferry up' started.
   #
@@ -1971,7 +2003,7 @@ cmd_node_add() {
     waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime for $name did not start"; tail -5 "$FERRY_RUN/logs/node-$index-cri.log"; return 1; }
-  ok "runtime on 10.244.$index.0/24, switch udp/$relay"
+  ok "runtime on $(node_slice "$index"), switch udp/$relay"
 
   "$here/bin/ferry-streamer" --listen "$stream_addr" \
     --exec-socket "$exec_sock" --control "$streamer_sock" \
@@ -1990,6 +2022,22 @@ cmd_node_add() {
       -e "s|$FERRY_RUN/volume-plugins|$run/volume-plugins|" \
       -e "s|^readOnlyPort: 0|readOnlyPort: 0\nport: $kubelet_port\nhealthzPort: $healthz_port|" \
       "$FERRY_RUN/kubelet.yaml" > "$run/kubelet.yaml"
+
+  # The Node is made here, holding the slice this node's runtime is on, so its
+  # podCIDR is that slice by construction. Left to the controller manager it is
+  # the lowest free /24, which is the same number only while every node was
+  # added and removed in order. The controller keeps a podCIDR it finds set, and
+  # the kubelet adopts the object. Mode 2 and ferry-netpol read this field.
+  kubectl apply -f - >/dev/null <<EOF || warn "could not pre-register $name; its podCIDR is the controller's choice"
+apiVersion: v1
+kind: Node
+metadata:
+  name: $name
+  labels: {ferry.dev/mode: vm-per-pod, ferry.dev/node-index: "$index"}
+spec:
+  podCIDR: $(node_slice "$index")
+  podCIDRs: [$(node_slice "$index")]
+EOF
 
   start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf" \
     "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log" "" "$index"
@@ -2121,6 +2169,12 @@ EOF
   kubectl create clusterrolebinding ferry-node-proxier \
     --clusterrole=system:node-proxier \
     --group=system:nodes >/dev/null 2>&1
+  # And its own NetworkPolicy rules, for the same reason: every Mac runs
+  # ferry-netpol for its own pods and its own edge. A policy selects peers
+  # anywhere in the cluster, so it reads every pod, namespace and node -- which
+  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
+  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
+  ferry_netpol_rbac
 
   # Let a node that has not joined yet read the node list.
   #
@@ -2169,12 +2223,6 @@ EOF
   echo "  Or, if that Mac already has ferry:"
   echo
   echo "    ferry join --server $server --token $token"
-  # And its own NetworkPolicy rules, for the same reason: every Mac runs
-  # ferry-netpol for its own pods and its own edge. A policy selects peers
-  # anywhere in the cluster, so it reads every pod, namespace and node -- which
-  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
-  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
-  ferry_netpol_rbac
   echo
   echo "  Good for 24 hours, and reusable -- each Mac claims a free slice of"
   echo "  $CLUSTER_CIDR for its own pods when it joins."
@@ -2423,7 +2471,7 @@ start_worker() {
     waited=$(( waited + 1 ))
   done
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
-  ok "runtime on 10.244.$index.0/24, switch udp/$RELAY_PORT"
+  ok "runtime on $(node_slice "$index"), switch udp/$RELAY_PORT"
 
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -2505,6 +2553,10 @@ EOF
     warn "bin/ferry-proxyd is missing; Services will not route on this node"
   fi
 
+  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
+  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
+  start_netpol "$FERRY_RUN/kubelet.conf"
+
   # Node ports and claims are per node too: a pod scheduled here needs its
   # volume made here, and a connection arriving here needs forwarding here.
   local lb="$LAN_IP"; [ "$lb" = "127.0.0.1" ] && lb=""
@@ -2530,7 +2582,7 @@ EOF
 
   echo
   bold "joined as $name"
-  echo "  its pods will be 10.244.$index.x and reach the other nodes' pods directly"
+  echo "  its pods will be on $(node_slice "$index") and reach the other nodes' pods directly"
 }
 
 # --- upgrades -------------------------------------------------------------
@@ -2553,10 +2605,6 @@ EOF
 # own code -- so the kubelet can be replaced without stopping the runtime, and
 # the pod VMs that drain did not move stay up across it.
 #
-  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
-  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
-  start_netpol "$FERRY_RUN/kubelet.conf"
-
 # One thing makes it harder: a checkout has one bin/. Every node on one Mac
 # shares a kubelet binary and therefore moves together. Rolling one node at a
 # time is still right -- drain, replace, wait, next -- but the roll is per Mac,
