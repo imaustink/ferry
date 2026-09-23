@@ -1236,16 +1236,44 @@ EOF
 # kernel, so the rules are worked out here and applied there -- the same way
 # Service rules already reach a pod. Without this, policies were accepted and
 # silently ignored, which is worse than not supporting them.
-start_netpol() {
+#
+# A Mac that joined runs its own, as the node: its pods and its edge ask a
+# socket on that Mac, and a socket cannot be reached across the network.
+start_netpol() { # [kubeconfig]
   [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
   rm -f "$FERRY_NETPOL_SOCK"
-  "$here/bin/ferry-netpol" --kubeconfig "$FERRY_HOME/admin.conf" \
+  "$here/bin/ferry-netpol" --kubeconfig "${1:-$FERRY_HOME/admin.conf}" \
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
   ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
   [ -S "$FERRY_NETPOL_SOCK" ] && ok "NetworkPolicies enforced in the pods" \
     || warn "ferry-netpol did not start; NetworkPolicies will be ignored"
+}
+
+# What a node's certificate needs for ferry-netpol to run as it. Made by
+# 'ferry token create', since a Mac cannot join without one, and idempotent, so
+# a cluster made before this existed gets it from its next token.
+ferry_netpol_rbac() {
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: ferry-node-netpol}
+rules:
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [list, watch]
+- apiGroups: [""]
+  resources: [pods, namespaces, nodes]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: ferry-node-netpol}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ferry-node-netpol}
+subjects:
+- {apiGroup: rbac.authorization.k8s.io, kind: Group, name: system:nodes}
+EOF
 }
 
 # The Mac's GPU, offered to pods over a socket.
@@ -2141,6 +2169,12 @@ EOF
   echo "  Or, if that Mac already has ferry:"
   echo
   echo "    ferry join --server $server --token $token"
+  # And its own NetworkPolicy rules, for the same reason: every Mac runs
+  # ferry-netpol for its own pods and its own edge. A policy selects peers
+  # anywhere in the cluster, so it reads every pod, namespace and node -- which
+  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
+  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
+  ferry_netpol_rbac
   echo
   echo "  Good for 24 hours, and reusable -- each Mac claims a free slice of"
   echo "  $CLUSTER_CIDR for its own pods when it joins."
@@ -2477,7 +2511,7 @@ EOF
   if [ -x "$here/bin/ferry-proxy" ]; then
     "$here/bin/ferry-proxy" --kubeconfig "$FERRY_RUN/kubelet.conf" \
       --node-ports --node-name "$name" \
-      --host-ports "$FERRY_RUN/cri/hostports" \
+      --host-ports "$FERRY_RUN/cri/hostports" --netpol-socket "$FERRY_NETPOL_SOCK" \
       ${lb:+--load-balancer-ip "$lb"} \
       >"$FERRY_RUN/logs/ferry-proxy.log" 2>&1 &
     echo $! > "$FERRY_RUN/ferry-proxy.pid"
@@ -2519,6 +2553,10 @@ EOF
 # own code -- so the kubelet can be replaced without stopping the runtime, and
 # the pod VMs that drain did not move stay up across it.
 #
+  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
+  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
+  start_netpol "$FERRY_RUN/kubelet.conf"
+
 # One thing makes it harder: a checkout has one bin/. Every node on one Mac
 # shares a kubelet binary and therefore moves together. Rolling one node at a
 # time is still right -- drain, replace, wait, next -- but the roll is per Mac,
