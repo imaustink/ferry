@@ -176,6 +176,9 @@ for i in $(seq 1 300); do
   sleep 0.1
 done
 
+# An array, because a handover starts it at a different point from a plain
+# start. The comments inside it expand to nothing, as they did as arguments.
+# shellcheck disable=SC2054,SC2206,SC2207
 api_cmd=("$bin/kube-apiserver" \
   --etcd-servers=http://127.0.0.1:$ETCD_CLIENT_PORT \
   --secure-port=$API_PORT --bind-address=0.0.0.0 --advertise-address="$ADVERTISE" \
@@ -213,7 +216,13 @@ api_cmd=("$bin/kube-apiserver" \
   `# their own, which they never do -- so SIGTERM took 60.2s, measured, and` \
   `# down.sh killed it at ten. Ended watches are re-established by the client` \
   `# from the resourceVersion it had, which is what they are built to do.` \
-  --shutdown-watch-termination-grace-period="${FERRY_WATCH_GRACE:-2s}")
+  --shutdown-watch-termination-grace-period="${FERRY_WATCH_GRACE:-2s}" \
+  `# The kubernetes Service's endpoint is written below rather than kept by` \
+  `# the API server. Its reconciler takes the address out as the API server` \
+  `# stops, which with one API server at one address empties the Service for` \
+  `# every in-cluster client until the next one puts it back -- a refused` \
+  `# connection to 10.96.0.1 on every restart and every upgrade.` \
+  --endpoint-reconciler-type=none)
 
 api_readyz() { # host
   curl -sgk --max-time 1 --cert "$PKI_DIR/admin.crt" --key "$PKI_DIR/admin.key" \
@@ -224,23 +233,36 @@ api_readyz() { # host
 # than waiting in the bridge behind everyone else.
 kubectl_at=()
 kube() { kubectl --kubeconfig "$STATE/admin.conf" ${kubectl_at[@]+"${kubectl_at[@]}"} "$@"; }
-kubernetes_endpoint() {
-  kube -n default get endpoints kubernetes -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true
-}
-# Put this API server back in the kubernetes Service. An API server leaving
-# removes its address from it as the first thing it does, and the old and new
-# one advertise the same address -- so the old one's departure empties the
-# Service, and every in-cluster client of 10.96.0.1 is refused until the new
-# one's reconciler puts it back, a second or more after it starts. Writing back
-# exactly what the reconciler would write closes the gap, and the reconciler
-# agrees with it on its next pass.
-restore_kubernetes_endpoint() {
-  kube -n default patch endpoints kubernetes --type=merge -p \
-    "{\"subsets\":[{\"addresses\":[{\"ip\":\"$ADVERTISE\"}],\"ports\":[{\"name\":\"https\",\"port\":$API_PORT,\"protocol\":\"TCP\"}]}]}" \
-    >/dev/null 2>&1 \
-  && kube -n default patch endpointslice kubernetes --type=merge -p \
-    "{\"endpoints\":[{\"addresses\":[\"$ADVERTISE\"],\"conditions\":{\"ready\":true}}]}" \
-    >/dev/null 2>&1
+# The kubernetes Service's one endpoint: this API server, at the address it
+# advertises. Written by ferry because the API server's own reconciler is off
+# (see --endpoint-reconciler-type above), and written whole, both the Endpoints
+# and the EndpointSlice kube-proxy reads, so a fresh cluster gets them too. The
+# first upgrade from an API server that still ran the reconciler finds them
+# emptied by its departure, and this puts them back.
+write_kubernetes_endpoint() {
+  kube apply --server-side --force-conflicts --field-manager=ferry --validate=false -f - >/dev/null 2>&1 <<YAML
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: kubernetes
+  namespace: default
+  labels: {endpointslice.kubernetes.io/skip-mirror: "true"}
+subsets:
+- addresses: [{ip: $ADVERTISE}]
+  ports: [{name: https, port: $API_PORT, protocol: TCP}]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kubernetes
+  namespace: default
+  labels: {kubernetes.io/service-name: kubernetes}
+addressType: IPv4
+endpoints:
+- addresses: [$ADVERTISE]
+  conditions: {ready: true}
+ports: [{name: https, port: $API_PORT, protocol: TCP}]
+YAML
 }
 listening() { # host -- is anything accepting on the API port there
   nc -z -G 1 "$1" "$API_PORT" >/dev/null 2>&1
@@ -317,9 +339,9 @@ if [ -n "$old_api" ]; then
   start kube-apiserver "${api_cmd[@]}"
   new_api="$(cat "$STATE/kube-apiserver.pid")"
   kubectl_at=(--server "https://[::1]:$API_PORT" --tls-server-name localhost)
-  # The Service back the moment the new one takes a write, rather than when its
-  # reconciler gets round to it.
-  ( for i in $(seq 1 300); do restore_kubernetes_endpoint && break; sleep 0.05; done ) &
+  # An old API server that still ran the endpoint reconciler has just emptied
+  # the Service. Put it back the moment the new one takes a write.
+  ( for i in $(seq 1 300); do write_kubernetes_endpoint && break; sleep 0.05; done ) &
   restoring=$!
   for i in $(seq 1 600); do
     api_readyz "[::1]" && break
@@ -340,7 +362,6 @@ if [ -n "$old_api" ]; then
   i=0
   while [ "$i" -lt 300 ] && kill -0 "$old_api" 2>/dev/null; do sleep 0.05; i=$((i + 1)); done
   kill -KILL "$old_api" 2>/dev/null || true
-  [ -n "$(kubernetes_endpoint)" ] || restore_kubernetes_endpoint || true
   kill -0 "$new_api" 2>/dev/null || { echo "    !! the new API server exited" >&2; exit 1; }
 else
   start kube-apiserver "${api_cmd[@]}"
@@ -409,6 +430,10 @@ subjects:
   kind: Group
   name: system:nodes
 YAML
+
+# Every start, not only the first: the address it advertises follows the Mac's
+# network, and nothing else writes it any more.
+write_kubernetes_endpoint || echo "    ! could not write the kubernetes Service's endpoint" >&2
 
 # Write down what this cluster now is.
 #
