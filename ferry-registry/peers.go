@@ -28,7 +28,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -43,6 +42,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/imaustink/ferry/nodeauth"
 )
 
 // Accepted for a manifest by tag, in the order a registry would prefer them.
@@ -394,68 +395,14 @@ func peersFromFile(path string, port int, self []string) func() []string {
 
 // credentials are a node's: the kubelet's client certificate and key, and the
 // cluster CA, found through the kubelet's kubeconfig. Read again for every
-// handshake, because the kubelet rotates its certificate in place.
+// handshake, because the kubelet rotates its certificate in place. What makes
+// a certificate a node's is nodeauth's, which ferry-netpol's peer port shares.
 type credentials struct {
 	kubeconfig string
 }
 
-// kubeconfigPaths pulls the three fields ferry's kubeconfigs use out of one.
-// Every kubeconfig ferry writes, and every one the kubelet writes after
-// bootstrap, names files rather than embedding them; -data is read too.
 func (c credentials) load() (tls.Certificate, *x509.CertPool, error) {
-	data, err := os.ReadFile(c.kubeconfig)
-	if err != nil {
-		return tls.Certificate{}, nil, err
-	}
-	fields := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
-		line = strings.NewReplacer("{", ",", "}", ",").Replace(line)
-		for _, piece := range strings.Split(line, ",") {
-			key, value, ok := strings.Cut(strings.TrimSpace(piece), ":")
-			if !ok {
-				continue
-			}
-			key = strings.TrimSpace(key)
-			value = strings.Trim(strings.TrimSpace(value), `"'`)
-			if _, have := fields[key]; !have && value != "" {
-				fields[key] = value
-			}
-		}
-	}
-	read := func(name string) ([]byte, error) {
-		if v := fields[name+"-data"]; v != "" {
-			return base64.StdEncoding.DecodeString(v)
-		}
-		if v := fields[name]; v != "" {
-			if !filepath.IsAbs(v) {
-				v = filepath.Join(filepath.Dir(c.kubeconfig), v)
-			}
-			return os.ReadFile(v)
-		}
-		return nil, fmt.Errorf("%s has no %s", c.kubeconfig, name)
-	}
-	caPEM, err := read("certificate-authority")
-	if err != nil {
-		return tls.Certificate{}, nil, err
-	}
-	certPEM, err := read("client-certificate")
-	if err != nil {
-		return tls.Certificate{}, nil, err
-	}
-	keyPEM, err := read("client-key")
-	if err != nil {
-		return tls.Certificate{}, nil, err
-	}
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return tls.Certificate{}, nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return tls.Certificate{}, nil, fmt.Errorf("no CA certificate in %s", c.kubeconfig)
-	}
-	return cert, pool, nil
+	return nodeauth.Load(c.kubeconfig)
 }
 
 // verifyNode accepts a certificate chain only if it is a node of this cluster.
@@ -463,33 +410,12 @@ func (c credentials) load() (tls.Certificate, *x509.CertPool, error) {
 // including the server, which has no serving certificate of its own that
 // every peer could check.
 func (c credentials) verifyNode(raw [][]byte, _ [][]*x509.Certificate) error {
-	if len(raw) == 0 {
-		return errors.New("no certificate")
-	}
 	_, pool, err := c.load()
 	if err != nil {
 		return err
 	}
-	leaf, err := x509.ParseCertificate(raw[0])
-	if err != nil {
-		return err
-	}
-	intermediates := x509.NewCertPool()
-	for _, der := range raw[1:] {
-		if cert, err := x509.ParseCertificate(der); err == nil {
-			intermediates.AddCert(cert)
-		}
-	}
-	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
-		return err
-	}
-	for _, org := range leaf.Subject.Organization {
-		if org == "system:nodes" {
-			return nil
-		}
-	}
-	return fmt.Errorf("%s is not a node", leaf.Subject.CommonName)
+	_, err = nodeauth.Node(raw, pool, x509.ExtKeyUsageAny)
+	return err
 }
 
 func (c credentials) certificate() (*tls.Certificate, error) {

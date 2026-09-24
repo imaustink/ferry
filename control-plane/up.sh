@@ -199,6 +199,10 @@ api_cmd=("$bin/kube-apiserver" \
   --proxy-client-cert-file="$PKI_DIR/front-proxy-client.crt" \
   --proxy-client-key-file="$PKI_DIR/front-proxy-client.key" \
   --authorization-mode=Node,RBAC --allow-privileged=true \
+  `# The Node authorizer decides what a kubelet may read; this decides which` \
+  `# objects it may change. Without it any node could patch another's Node,` \
+  `# relabel it, or delete pods bound anywhere in the cluster.` \
+  --enable-admission-plugins=NodeRestriction \
   `# A node on another Mac has no credentials yet, so it authenticates with a` \
   `# bootstrap token to ask for a certificate. Without this the token is not a` \
   `# credential at all and the join fails as Unauthorized.` \
@@ -414,22 +418,26 @@ for i in $(seq 1 600); do
   sleep 0.1
 done
 
-# The Node authorizer covers a kubelet's access to objects tied to its own
-# pods, but the kubelet still needs the baseline system:node role.
-kubectl apply -f - >/dev/null <<'YAML'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ferry:system-nodes
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:node
-subjects:
-- apiGroup: rbac.authorization.k8s.io
-  kind: Group
-  name: system:nodes
-YAML
+# A kubelet gets exactly what the Node authorizer gives it: its own Node, its
+# own pods, and the Secrets, ConfigMaps and volumes those pods name. This used
+# to bind the whole system:node ClusterRole to system:nodes as well, because
+# 'ferry node add' ran every added kubelet on the first node's certificate and
+# the Node authorizer refuses a kubelet for any other node's name. That made
+# every kubelet credential able to list every pod and read every Secret in the
+# cluster. Each node now has a certificate of its own ('ferry node add' signs
+# one), so the binding is deleted from a cluster that has it.
+kubectl delete clusterrolebinding ferry:system-nodes --ignore-not-found >/dev/null \
+  || echo "    ! could not delete the old ferry:system-nodes binding" >&2
+# Beyond its own objects a node reads the cluster's shape, and nothing else:
+# the Node list, Services and EndpointSlices. A Mac that joined renders its own
+# Service rules and finds the other Macs' switches from them, and a machine
+# routes to the other machines' pods from the Node list. The Node authorizer
+# alone gives a kubelet only its own Node and no EndpointSlices at all.
+# system:node-proxier is upstream's read-only role for exactly this, with no
+# pods and no Secrets in it. 'ferry token create' has always made this binding;
+# made here too, so a cluster with machines and no joined Mac has it.
+kubectl create clusterrolebinding ferry-node-proxier --clusterrole=system:node-proxier \
+  --group=system:nodes >/dev/null 2>&1 || true
 
 # Every start, not only the first: the address it advertises follows the Mac's
 # network, and nothing else writes it any more.

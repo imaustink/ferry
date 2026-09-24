@@ -55,4 +55,5 @@ $K label pod e34cli role=friend >/dev/null
 sleep 5
 probe "client=friend "
 $K delete networkpolicy e34-friends-only >/dev/null
-$K delete pod e34web e34cli --wait=false >/dev/null
+# KEEP=1 leaves the pods for experiments/35-netpol-follower/latency.py.
+[ -n "${KEEP:-}" ] || $K delete pod e34web e34cli --wait=false >/dev/null

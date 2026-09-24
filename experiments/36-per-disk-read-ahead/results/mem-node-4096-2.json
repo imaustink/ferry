@@ -1,0 +1,61 @@
+{
+  "shape": "vm-per-pod",
+  "workload": "custom",
+  "image": "docker.io/library/node:22-alpine",
+  "count": 4,
+  "create_seconds": 1.1524874999999999,
+  "baseline": {
+    "at": "07:50:55",
+    "free_mib": 12313.09375,
+    "used_mib": 64415.671875,
+    "compressed_mib": 5840.75,
+    "vms": 0,
+    "vm_resident_mib": 0,
+    "vm_cpu_percent": 0
+  },
+  "samples": [
+    {
+      "at": "07:51:07",
+      "free_mib": 11227.6875,
+      "used_mib": 64971.4375,
+      "compressed_mib": 5840.703125,
+      "vms": 4,
+      "vm_resident_mib": 1369.609375,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:51:17",
+      "free_mib": 11353.78125,
+      "used_mib": 64836.921875,
+      "compressed_mib": 5840.671875,
+      "vms": 4,
+      "vm_resident_mib": 1370,
+      "vm_cpu_percent": 0
+    },
+    {
+      "at": "07:51:28",
+      "free_mib": 11767.578125,
+      "used_mib": 64406.921875,
+      "compressed_mib": 5840.65625,
+      "vms": 4,
+      "vm_resident_mib": 1369.9375,
+      "vm_cpu_percent": 0.8
+    }
+  ],
+  "peak": {
+    "at": "07:51:17",
+    "free_mib": 11353.78125,
+    "used_mib": 64836.921875,
+    "compressed_mib": 5840.671875,
+    "vms": 4,
+    "vm_resident_mib": 1370,
+    "vm_cpu_percent": 0
+  },
+  "footprint_mib": 924,
+  "logs": [
+    "pod-00.log: 2026-09-23T14:50:55.736Z stdout F P| served",
+    "pod-01.log: 2026-09-23T14:50:56.005Z stdout F P| served",
+    "pod-02.log: 2026-09-23T14:50:56.289Z stdout F P| served",
+    "pod-03.log: 2026-09-23T14:50:56.574Z stdout F P| served"
+  ]
+}

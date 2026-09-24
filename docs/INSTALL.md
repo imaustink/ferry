@@ -145,6 +145,25 @@ CIDR, and ports offset from the first node's. It is one Mac's memory either
 way, so this is for testing scheduling and multi-node behaviour rather than for
 capacity.
 
+**Each node has its own credential.** `ferry node add` signs the node a kubelet
+client certificate with the cluster CA, `CN=system:node:<name>` in
+`O=system:nodes`, kept in `~/.ferry/pki/nodes/<name>.{crt,key,conf}`. A Mac
+that joined gets its node's the Kubernetes way, a bootstrap token and a CSR
+the control plane approves. Either way the Node authorizer and the
+NodeRestriction admission plugin give a node its own Node, its own pods and
+what they mount, and nothing of anyone else's: as any node,
+`kubectl auth can-i list secrets -A` and `list pods -A` both say `no`, and
+changing another node or deleting its pods is refused. Nodes can read the Node
+list, Services and EndpointSlices (upstream's `system:node-proxier`, bound as
+`ferry-node-proxier`), which is how each Mac renders its own Service rules.
+
+A cluster made before this bound the whole `system:node` role to every node
+(`ferry:system-nodes`), because added nodes all ran on the first node's
+certificate. The next `ferry up` or `ferry upgrade apply` deletes that binding,
+and first restarts the kubelet of any added node still on the first node's
+certificate onto one of its own; its runtime and pods stay up. `ferry node rm`
+deletes the node's key.
+
 ### Another Mac
 
 On the Mac already running the cluster:
@@ -269,6 +288,7 @@ not in the installer.
 |---|---|---|
 | `FERRY_POD_CPUS` | `2` | cpus per pod VM |
 | `FERRY_POD_MEMORY_MIB` | `512` | memory per pod VM |
+| `FERRY_POD_READAHEAD_KB` | `1024` | read-ahead, in KiB, of a pod's image disks, scratch disk, disk emptyDirs and block claims. The guest agent's own disk always stays at 128 KiB. A pod can ask for its own with the annotation `ferry.dev/read-ahead-kb`. Higher streams large files faster and costs a pod with one large binary more memory: node is 17 MiB more at 1024, 48 at 8192 ([experiment 36](../experiments/32-pod-memory-footprint/FINDINGS.md#read-ahead-on-the-pods-own-disks-experiment-36)) |
 | `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~133 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
@@ -318,6 +338,8 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_COREDNS_IMAGE` | `docker.io/coredns/coredns:1.11.3` | the CoreDNS mode 1 runs, and mode 2's machines run |
 | `FERRY_NODE_INDEX` | `0` | which `/24` of the cluster CIDR this node owns |
 | `FERRY_RELAY_PORT` | `8472` + profile shift | udp port the pod switch uses between Macs. The base of a range, not one port: node N added with `ferry node add` uses this plus N, up to 99 |
+| `FERRY_NETPOL_PEER_PORT` | `6444` + profile shift | on the control plane's Mac: the TLS port its ferry-netpol serves the other Macs' nodes their own pods' NetworkPolicy rules on. Only a kubelet client certificate the cluster CA signed, in `system:nodes`, is answered, and only with that node's pods |
+| `FERRY_NETPOL_UPSTREAM` | the join address's host, its port + 1 | on a joined Mac: where to follow the control plane's ferry-netpol, for a control plane whose peer port is not one above its API server's |
 | `FERRY_PEERS` | read from `$FERRY_HOME/peers` | the other Macs' relay endpoints |
 | `FERRY_ALLOW_OFF_SLICE` | — | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
 | `FERRY_HOST_CLUSTER_IPS` | `false` | `1` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |

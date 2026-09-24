@@ -165,6 +165,10 @@ FERRY_STREAMER_SOCK="${FERRY_STREAMER_SOCK:-/tmp/ferry-streamer$SUFFIX.sock}"
 FERRY_STREAM_ADDR="${FERRY_STREAM_ADDR:-127.0.0.1:$(( 10350 + PORT_SHIFT ))}"
 FERRY_PROXYD_SOCK="${FERRY_PROXYD_SOCK:-/tmp/ferry-proxyd$SUFFIX.sock}"
 FERRY_NETPOL_SOCK="${FERRY_NETPOL_SOCK:-/tmp/ferry-netpol$SUFFIX.sock}"
+# Where the control plane's ferry-netpol serves the other Macs their own nodes'
+# rules, over TLS. One above the API server's port, so a joining Mac works it
+# out from the address it was given to join at. See start_netpol.
+NETPOL_PEER_PORT="${FERRY_NETPOL_PEER_PORT:-$(( 6444 + PORT_SHIFT ))}"
 FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud$SUFFIX.sock}"
 # Pod sockets are named by pod uid, and macOS caps a unix socket path near 104
 # bytes, so this directory is deliberately short.
@@ -522,6 +526,7 @@ Environment:
                          these pods; without it ferry refuses rather than
                          partition a multi-node cluster silently
   FERRY_POD_MEMORY_MIB   memory per pod VM, default 512
+  FERRY_POD_READAHEAD_KB read-ahead of a pod's image and volume disks, KiB
   K8S_VERSION            kubernetes to build, default $FERRY_DEFAULT_K8S_VERSION (same as
                          'ferry build --kubernetes-version')
   K8S_CONTROL_PLANE_VERSION  the darwin control plane build to use, when the
@@ -1013,6 +1018,7 @@ start_control_plane() { # version
   # that field -- so the first machine in a worktree cluster came up with pods
   # on 10.244.1.x while the Mac's pods were on 10.156.0.x, and kube-proxy was
   # told a third answer.
+  migrate_node_credentials
   K8S_VERSION="$version" \
   STATE="$FERRY_HOME" POD_GATEWAY="$gateway" ADVERTISE="$advertise" NODE_NAME="$NODE_NAME" \
     CLUSTER_CIDR="$CLUSTER_CIDR" \
@@ -1105,6 +1111,7 @@ cmd_up() {
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet "$POD_SUBNET" --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
@@ -1290,16 +1297,60 @@ EOF
 # Service rules already reach a pod. Without this, policies were accepted and
 # silently ignored, which is worse than not supporting them.
 #
-# A Mac that joined runs its own, as the node: its pods and its edge ask a
-# socket on that Mac, and a socket cannot be reached across the network.
-start_netpol() { # [kubeconfig]
+# Compiled here and only here, with the cluster's own credentials. The other
+# Macs' nodes are served their own pods' rules on NETPOL_PEER_PORT, over TLS:
+# they present their kubelet's certificate and get what that node's pods need
+# and nothing else (ferry-netpol/serve.go). The port presents the API server's
+# certificate, which a joined Mac already trusts for this address. A joined
+# Mac runs start_netpol_follower instead.
+start_netpol() {
   [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
   rm -f "$FERRY_NETPOL_SOCK"
-  "$here/bin/ferry-netpol" --kubeconfig "${1:-$FERRY_HOME/admin.conf}" \
+  "$here/bin/ferry-netpol" --kubeconfig "$FERRY_HOME/admin.conf" \
+    --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
+    --listen "0.0.0.0:$NETPOL_PEER_PORT" --client-ca "$FERRY_HOME/pki/ca.crt" \
+    --tls-cert "$FERRY_HOME/pki/apiserver.crt" --tls-key "$FERRY_HOME/pki/apiserver.key" \
+    >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-netpol.pid"
+  ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
+  netpol_verdict
+  # A cluster that handed its nodes the old grant loses it here, in the
+  # background because it changes nothing this start waits on.
+  ferry_netpol_rbac_remove &
+}
+
+# A Mac that joined asks the control plane's ferry-netpol for its node's rules
+# and serves them on the same socket, so ferry-cri and ferry-proxy here are
+# unchanged. It used to run a ferry-netpol of its own as the node, which needed
+# every kubelet in the cluster to be able to read every pod.
+#
+# The peer port is one above the API server's on the control plane's Mac, so
+# it is worked out from the address this Mac joined at. A control plane older
+# than this has no peer port, and is said so rather than left to look enforced.
+start_netpol_follower() { # server(host:port) kubeconfig...
+  [ -x "$here/bin/ferry-netpol" ] || { warn "ferry-netpol not built; NetworkPolicies will be ignored"; return 0; }
+  local server="$1"; shift
+  local upstream="${FERRY_NETPOL_UPSTREAM:-${server%:*}:$(( ${server##*:} + 1 ))}" flags=() conf
+  for conf in "$@"; do flags+=(--node-kubeconfig "$conf"); done
+  rm -f "$FERRY_NETPOL_SOCK"
+  "$here/bin/ferry-netpol" --upstream "$upstream" "${flags[@]}" \
     --socket "$FERRY_NETPOL_SOCK" --cluster-cidr "$CLUSTER_CIDR" \
     >"$FERRY_RUN/logs/ferry-netpol.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-netpol.pid"
   ferry_await 15 test -S "$FERRY_NETPOL_SOCK"
+  # Answered only once the control plane has been heard from for every node;
+  # before that the socket holds and refuses, which is what keeps ferry-proxy
+  # from mistaking "not known yet" for "no policies".
+  if [ -S "$FERRY_NETPOL_SOCK" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+       --unix-socket "$FERRY_NETPOL_SOCK" http://ferry-netpol/rules)" != 200 ]; then
+    warn "NetworkPolicies NOT enforced yet: the control plane's ferry-netpol at $upstream is not answering"
+    echo "      The control plane needs a ferry newer than 0.6.0 for this; this Mac keeps asking."
+    return 0
+  fi
+  netpol_verdict "following $upstream"
+}
+
+netpol_verdict() { # [how]
   if [ ! -S "$FERRY_NETPOL_SOCK" ]; then
     warn "ferry-netpol did not start; NetworkPolicies will be ignored"
   elif [ "$KERNEL" != "$NAT_KERNEL" ]; then
@@ -1310,33 +1361,19 @@ start_netpol() { # [kubeconfig]
     warn "NetworkPolicies NOT enforced: the guest kernel has no nf_tables"
     echo "      Build one with: ferry kernel"
   else
-    ok "NetworkPolicies enforced in the pods"
+    ok "NetworkPolicies enforced in the pods${1:+, $1}"
   fi
 }
 
-# What a node's certificate needs for ferry-netpol to run as it. Made by
-# 'ferry token create', since a Mac cannot join without one, and idempotent, so
-# a cluster made before this existed gets it from its next token.
-ferry_netpol_rbac() {
-  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl apply -f - >/dev/null 2>&1 <<'EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata: {name: ferry-node-netpol}
-rules:
-- apiGroups: [networking.k8s.io]
-  resources: [networkpolicies]
-  verbs: [list, watch]
-- apiGroups: [""]
-  resources: [pods, namespaces, nodes]
-  verbs: [list, watch]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata: {name: ferry-node-netpol}
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ferry-node-netpol}
-subjects:
-- {apiGroup: rbac.authorization.k8s.io, kind: Group, name: system:nodes}
-EOF
+# The grant joined Macs' ferry-netpol used to run under: list and watch on
+# every NetworkPolicy, pod, namespace and node, for all of system:nodes. That
+# is wider than the Node authorizer gives a kubelet, and nothing needs it now,
+# so 'ferry up' and 'ferry token create' take it off any cluster that has it.
+# A joined Mac still running the old ferry-netpol stops getting rules, and
+# says so in its log; 'ferry join' from this version is the way back.
+ferry_netpol_rbac_remove() {
+  KUBECONFIG="$FERRY_HOME/admin.conf" kubectl delete --ignore-not-found \
+    clusterrolebinding/ferry-node-netpol clusterrole/ferry-node-netpol >/dev/null 2>&1
 }
 
 # The Mac's GPU, offered to pods over a socket.
@@ -1418,11 +1455,18 @@ advertise_gpu() { # node-name [kubeconfig]
     return 0
   fi
 
-  local code
-  code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
-    -X PATCH -H "Content-Type: application/merge-patch+json" \
-    -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
-    "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+  # A joined kubelet has its certificate a moment before it has registered its
+  # Node, and a patch in between is a 404 (measured on a rejoin), so that one
+  # answer is waited out.
+  local code _
+  for _ in $(seq 1 30); do
+    code="$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "${auth[@]}" \
+      -X PATCH -H "Content-Type: application/merge-patch+json" \
+      -d "{\"status\":{\"capacity\":{\"ferry.dev/gpu\":\"$GPU_CAPACITY\"}}}" \
+      "$server/api/v1/nodes/$node/status" 2>/dev/null)"
+    [ "$code" = 404 ] || break
+    sleep 1
+  done
   if [ "$code" = "200" ]; then
     ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
   else
@@ -2018,6 +2062,11 @@ cmd_node_add() {
   # renewed is somebody's live node, and is left alone.
   stale_node_gone "$name" || return 1
 
+  # A certificate of its own, not the first node's: the Node authorizer gives a
+  # kubelet only what belongs to the node its certificate names.
+  local kubeconfig
+  kubeconfig="$(node_credential "$name")" || return 1
+
   # Find the first free index. Node 0 is the one 'ferry up' started.
   #
   # Free across the whole cluster, not just this Mac: an index is a /24 of the
@@ -2066,6 +2115,7 @@ cmd_node_add() {
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$sock" --state "$run/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
@@ -2123,7 +2173,7 @@ spec:
   podCIDRs: [$(node_slice "$index")]
 EOF
 
-  start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf" \
+  start_kubelet "$name" "$run" "$kubeconfig" \
     "$FERRY_RUN/node-$index-kubelet.pid" "$FERRY_RUN/logs/node-$index-kubelet.log" "" "$index"
 
   export KUBECONFIG="$FERRY_HOME/admin.conf"
@@ -2159,6 +2209,9 @@ cmd_node_rm() {
     [ -f "$pidfile" ] && { kill -TERM "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"; }
   done
   kubectl delete node "$name" >/dev/null 2>&1
+  # Its certificate stays valid until it expires -- nothing revokes one -- but
+  # a node added again under this name gets a new key.
+  rm -f "$FERRY_HOME/pki/nodes/$name".{crt,key,conf}
   # A node added again under this name is a new node, and starts at the
   # cluster's version rather than whatever this one was left on. It also stops
   # holding that version in the store.
@@ -2257,12 +2310,14 @@ EOF
   kubectl create clusterrolebinding ferry-node-proxier \
     --clusterrole=system:node-proxier \
     --group=system:nodes >/dev/null 2>&1
-  # And its own NetworkPolicy rules, for the same reason: every Mac runs
-  # ferry-netpol for its own pods and its own edge. A policy selects peers
-  # anywhere in the cluster, so it reads every pod, namespace and node -- which
-  # the Node authorizer does not grant a kubelet (1.34 holds a node's pod list
-  # to its own pods). Read-only, the same reach a Calico or Cilium agent has.
-  ferry_netpol_rbac
+  # NetworkPolicy rules are not read the same way. A policy selects peers
+  # anywhere in the cluster, so compiling one reads every pod, namespace and
+  # node, which the Node authorizer does not grant a kubelet -- and a grant
+  # that did is what this used to make. The control plane compiles instead and
+  # serves each node its own part (start_netpol), so a node needs nothing
+  # beyond what its kubelet has; a cluster that still has the old grant loses
+  # it here.
+  ferry_netpol_rbac_remove
 
   # Let a node that has not joined yet read the node list.
   #
@@ -2460,7 +2515,7 @@ EOF
   RELAY_PORT=$((RELAY_PORT))
   clear_stopped
   echo worker > "$FERRY_HOME/role"
-  start_worker "$node_name" "$index" || return 1
+  start_worker "$node_name" "$index" "$server" || return 1
 }
 
 # The /24 of the cluster CIDR an index owns. For saying so out loud; ferry-cri
@@ -2522,8 +2577,8 @@ free_node_index() { # [kubeconfig]
 # The parts of a node that are not the control plane: a runtime, a streamer and
 # a kubelet. Used by 'ferry join'; 'ferry up' starts these itself because it has
 # a control plane to start first.
-start_worker() {
-  local name="$1" index="$2"
+start_worker() { # name index server(host:port)
+  local name="$1" index="$2" server="$3"
   rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK"
 
   # A joining Mac has its own GPU, so it runs its own daemon and advertises its
@@ -2534,6 +2589,7 @@ start_worker() {
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
     --pod-subnet auto --pod-cpus "$POD_CPUS" --pod-memory-mib "$POD_MEMORY_MIB" \
+    ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
@@ -2561,6 +2617,11 @@ start_worker() {
   [ -n "$ready" ] || { bad "the runtime did not start"; tail -5 "$FERRY_RUN/logs/ferry-cri.log"; return 1; }
   ok "runtime on $(node_slice "$index"), switch udp/$RELAY_PORT"
 
+  # The address the control plane's node reserves for CoreDNS: .2 of index 0's
+  # slice of the cluster CIDR. It was written as 10.244.0.2, which is right only
+  # for the default CIDR, so a Mac joined to any other had no DNS in its pods.
+  local dns=10.244.0.2
+  case "$CLUSTER_CIDR" in *.*.*.*/*) dns="${CLUSTER_CIDR%.*.*}.0.2" ;; esac
   cat > "$FERRY_RUN/kubelet.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -2585,7 +2646,7 @@ enforceNodeAllocatable: []
 failSwapOn: false
 readOnlyPort: 0
 clusterDomain: $CLUSTER_DOMAIN
-clusterDNS: [10.244.0.2]
+clusterDNS: [$dns]
 runtimeRequestTimeout: 10m
 authentication:
   x509: {clientCAFile: $FERRY_HOME/pki/ca.crt}
@@ -2637,9 +2698,10 @@ EOF
     warn "bin/ferry-proxyd is missing; Services will not route on this node"
   fi
 
-  # NetworkPolicy, for this Mac's pods and this Mac's edge. As the node, like
-  # ferry-proxyd; ferry-cri is already asking its socket and keeps asking.
-  start_netpol "$FERRY_RUN/kubelet.conf"
+  # NetworkPolicy, for this Mac's pods and this Mac's edge: fetched from the
+  # control plane as the node. ferry-cri is already asking its socket and keeps
+  # asking.
+  start_netpol_follower "$server" "$FERRY_RUN/kubelet.conf"
 
   # Node ports and claims are per node too: a pod scheduled here needs its
   # volume made here, and a connection arriving here needs forwarding here.
@@ -2809,6 +2871,69 @@ wait_node_version() { # name version seconds
   return 1
 }
 
+# The kubeconfig of a node 'ferry node add' runs on this Mac, holding a client
+# certificate of that node's own: CN=system:node:<name>, O=system:nodes.
+#
+# That name is the only thing the Node authorizer scopes a kubelet by. Added
+# nodes used to present the first node's certificate, which it refuses for any
+# other node, and that was papered over by binding the whole system:node role
+# to every node -- so every kubelet credential could list every pod and read
+# every Secret in the cluster. Signed here with the cluster CA, as
+# control-plane/pki.sh signs the first node's: this Mac holds the CA key, and a
+# CSR through the API server would need a bootstrap token and an approver to
+# arrive at the same certificate. A Mac that joined has its own kubelet's CSR.
+#
+# Kept beside the CA in FERRY_HOME, which outlives /tmp, and signed again only
+# when missing or not for this name. The kubeconfig is rewritten each time from
+# the first node's, so it points wherever that one does.
+node_credential() { # name -> the node's kubeconfig
+  local name="$1" dir="$FERRY_HOME/pki/nodes"
+  local crt="$dir/$name.crt" key="$dir/$name.key" conf="$dir/$name.conf"
+  local pki="$FERRY_HOME/pki"
+  [ -f "$pki/ca.key" ] && [ -f "$FERRY_HOME/kubelet.conf" ] || {
+    bad "no cluster CA key on this Mac to sign $name's certificate with" >&2; return 1; }
+  if [ ! -f "$key" ] || [ "$(openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+       != "subject=O=system:nodes,CN=system:node:$name" ]; then
+    mkdir -p "$dir" && chmod 700 "$dir"
+    openssl req -newkey rsa:2048 -nodes -keyout "$key" -out "$dir/$name.csr" \
+      -subj "/CN=system:node:$name/O=system:nodes" 2>/dev/null \
+      && printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$dir/$name.ext" \
+      && openssl x509 -req -in "$dir/$name.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+           -CAcreateserial -CAserial "$pki/ca.srl" -out "$crt" -days 3650 \
+           -extfile "$dir/$name.ext" 2>/dev/null
+    local rc=$?
+    rm -f "$dir/$name.csr" "$dir/$name.ext"
+    [ "$rc" = 0 ] || { rm -f "$crt" "$key"; bad "could not sign a certificate for $name" >&2; return 1; }
+    chmod 600 "$key"
+  fi
+  sed -e "s|client-certificate: .*|client-certificate: $crt|" \
+      -e "s|client-key: .*|client-key: $key|" \
+      "$FERRY_HOME/kubelet.conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+  echo "$conf"
+}
+
+# Restart onto its own certificate any added node still running on the first
+# node's. control-plane/up.sh deletes the binding that let those work, so this
+# runs before it, while the old API server still answers them. The kubelet only:
+# the runtime holds the pod VMs and stays up, as in 'ferry upgrade node'.
+migrate_node_credentials() {
+  local pidfile pid index run kubeconfig bootstrap logfile name
+  for pidfile in "$FERRY_RUN"/node-*-kubelet.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile")"
+    # -ww: ps may cut the command at the terminal's width otherwise, and the
+    # kubeconfig comes after the kubelet's full path and --config.
+    ps -ww -o args= -p "$pid" 2>/dev/null | grep -qF -- "--kubeconfig=$FERRY_HOME/kubelet.conf " || continue
+    index="${pidfile##*/node-}"; index="${index%-kubelet.pid}"
+    eval "$(node_layout "$index")"
+    name="$(cat "$run/node-name" 2>/dev/null)"
+    [ -n "$name" ] && [ "$kubeconfig" != "$FERRY_HOME/kubelet.conf" ] || continue
+    stop_kubelet "$pidfile"
+    start_kubelet "$name" "$run" "$kubeconfig" "$pidfile" "$logfile" "" "$index"
+    ok "node $name restarted on a certificate of its own"
+  done
+}
+
 # Start the kubelet for one node, wherever that node's state lives.
 #
 # Node 0 and the extra nodes differ only in which directory they keep and which
@@ -2906,7 +3031,12 @@ node_layout() { # index
     printf 'run=%q\n' "$FERRY_RUN/node-$1"
     printf 'pidfile=%q\n' "$FERRY_RUN/node-$1-kubelet.pid"
     printf 'logfile=%q\n' "$FERRY_RUN/logs/node-$1-kubelet.log"
-    printf 'kubeconfig=%q\n' "$FERRY_HOME/kubelet.conf"
+    # Its own certificate, signed now if it has none: a node added before
+    # nodes had one gets it at its next start.
+    local name conf
+    name="$(cat "$FERRY_RUN/node-$1/node-name" 2>/dev/null)"
+    conf="$([ -n "$name" ] && node_credential "$name")" || conf="$FERRY_HOME/kubelet.conf"
+    printf 'kubeconfig=%q\n' "$conf"
     printf 'bootstrap=\n'
   fi
 }

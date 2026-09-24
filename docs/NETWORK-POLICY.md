@@ -114,24 +114,117 @@ isolates -- against a snapshot swapped in atomically, with no lock on the
 connection path. Connection latency and throughput through the node port were
 the same before and after within the noise of the measurement.
 
-Two things the edge cannot do, and does not pretend to:
+What the edge cannot do, and does not pretend to: **a connection this Mac
+hands to another Mac's node port** reaches that Mac from this one's address,
+and is checked there against this Mac, not the client. That is what
+`externalTrafficPolicy: Cluster` means on any cluster: the source is rewritten
+on the way through. A pod on another node *of the same Mac* is dialled directly
+and checked against the real client.
 
-- **A connection this Mac hands to another Mac's node port** reaches that Mac
-  from this one's address, and is checked there against this Mac, not the
-  client. That is what `externalTrafficPolicy: Cluster` means on any cluster:
-  the source is rewritten on the way through. A pod on another node *of the
-  same Mac* is dialled directly and checked against the real client.
-- **A Mac that joined runs its own `ferry-netpol`**, as the node, for its own
-  pods and its own edge; a unix socket on the first Mac is not reachable from
-  another. The node's certificate reads policies, pods, namespaces and nodes
-  cluster-wide through the `ferry-node-netpol` ClusterRole, which
-  `ferry token create` makes -- the Node authorizer grants a kubelet only its
-  own pods. A cluster whose token predates this has no such role, and the
-  joined Mac warns that NetworkPolicies will be ignored until a new token is
-  made. Measured on a second profile joined to this Mac's cluster
-  (experiments/34-join-policy/policy.sh): before, a friends-only policy on the joined
-  node's pod let both a pod on the first node and an edge client through;
-  after, both are refused, and a labelled friend gets through in the pod.
+A connection is only ever checked against policy on the Mac that has the pod.
+`ferry-proxy` dials a pod directly only if it is on this Mac, and hands every
+other connection to the node port of the Mac that has it, with no pod named,
+so nothing is checked here (`chooseBackends` in `ferry-proxy/expose.go`). A
+ClusterIP bound on the Mac has only this Mac's pods behind it. That is what
+lets each Mac be served policy for its own nodes' pods alone, below.
+
+## More than one Mac
+
+Every policy is compiled on the control plane's Mac, by the one `ferry-netpol`
+that watches the cluster with the cluster's own credentials. Its unix socket
+serves this Mac's `ferry-cri` and `ferry-proxy`, which get every pod's rules:
+every node on this Mac, `ferry node add` included, is this Mac's.
+
+A Mac that joined cannot reach that socket, so the same `ferry-netpol` also
+listens on a TCP port of its own (6444, shifted per profile like every other
+port, one above the API server's). A joined Mac runs `ferry-netpol` as a
+**follower**: it compiles nothing and watches nothing, asks that port for its
+node's rules, and serves them on its own socket in exactly the two forms
+`ferry-cri` and `ferry-proxy` already ask for. Neither of them changed.
+
+**Authentication is the node's kubelet client certificate**, over mutual TLS.
+The port accepts a certificate only if it chains to the cluster CA, is in group
+`system:nodes` and is named `system:node:<name>` -- the three things the API
+server checks before the Node authorizer calls a client a node -- and serves
+it the rules for the pods on `<name>` and nothing else: its pods' nftables
+sections, and its pods' entries in the edge document. The check is
+`nodeauth.Node`, shared with `ferry-registry`'s peer port, which asks the same
+question. The port presents the API server's own serving certificate, which a
+joined Mac already trusts for that address, so a follower knows it is talking
+to the control plane and not to any other node of the cluster. A Mac with
+several nodes follows once per node, with each node's certificate, over one
+HTTP/2 connection per node, and serves the union.
+
+This replaced a ClusterRole, `ferry-node-netpol`, that `ferry token create`
+bound to `system:nodes` so that a joined Mac's `ferry-netpol` could compile for
+itself as the node. That let every kubelet credential in the cluster list
+every pod, namespace, node and NetworkPolicy, which is more than the Node
+authorizer grants a kubelet. It is gone: `ferry token create` no longer makes
+it, and both `ferry up` and `ferry token create` delete it from a cluster that
+has it. What a node now learns from policy that it could not ask the API
+server for is the addresses its own pods' policies admit, which it has to have
+to enforce them.
+
+**Updates are pushed, not polled.** The control plane holds each follower's
+request until that node's rules change -- each node has generations of its own,
+so a node is woken by changes to its pods and not by every pod in the cluster
+-- and the follower holds `ferry-cri`'s and `ferry-proxy`'s the same way.
+Compilation is coalesced: an event marks the rules stale and one goroutine
+compiles, where each event used to compile on its own informer's goroutine.
+
+**When the control plane cannot be reached**, nothing changes on the joined
+Mac. The follower publishes only what it received, so the last rules stay in
+force in `ferry-cri`, in each pod's kernel and at the edge -- even rules the
+cluster has since changed. It never publishes an empty or partial set: before
+the first answer for every node it holds its callers and then refuses them, and
+both consumers keep what they had when refused. It retries from 250 ms backing
+off to 5 s, and says when it loses and regains the control plane in its log. A
+pod that *starts* on the joined Mac while its rules cannot be fetched has no
+section, and starts unfiltered, which is the same as a pod that starts while
+`ferry-netpol` is down on a single Mac. A new pod needs the API server, which
+runs beside `ferry-netpol` on the control plane's Mac, so the two are rarely
+down apart.
+
+A joined Mac on a ferry older than this runs the old `ferry-netpol`, which
+loses its grant at the control plane's next `ferry up` and stops getting
+updates. `ferry join` from this version is the way back. A joined Mac on this
+version against an older control plane says that NetworkPolicies are not
+enforced yet, rather than looking enforced.
+
+Measured on a second profile joined to this Mac's cluster, the way experiment
+34 did it ([experiments/35-netpol-follower](../experiments/35-netpol-follower/)):
+
+| | before (own `ferry-netpol`, ClusterRole) | after (follower) |
+|---|---|---|
+| friends-only policy on the joined pod: pod -> pod / edge | refused / refused | refused / refused |
+| the same, client labelled a friend | served / refused | served / refused |
+| the same on the first node's pod (control) | -- | refused / refused, then served / refused |
+| `can-i list networkpolicies -A` as the joined node | yes | no |
+| ClusterRole `ferry-node-netpol` | present | absent |
+| policy applied -> pod closed, median of 7 | 93 ms | 93 ms |
+| policy applied -> edge refuses, median of 7 | 46 ms | 45 ms |
+| policy deleted -> edge serves, median of 7 | 41 ms | 37 ms |
+| `ferry-netpol` RSS on the joined Mac | 32.8 MB | 28.3 MB |
+
+Node A's certificate is served only A's pods; the other node's certificate
+only its own; no certificate and another cluster's kubelet certificate fail the
+handshake. With the control plane's `ferry-netpol` stopped and a deny-all
+deleted while it was down, the joined pod and its edge stayed closed for 40 s;
+started again, the edge opened 0.64 s later and the pod 0.73 s later.
+
+`kubectl auth can-i list pods --all-namespaces` and `list secrets
+--all-namespaces` as any node, joined or not, now say **no**. They used to say
+yes through a binding of the whole `system:node` ClusterRole to `system:nodes`
+(`ferry:system-nodes`), which existed because `ferry node add` ran its kubelets
+on the first node's certificate. Each node now has a certificate of its own,
+the binding is deleted at `ferry up`, and the policy checks above passed again
+without it, on a joined node and an added one
+([experiments/37-node-credentials](../experiments/37-node-credentials/)).
+
+In the same-Mac simulation both profiles' nodes have the Mac's LAN address, so
+the joined profile's `ferry-proxy` counts the first node's pods as its own and
+dials them directly, and it has no edge rules for them. Two real Macs have two
+addresses, and hand those connections over instead.
 
 ## One deliberate difference
 

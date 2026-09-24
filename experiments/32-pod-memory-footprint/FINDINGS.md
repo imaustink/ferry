@@ -101,10 +101,15 @@ its time, five runs each:
 128 KiB is where the time starts to climb; below it each MiB saved costs
 milliseconds per container start.
 
+**Since experiment 36** only the init disk stays there. ferry-cri raises the
+pod's own disks (images, scratch, disk emptyDirs, block claims) to 1 MiB once
+the VM is up; see "Read-ahead on the pod's own disks" below.
+
 **What it costs:** a cold sequential read of one large file. 512 MiB from the
 container's own rootfs, page cache dropped, five runs: median 4.9 GB/s at 8 MiB
 read-ahead, 3.0 GB/s at 128 KiB (spread 2.1-3.4). A privileged pod that wants
-the rest can write its own `read_ahead_kb`.
+the rest can write its own `read_ahead_kb`. (That was the disk layout before
+experiment 31. The cost, and its fix, on today's layout are below.)
 
 ### The kernel image is paid for twice
 
@@ -155,6 +160,133 @@ remains of the slope is ~21 MiB per GiB of VM: the page map (16 MiB per GiB,
 64 bytes per 4 KiB page) and hash tables sized from RAM, all zeroed at boot.
 A 16 KiB-page guest would cut the page map by four and was not tried: it
 changes what userspace sees, and some allocators still assume 4 KiB.
+
+## Read-ahead on the pod's own disks (experiment 36)
+
+The memory above was all on `/dev/vda`. The throughput cut fell on the other
+disks. Experiment 36 (`../36-per-disk-read-ahead/`, the same harness under
+other names; ferry at `1cec4dd`, same Mac) measured those disks separately.
+
+**Which disk is which.** The framework attaches the init filesystem first, as
+`vda` (it boots `root=/dev/vda`), then every pod volume, and records each
+volume's device letter in the VM instance's mount table under the pod's id.
+From a real cluster pod with a disk emptyDir, a memory emptyDir and a
+ReadWriteOnce claim: `vda` init (ro), `vdb` emptyDir, `vdc` the claim's block
+image, `vdd` the image (ro), `vde` scratch; the memory emptyDir is a tmpfs
+with no device. The order after `vda` changes with the pod (in the harness the
+image is `vdb`), and read-only does not tell the init disk from an image, so
+ferry-cri reads the devices from the mount table and does not guess.
+
+**Memory.** Host footprint per pod, image and scratch read-ahead varied, init
+disk at 128 KiB; 4 pods a cell, three passes, medians. Idle after a working
+start: nginx:1.27-alpine and python:3.12-slim (a spread of stdlib imports,
+SQLite, 20 requests to itself) and node:22-alpine each serve 20 requests.
+
+| read-ahead | alpine `sleep` | nginx | python | node |
+|--:|--:|--:|--:|--:|
+| 128 KiB | 134.9 | 144.9 | 182.4 | 198.4 |
+| 512 KiB | | | | 209.8 |
+| **1 MiB** | **134.1** | **146.9** | **186.8** | **215.4** |
+| 2 MiB | 134.3 | 147.2 | 186.8 | 221.6 |
+| 4 MiB | 134.6 | 146.9 | 186.5 | 230.4 |
+| 8 MiB | 134.8 | 147.3 | 186.9 | 246.4 |
+
+Passes agree within 1.5 MiB. Small files cost 0-4 MiB at any value, since a
+fault reads at most the file. node's binary is one 120 MiB file, and faults in
+it read around by the whole window, which is what vminitd did above. Any
+workload that is one large executable will behave the same way.
+
+**Throughput.** Cold on both sides: an image with a 2 GiB random `/big`, whose
+ext4 was replaced by an APFS clone of itself before each pod, so the Mac had
+none of it cached. Each setting read its own unread 192 MiB stretch. Ten pods,
+order rotated. The writable-disk column is a file on the scratch disk, which
+is the same kind of disk as an emptyDir or a claim. The Mac had that file
+cached, since the guest had just written it. Medians in GB/s:
+
+| read-ahead | image, cold, 64 KiB reads | image, cold, 1 MiB reads | image, Mac-cached, 64 KiB | writable disk, 64 KiB |
+|--:|--:|--:|--:|--:|
+| 128 KiB | 3.0 | 5.2 | 4.8 | 4.3-6.8 |
+| 512 KiB | | | | 11.0 |
+| **1 MiB** | **5.1** | 4.0 | **14.4** | **14.6-15.2** |
+| 2 MiB | 5.5 | 5.2 | 16.6 | 15.8 |
+| 8 MiB | 5.5 | 5.1 | 16.2 | 15.6 |
+
+Cold reads spread 2.1-6.0 GB/s from run to run. Read-ahead sets the size of the
+disk requests that a *small* read turns into. A 1 MiB read goes to the disk as
+1 MiB whatever the setting, and the device takes up to 4 MiB a request. So the
+1 MiB column hardly moves, and the 4.9 → 3.0 above (`dd bs=1M` from a
+per-container clone, before experiment 31) does not reproduce on the current
+layout. A program reading 64 KiB at a time got a third of the throughput at
+128 KiB. At 1 MiB it gets 87-100% back, and at 2 MiB all of it.
+
+**The choice: 1 MiB.** That gives 94% of the cold best and 87% of the cached
+best. It costs alpine, nginx and python 0-4 MiB. For node it is the knee:
+17 MiB more, against 24 at 2 MiB and 48 at 8 MiB. A workload that streams
+large files can ask for more with the annotation.
+
+**Mechanism.** After `create()` returns, ferry-cri opens one connection to
+vminitd. Over it, it sends one `writeFile` of `/sys/block/<dev>/queue/read_ahead_kb`
+for each pod disk, all together, while the containers are being added. The
+boot waits for them before it returns, so before any container process starts.
+There is no process in the guest.
+
+- The value is `--pod-read-ahead-kb`, default 1024, which `ferry up` passes
+  from `FERRY_POD_READAHEAD_KB`.
+- A pod's `ferry.dev/read-ahead-kb` annotation wins for that pod. The kubelet
+  copies pod annotations onto the sandbox config, so this needs no lookup
+  through ferry-streamer.
+- `WriteFileFlags` has no public initializer. The all-false value is built
+  from three zero bytes, and if the struct changes size the write is skipped
+  with a warning. A failure never fails the pod.
+
+Verified on a cluster: every disk above at 1024, `vda` at 128, and the
+annotated pod at 4096. The kernel patch stays as it is: vminitd has faulted
+itself in before any agent call could lower `vda`.
+
+**Its cost.**
+
+- Single cold pod starts, 20 each way, alternating with the runtime from before
+  this change: median 290 ms before and 295 ms after. The ranges were 272-378
+  and 262-371.
+- In a burst of 20 pods, the writes finished a median of 3 ms (at most 10 ms)
+  after the containers were added. Time to all running was 5.78 s before and
+  5.88 s after.
+- The dial takes the VM instance's lock, which adding a container also takes,
+  so the writes cannot hide completely behind it.
+- 20 idle pods: 135.5 MiB each before and 135.3 after. The 135 against 132.5
+  above is the old runtime too, on the same Mac, so it is today's baseline.
+
+**Not taken: a kernel boot argument.** The alternative was
+`virtio_blk.read_ahead_kb=`, handled in ferry's own patch and applied to every
+disk but the first. It costs nothing at runtime. But:
+
+- every checkout would need `ferry kernel` (Docker) before it took effect;
+- the changed kernel inputs would send a checkout that has not rebuilt back to
+  the 226 MiB `maxPods` figure;
+- "not the first disk" is a rule the kernel would have to trust, while
+  ferry-cri knows which disk is which.
+
+If the few milliseconds ever matter, this is the fix.
+
+**Did not work:**
+
+- Reading the image disk raw (`dd if=/dev/vdb`): the image ext4 is sparse, so
+  those reads are holes returned at 16 GB/s.
+- vminitd's sysctl RPC as a route to sysfs: it maps every `.` in a key to `/`
+  under `/proc/sys`.
+- A cold read of a writable disk: dropping the Mac's cache takes `purge`, which
+  needs root. The read path is the same virtio disk as the image's.
+
+```sh
+cd experiments/36-per-disk-read-ahead
+./probe-at.sh final-map probe-map.sh 2        # the disks and their read-ahead
+./memory.sh 3 4; ./memory.sh 3 4 "128 1024 2048 4096 8192" node
+./seq-cold.sh 10                              # IMAGE: an image with a 2 GiB /big
+HOLD=40s ./probe-at.sh seq-volume probe-seq.sh
+./latency.sh 10; ./density.sh 20              # need build/ferry-cri-before (bin/ferry-cri at 1cec4dd)
+./summarize.py results/memory*.txt results/seq-*.txt
+kubectl apply -f cluster-check.yaml           # against `ferry up`
+```
 
 ## What did not work
 
@@ -221,9 +353,9 @@ for dense, trusted, idle pods; the gap narrows from 13x to 8x.
   still costs more idle than a small one.
 - **One machine**, and not the one experiment 13 used (M1 Max, 32 GiB); the
   before figure reproduced within a MiB or two (227 against 225-226).
-- **The kernel patch has one measured cost**, cold sequential reads of large
-  files (4.9 → 3.0 GB/s median). Workloads that stream big files cold from
-  their image will see it.
+- **The kernel patch had one measured cost**, cold sequential reads of large
+  files (4.9 → 3.0 GB/s median). Since experiment 36 it applies to the init
+  disk only, because ferry-cri sets every other disk to 1 MiB.
 - **THP off** also takes huge pages from a workload that asks for them with
   `madvise`. Not measured for any workload.
 

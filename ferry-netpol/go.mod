@@ -3,6 +3,7 @@ module github.com/imaustink/ferry/ferry-netpol
 go 1.26.0
 
 require (
+	github.com/imaustink/ferry/nodeauth v0.0.0
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
 	k8s.io/client-go v0.37.0
@@ -55,3 +56,6 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// Shared with ferry-registry, in this repository rather than published.
+replace github.com/imaustink/ferry/nodeauth => ../nodeauth

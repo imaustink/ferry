@@ -1,0 +1,43 @@
+2026/09/23 07:59:46 1 containers running in 284ms
+VM footprint    403 MiB total, 403.4 MiB per container
+    trace     boot sandbox06ab3e95e000001 images=1 scratch=0ms pod=0ms create=236ms readahead=236ms add=245ms
+P| pass=volume ra=128 bs=1024k 268435456 bytes (256.0MB) copied, 0.015659 seconds, 16.0GB/s
+P| pass=volume ra=128 bs=64k 268435456 bytes (256.0MB) copied, 0.047941 seconds, 5.2GB/s
+P| pass=volume ra=256 bs=1024k 268435456 bytes (256.0MB) copied, 0.017353 seconds, 14.4GB/s
+P| pass=volume ra=256 bs=64k 268435456 bytes (256.0MB) copied, 0.027100 seconds, 9.2GB/s
+P| pass=volume ra=512 bs=1024k 268435456 bytes (256.0MB) copied, 0.017088 seconds, 14.6GB/s
+P| pass=volume ra=512 bs=64k 268435456 bytes (256.0MB) copied, 0.023118 seconds, 10.8GB/s
+P| pass=volume ra=1024 bs=1024k 268435456 bytes (256.0MB) copied, 0.017374 seconds, 14.4GB/s
+P| pass=volume ra=1024 bs=64k 268435456 bytes (256.0MB) copied, 0.017844 seconds, 14.0GB/s
+P| pass=volume ra=128 bs=1024k 268435456 bytes (256.0MB) copied, 0.017745 seconds, 14.1GB/s
+P| pass=volume ra=128 bs=64k 268435456 bytes (256.0MB) copied, 0.060422 seconds, 4.1GB/s
+P| pass=volume ra=256 bs=1024k 268435456 bytes (256.0MB) copied, 0.017243 seconds, 14.5GB/s
+P| pass=volume ra=256 bs=64k 268435456 bytes (256.0MB) copied, 0.033785 seconds, 7.4GB/s
+P| pass=volume ra=512 bs=1024k 268435456 bytes (256.0MB) copied, 0.017509 seconds, 14.3GB/s
+P| pass=volume ra=512 bs=64k 268435456 bytes (256.0MB) copied, 0.022724 seconds, 11.0GB/s
+P| pass=volume ra=1024 bs=1024k 268435456 bytes (256.0MB) copied, 0.017280 seconds, 14.5GB/s
+P| pass=volume ra=1024 bs=64k 268435456 bytes (256.0MB) copied, 0.017179 seconds, 14.6GB/s
+P| pass=volume ra=128 bs=1024k 268435456 bytes (256.0MB) copied, 0.017164 seconds, 14.6GB/s
+P| pass=volume ra=128 bs=64k 268435456 bytes (256.0MB) copied, 0.059864 seconds, 4.2GB/s
+P| pass=volume ra=256 bs=1024k 268435456 bytes (256.0MB) copied, 0.017013 seconds, 14.7GB/s
+P| pass=volume ra=256 bs=64k 268435456 bytes (256.0MB) copied, 0.033391 seconds, 7.5GB/s
+P| pass=volume ra=512 bs=1024k 268435456 bytes (256.0MB) copied, 0.017019 seconds, 14.7GB/s
+P| pass=volume ra=512 bs=64k 268435456 bytes (256.0MB) copied, 0.020869 seconds, 12.0GB/s
+P| pass=volume ra=1024 bs=1024k 268435456 bytes (256.0MB) copied, 0.017496 seconds, 14.3GB/s
+P| pass=volume ra=1024 bs=64k 268435456 bytes (256.0MB) copied, 0.017377 seconds, 14.4GB/s
+P| pass=volume ra=128 bs=1024k 268435456 bytes (256.0MB) copied, 0.017078 seconds, 14.6GB/s
+P| pass=volume ra=128 bs=64k 268435456 bytes (256.0MB) copied, 0.048208 seconds, 5.2GB/s
+P| pass=volume ra=256 bs=1024k 268435456 bytes (256.0MB) copied, 0.017219 seconds, 14.5GB/s
+P| pass=volume ra=256 bs=64k 268435456 bytes (256.0MB) copied, 0.034562 seconds, 7.2GB/s
+P| pass=volume ra=512 bs=1024k 268435456 bytes (256.0MB) copied, 0.017118 seconds, 14.6GB/s
+P| pass=volume ra=512 bs=64k 268435456 bytes (256.0MB) copied, 0.022845 seconds, 10.9GB/s
+P| pass=volume ra=1024 bs=1024k 268435456 bytes (256.0MB) copied, 0.017180 seconds, 14.6GB/s
+P| pass=volume ra=1024 bs=64k 268435456 bytes (256.0MB) copied, 0.015341 seconds, 16.3GB/s
+P| pass=volume ra=128 bs=1024k 268435456 bytes (256.0MB) copied, 0.017157 seconds, 14.6GB/s
+P| pass=volume ra=128 bs=64k 268435456 bytes (256.0MB) copied, 0.058569 seconds, 4.3GB/s
+P| pass=volume ra=256 bs=1024k 268435456 bytes (256.0MB) copied, 0.015253 seconds, 16.4GB/s
+P| pass=volume ra=256 bs=64k 268435456 bytes (256.0MB) copied, 0.032211 seconds, 7.8GB/s
+P| pass=volume ra=512 bs=1024k 268435456 bytes (256.0MB) copied, 0.015178 seconds, 16.5GB/s
+P| pass=volume ra=512 bs=64k 268435456 bytes (256.0MB) copied, 0.022638 seconds, 11.0GB/s
+P| pass=volume ra=1024 bs=1024k 268435456 bytes (256.0MB) copied, 0.017316 seconds, 14.4GB/s
+P| pass=volume ra=1024 bs=64k 268435456 bytes (256.0MB) copied, 0.015528 seconds, 16.1GB/s

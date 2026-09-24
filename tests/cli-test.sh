@@ -188,7 +188,7 @@ echo
 printf '\033[1m%s\033[0m\n' "NetworkPolicies are only called enforced where they can be"
 # The fallback kernel has no nf_tables, and 'ferry up' said "enforced" on it
 # while every rule apply in every pod failed.
-netpol="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+netpol="$(sed -n '/^netpol_verdict()/,/^}/p' "$repo/ferry")"
 contains "the fallback kernel is told apart" "$netpol" '[ "$KERNEL" != "$NAT_KERNEL" ]'
 contains "  and said out loud" "$netpol" "NetworkPolicies NOT enforced"
 echo
@@ -239,11 +239,32 @@ printf '\033[1m%s\033[0m\n' "a joined Mac enforces NetworkPolicy in its pods and
 # Measured before: a deny-all on a joined node's pod let every client through,
 # pod and edge alike, because nothing on that Mac served ferry-netpol's socket.
 worker="$(sed -n '/^start_worker()/,/^}/p' "$repo/ferry")"
-contains "start_worker runs ferry-netpol as the node" "$worker" 'start_netpol "$FERRY_RUN/kubelet.conf"'
+contains "start_worker follows the control plane's ferry-netpol as the node" "$worker" \
+  'start_netpol_follower "$server" "$FERRY_RUN/kubelet.conf"'
 contains "and its ferry-proxy asks it" \
   "$(echo "$worker" | sed -n '/bin\/ferry-proxy"/,/ferry-proxy.log/p')" '--netpol-socket "$FERRY_NETPOL_SOCK"'
-contains "and a token lets a node's certificate read what policy needs" \
-  "$(sed -n '/^cmd_token_create()/,/^}/p' "$repo/ferry")" 'ferry_netpol_rbac'
+leader="$(sed -n '/^start_netpol()/,/^}/p' "$repo/ferry")"
+contains "the control plane serves the other Macs' nodes their rules" "$leader" '--listen "0.0.0.0:$NETPOL_PEER_PORT"'
+contains "presenting the API server's certificate" "$leader" '--tls-cert "$FERRY_HOME/pki/apiserver.crt"'
+PORT_SHIFT=3000
+eval "$(sed -n '/^NETPOL_PEER_PORT=/p' "$repo/ferry")"
+follower="$(sed -n '/^start_netpol_follower()/,/^}/p' "$repo/ferry")"
+server="192.168.1.29:$(( 6443 + PORT_SHIFT ))"
+eval "$(echo "$follower" | grep -m1 'local upstream=' | sed 's/^ *local //; s/ flags=() conf$//')"
+is "a joined Mac finds the peer port one above the API server's" "$upstream" "192.168.1.29:$NETPOL_PEER_PORT"
+# Measured before: pods on a Mac joined to a cluster on 10.182.0.0/16 were told
+# DNS was at 10.244.0.2, and resolved nothing.
+lacks "a joined Mac's DNS is not the default CIDR's whatever the cluster's" "$worker" 'clusterDNS: [10.244.0.2]'
+dns_line="$(echo "$worker" | grep -m1 'dns="${CLUSTER_CIDR')"
+CLUSTER_CIDR=10.182.0.0/16; dns=10.244.0.2; eval "$dns_line"
+is "  it is .2 of the first node's slice of the cluster's" "$dns" 10.182.0.2
+# Measured before: every kubelet credential in the cluster could list every
+# pod, which is wider than the Node authorizer allows. Nothing grants it now,
+# and a cluster that has it loses it.
+token="$(sed -n '/^cmd_token_create()/,/^}/p' "$repo/ferry")"
+contains "a token takes the old grant away" "$token" 'ferry_netpol_rbac_remove'
+contains "and so does starting the control plane" "$leader" 'ferry_netpol_rbac_remove'
+lacks "and nothing in ferry makes it any more" "$(cat "$repo/ferry")" 'metadata: {name: ferry-node-netpol}'
 echo
 
 printf '\033[1m%s\033[0m\n' "an added node's podCIDR is the slice its runtime is on"
@@ -254,6 +275,101 @@ contains "and the Node is made with the slice as its podCIDR" "$nodeadd" 'podCID
 lacks "and no slice is printed as 10.244 whatever the profile" "$(cat "$repo/ferry")" '10.244.$index'
 eval "$(sed -n '/^node_slice()/,/^}/p' "$repo/ferry")"
 is "node_slice follows the profile's network" "$(CLUSTER_CIDR=10.171.0.0/16 node_slice 2)" "10.171.2.0/24"
+echo
+
+printf '\033[1m%s\033[0m\n' "every node presents a certificate of its own"
+# Measured before: added nodes ran on the first node's certificate, which the
+# Node authorizer refuses for any other name, so the whole system:node role was
+# bound to every node and any kubelet credential could list every pod and
+# Secret. With the binding gone and no certificate of its own, an added node
+# went NotReady in 46 s (experiments/37-node-credentials).
+up="$(cat "$repo/control-plane/up.sh")"
+contains "starting the control plane deletes the old binding" "$up" \
+  'kubectl delete clusterrolebinding ferry:system-nodes --ignore-not-found'
+lacks "and nothing binds system:node any more" "$up" 'name: system:node
+'
+contains "NodeRestriction keeps a node's writes to its own objects" "$up" '--enable-admission-plugins=NodeRestriction'
+contains "and a node can still read the cluster's shape" "$up" '--clusterrole=system:node-proxier'
+contains "node add starts the kubelet on its own credential" "$nodeadd" 'kubeconfig="$(node_credential "$name")"'
+lacks "  never on the first node's" "$nodeadd" 'start_kubelet "$name" "$run" "$FERRY_HOME/kubelet.conf"'
+contains "a restart or upgrade of an added node signs one if it has none" \
+  "$(sed -n '/^node_layout()/,/^}/p' "$repo/ferry")" 'node_credential "$name"'
+contains "and a running one is moved onto its own before the binding goes" \
+  "$(sed -n '/^start_control_plane()/,/^}/p' "$repo/ferry" | sed -n '1,/up.sh/p')" 'migrate_node_credentials'
+# Which kubelets it moves is read from their command lines, which are long: the
+# kubeconfig comes after the kubelet's whole path and --config, well past the
+# 80 columns ps can cut a command at. Two real processes stand in for kubelets,
+# one on the first node's credential and one on its own.
+if command -v python3 >/dev/null 2>&1; then
+  (
+    FERRY_HOME="$sandbox/migrate-home"; FERRY_RUN="$sandbox/migrate-run"
+    mkdir -p "$FERRY_HOME" "$FERRY_RUN"
+    long="$sandbox/a/path/as/long/as/a/checkout/bin/versions/v1.34.0/kubelet --config=$FERRY_RUN/node-1/kubelet.yaml"
+    python3 -c 'import time; time.sleep(30)' $long "--kubeconfig=$FERRY_HOME/kubelet.conf" --v=2 &
+    shared=$!
+    python3 -c 'import time; time.sleep(30)' $long "--kubeconfig=$FERRY_HOME/pki/nodes/w2.conf" --v=2 &
+    own=$!
+    echo "$shared" > "$FERRY_RUN/node-1-kubelet.pid"
+    echo "$own" > "$FERRY_RUN/node-2-kubelet.pid"
+    node_layout() { echo "run=$FERRY_RUN/node-$1 kubeconfig=$FERRY_HOME/pki/nodes/w$1.conf logfile=/dev/null"; }
+    stop_kubelet() { :; }
+    start_kubelet() { echo "restarted $1 on $3" >> "$FERRY_RUN/restarts"; }
+    ok() { :; }
+    mkdir -p "$FERRY_RUN/node-1" "$FERRY_RUN/node-2"
+    echo w1 > "$FERRY_RUN/node-1/node-name"; echo w2 > "$FERRY_RUN/node-2/node-name"
+    eval "$(sed -n '/^migrate_node_credentials()/,/^}/p' "$repo/ferry")"
+    COLUMNS=80 migrate_node_credentials
+    kill "$shared" "$own" 2>/dev/null
+    cat "$FERRY_RUN/restarts" 2>/dev/null
+  ) > "$sandbox/migrate.out" 2>&1
+  moved="$(cat "$sandbox/migrate.out")"
+  contains "a kubelet on the first node's credential is moved, long command and all" "$moved" \
+    "restarted w1 on $sandbox/migrate-home/pki/nodes/w1.conf"
+  lacks "  and one already on its own is left running" "$moved" "restarted w2"
+fi
+if command -v openssl >/dev/null 2>&1; then
+  FERRY_HOME="$sandbox/nodecred"; mkdir -p "$FERRY_HOME/pki"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$FERRY_HOME/pki/ca.key" \
+    -out "$FERRY_HOME/pki/ca.crt" -days 1 -subj /CN=test-ca 2>/dev/null
+  printf 'users:\n- name: kubelet\n  user:\n    client-certificate: %s\n    client-key: %s\n' \
+    "$FERRY_HOME/pki/kubelet.crt" "$FERRY_HOME/pki/kubelet.key" > "$FERRY_HOME/kubelet.conf"
+  eval "$(sed -n '/^node_credential()/,/^}/p' "$repo/ferry")"
+  conf="$(node_credential worker-1 2>&1)"
+  crt="$FERRY_HOME/pki/nodes/worker-1.crt"
+  is "node_credential names the node's kubeconfig" "$conf" "$FERRY_HOME/pki/nodes/worker-1.conf"
+  is "  whose certificate is system:node:worker-1 in system:nodes" \
+    "$(openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:worker-1"
+  if openssl verify -CAfile "$FERRY_HOME/pki/ca.crt" "$crt" >/dev/null 2>&1; then
+    ok "  signed by the cluster CA"; else bad "  signed by the cluster CA"; fi
+  contains "  for client auth only" "$(openssl x509 -in "$crt" -noout -ext extendedKeyUsage 2>/dev/null)" \
+    "TLS Web Client Authentication"
+  is "  with a key only its owner reads" "$(stat -f %Lp "$FERRY_HOME/pki/nodes/worker-1.key")" 600
+  contains "  and the kubeconfig presents it" "$(cat "$conf")" "client-certificate: $crt"
+  lacks "  not the first node's" "$(cat "$conf")" "pki/kubelet.crt"
+  before="$(cat "$crt")"; node_credential worker-1 >/dev/null
+  is "a second start keeps the same certificate" "$(cat "$crt")" "$before"
+  cp "$FERRY_HOME/pki/nodes/worker-1.crt" "$FERRY_HOME/pki/nodes/worker-2.crt"
+  cp "$FERRY_HOME/pki/nodes/worker-1.key" "$FERRY_HOME/pki/nodes/worker-2.key"
+  node_credential worker-2 >/dev/null
+  is "one named for another node is signed again" \
+    "$(openssl x509 -in "$FERRY_HOME/pki/nodes/worker-2.crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:worker-2"
+  rm "$FERRY_HOME/pki/ca.key"
+  # A subshell: node_credential says so with bad, which here is the counter.
+  if (node_credential worker-3) >/dev/null 2>&1; then bad "no CA key, no certificate"
+  else ok "no CA key, no certificate"; fi
+  unset FERRY_HOME
+  # The first node's is control-plane/pki.sh's, made once with the CA. A node
+  # renamed since would present a name the Node authorizer grants nothing.
+  PKI_DIR="$sandbox/pki" NODE_NAME=mac-a "$repo/control-plane/pki.sh" >/dev/null 2>&1
+  admin="$(cat "$sandbox/pki/admin.crt")"
+  PKI_DIR="$sandbox/pki" NODE_NAME=mac-b "$repo/control-plane/pki.sh" >/dev/null 2>&1
+  is "pki.sh signs the first node's again for its new name" \
+    "$(openssl x509 -in "$sandbox/pki/kubelet.crt" -noout -subject -nameopt RFC2253 2>/dev/null)" \
+    "subject=O=system:nodes,CN=system:node:mac-b"
+  is "  and leaves everything else it made" "$(cat "$sandbox/pki/admin.crt")" "$admin"
+fi
 echo
 
 printf '\033[1m%s\033[0m\n' "nft runs by PATH inside a pod, which is how portmap runs it"
