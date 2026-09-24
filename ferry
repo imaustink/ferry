@@ -2921,7 +2921,9 @@ migrate_node_credentials() {
   for pidfile in "$FERRY_RUN"/node-*-kubelet.pid; do
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile")"
-    ps -o args= -p "$pid" 2>/dev/null | grep -qF -- "--kubeconfig=$FERRY_HOME/kubelet.conf " || continue
+    # -ww: ps may cut the command at the terminal's width otherwise, and the
+    # kubeconfig comes after the kubelet's full path and --config.
+    ps -ww -o args= -p "$pid" 2>/dev/null | grep -qF -- "--kubeconfig=$FERRY_HOME/kubelet.conf " || continue
     index="${pidfile##*/node-}"; index="${index%-kubelet.pid}"
     eval "$(node_layout "$index")"
     name="$(cat "$run/node-name" 2>/dev/null)"

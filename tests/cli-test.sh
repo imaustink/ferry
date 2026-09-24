@@ -296,6 +296,37 @@ contains "a restart or upgrade of an added node signs one if it has none" \
   "$(sed -n '/^node_layout()/,/^}/p' "$repo/ferry")" 'node_credential "$name"'
 contains "and a running one is moved onto its own before the binding goes" \
   "$(sed -n '/^start_control_plane()/,/^}/p' "$repo/ferry" | sed -n '1,/up.sh/p')" 'migrate_node_credentials'
+# Which kubelets it moves is read from their command lines, which are long: the
+# kubeconfig comes after the kubelet's whole path and --config, well past the
+# 80 columns ps can cut a command at. Two real processes stand in for kubelets,
+# one on the first node's credential and one on its own.
+if command -v python3 >/dev/null 2>&1; then
+  (
+    FERRY_HOME="$sandbox/migrate-home"; FERRY_RUN="$sandbox/migrate-run"
+    mkdir -p "$FERRY_HOME" "$FERRY_RUN"
+    long="$sandbox/a/path/as/long/as/a/checkout/bin/versions/v1.34.0/kubelet --config=$FERRY_RUN/node-1/kubelet.yaml"
+    python3 -c 'import time; time.sleep(30)' $long "--kubeconfig=$FERRY_HOME/kubelet.conf" --v=2 &
+    shared=$!
+    python3 -c 'import time; time.sleep(30)' $long "--kubeconfig=$FERRY_HOME/pki/nodes/w2.conf" --v=2 &
+    own=$!
+    echo "$shared" > "$FERRY_RUN/node-1-kubelet.pid"
+    echo "$own" > "$FERRY_RUN/node-2-kubelet.pid"
+    node_layout() { echo "run=$FERRY_RUN/node-$1 kubeconfig=$FERRY_HOME/pki/nodes/w$1.conf logfile=/dev/null"; }
+    stop_kubelet() { :; }
+    start_kubelet() { echo "restarted $1 on $3" >> "$FERRY_RUN/restarts"; }
+    ok() { :; }
+    mkdir -p "$FERRY_RUN/node-1" "$FERRY_RUN/node-2"
+    echo w1 > "$FERRY_RUN/node-1/node-name"; echo w2 > "$FERRY_RUN/node-2/node-name"
+    eval "$(sed -n '/^migrate_node_credentials()/,/^}/p' "$repo/ferry")"
+    COLUMNS=80 migrate_node_credentials
+    kill "$shared" "$own" 2>/dev/null
+    cat "$FERRY_RUN/restarts" 2>/dev/null
+  ) > "$sandbox/migrate.out" 2>&1
+  moved="$(cat "$sandbox/migrate.out")"
+  contains "a kubelet on the first node's credential is moved, long command and all" "$moved" \
+    "restarted w1 on $sandbox/migrate-home/pki/nodes/w1.conf"
+  lacks "  and one already on its own is left running" "$moved" "restarted w2"
+fi
 if command -v openssl >/dev/null 2>&1; then
   FERRY_HOME="$sandbox/nodecred"; mkdir -p "$FERRY_HOME/pki"
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$FERRY_HOME/pki/ca.key" \
