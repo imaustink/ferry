@@ -253,6 +253,9 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 	if img := p.nodeClass.Spec.Image; img != "" {
 		_ = unstructured.SetNestedField(machine.Object, img, "spec", "image")
 	}
+	if d := p.nodeClass.Spec.Durability; d != "" {
+		_ = unstructured.SetNestedField(machine.Object, d, "spec", "durability")
+	}
 
 	if _, err := p.dynamic.Resource(machineGVR).Create(ctx, machine, metav1.CreateOptions{}); err != nil {
 		return nil, fmt.Errorf("creating machine %s: %w", claim.Name, err)
@@ -341,9 +344,11 @@ func (p *Provider) claimFor(m *unstructured.Unstructured) *karpv1.NodeClaim {
 }
 
 // IsDrifted says whether a machine no longer matches what the NodeClass asks
-// for. Only the image is checked: cpus and memory cannot be changed on a
-// running VM (experiment 14), so a machine of the wrong size is replaced by
-// Karpenter's own consolidation rather than by drift.
+// for. The image and the durability are checked: cpus and memory cannot be
+// changed on a running VM (experiment 14), so a machine of the wrong size is
+// replaced by Karpenter's own consolidation rather than by drift. A disk's
+// barrier is fixed when the VM boots too, so a durability change is met the
+// same way an image change is -- by replacing the machine.
 func (p *Provider) IsDrifted(ctx context.Context, claim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
 	name, ok := nameFromProviderID(claim.Status.ProviderID)
 	if !ok {
@@ -356,13 +361,15 @@ func (p *Provider) IsDrifted(ctx context.Context, claim *karpv1.NodeClaim) (clou
 		}
 		return "", err
 	}
-	want := p.nodeClass.Spec.Image
-	if want == "" {
-		return "", nil
+	if want := p.nodeClass.Spec.Image; want != "" {
+		if got, _, _ := unstructured.NestedString(m.Object, "spec", "image"); got != want {
+			return cloudprovider.DriftReason("NodeClassImageChanged"), nil
+		}
 	}
-	got, _, _ := unstructured.NestedString(m.Object, "spec", "image")
-	if got != want {
-		return cloudprovider.DriftReason("NodeClassImageChanged"), nil
+	if want := p.nodeClass.Spec.Durability; want != "" {
+		if got, _, _ := unstructured.NestedString(m.Object, "spec", "durability"); got != want {
+			return cloudprovider.DriftReason("NodeClassDurabilityChanged"), nil
+		}
 	}
 	return "", nil
 }

@@ -19,9 +19,10 @@ import (
 )
 
 type config struct {
-	image   string
-	bounds  bounds
-	maxPods int64
+	image      string
+	durability string
+	bounds     bounds
+	maxPods    int64
 }
 
 func configFromEnv() config {
@@ -31,8 +32,12 @@ func configFromEnv() config {
 		// image is built from, not the disk a machine is cloned from. Sharing
 		// the name means a checkout with a custom layout silently sets a node
 		// class image that is a directory of OCI blobs.
-		image:   os.Getenv("FERRY_MACHINE_IMAGE"),
-		maxPods: envInt("FERRY_MACHINE_MAX_PODS", 110),
+		image: os.Getenv("FERRY_MACHINE_IMAGE"),
+		// machineDurability in ferry's config file. Validated by the
+		// Machine CRD's enum when the machine is created, which is where
+		// a wrong value would otherwise be discovered too late.
+		durability: os.Getenv("FERRY_MACHINE_DURABILITY"),
+		maxPods:    envInt("FERRY_MACHINE_MAX_PODS", 110),
 		bounds: bounds{
 			minCPUs:     envInt("FERRY_MACHINE_MIN_CPUS", 2),
 			maxCPUs:     envInt("FERRY_MACHINE_MAX_CPUS", 8),
@@ -51,6 +56,7 @@ func configFromEnv() config {
 func (c config) nodeClass() *FerryNodeClass {
 	n := &FerryNodeClass{}
 	n.Spec.Image = c.image
+	n.Spec.Durability = c.durability
 	n.Spec.CPUs = Range{Min: c.bounds.minCPUs, Max: c.bounds.maxCPUs}
 	n.Spec.MemoryGi = Range{Min: c.bounds.minMemoryGi, Max: c.bounds.maxMemoryGi}
 	n.Spec.Limits = Limits{CPUs: c.bounds.limitCPUs, MemoryGi: c.bounds.limitMemoryGi}

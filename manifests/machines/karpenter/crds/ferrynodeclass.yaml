@@ -48,6 +48,13 @@ spec:
                     Node disk image machines are cloned from. Empty means
                     whatever ferry-machined was started with, which is the
                     ordinary case.
+                durability:
+                  type: string
+                  enum: [power-loss, os-crash, process-crash]
+                  description: >-
+                    What a write a provisioned machine's disk has acknowledged
+                    survives; see the Machine CRD's spec.durability. Empty
+                    leaves each machine on the cluster's default.
                 cpus:
                   type: object
                   description: Bounds on the cores a machine may have.

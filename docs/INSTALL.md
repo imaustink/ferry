@@ -304,6 +304,20 @@ It reaches the cluster as `kube-system/ferry-config`, a copy of the file that
 machines as they are made and Macs as they join. The file is the source: an
 edit to the ConfigMap lasts until the next rewrite.
 
+**`machineDurability`** is what a machine's disk survives, for a Machine
+whose spec does not say. A disk has one level more than the cluster: `os-crash`
+is an `fsync(2)`, which reaches the SSD without flushing its cache, so it
+survives the Mac crashing but not losing power. Unset, it follows the cluster
+— `os-crash` for `power-loss`, which is what machines always had, and
+`process-crash` for `process-crash`. One machine can choose its own:
+
+```yaml
+apiVersion: ferry.dev/v1alpha1
+kind: Machine
+metadata: {name: db-0}
+spec: {cpus: 2, memory: 4Gi, durability: power-loss}
+```
+
 Besides the settings above, the file takes a few that are one
 environment variable each: `podMemoryMiB` (`FERRY_POD_MEMORY_MIB`), `podCPUs`
 (`FERRY_POD_CPUS`), `maxPods` (`FERRY_MAX_PODS`), `machineLimitCPUs`
@@ -381,7 +395,7 @@ knowing when one of them is the thing you want to change on its own.
 |---|---|---|
 | `FERRY_DURABILITY` | `power-loss` | `process-crash` to acknowledge writes before they reach the disk: a crashed process loses nothing, a power loss or kernel panic can. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered. `full` and `relaxed`, the old names, still work |
 | `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `process-crash`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
-| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `process-crash` |
+| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you from `machineDurability`, or from the cluster's durability when that is unset; a Machine's own `spec.durability` overrides it for that machine |
 | `FERRY_BUILDER_CPUS` | half the Mac's cores, at least 2 | CPUs for the `ferry image build` builder pod. buildkit on the pod default of 2 is roughly half the speed of 8 |
 | `FERRY_BUILDER_MEMORY_GIB` | a quarter of the Mac's memory, 2–8 | memory for the builder pod |
 | `FERRY_BUILDER_POD` | `ferry-builder` | the builder pod's name |
@@ -424,6 +438,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_NODE_IMAGE` | `<root>/node-image/oci` | the OCI layout machines are built from |
 | `FERRY_NODE_DISK` | `$FERRY_HOME/node.ext4` | the disk unpacked from it, cloned per machine |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
+| `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
 | `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |

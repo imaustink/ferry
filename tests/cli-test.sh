@@ -292,7 +292,8 @@ ferry_config_migrate
 is "migration never overwrites what the file already says" "$(ferry_config_get durability)" power-loss
 unset FERRY_CONFIG DURABILITY_MARKER MACHINES_MARKER
 # Through the CLI, against a state directory of our own.
-cfg_env=(env FERRY_HOME="$cfg_scratch/home" FERRY_RUN="$cfg_scratch/run" FERRY_PROFILE=cfgtest)
+# FERRY_PROFILES too, or the profile is registered in the real ~/.ferry-profiles.
+cfg_env=(env FERRY_HOME="$cfg_scratch/home" FERRY_RUN="$cfg_scratch/run" FERRY_PROFILE=cfgtest FERRY_PROFILES="$cfg_scratch/profiles")
 mkdir -p "$cfg_scratch/home"
 out="$("${cfg_env[@]}" "$repo/ferry" init --purpose ci --yes </dev/null 2>&1)"
 contains "ferry init writes a config file from flags alone" "$out" "wrote $cfg_scratch/home/config.yaml"
@@ -327,6 +328,24 @@ is "  and is none in effect until they run" \
   "$(cd "$repo" && "${cfg_env[@]}" bash -c 'eval "$(sed -n "/^ferry_config_get()/,/^}/p;/^ferry_default_runtime()/,/^}/p;/^ferry_default_runtime_effective()/,/^}/p;/^machines_enabled()/,/^}/p" ferry)"; FERRY_CONFIG="$FERRY_HOME/config.yaml"; MACHINES_MARKER=/nonexistent; ferry_default_runtime_effective')" none
 out="$("${cfg_env[@]}" "$repo/ferry" init --force --yes --machines false --default-runtime ferry-shared </dev/null 2>&1)"; rc=$?
 is "ferry init refuses a ferry-shared default with no machines" "$rc" 1
+
+# A machine's disk follows the cluster unless machineDurability says.
+machine_sync() { # config-durability config-machine-durability
+  (
+    FERRY_CONFIG="$cfg_scratch/md.yaml"; DURABILITY_MARKER=/nonexistent
+    printf 'durability: %s\n%s\n' "$1" "${2:+machineDurability: $2}" > "$FERRY_CONFIG"
+    unset FERRY_DURABILITY FERRY_MACHINE_DURABILITY
+    for fn in ferry_config_get durability_normalize ferry_durability durability_is_process_crash \
+              ferry_machine_durability machine_disk_sync; do
+      eval "$(sed -n "/^$fn()/,/^}/p" "$repo/ferry")"
+    done
+    machine_disk_sync
+  )
+}
+is "a power-loss cluster's machines fsync, as before" "$(machine_sync power-loss "")" fsync
+is "a process-crash cluster's machines drop the barrier, as before" "$(machine_sync process-crash "")" none
+is "machineDurability power-loss is the full barrier" "$(machine_sync process-crash power-loss)" full
+is "  and os-crash is fsync whatever the cluster is" "$(machine_sync process-crash os-crash)" fsync
 echo
 
 # --- small helpers -----------------------------------------------------------

@@ -64,6 +64,11 @@ type FerryNodeClassSpec struct {
 	// a property of the installation rather than of a workload.
 	Image string `json:"image,omitempty"`
 
+	// Durability is what a write a machine's disk has acknowledged survives:
+	// power-loss, os-crash or process-crash, the Machine's own spec.durability.
+	// Empty leaves each machine on the cluster's default.
+	Durability string `json:"durability,omitempty"`
+
 	// CPUs bounds the cores a machine may have.
 	CPUs Range `json:"cpus,omitempty"`
 	// Memory bounds the memory ceiling a machine may have, in GiB.

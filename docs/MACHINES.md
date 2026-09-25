@@ -113,6 +113,29 @@ that vocabulary is deliberate: it is the model people already know from managed
 Kubernetes, and it leaves the door open to being a real CAPI provider later
 without redesigning the resource.
 
+### A machine chooses what its disk survives
+
+**Built.** `spec.durability` takes the cluster's words for one machine's root
+disk, plus the level only a disk has:
+
+| | the disk's barrier | survives |
+|---|---|---|
+| `power-loss` | `full` | the SSD losing power mid-write |
+| `os-crash` | `fsync` | the Mac crashing, not a power loss: `fsync(2)` on macOS reaches the drive without flushing its cache |
+| `process-crash` | `none` | `ferry-node` crashing, nothing more |
+
+Omitted, a machine takes the cluster's default, which is what every machine
+had before it could choose: `os-crash` under a `power-loss` cluster and
+`process-crash` under a `process-crash` one, or `machineDurability` from
+ferry's config when that is set. It is immutable with the rest of the spec, for
+the same reason — Virtualization.framework fixes a disk's barrier when the VM
+boots — and a FerryNodeClass `durability` that no longer matches a provisioned
+machine is drift, replaced the way an image change is.
+
+This used to be `FERRY_NODE_DISK_SYNC`, one value for every machine on the Mac,
+set on `ferry-node serve`. It still is the default; it is no longer the only
+answer.
+
 ### Resources are immutable
 
 [Experiment 14](../experiments/14-balloon/FINDINGS.md) measured what can be

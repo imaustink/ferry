@@ -199,7 +199,8 @@ func machineConfiguration(
     taints: [String] = [],
     interface: VmnetNetwork.Interface, console: Console,
     podNIC: MachineNIC? = nil,
-    volumesDir: String = ""
+    volumesDir: String = "",
+    diskSync: String? = nil
 ) throws -> VZVirtualMachineConfiguration {
     let config = VZVirtualMachineConfiguration()
     config.cpuCount = cpus
@@ -318,8 +319,12 @@ func machineConfiguration(
     // is on the Mac's disk, so a host crash or power loss can leave the node
     // filesystem torn -- survivable for a node that is a disposable clone,
     // not something to impose on anyone who has not asked for it.
+    //
+    // A machine can ask for its own (Machine spec.durability, arriving here as
+    // diskSync), and one that does not takes the server's, which ferry sets
+    // from the cluster's durability.
     let sync: VZDiskImageSynchronizationMode
-    switch ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"] {
+    switch diskSync ?? ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"] {
     case "none": sync = .none
     case "full": sync = .full
     default:     sync = .fsync

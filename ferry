@@ -460,6 +460,26 @@ ferry_durability() {
 }
 durability_is_process_crash() { [ "$(ferry_durability)" = process-crash ]; }
 
+# What a machine's disk barrier is, for a Machine that does not say
+# (spec.durability). machineDurability in the config file when set; otherwise
+# it follows the cluster's durability as it always has -- fsync for
+# power-loss, which is os-crash in a machine's terms, and none for
+# process-crash -- so mode 2 does not quietly keep a guarantee mode 1 gave up.
+# A disk has one level more than the cluster: fsync(2) reaches the SSD without
+# flushing its cache, which survives the Mac crashing but not losing power.
+ferry_machine_durability() {
+  local v="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}"
+  case "$v" in
+    power-loss|os-crash|process-crash) echo "$v" ;;
+    *) durability_is_process_crash && echo process-crash || echo os-crash ;;
+  esac
+}
+machine_disk_sync() {
+  case "$(ferry_machine_durability)" in
+    power-loss) echo full ;; process-crash) echo none ;; *) echo fsync ;;
+  esac
+}
+
 # Where a pod that names no RuntimeClass lands: ferry-vm (a VM of its own),
 # ferry-shared (a container on a machine), or none -- wherever it fits, which
 # is what every cluster did before this and is still the default. See
@@ -1791,7 +1811,9 @@ start_machines() {
   mkdir -p "$FERRY_HOME/volumes"
 
   # The machine's disk barrier follows the cluster's durability, so mode 2
-  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
+  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept --
+  # unless machineDurability says otherwise; see ferry_machine_durability. It
+  # is the default for a Machine with no spec.durability of its own.
   #
   # Keep these assignments directly above the command. A comment or a command
   # between them and it ends the line, and they become shell variables that
@@ -1801,7 +1823,7 @@ start_machines() {
   # The registry port is passed only when the registry is on, and blank
   # otherwise, so a FERRY_MACHINE_REGISTRY_PORT set on its own does not point
   # machines at a registry that is not running.
-  FERRY_NODE_DISK_SYNC="$(durability_is_process_crash && echo none || echo fsync)" \
+  FERRY_NODE_DISK_SYNC="$(machine_disk_sync)" \
   FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
   FERRY_NODE_USB="$(kernel_attaches_disks && echo 1)" \
   "$here/bin/ferry-node" serve \
@@ -2005,6 +2027,7 @@ start_provisioner() {
   FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_NODE_DISK="$NODE_DISK" \
+  FERRY_MACHINE_DURABILITY="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}" \
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
@@ -5696,7 +5719,7 @@ cmd_status() {
 # The file itself, and why it exists, is described where FERRY_CONFIG is set.
 
 # Every key the file may carry, in the order `ferry config` shows them.
-FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
+FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
 
 # A value as it should be written, or a failure: 1 for a value the key does
 # not take, 2 for a key there is no such thing as.
@@ -5706,6 +5729,7 @@ ferry_config_check() { # key value
     durability) local v; v="$(durability_normalize "$2")"; [ -n "$v" ] || return 1; echo "$v" ;;
     machines)   case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
     defaultRuntime) case "$2" in ferry-vm|ferry-shared|none) echo "$2" ;; *) return 1 ;; esac ;;
+    machineDurability) case "$2" in power-loss|os-crash|process-crash) echo "$2" ;; *) return 1 ;; esac ;;
     podMemoryMiB|podCPUs|maxPods|machineLimitCPUs|machineLimitMemoryGi)
                 case "$2" in ''|*[!0-9]*|0) return 1 ;; *) echo "$2" ;; esac ;;
     *) return 2 ;;
@@ -5717,6 +5741,7 @@ ferry_config_values() { # key
     durability) echo "power-loss | process-crash" ;;
     machines)   echo "true | false" ;;
     defaultRuntime) echo "ferry-vm | ferry-shared | none" ;;
+    machineDurability) echo "power-loss | os-crash | process-crash" ;;
     *)          echo "a whole number" ;;
   esac
 }
@@ -5741,6 +5766,10 @@ ferry_config_effective() { # key -> "value<TAB>source"
       if [ -n "${FERRY_DEFAULT_RUNTIME:-}" ]; then printf '%s\tFERRY_DEFAULT_RUNTIME, this run only%s\n' "$want" "$note"
       elif [ -n "$file_value" ]; then printf '%s\tfile%s\n' "$want" "$note"
       else printf 'none\tdefault: wherever a pod fits\n'; fi ;;
+    machineDurability)
+      if [ -n "${FERRY_MACHINE_DURABILITY:-}" ]; then printf '%s\tFERRY_MACHINE_DURABILITY, this run only\n' "$(ferry_machine_durability)"
+      elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_machine_durability)"
+      else printf '%s\tdefault: follows durability\n' "$(ferry_machine_durability)"; fi ;;
     machines)
       local on; machines_enabled && on=true || on=false
       if [ -n "$file_value" ]; then printf '%s\tfile\n' "$on"
@@ -5890,6 +5919,11 @@ machines: $3
 # -- gets what it names either way. Applied as taints on the other kind of
 # node, so a pod that picks by nodeSelector alone needs the RuntimeClass.
 defaultRuntime: $4
+
+# What a machine's disk survives, for a Machine whose spec does not say:
+# power-loss, os-crash or process-crash. Unset follows durability above --
+# os-crash for power-loss, process-crash for process-crash.
+# machineDurability: os-crash
 
 # One environment variable each, for when a default is not right here. The
 # values shown are what this Mac gets without them: memory per pod VM

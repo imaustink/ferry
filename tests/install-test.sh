@@ -574,6 +574,25 @@ contains "  with the class installed first, for a cluster started before it exis
 contains "the registry addon stays on the Mac its hostPort is served from" \
   "$(cat "$repo/addons/registry/registry.yaml")" "runtimeClassName: ferry-vm"
 
+# --- a machine's own durability -------------------------------------------
+printf '\033[1m%s\033[0m\n' "a machine can choose what its disk survives"
+machine_crd="$(cat "$repo/ferry-machined/crd.yaml")"
+contains "the Machine CRD has spec.durability" "$machine_crd" "enum: [power-loss, os-crash, process-crash]"
+contains "  shown with -o wide" "$machine_crd" "{name: Durability, type: string, jsonPath: .spec.durability, priority: 1}"
+contains "ferry-machined hands ferry-node the barrier it means" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" 'DiskSync string `json:"diskSync,omitempty"`'
+node_src="$(cat "$repo/experiments/18-node-image/Sources/ferry-node/main.swift")"
+contains "ferry-node opens the disk with the machine's own, else the server's" \
+  "$node_src" 'switch diskSync ?? ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"]'
+contains "  which serve passes through from the spec" \
+  "$(cat "$repo/experiments/18-node-image/Sources/ferry-node/Serve.swift")" "diskSync: spec.diskSync"
+contains "a provisioned machine carries its NodeClass's durability" \
+  "$(cat "$repo/ferry-karpenter/provider.go")" '"spec", "durability"'
+contains "  set from ferry's config" \
+  "$(sed -n '/^start_provisioner()/,/^}/p' "$repo/ferry")" 'FERRY_MACHINE_DURABILITY="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}"'
+contains "  and the FerryNodeClass CRD accepts it" \
+  "$(cat "$repo/manifests/machines/karpenter/crds/ferrynodeclass.yaml")" "enum: [power-loss, os-crash, process-crash]"
+
 # --- cluster DNS for machines ---------------------------------------------
 #
 # Mode 1's CoreDNS is a ferry-cri pod on the Mac's vmnet network; machines are
@@ -812,7 +831,9 @@ succeeds "  remembered for the cluster, the way machines is" \
 succeeds "  and it reaches etcd" \
   grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_process_crash' "$repo/ferry"
 succeeds "  and the machine disks, so mode 2 does not disagree with mode 1" \
-  grep -q 'durability_is_process_crash && echo none' "$repo/ferry"
+  grep -q 'durability_is_process_crash && echo process-crash || echo os-crash' "$repo/ferry"
+succeeds "  through the one function that decides a machine's barrier" \
+  grep -q 'FERRY_NODE_DISK_SYNC="$(machine_disk_sync)"' "$repo/ferry"
 # A process-crash cluster that looks like a power-loss one is the failure mode
 # worth preventing: it is only ever discovered after something is lost.
 succeeds "  a process-crash cluster says so every time it starts" \

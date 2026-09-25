@@ -29,6 +29,7 @@ spec:
         - {name: Node, type: string, jsonPath: .status.nodeRef.name}
         - {name: CPUs, type: integer, jsonPath: .spec.cpus, priority: 1}
         - {name: Memory, type: string, jsonPath: .spec.memory, priority: 1}
+        - {name: Durability, type: string, jsonPath: .spec.durability, priority: 1}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
       schema:
         openAPIV3Schema:
@@ -75,6 +76,19 @@ spec:
                   type: string
                   enum: [worker, controlPlane]
                   default: worker
+                durability:
+                  type: string
+                  enum: [power-loss, os-crash, process-crash]
+                  description: >-
+                    What a write this machine's disk has acknowledged
+                    survives. power-loss: a full barrier on the Mac's SSD for
+                    every flush. os-crash: an fsync(2), which survives the Mac
+                    crashing but not the SSD losing power mid-write.
+                    process-crash: none, which survives only ferry-node
+                    crashing. Omit it to take the cluster's: os-crash for a
+                    power-loss cluster, process-crash for a process-crash one
+                    -- or machineDurability in ferry's config. Fixed for the
+                    life of the machine, like everything else here.
                 node:
                   type: object
                   description: >-
