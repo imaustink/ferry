@@ -1,0 +1,973 @@
+19:49:57 soak into /Users/austinkurpuis/k5s/macos-k8s/.claude/worktrees/stress-test/experiments/38-soak/results/soak-3h: workloads=scale,job,abort cycles=0 hours=3
+19:50:10 cycle 1 scale ok in 5.3s
+19:50:24 cycle 1 job ok in 13.2s
+19:50:27 cycle 1 abort ok in 2.8s
+19:50:38 cycle 1 drained in 3.3s, 0 failures
+19:50:42 cycle 2 scale ok in 4.2s
+19:50:56 cycle 2 job ok in 13.6s
+19:50:59 cycle 2 abort ok in 3.1s
+19:51:11 cycle 2 drained in 3.3s, 0 failures
+19:51:15 cycle 3 scale ok in 4.2s
+19:51:29 cycle 3 job ok in 14.4s
+19:51:32 cycle 3 abort ok in 3.0s
+19:51:44 cycle 3 drained in 3.4s, 0 failures
+19:51:48 cycle 4 scale ok in 4.1s
+19:52:03 cycle 4 job ok in 14.5s
+19:52:06 cycle 4 abort ok in 3.1s
+19:52:18 cycle 4 drained in 3.4s, 0 failures
+19:52:55 cycle 5 scale ok in 37.0s
+19:53:08 cycle 5 job ok in 12.7s
+19:53:11 cycle 5 abort ok in 2.8s
+19:53:23 cycle 5 drained in 3.4s, 0 failures
+19:53:29 cycle 6 scale ok in 6.0s
+19:53:41 cycle 6 job ok in 12.5s
+19:53:45 cycle 6 abort ok in 3.1s
+19:53:57 cycle 6 drained in 3.4s, 0 failures
+19:54:03 cycle 7 scale ok in 6.1s
+19:54:15 cycle 7 job ok in 12.4s
+19:54:19 cycle 7 abort ok in 3.1s
+19:54:31 cycle 7 drained in 3.4s, 0 failures
+19:54:44 cycle 8 scale ok in 13.1s
+19:54:57 cycle 8 job ok in 12.3s
+19:55:00 cycle 8 abort ok in 2.9s
+19:55:12 cycle 8 drained in 3.4s, 0 failures
+19:55:22 cycle 9 scale ok in 10.2s
+19:55:34 cycle 9 job ok in 12.3s
+19:55:38 cycle 9 abort ok in 3.0s
+19:55:50 cycle 9 drained in 3.4s, 0 failures
+19:56:11 cycle 10 scale ok in 20.6s
+19:56:23 cycle 10 job ok in 12.3s
+19:56:26 cycle 10 abort ok in 2.9s
+19:56:39 cycle 10 drained in 3.4s, 0 failures
+19:57:22 cycle 11 scale ok in 43.2s
+19:57:35 cycle 11 job ok in 12.5s
+19:57:38 cycle 11 abort ok in 3.1s
+19:57:50 cycle 11 drained in 3.3s, 0 failures
+19:57:57 cycle 12 scale ok in 6.1s
+19:58:09 cycle 12 job ok in 12.4s
+19:58:12 cycle 12 abort ok in 2.6s
+19:58:25 cycle 12 drained in 3.5s, 0 failures
+19:58:31 cycle 13 scale ok in 6.2s
+19:58:43 cycle 13 job ok in 12.4s
+19:58:46 cycle 13 abort ok in 2.9s
+19:58:59 cycle 13 drained in 3.4s, 0 failures
+19:59:06 cycle 14 scale ok in 6.1s
+19:59:18 cycle 14 job ok in 12.4s
+19:59:21 cycle 14 abort ok in 3.1s
+19:59:34 cycle 14 drained in 3.4s, 0 failures
+19:59:46 cycle 15 scale ok in 11.1s
+19:59:58 cycle 15 job ok in 12.4s
+20:00:01 cycle 15 abort ok in 2.7s
+20:00:14 cycle 15 drained in 3.4s, 0 failures
+20:01:10 cycle 16 scale ok in 56.1s
+20:01:23 cycle 16 job ok in 12.6s
+20:01:26 cycle 16 abort ok in 3.1s
+20:01:40 cycle 16 drained in 3.4s, 0 failures
+20:01:46 cycle 17 scale ok in 6.1s
+20:01:58 cycle 17 job ok in 12.4s
+20:02:01 cycle 17 abort ok in 2.7s
+20:02:15 cycle 17 drained in 3.4s, 0 failures
+20:02:21 cycle 18 scale ok in 6.1s
+20:02:33 cycle 18 job ok in 12.4s
+20:02:36 cycle 18 abort ok in 3.1s
+20:02:50 cycle 18 drained in 3.4s, 0 failures
+20:02:56 cycle 19 scale ok in 6.4s
+20:03:10 cycle 19 job ok in 13.3s
+20:03:13 cycle 19 abort ok in 3.1s
+20:03:27 cycle 19 drained in 3.3s, 0 failures
+20:03:33 cycle 20 scale ok in 6.1s
+20:03:45 cycle 20 job ok in 12.4s
+20:03:48 cycle 20 abort ok in 2.9s
+20:04:02 cycle 20 drained in 3.5s, 0 failures
+20:04:15 cycle 21 scale ok in 12.1s
+20:04:27 cycle 21 job ok in 12.4s
+20:04:30 cycle 21 abort ok in 3.1s
+20:04:44 cycle 21 drained in 3.3s, 0 failures
+20:05:14 cycle 22 scale ok in 30.1s
+20:05:27 cycle 22 job ok in 12.4s
+20:05:30 cycle 22 abort ok in 3.1s
+20:05:44 cycle 22 drained in 3.5s, 0 failures
+20:05:51 cycle 23 scale ok in 6.6s
+20:06:04 cycle 23 job ok in 13.0s
+20:06:06 cycle 23 abort ok in 2.4s
+20:06:21 cycle 23 drained in 3.5s, 0 failures
+20:06:27 cycle 24 scale ok in 6.2s
+20:06:39 cycle 24 job ok in 12.3s
+20:06:42 cycle 24 abort ok in 3.0s
+20:06:57 cycle 24 drained in 3.5s, 0 failures
+20:07:03 cycle 25 scale ok in 6.1s
+20:07:16 cycle 25 job ok in 12.4s
+20:07:19 cycle 25 abort ok in 3.0s
+20:07:33 cycle 25 drained in 3.4s, 0 failures
+20:07:40 cycle 26 scale ok in 6.2s
+20:07:52 cycle 26 job ok in 12.4s
+20:07:55 cycle 26 abort ok in 2.9s
+20:08:10 cycle 26 drained in 3.4s, 0 failures
+20:08:17 cycle 27 scale ok in 7.1s
+20:08:29 cycle 27 job ok in 12.3s
+20:08:32 cycle 27 abort ok in 2.7s
+20:08:47 cycle 27 drained in 3.4s, 0 failures
+20:08:53 cycle 28 scale ok in 6.1s
+20:09:05 cycle 28 job ok in 12.4s
+20:09:08 cycle 28 abort ok in 2.8s
+20:09:23 cycle 28 drained in 3.5s, 0 failures
+20:09:30 cycle 29 scale ok in 6.6s
+20:09:43 cycle 29 job ok in 13.4s
+20:09:46 cycle 29 abort ok in 3.0s
+20:10:01 cycle 29 drained in 3.3s, 0 failures
+20:10:38 cycle 30 scale ok in 36.9s
+20:10:51 cycle 30 job ok in 12.8s
+20:10:53 cycle 30 abort ok in 2.2s
+20:11:09 cycle 30 drained in 3.5s, 0 failures
+20:11:16 cycle 31 scale ok in 7.2s
+20:11:28 cycle 31 job ok in 12.4s
+20:11:31 cycle 31 abort ok in 3.0s
+20:11:47 cycle 31 drained in 3.4s, 0 failures
+20:11:53 cycle 32 scale ok in 6.1s
+20:12:06 cycle 32 job ok in 12.5s
+20:12:08 cycle 32 abort ok in 2.5s
+20:12:24 cycle 32 drained in 3.5s, 0 failures
+20:12:31 cycle 33 scale ok in 7.0s
+20:12:43 cycle 33 job ok in 12.6s
+20:12:46 cycle 33 abort ok in 2.7s
+20:13:01 cycle 33 drained in 3.4s, 0 failures
+20:13:08 cycle 34 scale ok in 6.2s
+20:13:20 cycle 34 job ok in 12.4s
+20:13:23 cycle 34 abort ok in 2.5s
+20:13:38 cycle 34 drained in 3.5s, 0 failures
+20:14:02 cycle 35 scale ok in 23.1s
+20:14:14 cycle 35 job ok in 12.5s
+20:14:17 cycle 35 abort ok in 3.1s
+20:14:33 cycle 35 drained in 3.4s, 0 failures
+20:15:16 cycle 36 scale ok in 43.2s
+20:15:29 cycle 36 job ok in 12.4s
+20:15:31 cycle 36 abort ok in 2.6s
+20:15:47 cycle 36 drained in 3.4s, 0 failures
+20:15:54 cycle 37 scale ok in 7.0s
+20:16:07 cycle 37 job ok in 12.6s
+20:16:10 cycle 37 abort ok in 3.1s
+20:16:26 cycle 37 drained in 3.4s, 0 failures
+20:16:33 cycle 38 scale ok in 6.2s
+20:16:45 cycle 38 job ok in 12.3s
+20:16:48 cycle 38 abort ok in 2.7s
+20:17:04 cycle 38 drained in 3.4s, 0 failures
+20:17:10 cycle 39 scale ok in 6.2s
+20:17:23 cycle 39 job ok in 12.4s
+20:17:26 cycle 39 abort ok in 3.0s
+20:17:42 cycle 39 drained in 3.4s, 0 failures
+20:17:48 cycle 40 scale ok in 6.1s
+20:18:02 cycle 40 job ok in 13.5s
+20:18:05 cycle 40 abort ok in 3.0s
+20:18:21 cycle 40 drained in 3.4s, 0 failures
+20:19:35 cycle 41 scale ok in 74.2s
+20:19:48 cycle 41 job ok in 12.5s
+20:19:51 cycle 41 abort ok in 2.6s
+20:20:07 cycle 41 drained in 3.4s, 0 failures
+20:20:13 cycle 42 scale ok in 6.1s
+20:20:26 cycle 42 job ok in 12.4s
+20:20:29 cycle 42 abort ok in 3.1s
+20:20:46 cycle 42 drained in 3.5s, 0 failures
+20:20:53 cycle 43 scale ok in 7.0s
+20:21:05 cycle 43 job ok in 12.5s
+20:21:08 cycle 43 abort ok in 2.5s
+20:21:25 cycle 43 drained in 3.5s, 0 failures
+20:21:31 cycle 44 scale ok in 6.6s
+20:21:45 cycle 44 job ok in 13.4s
+20:21:48 cycle 44 abort ok in 3.0s
+20:22:05 cycle 44 drained in 3.4s, 0 failures
+20:22:12 cycle 45 scale ok in 7.0s
+20:22:24 cycle 45 job ok in 12.4s
+20:22:27 cycle 45 abort ok in 2.5s
+20:22:44 cycle 45 drained in 3.5s, 0 failures
+20:23:33 cycle 46 scale ok in 49.1s
+20:23:46 cycle 46 job ok in 12.6s
+20:23:49 cycle 46 abort ok in 2.7s
+20:24:06 cycle 46 drained in 3.4s, 0 failures
+20:24:12 cycle 47 scale ok in 6.3s
+20:24:24 cycle 47 job ok in 12.3s
+20:24:27 cycle 47 abort ok in 2.7s
+20:24:45 cycle 47 drained in 3.4s, 0 failures
+20:24:51 cycle 48 scale ok in 6.2s
+20:25:03 cycle 48 job ok in 12.4s
+20:25:06 cycle 48 abort ok in 3.1s
+20:25:24 cycle 48 drained in 3.4s, 0 failures
+20:25:31 cycle 49 scale ok in 7.1s
+20:25:43 cycle 49 job ok in 12.5s
+20:25:46 cycle 49 abort ok in 3.0s
+20:26:04 cycle 49 drained in 3.3s, 0 failures
+20:26:10 cycle 50 scale ok in 6.1s
+20:26:23 cycle 50 job ok in 12.4s
+20:26:25 cycle 50 abort ok in 2.8s
+20:26:43 cycle 50 drained in 3.3s, 0 failures
+20:27:37 cycle 51 scale ok in 54.1s
+20:27:50 cycle 51 job ok in 12.5s
+20:27:53 cycle 51 abort ok in 3.0s
+20:28:11 cycle 51 drained in 3.4s, 0 failures
+20:28:17 cycle 52 scale ok in 6.0s
+20:28:29 cycle 52 job ok in 12.6s
+20:28:32 cycle 52 abort ok in 2.9s
+20:28:50 cycle 52 drained in 3.4s, 0 failures
+20:28:56 cycle 53 scale ok in 6.1s
+20:29:09 cycle 53 job ok in 12.9s
+20:29:12 cycle 53 abort ok in 2.9s
+20:29:30 cycle 53 drained in 3.4s, 0 failures
+20:29:37 cycle 54 scale ok in 6.1s
+20:29:49 cycle 54 job ok in 12.4s
+20:29:52 cycle 54 abort ok in 2.5s
+20:30:10 cycle 54 drained in 3.5s, 0 failures
+20:30:16 cycle 55 scale ok in 6.2s
+20:30:28 cycle 55 job ok in 12.4s
+20:30:32 cycle 55 abort ok in 3.0s
+20:30:50 cycle 55 drained in 3.3s, 0 failures
+20:31:14 cycle 56 scale ok in 24.1s
+20:31:27 cycle 56 job ok in 12.5s
+20:31:29 cycle 56 abort ok in 2.8s
+20:31:48 cycle 56 drained in 3.3s, 0 failures
+20:31:54 cycle 57 scale ok in 6.1s
+20:32:06 cycle 57 job ok in 12.5s
+20:32:09 cycle 57 abort ok in 2.7s
+20:32:28 cycle 57 drained in 3.5s, 0 failures
+20:32:34 cycle 58 scale ok in 6.1s
+20:32:46 cycle 58 job ok in 12.5s
+20:32:50 cycle 58 abort ok in 3.1s
+20:33:08 cycle 58 drained in 3.4s, 0 failures
+20:33:15 cycle 59 scale ok in 6.2s
+20:33:27 cycle 59 job ok in 12.4s
+20:33:30 cycle 59 abort ok in 2.8s
+20:33:49 cycle 59 drained in 3.4s, 0 failures
+20:34:00 cycle 60 scale ok in 11.1s
+20:34:12 cycle 60 job ok in 12.5s
+20:34:16 cycle 60 abort ok in 3.1s
+20:34:35 cycle 60 drained in 3.4s, 0 failures
+20:34:41 cycle 61 scale ok in 6.1s
+20:34:53 cycle 61 job ok in 12.4s
+20:34:56 cycle 61 abort ok in 3.1s
+20:35:16 cycle 61 drained in 3.5s, 0 failures
+20:35:30 cycle 62 scale ok in 14.1s
+20:35:42 cycle 62 job ok in 12.5s
+20:35:45 cycle 62 abort ok in 2.8s
+20:36:04 cycle 62 drained in 3.4s, 0 failures
+20:36:10 cycle 63 scale ok in 6.1s
+20:36:23 cycle 63 job ok in 12.4s
+20:36:25 cycle 63 abort ok in 2.4s
+20:36:45 cycle 63 drained in 3.5s, 0 failures
+20:37:43 cycle 64 scale ok in 58.3s
+20:37:56 cycle 64 job ok in 12.5s
+20:37:59 cycle 64 abort ok in 3.2s
+20:38:18 cycle 64 drained in 3.4s, 0 failures
+20:38:24 cycle 65 scale ok in 6.1s
+20:38:37 cycle 65 job ok in 12.4s
+20:38:40 cycle 65 abort ok in 3.2s
+20:39:00 cycle 65 drained in 3.4s, 0 failures
+20:39:06 cycle 66 scale ok in 6.1s
+20:39:18 cycle 66 job ok in 12.5s
+20:39:21 cycle 66 abort ok in 3.1s
+20:39:41 cycle 66 drained in 3.4s, 0 failures
+20:39:47 cycle 67 scale ok in 6.1s
+20:40:00 cycle 67 job ok in 12.4s
+20:40:02 cycle 67 abort ok in 2.0s
+20:40:22 cycle 67 drained in 3.5s, 0 failures
+20:40:28 cycle 68 scale ok in 6.2s
+20:40:41 cycle 68 job ok in 12.4s
+20:40:44 cycle 68 abort ok in 3.0s
+20:41:03 cycle 68 drained in 3.5s, 0 failures
+20:41:10 cycle 69 scale ok in 6.1s
+20:41:22 cycle 69 job ok in 12.4s
+20:41:25 cycle 69 abort ok in 2.7s
+20:41:45 cycle 69 drained in 3.4s, 0 failures
+20:42:12 cycle 70 scale ok in 27.1s
+20:42:25 cycle 70 job ok in 12.5s
+20:42:28 cycle 70 abort ok in 3.1s
+20:42:48 cycle 70 drained in 3.5s, 0 failures
+20:42:55 cycle 71 scale ok in 7.1s
+20:43:08 cycle 71 job ok in 12.4s
+20:43:11 cycle 71 abort ok in 3.0s
+20:43:31 cycle 71 drained in 3.2s, 0 failures
+20:43:38 cycle 72 scale ok in 7.1s
+20:43:51 cycle 72 job ok in 12.4s
+20:43:53 cycle 72 abort ok in 2.8s
+20:44:14 cycle 72 drained in 3.4s, 0 failures
+20:44:20 cycle 73 scale ok in 6.2s
+20:44:33 cycle 73 job ok in 12.4s
+20:44:35 cycle 73 abort ok in 2.3s
+20:44:56 cycle 73 drained in 3.5s, 0 failures
+20:45:34 cycle 74 scale ok in 38.1s
+20:45:46 cycle 74 job ok in 12.5s
+20:45:49 cycle 74 abort ok in 3.1s
+20:46:10 cycle 74 drained in 3.4s, 0 failures
+20:46:16 cycle 75 scale ok in 6.1s
+20:46:29 cycle 75 job ok in 12.4s
+20:46:32 cycle 75 abort ok in 3.0s
+20:46:53 cycle 75 drained in 3.2s, 0 failures
+20:46:59 cycle 76 scale ok in 6.2s
+20:47:11 cycle 76 job ok in 12.3s
+20:47:14 cycle 76 abort ok in 3.1s
+20:47:35 cycle 76 drained in 3.4s, 0 failures
+20:47:41 cycle 77 scale ok in 6.2s
+20:47:54 cycle 77 job ok in 12.4s
+20:47:57 cycle 77 abort ok in 3.0s
+20:48:18 cycle 77 drained in 3.4s, 0 failures
+20:48:24 cycle 78 scale ok in 6.1s
+20:48:37 cycle 78 job ok in 12.6s
+20:48:40 cycle 78 abort ok in 3.1s
+20:49:01 cycle 78 drained in 3.4s, 0 failures
+20:49:07 cycle 79 scale ok in 6.2s
+20:49:20 cycle 79 job ok in 12.3s
+20:49:22 cycle 79 abort ok in 2.7s
+20:49:44 cycle 79 drained in 3.5s, 0 failures
+20:49:53 cycle 80 scale ok in 9.1s
+20:50:05 cycle 80 job ok in 12.4s
+20:50:09 cycle 80 abort ok in 3.1s
+20:50:30 cycle 80 drained in 3.4s, 0 failures
+20:50:36 cycle 81 scale ok in 6.1s
+20:50:48 cycle 81 job ok in 12.1s
+20:50:51 cycle 81 abort ok in 2.8s
+20:51:04 cycle 81 drained in 3.4s, 0 failures
+20:51:27 cycle 82 scale ok in 23.2s
+20:51:40 cycle 82 job ok in 12.7s
+20:51:43 cycle 82 abort ok in 3.1s
+20:51:56 cycle 82 drained in 3.3s, 0 failures
+20:52:47 cycle 83 scale ok in 51.1s
+20:53:00 cycle 83 job ok in 12.6s
+20:53:02 cycle 83 abort ok in 2.7s
+20:53:15 cycle 83 drained in 3.5s, 0 failures
+20:53:22 cycle 84 scale ok in 6.6s
+20:53:34 cycle 84 job ok in 12.3s
+20:53:37 cycle 84 abort ok in 2.9s
+20:53:50 cycle 84 drained in 3.4s, 0 failures
+20:53:56 cycle 85 scale ok in 6.1s
+20:54:09 cycle 85 job ok in 12.4s
+20:54:12 cycle 85 abort ok in 3.1s
+20:54:24 cycle 85 drained in 3.3s, 0 failures
+20:54:30 cycle 86 scale ok in 6.0s
+20:54:43 cycle 86 job ok in 12.5s
+20:54:46 cycle 86 abort ok in 2.6s
+20:54:58 cycle 86 drained in 3.5s, 0 failures
+20:55:06 cycle 87 scale ok in 7.1s
+20:55:18 cycle 87 job ok in 12.4s
+20:55:21 cycle 87 abort ok in 2.8s
+20:55:34 cycle 87 drained in 3.4s, 0 failures
+20:56:01 cycle 88 scale ok in 27.1s
+20:56:13 cycle 88 job ok in 12.5s
+20:56:16 cycle 88 abort ok in 3.0s
+20:56:29 cycle 88 drained in 3.4s, 0 failures
+20:56:38 cycle 89 scale ok in 9.1s
+20:56:51 cycle 89 job ok in 12.4s
+20:56:54 cycle 89 abort ok in 3.1s
+20:57:07 cycle 89 drained in 3.4s, 0 failures
+20:57:16 cycle 90 scale ok in 9.1s
+20:57:28 cycle 90 job ok in 12.4s
+20:57:32 cycle 90 abort ok in 3.1s
+20:57:44 cycle 90 drained in 3.3s, 0 failures
+20:58:25 cycle 91 scale ok in 41.2s
+20:58:38 cycle 91 job ok in 12.5s
+20:58:41 cycle 91 abort ok in 3.0s
+20:58:54 cycle 91 drained in 3.3s, 0 failures
+20:59:00 cycle 92 scale ok in 6.1s
+20:59:12 cycle 92 job ok in 12.4s
+20:59:15 cycle 92 abort ok in 2.8s
+20:59:28 cycle 92 drained in 3.3s, 0 failures
+20:59:34 cycle 93 scale ok in 6.0s
+20:59:47 cycle 93 job ok in 12.5s
+20:59:50 cycle 93 abort ok in 3.0s
+21:00:02 cycle 93 drained in 3.3s, 0 failures
+21:00:09 cycle 94 scale ok in 6.2s
+21:00:21 cycle 94 job ok in 12.4s
+21:00:24 cycle 94 abort ok in 2.9s
+21:00:37 cycle 94 drained in 3.4s, 0 failures
+21:01:24 cycle 95 scale ok in 47.1s
+21:01:37 cycle 95 job ok in 12.6s
+21:01:40 cycle 95 abort ok in 3.1s
+21:01:53 cycle 95 drained in 3.4s, 0 failures
+21:01:59 cycle 96 scale ok in 6.1s
+21:02:11 cycle 96 job ok in 12.5s
+21:02:14 cycle 96 abort ok in 2.9s
+21:02:27 cycle 96 drained in 3.5s, 0 failures
+21:02:33 cycle 97 scale ok in 6.2s
+21:02:46 cycle 97 job ok in 12.4s
+21:02:48 cycle 97 abort ok in 2.6s
+21:03:01 cycle 97 drained in 3.6s, 0 failures
+21:03:08 cycle 98 scale ok in 6.2s
+21:03:20 cycle 98 job ok in 12.4s
+21:03:23 cycle 98 abort ok in 3.0s
+21:03:36 cycle 98 drained in 3.4s, 0 failures
+21:03:45 cycle 99 scale ok in 9.1s
+21:03:57 cycle 99 job ok in 12.4s
+21:04:00 cycle 99 abort ok in 3.1s
+21:04:13 cycle 99 drained in 3.3s, 0 failures
+21:04:58 cycle 100 scale ok in 45.2s
+21:05:11 cycle 100 job ok in 12.5s
+21:05:14 cycle 100 abort ok in 2.6s
+21:05:26 cycle 100 drained in 3.4s, 0 failures
+21:05:33 cycle 101 scale ok in 6.1s
+21:05:45 cycle 101 job ok in 12.4s
+21:05:48 cycle 101 abort ok in 2.9s
+21:06:01 cycle 101 drained in 3.4s, 0 failures
+21:06:07 cycle 102 scale ok in 6.2s
+21:06:19 cycle 102 job ok in 12.4s
+21:06:23 cycle 102 abort ok in 3.1s
+21:06:35 cycle 102 drained in 3.4s, 0 failures
+21:06:42 cycle 103 scale ok in 6.2s
+21:06:54 cycle 103 job ok in 12.4s
+21:06:57 cycle 103 abort ok in 3.1s
+21:07:10 cycle 103 drained in 3.4s, 0 failures
+21:08:01 cycle 104 scale ok in 51.3s
+21:08:14 cycle 104 job ok in 12.5s
+21:08:17 cycle 104 abort ok in 3.0s
+21:08:30 cycle 104 drained in 3.4s, 0 failures
+21:08:51 cycle 105 scale ok in 21.7s
+21:09:04 cycle 105 job ok in 12.8s
+21:09:07 cycle 105 abort ok in 3.1s
+21:09:20 cycle 105 drained in 3.4s, 0 failures
+21:09:27 cycle 106 scale ok in 6.6s
+21:09:39 cycle 106 job ok in 12.3s
+21:09:41 cycle 106 abort ok in 2.5s
+21:09:54 cycle 106 drained in 3.5s, 0 failures
+21:10:01 cycle 107 scale ok in 6.1s
+21:10:14 cycle 107 job ok in 13.5s
+21:10:17 cycle 107 abort ok in 3.0s
+21:10:30 cycle 107 drained in 3.4s, 0 failures
+21:10:36 cycle 108 scale ok in 6.2s
+21:10:48 cycle 108 job ok in 12.3s
+21:10:51 cycle 108 abort ok in 3.1s
+21:11:04 cycle 108 drained in 3.5s, 0 failures
+21:11:15 cycle 109 scale ok in 10.6s
+21:11:28 cycle 109 job ok in 13.1s
+21:11:31 cycle 109 abort ok in 2.9s
+21:11:44 cycle 109 drained in 3.4s, 0 failures
+21:12:40 cycle 110 scale ok in 56.1s
+21:12:53 cycle 110 job ok in 12.6s
+21:12:56 cycle 110 abort ok in 2.9s
+21:13:08 cycle 110 drained in 3.4s, 0 failures
+21:13:14 cycle 111 scale ok in 6.1s
+21:13:27 cycle 111 job ok in 12.4s
+21:13:30 cycle 111 abort ok in 3.1s
+21:13:42 cycle 111 drained in 3.5s, 0 failures
+21:13:49 cycle 112 scale ok in 6.0s
+21:14:01 cycle 112 job ok in 12.5s
+21:14:04 cycle 112 abort ok in 2.7s
+21:14:16 cycle 112 drained in 3.4s, 0 failures
+21:14:23 cycle 113 scale ok in 6.1s
+21:14:35 cycle 113 job ok in 12.4s
+21:14:37 cycle 113 abort ok in 1.7s
+21:14:49 cycle 113 drained in 3.5s, 0 failures
+21:14:56 cycle 114 scale ok in 6.1s
+21:15:08 cycle 114 job ok in 12.7s
+21:15:11 cycle 114 abort ok in 2.5s
+21:15:24 cycle 114 drained in 3.5s, 0 failures
+21:15:30 cycle 115 scale ok in 6.2s
+21:15:42 cycle 115 job ok in 12.4s
+21:15:45 cycle 115 abort ok in 2.2s
+21:15:58 cycle 115 drained in 3.5s, 0 failures
+21:16:50 cycle 116 scale ok in 52.7s
+21:17:03 cycle 116 job ok in 12.3s
+21:17:06 cycle 116 abort ok in 3.0s
+21:17:18 cycle 116 drained in 3.4s, 0 failures
+21:17:25 cycle 117 scale ok in 6.6s
+21:17:37 cycle 117 job ok in 12.3s
+21:17:40 cycle 117 abort ok in 3.0s
+21:17:53 cycle 117 drained in 3.4s, 0 failures
+21:17:59 cycle 118 scale ok in 6.1s
+21:18:12 cycle 118 job ok in 12.4s
+21:18:14 cycle 118 abort ok in 2.7s
+21:18:27 cycle 118 drained in 3.4s, 0 failures
+21:18:34 cycle 119 scale ok in 6.2s
+21:18:46 cycle 119 job ok in 12.5s
+21:18:49 cycle 119 abort ok in 2.5s
+21:19:01 cycle 119 drained in 3.5s, 0 failures
+21:19:08 cycle 120 scale ok in 6.3s
+21:19:20 cycle 120 job ok in 12.3s
+21:19:23 cycle 120 abort ok in 2.7s
+21:19:36 cycle 120 drained in 3.4s, 0 failures
+21:20:23 cycle 121 scale ok in 47.1s
+21:20:36 cycle 121 job ok in 12.5s
+21:20:39 cycle 121 abort ok in 3.1s
+21:20:51 cycle 121 drained in 3.3s, 0 failures
+21:20:58 cycle 122 scale ok in 6.6s
+21:21:11 cycle 122 job ok in 13.3s
+21:21:14 cycle 122 abort ok in 2.6s
+21:21:27 cycle 122 drained in 3.4s, 0 failures
+21:21:36 cycle 123 scale ok in 9.1s
+21:21:49 cycle 123 job ok in 12.4s
+21:21:51 cycle 123 abort ok in 2.9s
+21:22:04 cycle 123 drained in 3.4s, 0 failures
+21:22:11 cycle 124 scale ok in 7.0s
+21:22:24 cycle 124 job ok in 12.5s
+21:22:26 cycle 124 abort ok in 2.5s
+21:22:39 cycle 124 drained in 3.5s, 0 failures
+21:23:38 cycle 125 scale ok in 59.0s
+21:23:51 cycle 125 job ok in 12.7s
+21:23:54 cycle 125 abort ok in 2.8s
+21:24:07 cycle 125 drained in 3.3s, 0 failures
+21:24:13 cycle 126 scale ok in 6.2s
+21:24:25 cycle 126 job ok in 12.4s
+21:24:28 cycle 126 abort ok in 2.8s
+21:24:41 cycle 126 drained in 3.4s, 0 failures
+21:24:47 cycle 127 scale ok in 6.0s
+21:25:00 cycle 127 job ok in 12.4s
+21:25:02 cycle 127 abort ok in 2.8s
+21:25:15 cycle 127 drained in 3.5s, 0 failures
+21:25:22 cycle 128 scale ok in 6.3s
+21:25:34 cycle 128 job ok in 12.2s
+21:25:37 cycle 128 abort ok in 2.8s
+21:25:50 cycle 128 drained in 3.4s, 0 failures
+21:26:36 cycle 129 scale ok in 46.1s
+21:26:49 cycle 129 job ok in 12.6s
+21:26:52 cycle 129 abort ok in 3.1s
+21:27:04 cycle 129 drained in 3.4s, 0 failures
+21:27:15 cycle 130 scale ok in 10.6s
+21:27:28 cycle 130 job ok in 12.9s
+21:27:30 cycle 130 abort ok in 2.1s
+21:27:43 cycle 130 drained in 3.5s, 0 failures
+21:27:50 cycle 131 scale ok in 7.1s
+21:28:03 cycle 131 job ok in 12.5s
+21:28:06 cycle 131 abort ok in 3.0s
+21:28:19 cycle 131 drained in 3.4s, 0 failures
+21:28:25 cycle 132 scale ok in 6.2s
+21:28:37 cycle 132 job ok in 12.5s
+21:28:40 cycle 132 abort ok in 2.9s
+21:28:53 cycle 132 drained in 3.5s, 0 failures
+21:29:39 cycle 133 scale ok in 45.1s
+21:29:51 cycle 133 job ok in 12.7s
+21:29:54 cycle 133 abort ok in 2.4s
+21:30:07 cycle 133 drained in 3.5s, 0 failures
+21:30:13 cycle 134 scale ok in 6.6s
+21:30:27 cycle 134 job ok in 13.3s
+21:30:30 cycle 134 abort ok in 3.1s
+21:30:43 cycle 134 drained in 3.4s, 0 failures
+21:30:49 cycle 135 scale ok in 6.2s
+21:31:01 cycle 135 job ok in 12.4s
+21:31:04 cycle 135 abort ok in 3.1s
+21:31:17 cycle 135 drained in 3.3s, 0 failures
+21:31:24 cycle 136 scale ok in 6.6s
+21:31:37 cycle 136 job ok in 13.3s
+21:31:40 cycle 136 abort ok in 3.1s
+21:31:54 cycle 136 drained in 3.5s, 0 failures
+21:32:55 cycle 137 scale ok in 61.0s
+21:33:07 cycle 137 job ok in 12.6s
+21:33:10 cycle 137 abort ok in 3.1s
+21:33:23 cycle 137 drained in 3.3s, 0 failures
+21:33:29 cycle 138 scale ok in 6.1s
+21:33:42 cycle 138 job ok in 12.4s
+21:33:45 cycle 138 abort ok in 3.0s
+21:33:57 cycle 138 drained in 3.3s, 0 failures
+21:34:04 cycle 139 scale ok in 6.1s
+21:34:16 cycle 139 job ok in 12.5s
+21:34:19 cycle 139 abort ok in 3.0s
+21:34:32 cycle 139 drained in 3.5s, 0 failures
+21:34:38 cycle 140 scale ok in 6.1s
+21:34:51 cycle 140 job ok in 12.5s
+21:34:54 cycle 140 abort ok in 3.1s
+21:35:07 cycle 140 drained in 3.5s, 0 failures
+21:35:24 cycle 141 scale ok in 17.1s
+21:35:36 cycle 141 job ok in 12.4s
+21:35:39 cycle 141 abort ok in 2.7s
+21:35:52 cycle 141 drained in 3.4s, 0 failures
+21:36:14 cycle 142 scale ok in 22.2s
+21:36:27 cycle 142 job ok in 12.4s
+21:36:30 cycle 142 abort ok in 3.0s
+21:36:43 cycle 142 drained in 3.4s, 0 failures
+21:36:49 cycle 143 scale ok in 6.2s
+21:37:01 cycle 143 job ok in 12.4s
+21:37:04 cycle 143 abort ok in 3.0s
+21:37:17 cycle 143 drained in 3.4s, 0 failures
+21:37:23 cycle 144 scale ok in 6.1s
+21:37:36 cycle 144 job ok in 12.8s
+21:37:39 cycle 144 abort ok in 2.8s
+21:37:52 cycle 144 drained in 3.4s, 0 failures
+21:38:45 cycle 145 scale ok in 53.0s
+21:38:58 cycle 145 job ok in 12.7s
+21:39:01 cycle 145 abort ok in 2.8s
+21:39:13 cycle 145 drained in 3.4s, 0 failures
+21:39:20 cycle 146 scale ok in 6.2s
+21:39:32 cycle 146 job ok in 12.3s
+21:39:34 cycle 146 abort ok in 2.5s
+21:39:47 cycle 146 drained in 3.4s, 0 failures
+21:39:54 cycle 147 scale ok in 6.2s
+21:40:06 cycle 147 job ok in 12.3s
+21:40:08 cycle 147 abort ok in 2.2s
+21:40:21 cycle 147 drained in 3.5s, 0 failures
+21:40:28 cycle 148 scale ok in 7.1s
+21:40:41 cycle 148 job ok in 12.5s
+21:40:44 cycle 148 abort ok in 2.7s
+21:40:57 cycle 148 drained in 3.4s, 0 failures
+21:42:00 cycle 149 scale ok in 63.2s
+21:42:12 cycle 149 job ok in 12.5s
+21:42:15 cycle 149 abort ok in 2.8s
+21:42:28 cycle 149 drained in 3.3s, 0 failures
+21:42:35 cycle 150 scale ok in 6.6s
+21:42:47 cycle 150 job ok in 12.3s
+21:42:50 cycle 150 abort ok in 3.1s
+21:43:03 cycle 150 drained in 3.4s, 0 failures
+21:43:09 cycle 151 scale ok in 6.3s
+21:43:23 cycle 151 job ok in 13.3s
+21:43:26 cycle 151 abort ok in 3.2s
+21:43:39 cycle 151 drained in 3.4s, 0 failures
+21:43:45 cycle 152 scale ok in 6.2s
+21:43:58 cycle 152 job ok in 12.4s
+21:44:00 cycle 152 abort ok in 2.9s
+21:44:14 cycle 152 drained in 3.5s, 0 failures
+21:44:21 cycle 153 scale ok in 7.1s
+21:44:33 cycle 153 job ok in 12.4s
+21:44:36 cycle 153 abort ok in 2.8s
+21:44:49 cycle 153 drained in 3.4s, 0 failures
+21:44:55 cycle 154 scale ok in 6.2s
+21:45:08 cycle 154 job ok in 12.3s
+21:45:10 cycle 154 abort ok in 2.7s
+21:45:23 cycle 154 drained in 3.4s, 0 failures
+21:45:37 cycle 155 scale ok in 13.6s
+21:45:50 cycle 155 job ok in 13.3s
+21:45:53 cycle 155 abort ok in 3.0s
+21:46:06 cycle 155 drained in 3.4s, 0 failures
+21:46:46 cycle 156 scale ok in 40.0s
+21:46:59 cycle 156 job ok in 12.6s
+21:47:02 cycle 156 abort ok in 3.0s
+21:47:15 cycle 156 drained in 3.3s, 0 failures
+21:47:21 cycle 157 scale ok in 6.1s
+21:47:34 cycle 157 job ok in 12.4s
+21:47:37 cycle 157 abort ok in 2.8s
+21:47:49 cycle 157 drained in 3.4s, 0 failures
+21:47:58 cycle 158 scale ok in 8.7s
+21:48:13 cycle 158 job ok in 14.3s
+21:48:16 cycle 158 abort ok in 3.1s
+21:48:29 cycle 158 drained in 3.4s, 0 failures
+21:48:36 cycle 159 scale ok in 7.0s
+21:48:48 cycle 159 job ok in 12.5s
+21:48:51 cycle 159 abort ok in 3.1s
+21:49:04 cycle 159 drained in 3.4s, 0 failures
+21:49:16 cycle 160 scale ok in 11.1s
+21:49:28 cycle 160 job ok in 12.4s
+21:49:31 cycle 160 abort ok in 3.1s
+21:49:44 cycle 160 drained in 3.4s, 0 failures
+21:50:23 cycle 161 scale ok in 38.6s
+21:50:36 cycle 161 job ok in 13.0s
+21:50:39 cycle 161 abort ok in 3.0s
+21:50:52 cycle 161 drained in 3.4s, 0 failures
+21:50:58 cycle 162 scale ok in 6.2s
+21:51:11 cycle 162 job ok in 12.5s
+21:51:14 cycle 162 abort ok in 2.6s
+21:51:27 cycle 162 drained in 3.4s, 0 failures
+21:51:33 cycle 163 scale ok in 6.6s
+21:51:47 cycle 163 job ok in 13.3s
+21:51:50 cycle 163 abort ok in 3.1s
+21:52:03 cycle 163 drained in 3.4s, 0 failures
+21:52:19 cycle 164 scale ok in 15.9s
+21:52:31 cycle 164 job ok in 12.7s
+21:52:35 cycle 164 abort ok in 3.2s
+21:52:48 cycle 164 drained in 3.4s, 0 failures
+21:52:54 cycle 165 scale ok in 6.1s
+21:53:07 cycle 165 job ok in 12.4s
+21:53:10 cycle 165 abort ok in 3.0s
+21:53:23 cycle 165 drained in 3.5s, 0 failures
+21:53:59 cycle 166 scale ok in 36.0s
+21:54:12 cycle 166 job ok in 12.7s
+21:54:15 cycle 166 abort ok in 3.1s
+21:54:28 cycle 166 drained in 3.4s, 0 failures
+21:54:35 cycle 167 scale ok in 7.1s
+21:54:47 cycle 167 job ok in 12.5s
+21:54:50 cycle 167 abort ok in 2.8s
+21:55:03 cycle 167 drained in 3.3s, 0 failures
+21:55:10 cycle 168 scale ok in 6.1s
+21:55:22 cycle 168 job ok in 12.4s
+21:55:25 cycle 168 abort ok in 3.2s
+21:55:38 cycle 168 drained in 3.3s, 0 failures
+21:55:45 cycle 169 scale ok in 6.6s
+21:55:57 cycle 169 job ok in 12.3s
+21:56:00 cycle 169 abort ok in 2.6s
+21:56:13 cycle 169 drained in 3.4s, 0 failures
+21:56:19 cycle 170 scale ok in 6.1s
+21:56:32 cycle 170 job ok in 12.4s
+21:56:34 cycle 170 abort ok in 2.6s
+21:56:48 cycle 170 drained in 3.5s, 0 failures
+21:56:54 cycle 171 scale ok in 6.2s
+21:57:06 cycle 171 job ok in 12.4s
+21:57:09 cycle 171 abort ok in 3.1s
+21:57:23 cycle 171 drained in 3.5s, 0 failures
+21:57:29 cycle 172 scale ok in 6.2s
+21:57:42 cycle 172 job ok in 12.6s
+21:57:45 cycle 172 abort ok in 3.1s
+21:57:58 cycle 172 drained in 3.4s, 0 failures
+21:58:09 cycle 173 scale ok in 11.1s
+21:58:22 cycle 173 job ok in 12.4s
+21:58:25 cycle 173 abort ok in 3.1s
+21:58:38 cycle 173 drained in 3.4s, 0 failures
+21:59:05 cycle 174 scale ok in 27.2s
+21:59:18 cycle 174 job ok in 12.4s
+21:59:21 cycle 174 abort ok in 3.1s
+21:59:34 cycle 174 drained in 3.4s, 0 failures
+21:59:40 cycle 175 scale ok in 6.2s
+21:59:53 cycle 175 job ok in 12.4s
+21:59:56 cycle 175 abort ok in 2.9s
+22:00:09 cycle 175 drained in 3.4s, 0 failures
+22:01:11 cycle 176 scale ok in 62.0s
+22:01:24 cycle 176 job ok in 12.7s
+22:01:27 cycle 176 abort ok in 3.1s
+22:01:40 cycle 176 drained in 3.4s, 0 failures
+22:01:46 cycle 177 scale ok in 6.1s
+22:01:58 cycle 177 job ok in 12.5s
+22:02:01 cycle 177 abort ok in 2.9s
+22:02:15 cycle 177 drained in 3.4s, 0 failures
+22:02:21 cycle 178 scale ok in 6.1s
+22:02:33 cycle 178 job ok in 12.5s
+22:02:36 cycle 178 abort ok in 2.8s
+22:02:49 cycle 178 drained in 3.4s, 0 failures
+22:02:57 cycle 179 scale ok in 7.2s
+22:03:09 cycle 179 job ok in 12.3s
+22:03:12 cycle 179 abort ok in 3.1s
+22:03:25 cycle 179 drained in 3.4s, 0 failures
+22:03:32 cycle 180 scale ok in 7.2s
+22:03:45 cycle 180 job ok in 12.5s
+22:03:48 cycle 180 abort ok in 3.1s
+22:04:01 cycle 180 drained in 3.5s, 0 failures
+22:05:05 cycle 181 scale ok in 63.3s
+22:05:17 cycle 181 job ok in 12.5s
+22:05:20 cycle 181 abort ok in 3.0s
+22:05:33 cycle 181 drained in 3.4s, 0 failures
+22:05:39 cycle 182 scale ok in 6.1s
+22:05:52 cycle 182 job ok in 12.4s
+22:05:55 cycle 182 abort ok in 3.0s
+22:06:08 cycle 182 drained in 3.4s, 0 failures
+22:06:14 cycle 183 scale ok in 6.1s
+22:06:27 cycle 183 job ok in 12.5s
+22:06:30 cycle 183 abort ok in 2.9s
+22:06:43 cycle 183 drained in 3.4s, 0 failures
+22:06:49 cycle 184 scale ok in 6.2s
+22:07:01 cycle 184 job ok in 12.4s
+22:07:04 cycle 184 abort ok in 3.0s
+22:07:18 cycle 184 drained in 3.4s, 0 failures
+22:07:24 cycle 185 scale ok in 6.1s
+22:07:36 cycle 185 job ok in 12.5s
+22:07:39 cycle 185 abort ok in 3.0s
+22:07:52 cycle 185 drained in 3.3s, 0 failures
+22:08:04 cycle 186 scale ok in 12.2s
+22:08:17 cycle 186 job ok in 12.4s
+22:08:20 cycle 186 abort ok in 3.0s
+22:08:33 cycle 186 drained in 3.4s, 0 failures
+22:09:13 cycle 187 scale ok in 40.2s
+22:09:26 cycle 187 job ok in 12.5s
+22:09:29 cycle 187 abort ok in 3.1s
+22:09:42 cycle 187 drained in 3.4s, 0 failures
+22:09:48 cycle 188 scale ok in 6.0s
+22:10:01 cycle 188 job ok in 12.5s
+22:10:04 cycle 188 abort ok in 2.9s
+22:10:17 cycle 188 drained in 3.4s, 0 failures
+22:10:26 cycle 189 scale ok in 9.1s
+22:10:38 cycle 189 job ok in 12.5s
+22:10:42 cycle 189 abort ok in 3.1s
+22:10:54 cycle 189 drained in 3.3s, 0 failures
+22:11:01 cycle 190 scale ok in 6.6s
+22:11:14 cycle 190 job ok in 12.9s
+22:11:17 cycle 190 abort ok in 3.0s
+22:11:30 cycle 190 drained in 3.4s, 0 failures
+22:12:10 cycle 191 scale ok in 40.0s
+22:12:23 cycle 191 job ok in 12.7s
+22:12:26 cycle 191 abort ok in 2.9s
+22:12:39 cycle 191 drained in 3.2s, 0 failures
+22:13:21 cycle 192 scale ok in 42.1s
+22:13:34 cycle 192 job ok in 12.6s
+22:13:37 cycle 192 abort ok in 2.7s
+22:13:50 cycle 192 drained in 3.4s, 0 failures
+22:13:56 cycle 193 scale ok in 6.2s
+22:14:08 cycle 193 job ok in 12.3s
+22:14:12 cycle 193 abort ok in 3.1s
+22:14:25 cycle 193 drained in 3.4s, 0 failures
+22:14:31 cycle 194 scale ok in 6.1s
+22:14:43 cycle 194 job ok in 12.5s
+22:14:47 cycle 194 abort ok in 3.0s
+22:14:59 cycle 194 drained in 3.4s, 0 failures
+22:15:07 cycle 195 scale ok in 7.1s
+22:15:19 cycle 195 job ok in 12.4s
+22:15:22 cycle 195 abort ok in 3.0s
+22:15:35 cycle 195 drained in 3.4s, 0 failures
+22:15:42 cycle 196 scale ok in 6.3s
+22:15:54 cycle 196 job ok in 12.4s
+22:15:57 cycle 196 abort ok in 3.1s
+22:16:10 cycle 196 drained in 3.4s, 0 failures
+22:17:32 cycle 197 scale ok in 81.3s
+22:17:44 cycle 197 job ok in 12.5s
+22:17:47 cycle 197 abort ok in 3.0s
+22:18:00 cycle 197 drained in 3.5s, 0 failures
+22:18:06 cycle 198 scale ok in 6.1s
+22:18:19 cycle 198 job ok in 12.4s
+22:18:22 cycle 198 abort ok in 2.9s
+22:18:35 cycle 198 drained in 3.3s, 0 failures
+22:18:41 cycle 199 scale ok in 6.6s
+22:18:55 cycle 199 job ok in 13.3s
+22:18:58 cycle 199 abort ok in 2.9s
+22:19:11 cycle 199 drained in 3.5s, 0 failures
+22:19:17 cycle 200 scale ok in 6.3s
+22:19:29 cycle 200 job ok in 12.3s
+22:19:32 cycle 200 abort ok in 2.9s
+22:19:45 cycle 200 drained in 3.4s, 0 failures
+22:19:51 cycle 201 scale ok in 6.0s
+22:20:04 cycle 201 job ok in 12.4s
+22:20:07 cycle 201 abort ok in 2.9s
+22:20:20 cycle 201 drained in 3.4s, 0 failures
+22:20:34 cycle 202 scale ok in 14.0s
+22:20:46 cycle 202 job ok in 12.6s
+22:20:50 cycle 202 abort ok in 3.0s
+22:21:03 cycle 202 drained in 3.4s, 0 failures
+22:21:09 cycle 203 scale ok in 6.1s
+22:21:21 cycle 203 job ok in 12.4s
+22:21:24 cycle 203 abort ok in 3.1s
+22:21:37 cycle 203 drained in 3.4s, 0 failures
+22:21:59 cycle 204 scale ok in 21.7s
+22:22:12 cycle 204 job ok in 12.8s
+22:22:15 cycle 204 abort ok in 2.8s
+22:22:28 cycle 204 drained in 3.4s, 0 failures
+22:22:49 cycle 205 scale ok in 21.1s
+22:23:02 cycle 205 job ok in 12.5s
+22:23:05 cycle 205 abort ok in 2.9s
+22:23:18 cycle 205 drained in 3.4s, 0 failures
+22:23:28 cycle 206 scale ok in 10.6s
+22:23:42 cycle 206 job ok in 13.4s
+22:23:45 cycle 206 abort ok in 2.9s
+22:23:58 cycle 206 drained in 3.4s, 0 failures
+22:24:04 cycle 207 scale ok in 6.2s
+22:24:16 cycle 207 job ok in 12.3s
+22:24:19 cycle 207 abort ok in 3.0s
+22:24:32 cycle 207 drained in 3.4s, 0 failures
+22:25:01 cycle 208 scale ok in 28.1s
+22:25:13 cycle 208 job ok in 12.4s
+22:25:16 cycle 208 abort ok in 2.8s
+22:25:29 cycle 208 drained in 3.3s, 0 failures
+22:25:36 cycle 209 scale ok in 7.0s
+22:25:49 cycle 209 job ok in 12.5s
+22:25:52 cycle 209 abort ok in 3.1s
+22:26:05 cycle 209 drained in 3.5s, 0 failures
+22:26:21 cycle 210 scale ok in 16.6s
+22:26:35 cycle 210 job ok in 13.3s
+22:26:38 cycle 210 abort ok in 3.1s
+22:26:51 cycle 210 drained in 3.4s, 0 failures
+22:26:57 cycle 211 scale ok in 6.1s
+22:27:10 cycle 211 job ok in 12.4s
+22:27:13 cycle 211 abort ok in 3.1s
+22:27:26 cycle 211 drained in 3.4s, 0 failures
+22:28:04 cycle 212 scale ok in 38.1s
+22:28:16 cycle 212 job ok in 12.5s
+22:28:19 cycle 212 abort ok in 2.7s
+22:28:32 cycle 212 drained in 3.4s, 0 failures
+22:28:38 cycle 213 scale ok in 6.2s
+22:28:51 cycle 213 job ok in 12.3s
+22:28:53 cycle 213 abort ok in 2.5s
+22:29:07 cycle 213 drained in 3.4s, 0 failures
+22:29:13 cycle 214 scale ok in 6.6s
+22:29:27 cycle 214 job ok in 13.4s
+22:29:29 cycle 214 abort ok in 2.6s
+22:29:42 cycle 214 drained in 3.3s, 0 failures
+22:29:59 cycle 215 scale ok in 17.1s
+22:30:12 cycle 215 job ok in 12.6s
+22:30:14 cycle 215 abort ok in 2.2s
+22:30:28 cycle 215 drained in 3.5s, 0 failures
+22:30:34 cycle 216 scale ok in 6.1s
+22:30:46 cycle 216 job ok in 12.5s
+22:30:50 cycle 216 abort ok in 3.1s
+22:31:03 cycle 216 drained in 3.4s, 0 failures
+22:31:22 cycle 217 scale ok in 19.0s
+22:31:34 cycle 217 job ok in 12.6s
+22:31:37 cycle 217 abort ok in 2.9s
+22:31:50 cycle 217 drained in 3.3s, 0 failures
+22:32:10 cycle 218 scale ok in 19.1s
+22:32:22 cycle 218 job ok in 12.5s
+22:32:25 cycle 218 abort ok in 2.8s
+22:32:38 cycle 218 drained in 3.4s, 0 failures
+22:33:30 cycle 219 scale ok in 52.1s
+22:33:43 cycle 219 job ok in 12.7s
+22:33:46 cycle 219 abort ok in 3.0s
+22:33:59 cycle 219 drained in 3.4s, 0 failures
+22:34:05 cycle 220 scale ok in 6.2s
+22:34:18 cycle 220 job ok in 12.4s
+22:34:20 cycle 220 abort ok in 2.4s
+22:34:33 cycle 220 drained in 3.5s, 0 failures
+22:34:41 cycle 221 scale ok in 7.1s
+22:34:55 cycle 221 job ok in 14.3s
+22:34:58 cycle 221 abort ok in 3.0s
+22:35:11 cycle 221 drained in 3.5s, 0 failures
+22:35:17 cycle 222 scale ok in 6.2s
+22:35:30 cycle 222 job ok in 12.4s
+22:35:33 cycle 222 abort ok in 2.7s
+22:35:46 cycle 222 drained in 3.5s, 0 failures
+22:35:52 cycle 223 scale ok in 6.2s
+22:36:04 cycle 223 job ok in 12.3s
+22:36:08 cycle 223 abort ok in 3.1s
+22:36:21 cycle 223 drained in 3.4s, 0 failures
+22:36:50 cycle 224 scale ok in 29.1s
+22:37:02 cycle 224 job ok in 12.5s
+22:37:05 cycle 224 abort ok in 3.0s
+22:37:19 cycle 224 drained in 3.4s, 0 failures
+22:37:36 cycle 225 scale ok in 17.1s
+22:37:48 cycle 225 job ok in 12.5s
+22:37:51 cycle 225 abort ok in 2.8s
+22:38:04 cycle 225 drained in 3.5s, 0 failures
+22:38:14 cycle 226 scale ok in 10.1s
+22:38:27 cycle 226 job ok in 12.4s
+22:38:29 cycle 226 abort ok in 2.4s
+22:38:43 cycle 226 drained in 3.5s, 0 failures
+22:38:49 cycle 227 scale ok in 6.2s
+22:39:01 cycle 227 job ok in 12.3s
+22:39:04 cycle 227 abort ok in 2.9s
+22:39:17 cycle 227 drained in 3.4s, 0 failures
+22:39:24 cycle 228 scale ok in 6.2s
+22:39:36 cycle 228 job ok in 12.3s
+22:39:39 cycle 228 abort ok in 2.8s
+22:39:52 cycle 228 drained in 3.4s, 0 failures
+22:40:24 cycle 229 scale ok in 31.6s
+22:40:37 cycle 229 job ok in 12.9s
+22:40:40 cycle 229 abort ok in 2.9s
+22:40:53 cycle 229 drained in 3.5s, 0 failures
+22:41:00 cycle 230 scale ok in 6.1s
+22:41:12 cycle 230 job ok in 12.4s
+22:41:15 cycle 230 abort ok in 3.1s
+22:41:28 cycle 230 drained in 3.3s, 0 failures
+22:41:34 cycle 231 scale ok in 6.1s
+22:41:47 cycle 231 job ok in 12.4s
+22:41:50 cycle 231 abort ok in 2.9s
+22:42:03 cycle 231 drained in 3.4s, 0 failures
+22:42:10 cycle 232 scale ok in 7.2s
+22:42:23 cycle 232 job ok in 12.3s
+22:42:26 cycle 232 abort ok in 3.0s
+22:42:39 cycle 232 drained in 3.2s, 0 failures
+22:42:45 cycle 233 scale ok in 6.2s
+22:42:58 cycle 233 job ok in 12.4s
+22:43:01 cycle 233 abort ok in 3.0s
+22:43:14 cycle 233 drained in 3.5s, 0 failures
+22:44:02 cycle 234 scale ok in 48.0s
+22:44:15 cycle 234 job ok in 12.6s
+22:44:18 cycle 234 abort ok in 3.1s
+22:44:31 cycle 234 drained in 3.4s, 0 failures
+22:44:38 cycle 235 scale ok in 6.1s
+22:44:50 cycle 235 job ok in 12.4s
+22:44:53 cycle 235 abort ok in 2.6s
+22:45:06 cycle 235 drained in 3.4s, 0 failures
+22:45:14 cycle 236 scale ok in 8.2s
+22:45:27 cycle 236 job ok in 12.3s
+22:45:30 cycle 236 abort ok in 3.0s
+22:45:43 cycle 236 drained in 3.4s, 0 failures
+22:45:49 cycle 237 scale ok in 6.1s
+22:46:01 cycle 237 job ok in 12.4s
+22:46:04 cycle 237 abort ok in 2.7s
+22:46:17 cycle 237 drained in 3.4s, 0 failures
+22:46:46 cycle 238 scale ok in 29.1s
+22:46:59 cycle 238 job ok in 12.5s
+22:47:02 cycle 238 abort ok in 2.6s
+22:47:15 cycle 238 drained in 3.4s, 0 failures
+22:47:21 cycle 239 scale ok in 6.1s
+22:47:34 cycle 239 job ok in 12.4s
+22:47:36 cycle 239 abort ok in 2.6s
+22:47:50 cycle 239 drained in 3.5s, 0 failures
+22:48:12 cycle 240 scale ok in 22.3s
+22:48:24 cycle 240 job ok in 12.3s
+22:48:27 cycle 240 abort ok in 3.1s
+22:48:40 cycle 240 drained in 3.4s, 0 failures
+22:48:48 cycle 241 scale ok in 7.0s
+22:49:00 cycle 241 job ok in 12.5s
+22:49:03 cycle 241 abort ok in 3.1s
+22:49:16 cycle 241 drained in 3.5s, 0 failures
+22:49:27 cycle 242 scale ok in 10.0s
+22:49:39 cycle 242 job ok in 12.5s
+22:49:42 cycle 242 abort ok in 3.1s
+22:49:56 cycle 242 drained in 3.5s, 0 failures
+22:50:02 cycle 243 scale ok in 6.1s
+22:50:14 cycle 243 job ok in 12.4s
+22:50:17 cycle 243 abort ok in 3.0s
+22:50:30 cycle 243 drained in 3.4s, 0 failures
