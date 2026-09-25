@@ -1253,6 +1253,7 @@ EOF
   if [ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
     ok "node $NODE_NAME Ready"
     ensure_mode_label "$NODE_NAME"
+    install_runtime_classes
   else
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
@@ -1524,6 +1525,14 @@ ensure_mode_label() { # node
   kube label node "$1" "ferry.dev/host=$NODE_NAME" --overwrite >/dev/null 2>&1 || true
 }
 
+# The two RuntimeClasses, ferry-vm and ferry-shared: the Kubernetes spelling of
+# the choice the mode label above already expresses. See
+# manifests/runtimeclasses.yaml. On every start, because they live in etcd.
+install_runtime_classes() {
+  kube apply -f "$here/manifests/runtimeclasses.yaml" >/dev/null 2>&1 \
+    || { warn "could not install the ferry-vm and ferry-shared RuntimeClasses"; return 1; }
+}
+
 start_machines() {
   machines_ready || return 1
 
@@ -1536,6 +1545,7 @@ start_machines() {
   # enabled, purged and brought back.
   kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
     || { bad "could not install the Machine CRD"; return 1; }
+  install_runtime_classes
   install_machine_dns || return 1
 
   mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
@@ -1764,7 +1774,7 @@ start_provisioner() {
   sleep 2
   if running ferry-karpenter; then
     ok "provisioning on demand, up to $MACHINE_LIMIT_CPUS cpus and ${MACHINE_LIMIT_MEMORY_GI}Gi of machines"
-    echo "      a pod with nodeSelector ferry.dev/mode=shared makes the node it needs"
+    echo "      a pod with runtimeClassName: ferry-shared makes the node it needs"
   else
     warn "ferry-karpenter did not start; machines must be declared by hand"
     tail -3 "$FERRY_RUN/logs/ferry-karpenter.log" 2>/dev/null | sed 's/^/      /'
@@ -4755,7 +4765,9 @@ cmd_machines_enable() {
   echo "    kubectl get machines"
   echo "    kubectl get nodes -L ferry.dev/mode"
   echo
-  echo "  Pods choose with nodeSelector: {ferry.dev/mode: shared}"
+  echo "  Pods choose with a RuntimeClass:"
+  echo "    runtimeClassName: ferry-shared   # dense, one kernel for many pods"
+  echo "    runtimeClassName: ferry-vm       # a kernel each"
 }
 
 cmd_machines_disable() {

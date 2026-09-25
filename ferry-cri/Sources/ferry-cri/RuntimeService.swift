@@ -4,6 +4,27 @@ import Containerization
 import Foundation
 import GRPCCore
 
+/// The RuntimeClass handlers ferry-cri answers to.
+///
+/// Every pod it runs is a virtual machine, so there is one handler, and the
+/// empty one -- a pod that names no RuntimeClass -- means the same thing. What
+/// this exists to catch is a pod that asked for something else: a
+/// `ferry-shared` pod's handler is containerd's `runc`, and one that reached
+/// this node anyway would otherwise have been started as a VM without a word.
+/// The CRI says an unknown handler is to be refused (api.proto, RunPodSandbox).
+enum RuntimeHandlers {
+    static let vm = "ferry-vm"
+    static let served = ["", vm]
+
+    static func refusal(for handler: String) -> String? {
+        if served.contains(handler) { return nil }
+        return "ferry-cri runs every pod as its own virtual machine (RuntimeClass ferry-vm) "
+            + "and has no runtime handler \"\(handler)\"; a pod asking for it belongs on a node "
+            + "that serves it -- ferry-shared pods run on machines, "
+            + "`kubectl get nodes -L ferry.dev/mode`"
+    }
+}
+
 struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     let runtime: PodRuntime
     let version: String
@@ -46,6 +67,15 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
         var response = Runtime_V1_StatusResponse()
         response.status = status
+        // What the kubelet publishes as node.status.runtimeHandlers, so
+        // `kubectl get node -o yaml` says which RuntimeClass handlers this
+        // node can serve.
+        response.runtimeHandlers = RuntimeHandlers.served.map { name in
+            var handler = Runtime_V1_RuntimeHandler()
+            handler.name = name
+            handler.features = Runtime_V1_RuntimeHandlerFeatures()
+            return handler
+        }
         if request.verbose {
             response.info = [
                 "gateway": await runtime.gateway,
@@ -68,6 +98,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     // MARK: Sandboxes
 
     func runPodSandbox(request: Runtime_V1_RunPodSandboxRequest, context: ServerContext) async throws -> Runtime_V1_RunPodSandboxResponse {
+        if let refusal = RuntimeHandlers.refusal(for: request.runtimeHandler) {
+            throw RPCError(code: .invalidArgument, message: refusal)
+        }
         do {
             let id = try await runtime.runPodSandbox(config: request.config)
             var response = Runtime_V1_RunPodSandboxResponse()

@@ -500,6 +500,31 @@ contains "and 'ferry up' asserts it once the node is Ready" \
 contains "and it is applied where the controller already has the Node" \
   "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
 
+# The same choice, spelled the way Kubernetes spells a runtime. Each class
+# selects the label above rather than replacing it, so the two spellings place
+# a pod identically.
+runtimeclasses="$(cat "$repo/manifests/runtimeclasses.yaml")"
+contains "a ferry-vm RuntimeClass exists" "$runtimeclasses" "name: ferry-vm"
+contains "  handled by ferry-cri under that name" "$runtimeclasses" "handler: ferry-vm"
+contains "  and scheduled onto the vm-per-pod label" "$runtimeclasses" "nodeSelector: {ferry.dev/mode: vm-per-pod}"
+contains "a ferry-shared RuntimeClass exists" "$runtimeclasses" "name: ferry-shared"
+# containerd's default runtime in the node image is called runc; naming any
+# other handler would need a node image rebuilt to serve it.
+contains "  handled by the machine's own containerd runtime" "$runtimeclasses" "handler: runc"
+contains "  and scheduled onto the shared label" "$runtimeclasses" "nodeSelector: {ferry.dev/mode: shared}"
+contains "'ferry up' installs them once the node is Ready" \
+  "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+contains "  and so does starting machines, which a purge would otherwise leave without" \
+  "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+# The CRI says an unknown handler is refused. Ignoring it meant a pod asking
+# for a shared kernel that reached the Mac became a VM without a word.
+cri_service="$(cat "$repo/ferry-cri/Sources/ferry-cri/RuntimeService.swift")"
+contains "ferry-cri checks the handler a sandbox is asked for" "$cri_service" \
+  "RuntimeHandlers.refusal(for: request.runtimeHandler)"
+contains "  and refuses one it does not serve" "$cri_service" "code: .invalidArgument, message: refusal"
+contains "  while a pod naming no RuntimeClass still runs" "$cri_service" 'static let served = ["", vm]'
+contains "  and says which it serves, for node.status.runtimeHandlers" "$cri_service" "response.runtimeHandlers"
+
 # --- cluster DNS for machines ---------------------------------------------
 #
 # Mode 1's CoreDNS is a ferry-cri pod on the Mac's vmnet network; machines are

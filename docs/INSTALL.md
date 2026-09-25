@@ -532,23 +532,33 @@ missing directory. Mode 1 is unaffected either way.
 
 ### Choosing a mode
 
-A pod picks with a node selector, which is what `kubectl get nodes` already
-shows:
+A pod picks with a RuntimeClass, the way it would pick Kata or gVisor:
+
+```yaml
+runtimeClassName: ferry-shared   # dense, one kernel for many pods
+runtimeClassName: ferry-vm       # a kernel each
+```
+
+Each class is a node selector underneath, on the label `kubectl get nodes`
+already shows, so the older spelling still works and places a pod identically:
 
 ```sh
 kubectl get nodes -L ferry.dev/mode
 ```
 
 ```yaml
-nodeSelector: {ferry.dev/mode: shared}       # dense, one kernel for many pods
-nodeSelector: {ferry.dev/mode: vm-per-pod}   # a kernel each
+nodeSelector: {ferry.dev/mode: shared}       # same as ferry-shared
+nodeSelector: {ferry.dev/mode: vm-per-pod}   # same as ferry-vm
 ```
 
 The Mac node sets `vm-per-pod` on its own kubelet; `ferry-machined` labels each
-machine `shared` once its node registers. Nothing balances between them: the
-scheduler places a pod wherever it fits unless the pod says. Provisioning a
-machine because a pod needs one, and removing it when it does not, are
-MACHINES.md milestones 4 and 5.
+machine `shared` once its node registers. `ferry up` installs both classes
+(`manifests/runtimeclasses.yaml`). ferry-cri refuses a sandbox whose handler is
+not its own, so a `ferry-shared` pod that somehow reaches the Mac fails with a
+reason rather than quietly becoming a VM.
+
+A pod that names neither goes wherever it fits unless the cluster has a
+default; see `defaultRuntime` under [Configuration](#configuration).
 
 ### Cluster DNS inside machines
 

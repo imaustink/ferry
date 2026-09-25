@@ -252,7 +252,7 @@ container, no network namespace plumbing.
 None of that changes if you want density instead. A `Machine` is a Linux node VM
 whose pods are ordinary containers sharing its kernel — ~45ms to start one
 against ~300ms for a pod VM — and a pod picks with
-`nodeSelector: {ferry.dev/mode: shared}` or `vm-per-pod`. It is still nothing to
+`runtimeClassName: ferry-shared` or `ferry-vm`. It is still nothing to
 size up front, and not because sizing is easy here — because you never do it. A
 pod that fits nowhere causes a machine shaped to fit it, and an idle machine is
 taken away again — which is what returns its memory, since a VM that keeps
@@ -360,8 +360,9 @@ cost time.
   stopped, `Node` removed, disk cleaned up behind a finalizer. Pods on two
   machines reach each other, each node routing to the others' pod CIDR slices.
   A pod chooses between the modes with
-  `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}`, which is node selection
-  rather than a new concept.
+  `runtimeClassName: ferry-shared | ferry-vm`, which is node selection
+  underneath — `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}` still
+  works and means the same.
 
   Nobody declares that `Machine` in the ordinary case. A pending pod that fits
   no existing node creates one sized to fit it, and an empty machine is
