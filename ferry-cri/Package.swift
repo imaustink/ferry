@@ -9,7 +9,11 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/containerization.git", exact: "0.45.0"),
         .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.3.0"),
-        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.9.0"),
+        // 2.9.2 with one addition: the HTTP/2 control-frame rate limit can be
+        // set, and main.swift raises it. See vendor/grpc-swift-nio-transport/FERRY.md.
+        // A path dependency replaces the URL one for the whole graph, so
+        // Containerization's own gRPC client gets this copy too, at its default.
+        .package(path: "vendor/grpc-swift-nio-transport"),
         .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", from: "2.2.0"),
         // Already in the graph through Containerization and gRPC; named here only
         // so ferry-cri can own the one event loop group every pod VM shares.

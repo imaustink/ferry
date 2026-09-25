@@ -160,6 +160,7 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     func startContainer(request: Runtime_V1_StartContainerRequest, context: ServerContext) async throws -> Runtime_V1_StartContainerResponse {
         do {
             let began = ContinuousClock.now
+            if Self.tracing { print("    trace     start-begin \(request.containerID) at \(Date().timeIntervalSince1970)") }
             try await runtime.startContainer(request.containerID)
             trace("start", request.containerID, since: began)
             return Runtime_V1_StartContainerResponse()
@@ -188,7 +189,7 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         guard Self.tracing else { return }
         let ms = (ContinuousClock.now - began).components
         let millis = ms.seconds * 1000 + ms.attoseconds / 1_000_000_000_000_000
-        print("    trace     \(call) \(what) \(millis)ms")
+        print("    trace     \(call) \(what) \(millis)ms at \(Date().timeIntervalSince1970)")
     }
 
     private func crioState(_ s: ContainerRunState) -> Runtime_V1_ContainerState {

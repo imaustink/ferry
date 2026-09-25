@@ -135,10 +135,26 @@ do {
 }
 
 try? FileManager.default.removeItem(atPath: socketPath)
+// NIO's HTTP/2 flood protection allows a client 200 PINGs in 30 seconds, and the
+// kubelet's gRPC client sends one each time data arrives while none is
+// outstanding -- its BDP estimator, which over a Unix socket never finds a
+// window worth growing into and so never stops. A 20-pod burst went past the
+// limit in under 30 s, six times in four soak cycles. NIO answered with a GOAWAY
+// that said no call had been processed, so the kubelet sent every call in
+// flight again, and the ones it could not resend it failed. Either way a pod
+// got a second container beside a first that was already starting, and
+// crash-looped on its ports (experiment 38).
+//
+// The socket is this user's alone and its one client is the kubelet, so the
+// limit is set where no real client reaches it. It is not removed: the limiter
+// allocates room for the whole count up front.
 let server = GRPCServer(
     transport: .http2NIOPosix(
         address: .unixDomainSocket(path: socketPath),
-        transportSecurity: .plaintext
+        transportSecurity: .plaintext,
+        config: .defaults {
+            $0.http2.controlFrameRateLimit = .init(maximumCount: 10_000, window: .seconds(1))
+        }
     ),
     services: [
         FerryRuntimeService(runtime: runtime, version: runtimeVersion,
