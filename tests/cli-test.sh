@@ -295,7 +295,8 @@ unset FERRY_CONFIG DURABILITY_MARKER MACHINES_MARKER
 # FERRY_PROFILES too, or the profile is registered in the real ~/.ferry-profiles.
 cfg_env=(env FERRY_HOME="$cfg_scratch/home" FERRY_RUN="$cfg_scratch/run" FERRY_PROFILE=cfgtest FERRY_PROFILES="$cfg_scratch/profiles")
 mkdir -p "$cfg_scratch/home"
-out="$("${cfg_env[@]}" "$repo/ferry" init --purpose ci --yes </dev/null 2>&1)"
+# --machines false, so the answers do not depend on whether mode 2 is built here.
+out="$("${cfg_env[@]}" "$repo/ferry" init --purpose ci --machines false --yes </dev/null 2>&1)"
 contains "ferry init writes a config file from flags alone" "$out" "wrote $cfg_scratch/home/config.yaml"
 cfg="$(cat "$cfg_scratch/home/config.yaml" 2>/dev/null)"
 contains "  versioned like a Kubernetes config" "$cfg" "apiVersion: ferry.dev/v1alpha1"
