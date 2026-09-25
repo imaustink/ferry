@@ -316,6 +316,17 @@ is "  and validated" "$rc" 2
 out="$("${cfg_env[@]}" "$repo/ferry" config set nonsense 1 2>&1)"; rc=$?
 is "an unknown key is refused" "$rc" 2
 contains "  naming the ones there are" "$out" "settings: purpose durability"
+contains "ferry init writes a default runtime" "$cfg" "defaultRuntime: ferry-vm"
+out="$("${cfg_env[@]}" "$repo/ferry" config set defaultRuntime ferry-kata 2>&1)"; rc=$?
+is "a default runtime that is not one is refused" "$rc" 2
+contains "  naming the ones that are" "$out" "ferry-vm | ferry-shared | none"
+"${cfg_env[@]}" "$repo/ferry" config set defaultRuntime ferry-shared >/dev/null 2>&1
+out="$("${cfg_env[@]}" "$repo/ferry" config 2>&1)"
+contains "a ferry-shared default says it waits for machines" "$out" "ferry-shared waits for machines"
+is "  and is none in effect until they run" \
+  "$(cd "$repo" && "${cfg_env[@]}" bash -c 'eval "$(sed -n "/^ferry_config_get()/,/^}/p;/^ferry_default_runtime()/,/^}/p;/^ferry_default_runtime_effective()/,/^}/p;/^machines_enabled()/,/^}/p" ferry)"; FERRY_CONFIG="$FERRY_HOME/config.yaml"; MACHINES_MARKER=/nonexistent; ferry_default_runtime_effective')" none
+out="$("${cfg_env[@]}" "$repo/ferry" init --force --yes --machines false --default-runtime ferry-shared </dev/null 2>&1)"; rc=$?
+is "ferry init refuses a ferry-shared default with no machines" "$rc" 1
 echo
 
 # --- small helpers -----------------------------------------------------------

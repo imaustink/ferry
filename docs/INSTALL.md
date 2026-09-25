@@ -260,16 +260,17 @@ kind: FerryConfig
 purpose: dev              # dev | ci | node -- recorded, not acted on
 durability: power-loss    # power-loss | process-crash
 machines: true            # whether mode 2 runs
+defaultRuntime: ferry-vm  # ferry-vm | ferry-shared | none
 ```
 
 `ferry init` asks what the cluster is for and writes it. Each purpose starts
 from sensible answers and every one is asked about:
 
-| purpose | machines | durability | for |
-|---|---|---|---|
-| `dev` | on, where available | `power-loss` | a laptop you develop on |
-| `ci` | on, where available | `process-crash` | clusters a script creates and deletes |
-| `node` | off | `power-loss` | an always-on node holding what you would rebuild by hand |
+| purpose | machines | durability | defaultRuntime | for |
+|---|---|---|---|---|
+| `dev` | on, where available | `power-loss` | `ferry-vm` | a laptop you develop on |
+| `ci` | on, where available | `process-crash` | `ferry-shared` | clusters a script creates and deletes |
+| `node` | off | `power-loss` | `ferry-vm` | an always-on node holding what you would rebuild by hand |
 
 `ferry init --purpose ci --yes` answers from flags alone, for a script.
 
@@ -286,7 +287,24 @@ up` names the file every time it starts, so a setting is never somewhere you
 cannot see it. `ferry down --purge` deletes the cluster's data and keeps its
 config, which is the point of having one; `ferry init --force` starts again.
 
-Besides the three above, the file takes a few settings that are one
+**`defaultRuntime`** is where a pod that names no RuntimeClass runs. Without
+one — `none`, and every cluster from before this setting — such a pod goes
+wherever it fits, and a ten-replica Deployment was measured splitting 5/5
+between the Mac and a machine. `ferry-vm` keeps it on the Mac; `ferry-shared`
+sends it to a machine, and waits for machines to be on before it does
+anything. It is applied as a taint on the other kind of node — the machines
+for `ferry-vm`, the Macs for `ferry-shared` — which each RuntimeClass
+tolerates, so `runtimeClassName` always gets a pod what it names. A pod that
+picks by `nodeSelector` alone does not carry the toleration, and needs the
+RuntimeClass once a default is set. `ferry config set defaultRuntime …`
+applies to a running cluster at once.
+
+It reaches the cluster as `kube-system/ferry-config`, a copy of the file that
+`ferry up` and `ferry config set` rewrite, which `ferry-machined` reads to taint
+machines as they are made and Macs as they join. The file is the source: an
+edit to the ConfigMap lasts until the next rewrite.
+
+Besides the settings above, the file takes a few that are one
 environment variable each: `podMemoryMiB` (`FERRY_POD_MEMORY_MIB`), `podCPUs`
 (`FERRY_POD_CPUS`), `maxPods` (`FERRY_MAX_PODS`), `machineLimitCPUs`
 (`FERRY_MACHINE_LIMIT_CPUS`) and `machineLimitMemoryGi`
@@ -406,6 +424,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_NODE_IMAGE` | `<root>/node-image/oci` | the OCI layout machines are built from |
 | `FERRY_NODE_DISK` | `$FERRY_HOME/node.ext4` | the disk unpacked from it, cloned per machine |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
+| `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
 | `FERRY_MACHINE_LIMIT_CPUS` | half the Mac's cores | total cpus the provisioner may commit to machines |
@@ -611,6 +630,12 @@ reason rather than quietly becoming a VM.
 
 A pod that names neither goes wherever it fits unless the cluster has a
 default; see `defaultRuntime` under [Configuration](#configuration).
+
+`ferry-vm` also carries a pod overhead: the ~133 MiB a pod VM costs before its
+workload does anything, counted by the scheduler on top of the pod's requests.
+Only a pod that names the class is charged it — Kubernetes has no default
+RuntimeClass to charge the rest — so the memory-derived `maxPods` stays as the
+ceiling for pods that do not.
 
 ### Cluster DNS inside machines
 

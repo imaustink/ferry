@@ -25,6 +25,14 @@ metadata:
 # What ferry-cri answers to. An empty handler is accepted as well, which is
 # every pod that names no RuntimeClass.
 handler: ferry-vm
+# What a pod VM costs the Mac before its workload does anything -- its own
+# kernel and guest agent, measured at 133 MiB idle whatever it runs
+# (experiment 32). Counted by the scheduler on top of the pod's own requests,
+# so memory, not a pod count, is what fills the Mac. Only a pod that names this
+# class is charged it; maxPods stays as the ceiling for the ones that do not.
+# `ferry up` fills in the figure it derives maxPods from.
+overhead:
+  podFixed: {memory: __POD_OVERHEAD_MIB__Mi}
 scheduling:
   nodeSelector: {ferry.dev/mode: vm-per-pod}
   # Only matters when the cluster's default is ferry-shared, which taints the

@@ -80,9 +80,15 @@ type controller struct {
 	kube     kubernetes.Interface
 	dynamic  dynamic.Interface
 	machines map[string]*machine
+	// The cluster's default runtime as last read; see defaultruntime.go.
+	policy string
 }
 
 func (c *controller) reconcileAll(ctx context.Context) error {
+	// First, so a machine created below is born with the taint the current
+	// default asks for rather than getting it a tick later.
+	c.reconcileDefaultRuntime(ctx)
+
 	list, err := c.dynamic.Resource(machineGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -174,6 +180,10 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	// belongs to the process that made it (experiment 19), so every machine has
 	// to be hosted by the same one or they land on networks vmnet keeps apart.
 	taints, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "node", "taints")
+	// At registration rather than patched on afterwards, for the reason the
+	// taints field exists at all: a pod that names no RuntimeClass must not
+	// get onto a machine in the moment before its taint arrives.
+	taints = withRegistrationTaint(taints, c.policy)
 	spec := machineSpec{
 		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
 		Token: token, Taints: taints,

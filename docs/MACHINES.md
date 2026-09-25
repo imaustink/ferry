@@ -514,6 +514,44 @@ local volume is anywhere. To move it, delete its claims and let them be made
 again on the machine — which starts it with empty volumes — or give it
 ReadWriteMany claims, which are the shared directory on both.
 
+### A default for pods that do not choose
+
+**Built.** Kubernetes has no default RuntimeClass, so the default is made the
+way Kubernetes makes every "not here unless you ask": a taint. `defaultRuntime`
+in ferry's config file picks which kind of node gets one.
+
+```
+defaultRuntime: ferry-vm       machines tainted ferry.dev/mode=shared:NoSchedule
+defaultRuntime: ferry-shared   Macs tainted ferry.dev/mode=vm-per-pod:NoSchedule
+defaultRuntime: none           neither; a pod goes wherever it fits
+```
+
+Each RuntimeClass tolerates its own nodes' taint, so a pod that names one gets
+it whatever the default is, and a pod that names nothing can only go to the
+untainted kind. ferry's own pods that belong somewhere particular say so: mode
+1's CoreDNS tolerates the Macs' taint, machine CoreDNS the machines', and the
+builder and the registry addon name `ferry-vm`.
+
+The policy lives in the config file and reaches the cluster as
+`kube-system/ferry-config`, which `ferry up` and `ferry config set` rewrite from
+the file. `ferry-machined` reads it every reconcile, and does two things with
+it: a machine created under `ferry-vm` registers with the taint — the same
+race-free route the provisioner's taints already take — and every labelled
+node's `ferry.dev/mode` taint is made to match, which covers a Mac that joins
+after `ferry up` and a default changed on a running cluster. Karpenter's
+NodePool is given the machines' taint under `ferry-vm`, or it would make a
+machine for a pending pod that cannot use it.
+
+`ferry-shared` is refused in effect, not in the file, while machines are off:
+tainting every Mac with nothing untainted to go to would leave no node that runs
+a pod. `ferry machines disable` takes the Macs' taint back off for the same
+reason.
+
+The cost is the `nodeSelector` spelling. A pod that picks `shared` by selector
+alone has no toleration for a `ferry-vm` default's taint and stays Pending; it
+needs `runtimeClassName: ferry-shared`. The default is `none` for every existing
+cluster, so nothing moves until someone chooses one — `ferry init` asks.
+
 ## Milestones
 
 1. ~~**One machine, by hand.**~~ **Done** —

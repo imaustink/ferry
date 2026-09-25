@@ -35,6 +35,11 @@ spec:
       labels:
         app: registry
     spec:
+      # On the Mac. localhost:5001 is ferry-proxy forwarding the Mac's own
+      # port to a pod on the Mac; on a machine the hostPort would be that
+      # machine's, which nothing on the Mac asks. Named as a RuntimeClass so it
+      # stays here whatever the cluster's default runtime is.
+      runtimeClassName: ferry-vm
       containers:
       - name: registry
         image: registry:3.1.1

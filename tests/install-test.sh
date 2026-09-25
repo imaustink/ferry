@@ -525,6 +525,55 @@ contains "  and refuses one it does not serve" "$cri_service" "code: .invalidArg
 contains "  while a pod naming no RuntimeClass still runs" "$cri_service" 'static let served = ["", vm]'
 contains "  and says which it serves, for node.status.runtimeHandlers" "$cri_service" "response.runtimeHandlers"
 
+# --- a default for pods that name no RuntimeClass -------------------------
+#
+# Kubernetes has none, so it is a taint on the other kind of node. A
+# Deployment with no selector split 5/5 between the modes without one.
+printf '\033[1m%s\033[0m\n' "a default runtime for pods that do not choose"
+contains "ferry-vm charges a pod VM's idle cost as pod overhead" "$runtimeclasses" "podFixed: {memory: __POD_OVERHEAD_MIB__Mi}"
+contains "  filled in from the figure maxPods is derived from" \
+  "$(sed -n '/^install_runtime_classes()/,/^}/p' "$repo/ferry")" 's/__POD_OVERHEAD_MIB__/$pod_overhead_mib/'
+contains "each class tolerates the taint its own nodes get as a default" "$runtimeclasses" \
+  "{key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}"
+contains "  both of them" "$runtimeclasses" "{key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}"
+apply_default="$(sed -n '/^ferry_apply_default_runtime()/,/^}/p' "$repo/ferry")"
+contains "a ferry-vm default taints the machines" "$apply_default" \
+  "kube taint nodes -l ferry.dev/mode=shared ferry.dev/mode=shared:NoSchedule --overwrite"
+contains "a ferry-shared default taints the Macs" "$apply_default" \
+  "kube taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode=vm-per-pod:NoSchedule --overwrite"
+contains "  and whichever is not wanted comes off" "$apply_default" "ferry.dev/mode:NoSchedule-"
+contains "Karpenter's NodePool learns the machines' taint, so it does not make machines pods cannot use" \
+  "$apply_default" "kube patch nodepool default"
+contains "  and gets it back after every apply of the NodePool file" \
+  "$(sed -n '/^start_provisioner()/,/^}/p' "$repo/ferry")" "ferry_apply_default_runtime"
+contains "ferry-shared waits for machines rather than tainting every node that runs pods" \
+  "$(sed -n '/^ferry_default_runtime_effective()/,/^}/p' "$repo/ferry")" '! machines_enabled; then echo none'
+contains "turning machines off takes a ferry-shared default's taint off the Macs" \
+  "$(sed -n '/^cmd_machines_disable()/,/^}/p' "$repo/ferry")" "ferry_apply_default_runtime"
+up_src="$(sed -n '/^cmd_up()/,/^}/p' "$repo/ferry")"
+contains "'ferry up' publishes the config into the cluster" "$up_src" "ferry_config_publish"
+contains "  and applies the default" "$up_src" "ferry_apply_default_runtime"
+contains "the copy in the cluster is kube-system/ferry-config" \
+  "$(sed -n '/^ferry_config_publish()/,/^}/p' "$repo/ferry")" "name: ferry-config"
+contains "  which ferry-machined reads, so nodes that arrive later are covered" \
+  "$(cat "$repo/ferry-machined/defaultruntime.go")" 'configName        = "ferry-config"'
+contains "  and applies on every reconcile" "$(cat "$repo/ferry-machined/reconcile.go")" "c.reconcileDefaultRuntime(ctx)"
+contains "  and a machine is born with the taint, not patched after" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" "withRegistrationTaint(taints, c.policy)"
+# ferry's own pods that belong somewhere particular must say so, or a default
+# moves them: DNS off the node every kubelet was told it is on, the registry
+# off the Mac its hostPort is served from.
+contains "mode 1 CoreDNS stays on its Mac under a ferry-shared default" \
+  "$(cat "$repo/manifests/coredns.yaml")" "{key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}"
+contains "machine CoreDNS stays on machines under a ferry-vm default" \
+  "$(cat "$repo/manifests/machines/coredns.yaml")" "{key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}"
+contains "the builder is always a VM of its own" \
+  "$(sed -n '/^ferry_builder_up()/,/^}/p' "$repo/ferry")" "runtimeClassName: ferry-vm"
+contains "  with the class installed first, for a cluster started before it existed" \
+  "$(sed -n '/^ferry_builder_up()/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+contains "the registry addon stays on the Mac its hostPort is served from" \
+  "$(cat "$repo/addons/registry/registry.yaml")" "runtimeClassName: ferry-vm"
+
 # --- cluster DNS for machines ---------------------------------------------
 #
 # Mode 1's CoreDNS is a ferry-cri pod on the Mac's vmnet network; machines are

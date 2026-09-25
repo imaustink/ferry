@@ -460,6 +460,21 @@ ferry_durability() {
 }
 durability_is_process_crash() { [ "$(ferry_durability)" = process-crash ]; }
 
+# Where a pod that names no RuntimeClass lands: ferry-vm (a VM of its own),
+# ferry-shared (a container on a machine), or none -- wherever it fits, which
+# is what every cluster did before this and is still the default. See
+# ferry-machined/defaultruntime.go for how it is enforced, and why by taints.
+ferry_default_runtime() {
+  local v="${FERRY_DEFAULT_RUNTIME:-$(ferry_config_get defaultRuntime)}"
+  case "$v" in ferry-vm|ferry-shared) echo "$v" ;; *) echo none ;; esac
+}
+# What can actually be honoured. A ferry-shared default with no machines would
+# taint every node that can run a pod, so it is none until machines run.
+ferry_default_runtime_effective() {
+  local want; want="$(ferry_default_runtime)"
+  if [ "$want" = ferry-shared ] && ! machines_enabled; then echo none; else echo "$want"; fi
+}
+
 # Move what the marker files recorded into the config file, once, and remove
 # them, so there is one place a setting lives. Only fills keys the file does
 # not already have: a file someone wrote wins over a marker nobody remembers.
@@ -1399,6 +1414,10 @@ EOF
     ok "node $NODE_NAME Ready"
     ensure_mode_label "$NODE_NAME"
     install_runtime_classes
+    ferry_config_publish
+    ferry_apply_default_runtime
+    [ "$(ferry_default_runtime_effective)" = none ] \
+      || ok "pods that name no RuntimeClass run as $(ferry_default_runtime_effective)"
   else
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
@@ -1673,9 +1692,82 @@ ensure_mode_label() { # node
 # The two RuntimeClasses, ferry-vm and ferry-shared: the Kubernetes spelling of
 # the choice the mode label above already expresses. See
 # manifests/runtimeclasses.yaml. On every start, because they live in etcd.
+#
+# ferry-vm carries a pod overhead: what a pod VM costs the Mac before its
+# workload does anything, so the scheduler counts it against the node's memory
+# like any other request. The figure is the one maxPods is derived from, and
+# follows it -- a checkout on an older kernel pays more (pod_overhead_mib).
 install_runtime_classes() {
-  kube apply -f "$here/manifests/runtimeclasses.yaml" >/dev/null 2>&1 \
+  sed "s/__POD_OVERHEAD_MIB__/$pod_overhead_mib/" "$here/manifests/runtimeclasses.yaml" \
+    | kube apply -f - >/dev/null 2>&1 \
     || { warn "could not install the ferry-vm and ferry-shared RuntimeClasses"; return 1; }
+}
+
+# The config file, copied into the cluster where a controller can read it and
+# kubectl can show it: kube-system/ferry-config.
+#
+# A copy, not a second source. The file is what `ferry up` follows, since most
+# of it -- durability above all -- has to be known before there is an API
+# server to ask; etcd cannot read its own fsync setting out of etcd. So this is
+# written from the file at every start and every `ferry config set`, and an
+# edit made here is overwritten by the next one. What reads it is
+# ferry-machined, for the default runtime, which is a setting about nodes that
+# arrive long after `ferry up` has finished.
+ferry_config_publish() {
+  kube apply -f - >/dev/null 2>&1 <<EOF || warn "could not publish kube-system/ferry-config; the default runtime will not follow it"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferry-config
+  namespace: kube-system
+  labels: {app.kubernetes.io/managed-by: ferry}
+  annotations:
+    ferry.dev/source: "$FERRY_CONFIG"
+    ferry.dev/note: "A copy of the file named in ferry.dev/source, rewritten by every ferry up and ferry config set. Edit that file instead."
+data:
+  defaultRuntime: "$(ferry_default_runtime_effective)"
+  durability: "$(ferry_durability)"
+  machines: "$(machines_enabled && echo true || echo false)"
+  purpose: "$(ferry_config_get purpose)"
+EOF
+}
+
+# Put the default's taints where they belong now, rather than waiting a tick
+# for ferry-machined -- which is not running at all when machines are off, and
+# then the only thing left to do is take a ferry-shared default's taint back
+# off the Macs. Karpenter's NodePool gets the machines' taint too: it simulates
+# whether a pending pod would fit a machine it could make, and a machine it
+# does not know is tainted is one it would make for a pod that cannot use it.
+ferry_apply_default_runtime() {
+  local want effective
+  want="$(ferry_default_runtime)"; effective="$(ferry_default_runtime_effective)"
+  if [ "$want" != "$effective" ]; then
+    warn "defaultRuntime ferry-shared needs machines; pods that name nothing stay on the Mac"
+    echo "      ferry machines enable     to turn them on"
+  fi
+  local mac_taint="" machine_taint=""
+  case "$effective" in
+    ferry-vm)     machine_taint=1 ;;
+    ferry-shared) mac_taint=1 ;;
+  esac
+  if [ -n "$mac_taint" ]; then
+    kube taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode=vm-per-pod:NoSchedule --overwrite >/dev/null 2>&1
+  else
+    kube taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode:NoSchedule- >/dev/null 2>&1
+  fi
+  if [ -n "$machine_taint" ]; then
+    kube taint nodes -l ferry.dev/mode=shared ferry.dev/mode=shared:NoSchedule --overwrite >/dev/null 2>&1
+  else
+    kube taint nodes -l ferry.dev/mode=shared ferry.dev/mode:NoSchedule- >/dev/null 2>&1
+  fi
+  if kube get nodepool default >/dev/null 2>&1; then
+    local taints=null
+    [ -n "$machine_taint" ] && taints='[{"key":"ferry.dev/mode","value":"shared","effect":"NoSchedule"}]'
+    kube patch nodepool default --type merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"taints\":$taints}}}}" >/dev/null 2>&1 \
+      || warn "could not give the default NodePool the default runtime's taint"
+  fi
+  return 0
 }
 
 start_machines() {
@@ -1879,6 +1971,9 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
+    # The apply above has just put the NodePool back as the file has it,
+    # without the default runtime's taint.
+    ferry_apply_default_runtime
   fi
 
   # Settings through the environment, the command line left to Karpenter.
@@ -4065,6 +4160,8 @@ cmd_addons() {
       done
       [ "${#names[@]}" -gt 0 ] || { bad "usage: ferry addons $action <name>... [--no-wait]"; return 2; }
       kubectl get --raw /readyz >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+      # The registry addon names runtimeClassName: ferry-vm; see ferry_builder_up.
+      [ "$action" = enable ] && install_runtime_classes >/dev/null 2>&1
       local name failed=0
       for name in "${names[@]}"; do
         if [ "$action" = enable ]; then addon_enable "$name" $no_wait || failed=1
@@ -4261,6 +4358,11 @@ ferry_builder_up() {
     --from-file=tls.key="$pki/server.key" >/dev/null 2>&1 \
     || { bad "could not store the builder certificates"; return 1; }
 
+  # The pod names runtimeClassName: ferry-vm, and a cluster started by a ferry
+  # from before the class existed does not have it until its next 'ferry up'.
+  # Quietly, because a joined Mac's credentials cannot install it and a
+  # control plane that is current already has.
+  install_runtime_classes >/dev/null 2>&1
   echo "  starting the builder ($cpus cpu, ${mem} GiB)"
   # The policy goes on with the pod, in one apply, so there is no window where
   # the builder is up and unprotected.
@@ -4309,6 +4411,10 @@ metadata:
 spec:
   # Nothing in the cluster should evict the thing the person is waiting on.
   priorityClassName: system-node-critical
+  # A VM of its own, whatever the cluster's default: buildkitd is privileged,
+  # and a privileged pod on a machine shares that machine's kernel with every
+  # other pod on it. It is also sized from the Mac, not from a machine.
+  runtimeClassName: ferry-vm
   containers:
     - name: buildkitd
       image: $FERRY_BUILDKIT_IMAGE
@@ -4897,6 +5003,9 @@ cmd_machines_enable() {
   fi
   ferry_config_migrate
   ferry_config_set machines true
+  # A ferry-shared default waits for machines; now there are some.
+  ferry_config_publish
+  ferry_apply_default_runtime
   echo
   bold "machines are on"
   echo "  They come back with the cluster; 'ferry machines disable' turns them off."
@@ -4928,6 +5037,12 @@ cmd_machines_disable() {
   ferry_config_migrate
   ferry_config_set machines false
   stop_machines
+  # A ferry-shared default tainted the Macs so pods would go to machines; with
+  # none left, that taint would leave nothing able to run a pod.
+  if have_cluster; then
+    ferry_config_publish
+    ferry_apply_default_runtime
+  fi
   echo
   echo "  Machine objects and the CRD are left alone; deleting a Machine is how"
   echo "  its node and disk go away. The node image and $NODE_DISK are kept."
@@ -5523,6 +5638,10 @@ cmd_status() {
   fi
   if [ -f "$FERRY_CONFIG" ]; then echo "  config     $FERRY_CONFIG"
   else echo "  config     none -- defaults; 'ferry init' to choose"; fi
+  case "$(ferry_default_runtime_effective)" in
+    none) echo "  runtime    no default -- a pod that names no RuntimeClass goes wherever it fits" ;;
+    *)    echo "  runtime    $(ferry_default_runtime_effective) for a pod that names no RuntimeClass" ;;
+  esac
   if durability_is_process_crash; then
     echo "  durability process-crash -- survives a crashed process, not a power loss"
   else
@@ -5577,7 +5696,7 @@ cmd_status() {
 # The file itself, and why it exists, is described where FERRY_CONFIG is set.
 
 # Every key the file may carry, in the order `ferry config` shows them.
-FERRY_CONFIG_KEYS="purpose durability machines podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
+FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
 
 # A value as it should be written, or a failure: 1 for a value the key does
 # not take, 2 for a key there is no such thing as.
@@ -5586,6 +5705,7 @@ ferry_config_check() { # key value
     purpose)    case "$2" in dev|ci|node) echo "$2" ;; *) return 1 ;; esac ;;
     durability) local v; v="$(durability_normalize "$2")"; [ -n "$v" ] || return 1; echo "$v" ;;
     machines)   case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
+    defaultRuntime) case "$2" in ferry-vm|ferry-shared|none) echo "$2" ;; *) return 1 ;; esac ;;
     podMemoryMiB|podCPUs|maxPods|machineLimitCPUs|machineLimitMemoryGi)
                 case "$2" in ''|*[!0-9]*|0) return 1 ;; *) echo "$2" ;; esac ;;
     *) return 2 ;;
@@ -5596,6 +5716,7 @@ ferry_config_values() { # key
     purpose)    echo "dev | ci | node" ;;
     durability) echo "power-loss | process-crash" ;;
     machines)   echo "true | false" ;;
+    defaultRuntime) echo "ferry-vm | ferry-shared | none" ;;
     *)          echo "a whole number" ;;
   esac
 }
@@ -5613,6 +5734,13 @@ ferry_config_effective() { # key -> "value<TAB>source"
       elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_durability)"
       elif [ -f "$DURABILITY_MARKER" ]; then printf '%s\tolder marker file; the next up moves it here\n' "$(ferry_durability)"
       else printf 'power-loss\tdefault\n'; fi ;;
+    defaultRuntime)
+      local want effective note=""
+      want="$(ferry_default_runtime)"; effective="$(ferry_default_runtime_effective)"
+      [ "$want" != "$effective" ] && note="; ferry-shared waits for machines"
+      if [ -n "${FERRY_DEFAULT_RUNTIME:-}" ]; then printf '%s\tFERRY_DEFAULT_RUNTIME, this run only%s\n' "$want" "$note"
+      elif [ -n "$file_value" ]; then printf '%s\tfile%s\n' "$want" "$note"
+      else printf 'none\tdefault: wherever a pod fits\n'; fi ;;
     machines)
       local on; machines_enabled && on=true || on=false
       if [ -n "$file_value" ]; then printf '%s\tfile\n' "$on"
@@ -5683,7 +5811,13 @@ ferry_config_takes_effect() { # key
   running kubelet || return 0
   case "$1" in
     machines) echo "    the cluster is up: 'ferry machines enable' or 'disable' changes it now" ;;
-    purpose)  : ;;
+    purpose)  ferry_config_publish ;;
+    # Applied to the running cluster at once: it is taints and a ConfigMap,
+    # and nothing about it needs a restart.
+    defaultRuntime)
+      ferry_config_publish
+      ferry_apply_default_runtime
+      echo "    applied to the running cluster" ;;
     *)        echo "    the cluster is up: this takes effect at the next 'ferry restart'" ;;
   esac
 }
@@ -5725,7 +5859,7 @@ ferry_yes() { # question default(y|n)
 
 # The file `ferry init` writes: every choice, with what it means beside it, so
 # the file explains itself to whoever opens it next.
-ferry_config_write() { # purpose durability machines
+ferry_config_write() { # purpose durability machines default-runtime
   mkdir -p "$(dirname "$FERRY_CONFIG")"
   cat > "$FERRY_CONFIG" <<EOF
 # ferry's configuration for the $PROFILE cluster, written by 'ferry init'.
@@ -5750,6 +5884,13 @@ durability: $2
 # Whether mode 2 runs: machines, Linux node VMs whose pods share a kernel.
 machines: $3
 
+# Where a pod that names no RuntimeClass runs: ferry-vm (a VM of its own),
+# ferry-shared (a container on a machine; needs machines), or none (wherever
+# it fits). A pod that names one -- runtimeClassName: ferry-vm or ferry-shared
+# -- gets what it names either way. Applied as taints on the other kind of
+# node, so a pod that picks by nodeSelector alone needs the RuntimeClass.
+defaultRuntime: $4
+
 # One environment variable each, for when a default is not right here. The
 # values shown are what this Mac gets without them: memory per pod VM
 # (FERRY_POD_MEMORY_MIB), CPUs per pod VM (FERRY_POD_CPUS), pods advertised,
@@ -5764,7 +5905,7 @@ EOF
 }
 
 cmd_init() {
-  local purpose="" durability="" machines="" force="" interactive=""
+  local purpose="" durability="" machines="" default_runtime="" force="" interactive=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --purpose) purpose="${2:-}"; shift 2 ;;
@@ -5774,11 +5915,14 @@ cmd_init() {
       --disposable) durability=process-crash; shift ;;
       --machines) machines="${2:-}"; shift 2 ;;
       --machines=*) machines="${1#*=}"; shift ;;
+      --default-runtime) default_runtime="${2:-}"; shift 2 ;;
+      --default-runtime=*) default_runtime="${1#*=}"; shift ;;
       --force) force=1; shift ;;
       --yes|-y) interactive=no; shift ;;
       *) bad "unknown option $1"
          echo "    usage: ferry init [--purpose dev|ci|node] [--durability power-loss|process-crash]"
-         echo "                      [--machines true|false] [--yes] [--force]"
+         echo "                      [--machines true|false] [--default-runtime ferry-vm|ferry-shared|none]"
+         echo "                      [--yes] [--force]"
          return 2 ;;
     esac
   done
@@ -5795,6 +5939,10 @@ cmd_init() {
   if [ -n "$machines" ]; then
     machines="$(ferry_config_check machines "$machines")" \
       || { bad "--machines: expected $(ferry_config_values machines)"; return 2; }
+  fi
+  if [ -n "$default_runtime" ]; then
+    default_runtime="$(ferry_config_check defaultRuntime "$default_runtime")" \
+      || { bad "--default-runtime: expected $(ferry_config_values defaultRuntime)"; return 2; }
   fi
   if [ -f "$FERRY_CONFIG" ] && [ -z "$force" ]; then
     bad "this cluster is already configured: $FERRY_CONFIG"
@@ -5829,11 +5977,11 @@ cmd_init() {
 
   # What each purpose starts from. Every one of these is still asked about
   # below when there is someone to ask.
-  local want_machines want_durability
+  local want_machines want_durability want_runtime
   case "$purpose" in
-    dev)  want_machines=true;  want_durability=power-loss ;;
-    ci)   want_machines=true;  want_durability=process-crash ;;
-    node) want_machines=false; want_durability=power-loss ;;
+    dev)  want_machines=true;  want_durability=power-loss;    want_runtime=ferry-vm ;;
+    ci)   want_machines=true;  want_durability=process-crash; want_runtime=ferry-shared ;;
+    node) want_machines=false; want_durability=power-loss;    want_runtime=ferry-vm ;;
   esac
   [ -n "$have_machines" ] || want_machines=false
 
@@ -5847,6 +5995,23 @@ cmd_init() {
   fi
   if [ "$machines" = true ] && [ -z "$have_machines" ]; then
     bad "--machines true: mode 2 is not available here"; return 1
+  fi
+
+  # Only a question when there are two kinds of node to choose between.
+  # Without machines every pod is a VM, and ferry-vm says so.
+  if [ "$machines" = false ]; then
+    [ "$default_runtime" = ferry-shared ] && {
+      bad "--default-runtime ferry-shared needs machines, which this cluster will not run"; return 1; }
+    [ -n "$default_runtime" ] || default_runtime=ferry-vm
+  elif [ -z "$default_runtime" ]; then
+    if [ "$interactive" = yes ]; then
+      default_runtime="$(ferry_choose "Where should a pod that names no RuntimeClass run?" "$want_runtime" \
+        "ferry-vm|its own VM, with its own kernel: isolation (runtimeClassName: ferry-shared to opt out)" \
+        "ferry-shared|a container on a machine: density and speed (runtimeClassName: ferry-vm to opt out)" \
+        "none|wherever it fits, either kind -- what ferry did before this choice existed")"
+    else
+      default_runtime="$want_runtime"
+    fi
   fi
 
   if [ -z "$durability" ]; then
@@ -5866,7 +6031,7 @@ cmd_init() {
     fi
   fi
 
-  ferry_config_write "$purpose" "$durability" "$machines"
+  ferry_config_write "$purpose" "$durability" "$machines" "$default_runtime"
   # Whatever the markers said is superseded by what was just chosen.
   rm -f "$DURABILITY_MARKER" "$MACHINES_MARKER"
   echo
