@@ -2211,6 +2211,9 @@ actor PodRuntime {
                 // Report success and start it once the VM is up. The kubelet
                 // polls container status, so it sees the container running a
                 // moment later rather than being told it failed.
+                if Self.tracing {
+                    print("    trace     start \(id) deferred: expected=\(expected) created=\(created.sorted())")
+                }
                 sandboxes[record.sandboxID]?.pendingStart.append(id)
                 return
             }
@@ -2286,14 +2289,36 @@ actor PodRuntime {
 
     /// Containers between asking the VM to start them and hearing back. The
     /// start that booted a pod starts the ones that were waiting for it, and
-    /// the kubelet may be starting one of those itself; one of them wins.
-    private var starting: Set<String> = []
+    /// the kubelet may be starting one of those itself; one of them does the
+    /// work and the other waits for it.
+    ///
+    /// Waits, and does not return early. The kubelet's gRPC client can deliver
+    /// one StartContainer twice -- measured under a 20-pod burst, the second
+    /// arriving 1.8 s into the first's boot -- and it acts on whichever reply
+    /// comes back first. A duplicate that returned at once said "started" of a
+    /// container still CREATED; the kubelet reads CREATED as a start that did
+    /// not happen, made a second container beside the first, and the first
+    /// then came up anyway holding its ports. The pod crash-looped on
+    /// "address already in use" until it was deleted (experiment 38).
+    private var starting: [String: Task<Void, Error>] = [:]
 
     private func start(_ id: String, in pod: LinuxPod) async throws {
-        guard containers[id]?.state == .created, starting.insert(id).inserted else { return }
-        defer { starting.remove(id) }
-        try await pod.startContainer(id)
-        markStarted(id, pod: pod)
+        if let inFlight = starting[id] {
+            if Self.tracing { print("    trace     start \(id) joins the start already under way") }
+            try await inFlight.value
+            return
+        }
+        guard containers[id]?.state == .created else { return }
+        // Marked running inside the task, so a caller waiting on it finds the
+        // container running when it wakes rather than racing the one that
+        // started it to the state change.
+        let task = Task {
+            try await pod.startContainer(id)
+            self.markStarted(id, pod: pod)
+        }
+        starting[id] = task
+        defer { starting[id] = nil }
+        try await task.value
     }
 
     private func markStarted(_ id: String, pod: LinuxPod) {
@@ -2337,7 +2362,12 @@ actor PodRuntime {
     /// a liveness failure is a StopContainer and nothing else.
     func stopContainer(_ id: String, timeout: Int64) async throws {
         guard let record = containers[id] else { throw RuntimeFailure.notFound("container \(id)") }
-        guard record.state == .running else { return }
+        guard record.state == .running else {
+            if Self.tracing {
+                print("    trace     stop \(id) ignored: state=\(record.state) in-flight=\(starting[id] != nil)")
+            }
+            return
+        }
         var code: Int32 = 128 + 9
         if let sandbox = sandboxes[record.sandboxID] {
             if timeout > 0, (try? await sandbox.pod.killContainer(id, signal: .term)) != nil,
