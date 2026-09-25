@@ -563,7 +563,12 @@ race-free route the provisioner's taints already take — and every labelled
 node's `ferry.dev/mode` taint is made to match, which covers a Mac that joins
 after `ferry up` and a default changed on a running cluster. Karpenter's
 NodePool is given the machines' taint under `ferry-vm`, or it would make a
-machine for a pending pod that cannot use it.
+machine for a pending pod that cannot use it. Changing the default to or from
+`ferry-vm` therefore changes the NodePool's template, which Karpenter treats
+as drift: each provisioned machine is replaced by one made under the new
+default, its pods moved as consolidation would move them. Seen on a live
+cluster: switching to `ferry-shared` marked the one machine drifted and a
+replacement was Ready within seconds.
 
 `ferry-shared` is refused in effect, not in the file, while machines are off:
 tainting every Mac with nothing untainted to go to would leave no node that runs

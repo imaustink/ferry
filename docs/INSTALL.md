@@ -297,7 +297,9 @@ for `ferry-vm`, the Macs for `ferry-shared` — which each RuntimeClass
 tolerates, so `runtimeClassName` always gets a pod what it names. A pod that
 picks by `nodeSelector` alone does not carry the toleration, and needs the
 RuntimeClass once a default is set. `ferry config set defaultRuntime …`
-applies to a running cluster at once.
+applies to a running cluster at once; switching to or from `ferry-vm` changes
+Karpenter's NodePool, so provisioned machines are replaced with ones made under
+the new default.
 
 It reaches the cluster as `kube-system/ferry-config`, a copy of the file that
 `ferry up` and `ferry config set` rewrite, which `ferry-machined` reads to taint
