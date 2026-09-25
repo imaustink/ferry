@@ -349,6 +349,188 @@ is "machineDurability power-loss is the full barrier" "$(machine_sync process-cr
 is "  and os-crash is fsync whatever the cluster is" "$(machine_sync process-crash os-crash)" fsync
 echo
 
+# --- ferry init, answered at a terminal ------------------------------------
+#
+# Through a real pseudo-terminal with expect, against two fake roots: one where
+# mode 2 is built (bin/ferry-machined, bin/ferry-node, a node image) and one
+# where it is not, so the answers do not depend on what this Mac has built.
+printf '\033[1m%s\033[0m\n' "ferry init asks the right questions at a terminal"
+if ! command -v expect >/dev/null 2>&1; then
+  echo "  (skipped: expect is not installed)"
+else
+  wiz="$sandbox/wizard"
+  for kind in with without; do
+    mkdir -p "$wiz/$kind/lib" "$wiz/$kind/bin"
+    cp "$repo/ferry" "$wiz/$kind/ferry"; cp "$repo"/lib/*.sh "$wiz/$kind/lib/"
+  done
+  for b in ferry-machined ferry-node; do printf '#!/bin/sh\n' > "$wiz/with/bin/$b"; chmod +x "$wiz/with/bin/$b"; done
+  mkdir -p "$wiz/with/node-image/oci"
+  # root, then pairs of "what to wait for" "what to answer"; prints the
+  # transcript, and leaves the file at $wiz/home/config.yaml.
+  wizard() {
+    local root="$1"; shift
+    rm -rf "$wiz/home"; mkdir -p "$wiz/home"
+    {
+      echo 'set timeout 15'
+      echo "spawn env FERRY_HOME=$wiz/home FERRY_RUN=$wiz/run FERRY_PROFILE=wiztest FERRY_PROFILES=$wiz/profiles FERRY_NODE_IMAGE=$root/node-image/oci $root/ferry init"
+      while [ $# -gt 1 ]; do
+        printf 'expect {\n  -exact {%s} {}\n  timeout {puts "EXPECT-TIMEOUT: %s"; exit 1}\n}\n' "$1" "$1"
+        printf 'send -- "%s\\r"\n' "$2"
+        shift 2
+      done
+      echo 'expect eof'
+    } > "$wiz/script.exp"
+    expect "$wiz/script.exp" 2>&1
+  }
+  wiz_value() { sed -n "s/^$1: //p" "$wiz/home/config.yaml"; }
+
+  out="$(wizard "$wiz/with" "choice: " "2" "Run machines as well" "" \
+    "Where should a pod that names no RuntimeClass run?" "" "from a script if it were lost?" "")"
+  lacks "ci, taking every default: no question went unanswered" "$out" "EXPECT-TIMEOUT"
+  is "  purpose ci" "$(wiz_value purpose)" ci
+  is "  machines on, the ci default" "$(wiz_value machines)" true
+  is "  ferry-shared, the ci default" "$(wiz_value defaultRuntime)" ferry-shared
+  is "  process-crash, the ci default" "$(wiz_value durability)" process-crash
+
+  out="$(wizard "$wiz/with" "choice: " "3" "Run machines as well" "" "from a script if it were lost?" "")"
+  lacks "node, taking every default" "$out" "EXPECT-TIMEOUT"
+  is "  machines off, the node default" "$(wiz_value machines)" false
+  lacks "  so the runtime is not asked about" "$out" "Where should a pod"
+  is "  and is ferry-vm" "$(wiz_value defaultRuntime)" ferry-vm
+  is "  power-loss, the node default" "$(wiz_value durability)" power-loss
+
+  out="$(wizard "$wiz/with" "choice: " "production" "one of 1-3" "dev" \
+    "Run machines as well" "y" "Where should a pod that names no RuntimeClass run?" "none" \
+    "from a script if it were lost?" "y")"
+  lacks "every answer given, by name, after a wrong one" "$out" "EXPECT-TIMEOUT"
+  contains "  a wrong answer is asked again" "$out" "one of 1-3"
+  is "  the purpose is named, not numbered" "$(wiz_value purpose)" dev
+  is "  no default runtime, as answered" "$(wiz_value defaultRuntime)" none
+  is "  process-crash, as answered against dev's default" "$(wiz_value durability)" process-crash
+
+  out="$(wizard "$wiz/without" "choice: " "" "from a script if it were lost?" "")"
+  lacks "without mode 2 built" "$out" "EXPECT-TIMEOUT"
+  contains "  it says so" "$out" "mode 2 is not available here"
+  lacks "  and does not ask about machines" "$out" "Run machines as well"
+  is "  which are off" "$(wiz_value machines)" false
+  is "  and every pod is a VM" "$(wiz_value defaultRuntime)" ferry-vm
+
+  # From flags, where mode 2 is built: the purpose's defaults.
+  rm -rf "$wiz/home"; mkdir -p "$wiz/home"
+  env FERRY_HOME="$wiz/home" FERRY_RUN="$wiz/run" FERRY_PROFILE=wiztest FERRY_PROFILES="$wiz/profiles" \
+    FERRY_NODE_IMAGE="$wiz/with/node-image/oci" "$wiz/with/ferry" init --purpose ci --yes </dev/null >/dev/null 2>&1
+  is "--purpose ci --yes with mode 2 built turns machines on" "$(wiz_value machines)" true
+  is "  and defaults to ferry-shared" "$(wiz_value defaultRuntime)" ferry-shared
+fi
+echo
+
+# --- the default runtime, against a kubectl that records ------------------
+#
+# The functions that taint nodes, patch the NodePool, publish the ConfigMap and
+# install the RuntimeClasses, run for real with `kube` replaced by a recorder:
+# every call's arguments go to $kube_calls and anything applied to
+# $kube_applied. Seen working on a live cluster; this is what keeps them so.
+printf '\033[1m%s\033[0m\n' "the default runtime reaches the cluster as it should"
+stub="$sandbox/stub"; mkdir -p "$stub"
+kube_calls="$stub/calls"; kube_applied="$stub/applied"
+FERRY_CONFIG="$stub/config.yaml"; MACHINES_MARKER="$stub/machines-enabled"
+DURABILITY_MARKER="$stub/durability"
+eval "$(grep '^FERRY_CONFIG_API=' "$repo/ferry")"
+for fn in ferry_config_get ferry_config_set durability_normalize ferry_durability machines_enabled \
+          ferry_default_runtime ferry_default_runtime_effective ferry_apply_default_runtime \
+          ferry_config_publish install_runtime_classes; do
+  eval "$(sed -n "/^$fn()/,/^}/p" "$repo/ferry")"
+done
+warn() { echo "WARN $*"; }
+stub_nodepool=1
+kube() {
+  printf '%s\n' "$*" >> "$kube_calls"
+  case "$1" in
+    apply) cat >> "$kube_applied"; echo "---" >> "$kube_applied" ;;
+    get)   [ "$2" = nodepool ] && [ "$stub_nodepool" = 1 ] && return 0; return 1 ;;
+  esac
+  return 0
+}
+with_default() { # defaultRuntime machines -> runs ferry_apply_default_runtime, prints its output
+  : > "$kube_calls"; : > "$kube_applied"
+  printf 'defaultRuntime: %s\nmachines: %s\n' "$1" "$2" > "$FERRY_CONFIG"
+  ferry_apply_default_runtime
+}
+mac_taint='taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode=vm-per-pod:NoSchedule --overwrite'
+mac_untaint='taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode:NoSchedule-'
+machine_taint='taint nodes -l ferry.dev/mode=shared ferry.dev/mode=shared:NoSchedule --overwrite'
+machine_untaint='taint nodes -l ferry.dev/mode=shared ferry.dev/mode:NoSchedule-'
+pool_tainted='"taints":[{"key":"ferry.dev/mode","value":"shared","effect":"NoSchedule"}]'
+pool_clear='"taints":null'
+
+with_default ferry-vm true >/dev/null; calls="$(cat "$kube_calls")"
+contains "ferry-vm taints the machines" "$calls" "$machine_taint"
+contains "  and takes the Macs' taint off" "$calls" "$mac_untaint"
+lacks "  and does not taint the Macs" "$calls" "$mac_taint"
+contains "  and gives the NodePool the machines' taint" "$calls" "$pool_tainted"
+
+with_default ferry-shared true >/dev/null; calls="$(cat "$kube_calls")"
+contains "ferry-shared taints the Macs" "$calls" "$mac_taint"
+contains "  and takes the machines' taint off" "$calls" "$machine_untaint"
+contains "  and clears the NodePool's" "$calls" "$pool_clear"
+
+out="$(with_default ferry-shared false)"; calls="$(cat "$kube_calls")"
+contains "ferry-shared with machines off says it is waiting" "$out" "WARN defaultRuntime ferry-shared needs machines"
+lacks "  and taints no Mac, which would leave nothing to run a pod" "$calls" "$mac_taint"
+contains "  and takes any Mac taint off" "$calls" "$mac_untaint"
+
+out="$(with_default none true)"; calls="$(cat "$kube_calls")"
+contains "none clears the Macs" "$calls" "$mac_untaint"
+contains "  and the machines" "$calls" "$machine_untaint"
+contains "  and the NodePool" "$calls" "$pool_clear"
+lacks "  and warns about nothing" "$out" "WARN"
+
+stub_nodepool=0; with_default ferry-vm true >/dev/null
+lacks "no NodePool (machines never enabled): nothing is patched" "$(cat "$kube_calls")" "patch nodepool"
+stub_nodepool=1
+
+printf 'defaultRuntime: ferry-vm\nmachines: true\n' > "$FERRY_CONFIG"
+FERRY_DEFAULT_RUNTIME=ferry-shared
+is "FERRY_DEFAULT_RUNTIME overrides the file for one run" "$(ferry_default_runtime)" ferry-shared
+unset FERRY_DEFAULT_RUNTIME
+printf 'defaultRuntime: ferry-kata\n' > "$FERRY_CONFIG"
+is "a value that is not a runtime is no default" "$(ferry_default_runtime)" none
+
+# The copy in the cluster.
+publish() { # config... -> the ConfigMap applied
+  : > "$kube_applied"; printf '%s\n' "$@" > "$FERRY_CONFIG"
+  ferry_config_publish; cat "$kube_applied"
+}
+cm="$(publish 'purpose: ci' 'durability: relaxed' 'defaultRuntime: ferry-vm' 'machines: true')"
+contains "the ConfigMap is kube-system/ferry-config" "$cm" "name: ferry-config"
+contains "  in kube-system" "$cm" "namespace: kube-system"
+contains "  carrying the default" "$cm" 'defaultRuntime: "ferry-vm"'
+contains "  the durability, in its new name" "$cm" 'durability: "process-crash"'
+contains "  whether machines run" "$cm" 'machines: "true"'
+contains "  the purpose" "$cm" 'purpose: "ci"'
+contains "  and naming the file it is a copy of" "$cm" "ferry.dev/source: \"$FERRY_CONFIG\""
+cm="$(publish 'defaultRuntime: ferry-shared' 'machines: false')"
+contains "a ferry-shared default with machines off is published as none, what is in effect" \
+  "$cm" 'defaultRuntime: "none"'
+if command -v ruby >/dev/null 2>&1; then
+  is "  and is a ConfigMap Kubernetes would parse" \
+    "$(printf '%s\n' "$cm" | ruby -ryaml -e 'd = YAML.load(STDIN.read.split(/^---$/)[0]); print d["kind"], " ", d["data"].keys.sort.join(",")' 2>&1)" \
+    "ConfigMap defaultRuntime,durability,machines,purpose"
+fi
+
+# The RuntimeClasses, with the overhead filled in.
+here="$repo"
+pod_overhead_mib=133; : > "$kube_applied"; install_runtime_classes
+rc="$(cat "$kube_applied")"
+contains "ferry-vm is installed with the pod VM's overhead" "$rc" "podFixed: {memory: 133Mi}"
+lacks "  and no placeholder left in it" "$rc" "__POD_OVERHEAD_MIB__"
+contains "  alongside ferry-shared" "$rc" "name: ferry-shared"
+pod_overhead_mib=226; : > "$kube_applied"; install_runtime_classes
+contains "a checkout on an older kernel charges what its pod VMs cost" "$(cat "$kube_applied")" "podFixed: {memory: 226Mi}"
+unset -f kube warn
+unset FERRY_CONFIG MACHINES_MARKER DURABILITY_MARKER here pod_overhead_mib
+echo
+
 # --- small helpers -----------------------------------------------------------
 
 printf '\033[1m%s\033[0m\n' "telling whether a gateway is on the profile's pod network"

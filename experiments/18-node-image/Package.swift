@@ -18,6 +18,11 @@ let package = Package(
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationExtras", package: "containerization"),
             ]
-        )
+        ),
+        // `swift test`, run by tests/run.sh.
+        .testTarget(
+            name: "ferry-node-tests",
+            dependencies: ["ferry-node"]
+        ),
     ]
 )

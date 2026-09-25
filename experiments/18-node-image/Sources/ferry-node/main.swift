@@ -188,6 +188,19 @@ let usbHotplugEnabled = ProcessInfo.processInfo.environment["FERRY_NODE_USB"] ==
 /// The virtiofs tag init.sh mounts the volumes share by.
 let volumesTag = "ferry-volumes"
 
+/// A machine's root-disk barrier: its own (a Machine's spec.durability, as
+/// ferry-machined translates it) when it has one, else the server's
+/// FERRY_NODE_DISK_SYNC, else fsync. Anything unrecognised is fsync too --
+/// the barrier ferry has always used -- rather than a guess in either
+/// direction.
+func diskSynchronizationMode(_ own: String?, serverDefault: String?) -> VZDiskImageSynchronizationMode {
+    switch own ?? serverDefault {
+    case "none": return .none
+    case "full": return .full
+    default:     return .fsync
+    }
+}
+
 /// Everything a machine is, in one place, so `run` and `serve` cannot drift
 /// apart on what a node boots with.
 @available(macOS 26.0, *)
@@ -323,12 +336,8 @@ func machineConfiguration(
     // A machine can ask for its own (Machine spec.durability, arriving here as
     // diskSync), and one that does not takes the server's, which ferry sets
     // from the cluster's durability.
-    let sync: VZDiskImageSynchronizationMode
-    switch diskSync ?? ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"] {
-    case "none": sync = .none
-    case "full": sync = .full
-    default:     sync = .fsync
-    }
+    let sync = diskSynchronizationMode(
+        diskSync, serverDefault: ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"])
     let rootAttachment = try VZDiskImageStorageDeviceAttachment(
         url: URL(filePath: disk), readOnly: false,
         cachingMode: .automatic, synchronizationMode: sync)
