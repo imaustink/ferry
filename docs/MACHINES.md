@@ -440,6 +440,9 @@ the default. The Mac node is where the provisioner runs.
 
 ## How a pod chooses
 
+How to use this is [RUNTIMES.md](RUNTIMES.md); what follows is how it came to
+be built this way.
+
 It does not need a new concept. The Mac is a node and each machine is a node,
 so isolation becomes node selection — which Kubernetes already expresses:
 

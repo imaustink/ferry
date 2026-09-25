@@ -452,6 +452,9 @@ out when you can watch it rather than alongside an unrelated upgrade.
 ./tests/run.sh
 ```
 
+[tests/README.md](../tests/README.md) covers every kind; these are the
+upgrade ones.
+
 - `tests/versions-test.sh` — the store and the skew rules: version arithmetic,
   what each version is paired with, installing and flipping and listing,
   adopting a pre-store checkout (including that the inode survives), and the

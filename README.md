@@ -262,7 +262,7 @@ container, no network namespace plumbing.
 None of that changes if you want density instead. A `Machine` is a Linux node VM
 whose pods are ordinary containers sharing its kernel — ~45ms to start one
 against ~300ms for a pod VM — and a pod picks with
-`runtimeClassName: ferry-shared` or `ferry-vm`. It is still nothing to
+`runtimeClassName: ferry-shared` or `ferry-vm` ([docs/RUNTIMES.md](docs/RUNTIMES.md)). It is still nothing to
 size up front, and not because sizing is easy here — because you never do it. A
 pod that fits nowhere causes a machine shaped to fit it, and an idle machine is
 taken away again — which is what returns its memory, since a VM that keeps
@@ -420,8 +420,10 @@ patches/kubelet-vX.Y/                per-minor shims, laid over the shared tree
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
 manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines
-tests/                               what can be checked without a cluster
+tests/                               run.sh: shell, Go and Swift tests, no cluster;
+                                     e2e/: against a throwaway cluster. See tests/README.md
 docs/                                HANDOFF.md (the full picture), INSTALL.md,
+                                     RUNTIMES.md (choosing ferry-vm or ferry-shared),
                                      MACHINES.md (mode 2), SERVICES.md,
                                      BENCHMARKING.md (how to measure this honestly)
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
@@ -505,6 +507,23 @@ kubectl exec probe -- wget -qO- http://web
 ferry status
 ferry down
 ```
+
+With machines on (`ferry machines enable`), a pod chooses between its own VM
+and a container on a shared kernel with `runtimeClassName`:
+
+```sh
+kubectl run isolated --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-vm"}}' -- sleep 3600
+kubectl run dense --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-shared"}}' -- sleep 3600
+
+kubectl get pods -o wide              # isolated on the Mac, dense on a machine
+kubectl get nodes -L ferry.dev/mode   # the machine was made for it
+```
+
+[docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
+Jobs, what a pod that names neither gets, and what to do when one will not
+start.
 
 `ferry doctor` explains what is missing if the machine is not ready.
 
@@ -675,6 +694,11 @@ git clone https://github.com/imaustink/ferry && cd ferry
   anything — a 6.3 driver reading 6.4 module interfaces, or a `swift-package`
   that dies in dyld before it reads a manifest. `ferry doctor` checks for this
   by running SwiftPM rather than by asking it its version.
+
+To test a change, `./tests/run.sh` runs everything that needs no cluster —
+the shell suites, then Go and Swift unit tests — and `tests/e2e/` holds the
+tests that bring one up. [tests/README.md](tests/README.md) says what each
+covers and needs.
 
 Most of this was developed on macOS 15. What actually needs 26 is routable
 per-pod addressing (`VZVmnetNetworkDeviceAttachment`) and the toolchain Apple's

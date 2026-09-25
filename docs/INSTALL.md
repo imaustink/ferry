@@ -620,7 +620,9 @@ missing directory. Mode 1 is unaffected either way.
 
 ### Choosing a mode
 
-A pod picks with a RuntimeClass, the way it would pick Kata or gVisor:
+[RUNTIMES.md](RUNTIMES.md) is the guide: workload examples, defaults, and what
+to do when a pod will not start. In short, a pod picks with a RuntimeClass, the
+way it would pick Kata or gVisor:
 
 ```yaml
 runtimeClassName: ferry-shared   # dense, one kernel for many pods
