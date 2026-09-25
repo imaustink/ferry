@@ -749,22 +749,27 @@ succeeds "karpenter's health probe port is shifted like the rest" \
 # Durability, as a flag rather than two environment variables nobody finds.
 # Full is the default because it is the guarantee kind and minikube cannot
 # offer at all; relaxed is worth 3x on a pod start and is the caller's call.
+# The levels are named for the failure they survive -- power-loss and
+# process-crash -- because 'full' and 'relaxed' said how hard ferry tried and
+# not what was kept.
 succeeds "durability is a flag on ferry up" \
-  grep -q 'durability relaxed to trade crash-safety for speed' "$repo/ferry"
+  grep -q -- '--disposable to trade surviving a power loss for speed' "$repo/ferry"
 succeeds "  validated rather than trusted" \
-  grep -q "expected 'full' or 'relaxed'" "$repo/ferry"
+  grep -q "expected 'power-loss' or 'process-crash'" "$repo/ferry"
+succeeds "  the old names still mean what they did" \
+  grep -q 'power-loss|full) echo power-loss' "$repo/ferry"
 succeeds "  remembered for the cluster, the way machines is" \
   grep -q 'DURABILITY_MARKER=' "$repo/ferry"
 succeeds "  and it reaches etcd" \
-  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed' "$repo/ferry"
+  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_process_crash' "$repo/ferry"
 succeeds "  and the machine disks, so mode 2 does not disagree with mode 1" \
-  grep -q 'FERRY_NODE_DISK_SYNC="$(durability_is_relaxed' "$repo/ferry"
-# A relaxed cluster that looks like a full one is the failure mode worth
-# preventing: it is only ever discovered after something is lost.
-succeeds "  a relaxed cluster says so every time it starts" \
-  grep -q 'writes are acknowledged before they reach the disk' "$repo/ferry"
+  grep -q 'durability_is_process_crash && echo none' "$repo/ferry"
+# A process-crash cluster that looks like a power-loss one is the failure mode
+# worth preventing: it is only ever discovered after something is lost.
+succeeds "  a process-crash cluster says so every time it starts" \
+  grep -q 'Writes are acknowledged before they reach the disk' "$repo/ferry"
 succeeds "  and ferry status says which one you are on" \
-  test "$(grep -c 'durability_is_relaxed' "$repo/ferry")" -ge 4
+  test "$(grep -c 'durability_is_process_crash' "$repo/ferry")" -ge 4
 
 # --purge destroys the cluster, so the control plane does not have to wait
 # its turn behind the components -- nothing between them needs an API server.

@@ -303,15 +303,15 @@ not in the installer.
 
 ### Durability and speed
 
-`ferry up --durability relaxed` sets the first two together and is the
+`ferry up --disposable` (durability `process-crash`) sets the first two together and is the
 supported way in; the rest are here because the code reads them and are worth
 knowing when one of them is the thing you want to change on its own.
 
 | | default | |
 |---|---|---|
-| `FERRY_DURABILITY` | `full` | `relaxed` to acknowledge writes before they reach the disk. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered |
-| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `relaxed`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
-| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `relaxed` |
+| `FERRY_DURABILITY` | `power-loss` | `process-crash` to acknowledge writes before they reach the disk: a crashed process loses nothing, a power loss or kernel panic can. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered. `full` and `relaxed`, the old names, still work |
+| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `process-crash`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
+| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `process-crash` |
 | `FERRY_BUILDER_CPUS` | half the Mac's cores, at least 2 | CPUs for the `ferry image build` builder pod. buildkit on the pod default of 2 is roughly half the speed of 8 |
 | `FERRY_BUILDER_MEMORY_GIB` | a quarter of the Mac's memory, 2–8 | memory for the builder pod |
 | `FERRY_BUILDER_POD` | `ferry-builder` | the builder pod's name |

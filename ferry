@@ -327,10 +327,16 @@ FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
 MACHINES_MARKER="$FERRY_HOME/machines-enabled"
 machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
 
-# How hard this cluster tries not to lose a write.
+# How hard this cluster tries not to lose a write, named for what it survives.
 #
-#   full      every etcd commit reaches the SSD before it is acknowledged
-#   relaxed   it reaches the OS, and the SSD when the OS gets to it
+#   power-loss      every etcd commit reaches the SSD before it is acknowledged
+#   process-crash   it reaches the OS, and the SSD when the OS gets to it: a
+#                   crashed etcd or ferry loses nothing, a kernel panic or a
+#                   pulled plug can lose what the API server already confirmed
+#
+# These were 'full' and 'relaxed', which said how hard ferry tried and not what
+# you get. Both old names are still accepted, on the flag, in the environment
+# and in an existing cluster's recorded setting, and mean exactly what they did.
 #
 # The difference is one syscall and it is not small. Go's os.File.Sync() is
 # fcntl(F_FULLFSYNC) on darwin -- a flush of the drive's own write cache --
@@ -339,24 +345,34 @@ machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
 # cheap one for free. On this Mac: 0.031ms against 3.961ms, and every pod
 # status update is an etcd write.
 #
-# 'relaxed' gives that up deliberately. A cluster you recreate on demand
-# loses nothing it minds losing, and a 20-pod burst goes from 1.16s to
-# 0.39s. A cluster holding something you would have to rebuild by hand
-# should stay 'full', which is the default and what you get by saying
-# nothing.
+# 'process-crash' gives that up deliberately. A cluster you recreate on demand
+# loses nothing it minds losing, and a 20-pod burst on machines goes from
+# 1.19s to 0.77s. A cluster holding something you would have to rebuild by
+# hand should stay 'power-loss', which is the default and what you get by
+# saying nothing. `ferry up --disposable` is the same choice, said as intent.
 #
 # In FERRY_HOME so the choice outlives a restart, the same way machines does:
 # a cluster brought back by the login agent keeps the durability it was
 # created with rather than silently changing character.
 DURABILITY_MARKER="$FERRY_HOME/durability"
+# The one spelling of each level, from any spelling of it. Empty for anything
+# that is not a level at all, so a caller can refuse it.
+durability_normalize() { # value
+  case "$1" in
+    power-loss|full) echo power-loss ;;
+    process-crash|relaxed) echo process-crash ;;
+  esac
+}
 ferry_durability() {
   # The environment wins, for a one-off run that does not want to change the
   # cluster's recorded setting.
-  if [ -n "${FERRY_DURABILITY:-}" ]; then echo "$FERRY_DURABILITY"; return; fi
-  local v; v="$(cat "$DURABILITY_MARKER" 2>/dev/null)"
-  case "$v" in relaxed|full) echo "$v" ;; *) echo full ;; esac
+  local v
+  if [ -n "${FERRY_DURABILITY:-}" ]; then v="$FERRY_DURABILITY"
+  else v="$(cat "$DURABILITY_MARKER" 2>/dev/null)"; fi
+  v="$(durability_normalize "$v")"
+  echo "${v:-power-loss}"
 }
-durability_is_relaxed() { [ "$(ferry_durability)" = relaxed ]; }
+durability_is_process_crash() { [ "$(ferry_durability)" = process-crash ]; }
 # Where the node image lives in a checkout and in a release. 'ferry node-image'
 # writes it; release/build.sh ships it.
 NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
@@ -473,7 +489,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry up          start the cluster
-                    --durability relaxed to trade crash-safety for speed
+                    --disposable to trade surviving a power loss for speed
+                    (--durability power-loss|process-crash, remembered)
   ferry down        stop the cluster (--purge to drop its data as well)
   ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
@@ -1026,7 +1043,7 @@ start_control_plane() { # version
     ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
     SERVICE_NODE_PORT_RANGE="$(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))" \
-    FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
+    FERRY_ETCD_NO_FSYNC="$(durability_is_process_crash && echo 1 || true)" \
     FERRY_KEEP_ETCD="${FERRY_KEEP_ETCD:-}" FERRY_HANDOVER="${FERRY_HANDOVER:-}" \
     FERRY_HANDOVER_BIN="$here/bin/ferry-handover" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1
@@ -1046,23 +1063,32 @@ start_control_plane() { # version
 }
 
 cmd_up() {
-  # --durability full|relaxed, remembered for this cluster. Parsed before
-  # anything starts, because it decides how etcd and the machine disks are
-  # opened and those happen early.
-  local want_durability=""
+  # --durability power-loss|process-crash, remembered for this cluster.
+  # Parsed before anything starts, because it decides how etcd and the machine
+  # disks are opened and those happen early.
+  #
+  # --disposable says the same thing as intent: this is a cluster you
+  # recreate from a script. --fast was the first spelling of it and still
+  # works, but it named the gain and hid the cost. 'full' and 'relaxed' are
+  # the old names of the two levels and are accepted and translated.
+  local want_durability="" asked_durability=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --durability) want_durability="${2:-}"; shift 2 ;;
-      --durability=*) want_durability="${1#*=}"; shift ;;
-      --fast) want_durability=relaxed; shift ;;
+      --durability) asked_durability="${2:-}"; shift 2 ;;
+      --durability=*) asked_durability="${1#*=}"; shift ;;
+      --disposable) asked_durability=process-crash; shift ;;
+      --fast) asked_durability=process-crash
+              warn "--fast is now --disposable: the same setting, named for what it gives up"
+              shift ;;
       *) shift ;;
     esac
   done
-  case "$want_durability" in
-    "") ;;
-    full|relaxed) : ;;
-    *) bad "--durability $want_durability: expected 'full' or 'relaxed'"; return 2 ;;
-  esac
+  if [ -n "$asked_durability" ]; then
+    want_durability="$(durability_normalize "$asked_durability")"
+    [ -n "$want_durability" ] || {
+      bad "--durability $asked_durability: expected 'power-loss' or 'process-crash'"
+      return 2; }
+  fi
 
   for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
@@ -1100,10 +1126,11 @@ cmd_up() {
   # Said every time, not only when it changes: someone reading this scrollback
   # to work out why a cluster lost data should not have to remember which day
   # they passed the flag.
-  if durability_is_relaxed; then
-    warn "durability: relaxed -- writes are acknowledged before they reach the disk"
-    echo "      Fine for a cluster you recreate. A hard power loss can leave"
-    echo "      etcd needing a restore. 'ferry up --durability full' to change it."
+  if durability_is_process_crash; then
+    warn "durability: process-crash -- a crashed process loses nothing, a power loss can"
+    echo "      Writes are acknowledged before they reach the disk. Fine for a"
+    echo "      cluster you recreate; a power loss or kernel panic can leave etcd"
+    echo "      needing a restore. 'ferry up --durability power-loss' to change it."
   fi
 
   start_gpud
@@ -1564,7 +1591,7 @@ start_machines() {
   # The registry port is passed only when the registry is on, and blank
   # otherwise, so a FERRY_MACHINE_REGISTRY_PORT set on its own does not point
   # machines at a registry that is not running.
-  FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
+  FERRY_NODE_DISK_SYNC="$(durability_is_process_crash && echo none || echo fsync)" \
   FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
   FERRY_NODE_USB="$(kernel_attaches_disks && echo 1)" \
   "$here/bin/ferry-node" serve \
@@ -5369,10 +5396,10 @@ cmd_status() {
   else
     echo "  kubernetes ${cluster:-${active:-not built}}"
   fi
-  if durability_is_relaxed; then
-    echo "  durability relaxed -- writes acknowledged before they reach the disk"
+  if durability_is_process_crash; then
+    echo "  durability process-crash -- survives a crashed process, not a power loss"
   else
-    echo "  durability full -- every etcd commit reaches the disk first"
+    echo "  durability power-loss -- every etcd commit reaches the disk first"
   fi
   for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"

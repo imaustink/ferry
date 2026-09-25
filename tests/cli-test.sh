@@ -206,6 +206,7 @@ up_with() { # running-processes recorded-durability [args...]
     here="$up_scratch"; KERNEL="$up_scratch/vmlinux"; mkdir -p "$here/bin"
     touch "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"
     DURABILITY_MARKER="$up_scratch/durability"; unset FERRY_DURABILITY
+    eval "$(sed -n '/^durability_normalize()/,/^}/p' "$repo/ferry")"
     eval "$(sed -n '/^ferry_durability()/,/^}/p' "$repo/ferry")"
     eval "$(sed -n '/^cmd_up()/,/^}/p' "$repo/ferry")"
     align_to_cluster_version() { echo STARTING; return 1; }
@@ -218,6 +219,15 @@ out="$(up_with "ferry-cri kubelet" full)"; is "exits 0 when it is already up" "$
 lacks "  and starts nothing" "$out" STARTING
 up_with "ferry-cri kubelet" full --fast >/dev/null; is "refuses a durability it was not started with" "$?" 1
 up_with "ferry-cri kubelet" relaxed --fast >/dev/null; is "and accepts the one it was" "$?" 0
+# The levels are named for what they survive now. The old names are what
+# every existing cluster has recorded, so they have to keep meaning the same.
+up_with "ferry-cri kubelet" relaxed --disposable >/dev/null; is "--disposable is the level 'relaxed' recorded" "$?" 0
+up_with "ferry-cri kubelet" process-crash --durability relaxed >/dev/null; is "  and the old name on the flag is the new level" "$?" 0
+up_with "ferry-cri kubelet" full --durability power-loss >/dev/null; is "  as 'full' is power-loss" "$?" 0
+up_with "ferry-cri kubelet" power-loss --disposable >/dev/null; is "  and a disposable ask of a power-loss cluster is refused" "$?" 1
+out="$(up_with "" full --durability sometimes)"; is "a level that is not one is refused" "$?" 2
+contains "  naming the ones that are" "$out" "expected 'power-loss' or 'process-crash'"
+lacks "  before anything starts" "$out" STARTING
 out="$(up_with kubelet full)"; is "a half-up cluster still refuses" "$?" 1
 contains "  and says which half" "$out" "kubelet alone"
 contains "a stopped cluster is started" "$(up_with "" full)" STARTING
