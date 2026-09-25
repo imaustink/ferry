@@ -241,7 +241,9 @@ found wrong with the previous one. Each is now recorded per stack in
   ferry columns came out `relaxed` (now `process-crash`) and mode 2's 20-pod burst read 0.64 s
   instead of 1.19 s — a number that would have had mode 2 beating kind on a
   row it loses. The harness now passes `--durability` every time and records
-  what `ferry status` reports back.
+  what `ferry status` reports back. The setting now lives in a config file
+  that `ferry up` names every time it starts, rather than a marker nothing
+  mentioned.
 - **An unreadable VM is not a free one.** `vmmap` occasionally returns nothing
   for a process, and the footprint helper used to skip it silently, so a mode 2
   cluster reported 670.8 MiB across two VMs where every comparable run reported
@@ -472,6 +474,11 @@ curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=
 
 A release also carries **mode 2** — the node as the VM, pods sharing its kernel
 ([docs/MACHINES.md](docs/MACHINES.md)) — off until `ferry machines enable`.
+
+Not sure which setup you want? `ferry init` asks what the cluster is for — a
+laptop you develop on, clusters a script creates and deletes, or an always-on
+node — and writes the answers to a config file that `ferry config` explains and
+every `ferry up` names. See [Configuration](docs/INSTALL.md#configuration).
 
 Details, the environment variables, and how to uninstall are in
 [docs/INSTALL.md](docs/INSTALL.md). To build ferry instead of installing it, see

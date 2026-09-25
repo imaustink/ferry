@@ -206,7 +206,12 @@ up_with() { # running-processes recorded-durability [args...]
     here="$up_scratch"; KERNEL="$up_scratch/vmlinux"; mkdir -p "$here/bin"
     touch "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"
     DURABILITY_MARKER="$up_scratch/durability"; unset FERRY_DURABILITY
-    eval "$(sed -n '/^durability_normalize()/,/^}/p' "$repo/ferry")"
+    FERRY_CONFIG="$up_scratch/config.yaml"; rm -f "$FERRY_CONFIG"
+    MACHINES_MARKER="$up_scratch/machines-enabled"
+    eval "$(grep '^FERRY_CONFIG_API=' "$repo/ferry")"
+    for fn in ferry_config_get ferry_config_set ferry_config_migrate durability_normalize; do
+      eval "$(sed -n "/^$fn()/,/^}/p" "$repo/ferry")"
+    done
     eval "$(sed -n '/^ferry_durability()/,/^}/p' "$repo/ferry")"
     eval "$(sed -n '/^cmd_up()/,/^}/p' "$repo/ferry")"
     align_to_cluster_version() { echo STARTING; return 1; }
@@ -232,6 +237,85 @@ out="$(up_with kubelet full)"; is "a half-up cluster still refuses" "$?" 1
 contains "  and says which half" "$out" "kubelet alone"
 contains "a stopped cluster is started" "$(up_with "" full)" STARTING
 rm -rf "$up_scratch"
+echo
+
+# --- the config file ---------------------------------------------------------
+
+printf '\033[1m%s\033[0m\n' "a cluster's choices are a file, not markers"
+# The benchmark harness passed --durability once, --purge kept the marker, and
+# four columns were measured on a setting nobody chose for them.
+cfg_scratch="$sandbox/config"
+mkdir -p "$cfg_scratch"
+# In this shell rather than a subshell, so the counts below are counted.
+FERRY_CONFIG="$cfg_scratch/config.yaml"
+DURABILITY_MARKER="$cfg_scratch/durability"; MACHINES_MARKER="$cfg_scratch/machines-enabled"
+unset FERRY_DURABILITY
+eval "$(grep '^FERRY_CONFIG_API=' "$repo/ferry")"
+for fn in ferry_config_get ferry_config_set ferry_config_unset ferry_config_migrate \
+          durability_normalize ferry_durability machines_enabled; do
+  eval "$(sed -n "/^$fn()/,/^}/p" "$repo/ferry")"
+done
+cat > "$FERRY_CONFIG" <<'YAML'
+# a comment someone wrote
+apiVersion: ferry.dev/v1alpha1
+kind: FerryConfig
+durability: "relaxed"   # quoted, and commented
+# machines: true
+YAML
+is "a value is read without its quotes or its comment" "$(ferry_config_get durability)" relaxed
+is "  and an old name still means its level" "$(ferry_durability)" process-crash
+is "a commented-out key is not a value" "$(ferry_config_get machines)" ""
+ferry_config_set durability power-loss
+is "setting a key replaces it in place" "$(grep -c '^durability:' "$FERRY_CONFIG")" 1
+is "  and says what was set" "$(ferry_config_get durability)" power-loss
+contains "  keeping every comment around it" "$(cat "$FERRY_CONFIG")" "# a comment someone wrote"
+ferry_config_set machines true
+is "a new key is added" "$(ferry_config_get machines)" true
+if machines_enabled; then ok "  and machines are on because the file says so"; else bad "  and machines are on because the file says so"; fi
+ferry_config_unset machines
+is "unsetting removes only that key" "$(ferry_config_get machines)$(ferry_config_get durability)" power-loss
+FERRY_DURABILITY=relaxed; is "the environment still wins for one run" "$(ferry_durability)" process-crash
+unset FERRY_DURABILITY
+
+# A cluster from before the file: its markers are read, then moved.
+rm -f "$FERRY_CONFIG"; echo relaxed > "$DURABILITY_MARKER"; : > "$MACHINES_MARKER"
+is "an unmigrated cluster's durability marker is still read" "$(ferry_durability)" process-crash
+if machines_enabled; then ok "  and its machines marker"; else bad "  and its machines marker"; fi
+ferry_config_migrate
+is "migrating writes the durability into the file, in its new name" "$(ferry_config_get durability)" process-crash
+is "  and machines" "$(ferry_config_get machines)" true
+if [ ! -e "$DURABILITY_MARKER" ] && [ ! -e "$MACHINES_MARKER" ]; then ok "  and removes both markers"
+else bad "  and removes both markers"; fi
+# A file someone wrote wins over a marker nobody remembers.
+ferry_config_set durability power-loss; echo relaxed > "$DURABILITY_MARKER"
+ferry_config_migrate
+is "migration never overwrites what the file already says" "$(ferry_config_get durability)" power-loss
+unset FERRY_CONFIG DURABILITY_MARKER MACHINES_MARKER
+# Through the CLI, against a state directory of our own.
+cfg_env=(env FERRY_HOME="$cfg_scratch/home" FERRY_RUN="$cfg_scratch/run" FERRY_PROFILE=cfgtest)
+mkdir -p "$cfg_scratch/home"
+out="$("${cfg_env[@]}" "$repo/ferry" init --purpose ci --yes </dev/null 2>&1)"
+contains "ferry init writes a config file from flags alone" "$out" "wrote $cfg_scratch/home/config.yaml"
+cfg="$(cat "$cfg_scratch/home/config.yaml" 2>/dev/null)"
+contains "  versioned like a Kubernetes config" "$cfg" "apiVersion: ferry.dev/v1alpha1"
+contains "  with the purpose it was given" "$cfg" "purpose: ci"
+contains "  and that purpose's durability" "$cfg" "durability: process-crash"
+out="$("${cfg_env[@]}" "$repo/ferry" init --yes </dev/null 2>&1)"; rc=$?
+is "  and will not overwrite it unasked" "$rc" 1
+contains "  saying how to change it instead" "$out" "ferry init --force"
+out="$("${cfg_env[@]}" "$repo/ferry" init --purpose prod --yes --force </dev/null 2>&1)"; rc=$?
+is "a purpose that is not one is refused" "$rc" 2
+contains "  before any file is written" "$(cat "$cfg_scratch/home/config.yaml")" "purpose: ci"
+out="$("${cfg_env[@]}" FERRY_POD_MEMORY_MIB=1024 "$repo/ferry" config 2>&1)"
+contains "ferry config says where a value came from" "$out" "process-crash    file"
+contains "  including one the environment set for this run" "$out" "FERRY_POD_MEMORY_MIB, this run only"
+"${cfg_env[@]}" "$repo/ferry" config set podMemoryMiB 768 >/dev/null 2>&1
+is "a pass-through setting is written" "$("${cfg_env[@]}" "$repo/ferry" config get podMemoryMiB)" 768
+out="$("${cfg_env[@]}" "$repo/ferry" config set podMemoryMiB lots 2>&1)"; rc=$?
+is "  and validated" "$rc" 2
+out="$("${cfg_env[@]}" "$repo/ferry" config set nonsense 1 2>&1)"; rc=$?
+is "an unknown key is refused" "$rc" 2
+contains "  naming the ones there are" "$out" "settings: purpose durability"
 echo
 
 # --- small helpers -----------------------------------------------------------

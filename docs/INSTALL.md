@@ -248,6 +248,57 @@ A node VM on this Mac whose pods are ordinary Linux containers sharing its
 kernel. `kubectl delete machine worker-0` takes it away — VM stopped, Node
 removed, disk cleaned up. See [Machines — mode 2](#machines--mode-2).
 
+## Configuration
+
+What a cluster is meant to be lives in one file beside its state,
+`~/.ferry<-profile>/config.yaml`, shaped like the configuration files
+Kubernetes components read:
+
+```yaml
+apiVersion: ferry.dev/v1alpha1
+kind: FerryConfig
+purpose: dev              # dev | ci | node -- recorded, not acted on
+durability: power-loss    # power-loss | process-crash
+machines: true            # whether mode 2 runs
+```
+
+`ferry init` asks what the cluster is for and writes it. Each purpose starts
+from sensible answers and every one is asked about:
+
+| purpose | machines | durability | for |
+|---|---|---|---|
+| `dev` | on, where available | `power-loss` | a laptop you develop on |
+| `ci` | on, where available | `process-crash` | clusters a script creates and deletes |
+| `node` | off | `power-loss` | an always-on node holding what you would rebuild by hand |
+
+`ferry init --purpose ci --yes` answers from flags alone, for a script.
+
+```sh
+ferry config                         # every setting, its value, and where it came from
+ferry config set durability process-crash
+ferry config unset podMemoryMiB      # back to the default
+```
+
+The precedence is the usual one: a flag, for this run; a `FERRY_*` variable,
+for this run; the file; the default. A flag that is meant to be remembered —
+`ferry up --durability`, `ferry machines enable` — writes the file, and `ferry
+up` names the file every time it starts, so a setting is never somewhere you
+cannot see it. `ferry down --purge` deletes the cluster's data and keeps its
+config, which is the point of having one; `ferry init --force` starts again.
+
+Besides the three above, the file takes a few settings that are one
+environment variable each: `podMemoryMiB` (`FERRY_POD_MEMORY_MIB`), `podCPUs`
+(`FERRY_POD_CPUS`), `maxPods` (`FERRY_MAX_PODS`), `machineLimitCPUs`
+(`FERRY_MACHINE_LIMIT_CPUS`) and `machineLimitMemoryGi`
+(`FERRY_MACHINE_LIMIT_MEMORY_GI`).
+
+**Before this file** the same choices were marker files — `durability` and
+`machines-enabled` in `~/.ferry` — written by flags and read back without a
+word. They are still read, and the first `ferry up`, `ferry config set` or
+`ferry machines` moves them into the file and removes them. A ferry from before
+this change does not read the file, so going back to one loses those two
+settings.
+
 ## Parameters
 
 Everything below is an environment variable. The installer's are read by
@@ -277,6 +328,7 @@ not in the installer.
 |---|---|---|
 | `FERRY_PROFILE` | `default`, or the worktree's name | which cluster this is; decides ports, state and pod network |
 | `FERRY_HOME` | `~/.ferry<-profile>` | etcd, PKI, kubeconfigs, logs — survives a restart |
+| `FERRY_CONFIG` | `$FERRY_HOME/config.yaml` | this cluster's settings; see [Configuration](#configuration) |
 | `FERRY_RUN` | `/tmp/ferry-run<-profile>` | sockets, pid files, per-run state. Under `/tmp` because macOS caps a unix socket path near 104 bytes |
 | `FERRY_PROFILES` | `~/.ferry-profiles` | the register mapping profile names to index numbers |
 | `FERRY_NODE_NAME` | `ferry-mac<-profile>` | this node's name |

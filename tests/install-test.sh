@@ -430,7 +430,7 @@ contains "starting machines installs the CRD, on every start" \
 # Enabling has to survive a restart, or a cluster comes back in mode 1 only and
 # the machines that were running are simply gone.
 contains "and 'machines enable' records the choice, so the cluster comes back with them" \
-  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "MACHINES_MARKER"
+  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "ferry_config_set machines true"
 contains "'ferry up' starts them for a cluster that asked" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "machines_enabled"
 # A release built without the image should say so rather than fail obscurely on
