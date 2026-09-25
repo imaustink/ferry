@@ -284,8 +284,14 @@ sync_ms() { # machine: busybox's "real 0m 1.23s", in ms
 }
 full="$(sync_ms d-full)"; fsync="$(sync_ms hand-0)"; none="$(sync_ms d-none)"
 echo "  300 write+sync rounds: power-loss ${full}ms, os-crash ${fsync}ms, process-crash ${none}ms"
-if [ "${full:-0}" -gt "${fsync:-0}" ] && [ "${fsync:-0}" -gt "${none:-0}" ]; then r=ordered; else r="$full/$fsync/$none"; fi
-is "each level costs what it promises: full > fsync > none" "$r" ordered
+# Only the full barrier is big enough to see this way. An fsync(2) on this
+# SSD is ~0.03ms against ~4ms for F_FULLFSYNC (README), so across 300 rounds
+# os-crash and process-crash differ by less than the loop's own noise: two
+# runs gave 790/120 and 330/460. What reaches ferry-node for those two is
+# checked above in the spec files, and which barrier wins is DiskSyncTests.
+slowest_other=$fsync; [ "${none:-0}" -gt "${slowest_other:-0}" ] && slowest_other=$none
+if [ "${full:-0}" -gt $(( 2 * ${slowest_other:-0} )) ]; then r=yes; else r="$full vs $fsync/$none"; fi
+is "power-loss pays the full barrier: over twice os-crash and process-crash" "$r" yes
 kubectl delete machine d-full d-none hand-0 --wait=false >/dev/null
 
 # --- E: the builder and the registry addon --------------------------------------

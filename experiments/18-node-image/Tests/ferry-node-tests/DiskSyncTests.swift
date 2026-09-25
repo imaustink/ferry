@@ -1,8 +1,9 @@
 // A machine's root-disk barrier: the Machine's own, else the server's, else
-// fsync. Measured on a live cluster, 300 write+sync rounds in a pod took
-// 1.81s at full, 0.79s at fsync and 0.12s at none -- so the wrong one here is
-// either a durability promise broken or a machine three times slower than
-// asked for.
+// fsync. Measured on a live cluster (tests/e2e/runtime.sh), 300 write+sync
+// rounds in a pod took 1.7-1.8s at full against 0.1-0.8s at fsync or none --
+// so the wrong one here is either a durability promise broken or a machine
+// several times slower than asked for. fsync and none are too close to tell
+// apart by timing on an SSD; that they are chosen correctly is this suite.
 
 import Testing
 import Virtualization
