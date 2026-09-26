@@ -7,6 +7,7 @@ require (
 	k8s.io/api v0.35.1
 	k8s.io/apimachinery v0.35.1
 	k8s.io/client-go v0.35.1
+	k8s.io/component-helpers v0.35.0
 	k8s.io/utils v0.0.0-20251222233032-718f0e51e6d2
 	sigs.k8s.io/controller-runtime v0.23.1
 	sigs.k8s.io/karpenter v1.14.1
@@ -86,7 +87,6 @@ require (
 	k8s.io/apiserver v0.35.0 // indirect
 	k8s.io/cloud-provider v0.35.0 // indirect
 	k8s.io/component-base v0.35.0 // indirect
-	k8s.io/component-helpers v0.35.0 // indirect
 	k8s.io/csi-translation-lib v0.35.0 // indirect
 	k8s.io/dynamic-resource-allocation v0.35.0 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect

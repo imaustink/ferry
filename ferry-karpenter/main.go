@@ -84,6 +84,13 @@ func main() {
 	// process was told where to connect.
 	ctx, op := operator.NewOperator()
 	mgr := op.Manager
+	// The Mac's own node and pods, read from the manager's cache, so machines
+	// are not made from memory the Mac's pod VMs hold. See host in shapes.go.
+	provider.kube = mgr.GetClient()
+	provider.hostNode = os.Getenv("FERRY_HOST_NODE")
+	if provider.hostNode == "" {
+		log.Printf("    host     FERRY_HOST_NODE unset; machines are bounded by the budget alone")
+	}
 	recorder := events.NewRecorder(mgr.GetEventRecorderFor("ferry-karpenter"))
 	cluster := state.NewCluster(clock.RealClock{}, mgr.GetClient(), provider)
 	store := nodeoverlay.NewInstanceTypeStore()

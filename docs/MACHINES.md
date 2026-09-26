@@ -249,6 +249,38 @@ the promise ceiling; the Mac's free memory is the real one, and a machine that
 would cross it should fail to provision rather than take the machine down with
 it.
 
+**Built, as one ledger for both modes.** The Mac node and its machines are one
+pool of RAM that the scheduler sees as separate nodes, and for a while each
+side was counted as if the other did not exist: the Mac node advertised all of
+the Mac's memory, and machines were bounded only against each other by
+`FERRY_MACHINE_LIMIT_MEMORY_GI`. Between them the cluster could be promised
+about 125% of the Mac. Now both count the same promises the scheduler counts —
+machines by `spec.memory`, the Mac's pods by their requests plus the
+`ferry-vm` overhead — against the Mac's memory, from both directions:
+
+- **The Mac node reserves what machines hold.** `ferry-machined` writes the sum
+  of every Machine's `spec.memory` to `$FERRY_RUN/machines-memory`, and the
+  Mac's kubelet subtracts it from its allocatable memory on every status update
+  (`patches/kubelet/pkg/kubelet/cm/ferry_machine_reservation_darwin.go`). A
+  machine arriving makes the Mac node smaller within about ten seconds; one
+  leaving gives the memory back.
+- **Karpenter does not make a machine out of memory the Mac's pods hold.** It
+  refuses a shape when the machines, the new shape and the requests of pods on
+  this Mac's own nodes would add up to more than the Mac node's capacity. The
+  refusal says so, instead of blaming the machine limit.
+
+The machine limit is still there, as a cap on how much machines may take in
+total. It is no longer the only thing stopping the two modes from overlapping.
+
+What is left open: nothing is enforced. A running pod on the Mac is never
+evicted because a machine arrived, and a Machine written by hand does not go
+through Karpenter, so it can take the Mac node's allocatable below what its
+pods already requested. When that happens the scheduler stops placing new pods
+there, and nothing is taken from pods already running. Promised memory
+is not the same as used memory either: this ledger adds up promises, and a Mac
+under real pressure is still something only the kubelet's eviction thresholds
+see.
+
 Two smaller accounting notes. The 128-VM cap now bounds machines rather than
 pods, which is no constraint at all at this scale — but in a mixed cluster,
 pod VMs and node VMs draw on the same 128. And each node VM has its own

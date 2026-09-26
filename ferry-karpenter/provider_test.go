@@ -110,7 +110,7 @@ func TestCreatePicksTheSmallestOfferedShape(t *testing.T) {
 		Values:   names,
 	}}
 
-	got, ok := cheapestThatFits(b, shape{}, shapesFromRequirements(claim))
+	got, ok := cheapestThatFits(b, host{}, shape{}, shapesFromRequirements(claim))
 	if !ok {
 		t.Fatal("nothing fitted an empty Mac")
 	}
@@ -139,11 +139,11 @@ func TestTheBudgetNarrowsTheChoice(t *testing.T) {
 	b := bounds{limitCPUs: 8, limitMemoryGi: 16}
 	candidates := []shape{{cpus: 2, memoryGi: 2}, {cpus: 4, memoryGi: 8}}
 
-	got, ok := cheapestThatFits(b, shape{cpus: 6, memoryGi: 12}, candidates)
+	got, ok := cheapestThatFits(b, host{}, shape{cpus: 6, memoryGi: 12}, candidates)
 	if !ok || got.cpus != 2 {
 		t.Errorf("with 2 cpus left, chose %v (ok=%v); want the 2-cpu shape", got, ok)
 	}
-	if _, ok := cheapestThatFits(b, shape{cpus: 8, memoryGi: 16}, candidates); ok {
+	if _, ok := cheapestThatFits(b, host{}, shape{cpus: 8, memoryGi: 16}, candidates); ok {
 		t.Error("a spent budget still afforded a machine")
 	}
 }
