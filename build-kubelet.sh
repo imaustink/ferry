@@ -306,6 +306,13 @@ cd "$src"
 # `kubectl top pods` works. This builds on the Mac that will run it, so the C
 # toolchain is the one already installed for Swift.
 rm -f "$out" "$out.inputs"
+# The overlay's own tests, which nothing else can run: they are darwin files
+# inside upstream's tree, so they compile only here, after the overlay is laid
+# down. Before the build, so a failing one leaves no kubelet behind. Only
+# ferry's -- TestFerry* -- since upstream's are upstream's to keep green.
+echo "==> testing the overlay"
+GOFLAGS=-mod=vendor CGO_ENABLED=1 \
+  go test -count=1 -run '^TestFerry' ./pkg/kubelet/cm/
 GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
   go build -ldflags "$ldflags" -o "$out" ./cmd/kubelet
 # What it was built from, so 'ferry build' can tell when that has moved on.

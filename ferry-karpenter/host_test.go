@@ -72,7 +72,7 @@ func TestHostCountsOnlyThisMacsLivePods(t *testing.T) {
 		podOn("in-a-machine", "machine-0", "2Gi", corev1.PodRunning),
 		podOn("elsewhere", "other-mac", "4Gi", corev1.PodRunning),
 	)
-	h, err := p.host(context.Background())
+	h, err := p.host(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,11 +92,11 @@ func TestAnUnknownHostDoesNotBlock(t *testing.T) {
 		"not yet there": hostProvider("mac"),
 		"no capacity":   hostProvider("mac", node("mac", nil, "")),
 	} {
-		h, err := p.host(context.Background())
+		h, err := p.host(context.Background(), 0)
 		if err != nil || h.known {
 			t.Errorf("%s: host %+v, %v; want unknown and no error", name, h, err)
 		}
-		if !h.fits(shape{}, shape{cpus: 64, memoryGi: 1024}) {
+		if !h.fits(shape{cpus: 64, memoryGi: 1024}) {
 			t.Errorf("%s: an unknown host refused a machine", name)
 		}
 	}
@@ -106,14 +106,46 @@ func TestAnUnknownHostDoesNotBlock(t *testing.T) {
 // pods already hold the memory.
 func TestTheMacsPodsNarrowTheChoice(t *testing.T) {
 	b := bounds{limitCPUs: 8, limitMemoryGi: 16}
-	h := host{known: true, capacity: 32 << 30, podMemory: 26 << 30}
 	candidates := []shape{{cpus: 2, memoryGi: 2}, {cpus: 4, memoryGi: 8}}
 
+	h := host{known: true, capacity: 32 << 30, podMemory: 26 << 30, machineMemory: 2 << 30}
 	got, ok := cheapestThatFits(b, h, shape{cpus: 2, memoryGi: 2}, candidates)
 	if !ok || got.memoryGi != 2 {
 		t.Errorf("with 4 GiB of the Mac left, chose %v (ok=%v); want the 2 GiB shape", got, ok)
 	}
+	h.machineMemory = 6 << 30
 	if _, ok := cheapestThatFits(b, h, shape{cpus: 2, memoryGi: 6}, candidates); ok {
 		t.Error("a machine was afforded from memory the Mac's pods hold")
+	}
+}
+
+// A hand-written machine need not be a whole number of GiB. The limit is
+// written in GiB and may round it down, but the host check has to use the
+// bytes the Mac's kubelet reserves, or the two directions of the ledger count
+// one machine differently.
+func TestMachineMemoryIsCountedInBytes(t *testing.T) {
+	m := machineWith("hand-written", "")
+	m.Object["spec"].(map[string]any)["memory"] = "1536Mi"
+	p := providerWith("", m)
+
+	committed, bytes, err := p.committed(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.memoryGi != 1 {
+		t.Errorf("the limit sees %d GiB, want the whole GiB it always has", committed.memoryGi)
+	}
+	if bytes != 1536<<20 {
+		t.Errorf("the host sees %d MiB, want 1536 as the kubelet reserves", bytes>>20)
+	}
+
+	// 29.75 GiB of pods and 1.5 of machine leave 0.75 on a 32 GiB Mac, not the
+	// 1 GiB another machine needs; counting the machine as 1 GiB would find 1.25.
+	h := host{known: true, capacity: 32 << 30, podMemory: 29<<30 + 768<<20, machineMemory: bytes}
+	if !(host{known: true, capacity: 32 << 30, podMemory: h.podMemory, machineMemory: 1 << 30}).fits(shape{cpus: 1, memoryGi: 1}) {
+		t.Fatal("this test assumes whole-GiB counting would have fitted the machine")
+	}
+	if h.fits(shape{cpus: 1, memoryGi: 1}) {
+		t.Error("a machine fitted into the half GiB the hand-written one holds")
 	}
 }

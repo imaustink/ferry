@@ -47,7 +47,10 @@ func (s shape) capacity(maxPods int64) corev1.ResourceList {
 	}
 }
 
-const gibibyte = 1024 * 1024 * 1024
+const (
+	mebibyte = 1024 * 1024
+	gibibyte = 1024 * mebibyte
+)
 
 // bounds is what a NodeClass allows a machine to be, and what the Mac will
 // spend in total.
@@ -155,14 +158,15 @@ type host struct {
 	// Unknown when there is no Mac node to read -- one not registered yet, or a
 	// provisioner started without being told its name. Then only the limit
 	// applies, which is what applied before there was a host to count.
-	known     bool
-	capacity  int64 // bytes of memory the Mac node reports
-	podMemory int64 // bytes requested by pods on the Mac's own nodes
+	known         bool
+	capacity      int64 // bytes of memory the Mac node reports
+	podMemory     int64 // bytes requested by pods on the Mac's own nodes
+	machineMemory int64 // bytes machines hold, exact, as the kubelet reserves them
 }
 
-func (h host) fits(committed shape, next shape) bool {
+func (h host) fits(next shape) bool {
 	if !h.known {
 		return true
 	}
-	return (committed.memoryGi+next.memoryGi)*gibibyte+h.podMemory <= h.capacity
+	return h.machineMemory+next.memoryGi*gibibyte+h.podMemory <= h.capacity
 }

@@ -90,11 +90,11 @@ func (p *Provider) RepairPolicies() []cloudprovider.RepairPolicy { return nil }
 
 func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
 	b := p.nodeClass.bounds()
-	committed, err := p.committed(ctx)
+	committed, machineMemory, err := p.committed(ctx)
 	if err != nil {
 		return nil, err
 	}
-	h, err := p.host(ctx)
+	h, err := p.host(ctx, machineMemory)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +105,7 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 		// had right now, with availability expressed on the offering. That is
 		// what lets it explain "this pod does not fit" rather than behaving as
 		// though the shape never existed.
-		available := b.fits(committed, s) && h.fits(committed, s)
+		available := b.fits(committed, s) && h.fits(s)
 		out = append(out, &cloudprovider.InstanceType{
 			Name:         s.name(),
 			Capacity:     s.capacity(p.nodeClass.maxPods()),
@@ -172,27 +172,39 @@ const (
 // is still booting has taken its memory from the Mac without having registered
 // a node yet, and provisioning against the node list would double-spend during
 // exactly the window Karpenter is most likely to ask again.
-func (p *Provider) committed(ctx context.Context) (shape, error) {
+//
+// Memory comes back twice. The shape is in whole GiB, which is what the limit
+// is written in; the bytes are exact, which is what ferry-machined's ledger
+// writes and the Mac's kubelet reserves. A hand-written 1536Mi machine is 1 GiB
+// to the first and 1.5 to the second, and the host check has to agree with the
+// kubelet or the two directions of the ledger count one machine differently.
+func (p *Provider) committed(ctx context.Context) (shape, int64, error) {
 	list, err := p.dynamic.Resource(machineGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return shape{}, fmt.Errorf("listing machines: %w", err)
+		return shape{}, 0, fmt.Errorf("listing machines: %w", err)
 	}
 	var total shape
+	var bytes int64
 	for i := range list.Items {
 		cpus, memoryGi := machineShape(&list.Items[i])
 		total.cpus += cpus
 		total.memoryGi += memoryGi
+		bytes += machineMemory(&list.Items[i])
 	}
-	return total, nil
+	return total, bytes, nil
+}
+
+func machineMemory(m *unstructured.Unstructured) int64 {
+	mem, _, _ := unstructured.NestedString(m.Object, "spec", "memory")
+	if q, err := resource.ParseQuantity(mem); err == nil {
+		return q.Value()
+	}
+	return 0
 }
 
 func machineShape(m *unstructured.Unstructured) (cpus, memoryGi int64) {
 	cpus, _, _ = unstructured.NestedInt64(m.Object, "spec", "cpus")
-	mem, _, _ := unstructured.NestedString(m.Object, "spec", "memory")
-	if q, err := resource.ParseQuantity(mem); err == nil {
-		memoryGi = q.Value() / gibibyte
-	}
-	return cpus, memoryGi
+	return cpus, machineMemory(m) / gibibyte
 }
 
 // host reads what the Mac's own nodes have promised their pods, and what the
@@ -206,7 +218,9 @@ func machineShape(m *unstructured.Unstructured) (cpus, memoryGi int64) {
 // Read through Karpenter's cache, which already holds every node and pod and
 // indexes pods by node, so this costs no API round trip however often
 // Karpenter asks for instance types.
-func (p *Provider) host(ctx context.Context) (host, error) {
+//
+// machineMemory is what machines already hold, in bytes, from `committed`.
+func (p *Provider) host(ctx context.Context, machineMemory int64) (host, error) {
 	if p.kube == nil || p.hostNode == "" {
 		return host{}, nil
 	}
@@ -248,7 +262,7 @@ func (p *Provider) host(ctx context.Context) (host, error) {
 			}
 		}
 	}
-	return host{known: true, capacity: capacity.Value(), podMemory: requested}, nil
+	return host{known: true, capacity: capacity.Value(), podMemory: requested, machineMemory: machineMemory}, nil
 }
 
 // --- the lifecycle --------------------------------------------------------
@@ -276,11 +290,11 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 	p.creating.Lock()
 	defer p.creating.Unlock()
 
-	committed, err := p.committed(ctx)
+	committed, machineMemory, err := p.committed(ctx)
 	if err != nil {
 		return nil, err
 	}
-	h, err := p.host(ctx)
+	h, err := p.host(ctx, machineMemory)
 	if err != nil {
 		return nil, err
 	}
@@ -307,8 +321,8 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 		// setting, and the Mac's own pods are a workload to move or shrink.
 		if b.fits(committed, candidates[0]) {
 			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
-				"the Mac has %d GiB of memory, its own pods have requested %d MiB of it and machines hold %d GiB; %s would exceed it",
-				h.capacity/gibibyte, h.podMemory/(1024*1024), committed.memoryGi, candidates[0].name()))
+				"the Mac has %d GiB of memory, its own pods have requested %d MiB of it and machines hold %d MiB; %s would exceed it",
+				h.capacity/gibibyte, h.podMemory/mebibyte, h.machineMemory/mebibyte, candidates[0].name()))
 		}
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
 			"the Mac has committed %d cpus and %d GiB to machines; %s would exceed the limit of %d cpus and %d GiB",
@@ -497,7 +511,7 @@ func shapesFromRequirements(claim *karpv1.NodeClaim) []shape {
 // is none.
 func cheapestThatFits(b bounds, h host, committed shape, candidates []shape) (shape, bool) {
 	for _, s := range candidates {
-		if b.fits(committed, s) && h.fits(committed, s) {
+		if b.fits(committed, s) && h.fits(s) {
 			return s, true
 		}
 	}
