@@ -27,6 +27,10 @@ echo "PVC: $(count pvc.log 'written on macOS') of 3 reads (macOS pod, Linux pod 
 echo "stats: $(grep -oE 'verdict: [a-zA-Z]+' "$b/stats.log" | awk '{print $2}') (container CPU and memory from the summary API)"
 "$here/run-macos-oom.sh" > "$b/oom.log" 2>&1
 echo "memory limits: $(count oom.log 'verdict: ok') of 2 (a pod over its limit OOMKilled, one within it running)"
+"$here/run-macos-restart.sh" > "$b/restart.log" 2>&1
+echo "restart: $(count restart.log 'verdict: ok') of 2 (a crash loop and a liveness failure both restart in place)"
+"$here/run-macos-subpath.sh" > "$b/subpath.log" 2>&1
+echo "subPath: $(count subpath.log 'Succeeded') of 1 (single ConfigMap key at an exact path, emptyDir subdir)"
 "$here/run-nfs-attack.sh" > "$b/nfs-attack.log" 2>&1
 echo "NFS isolation: $(count nfs-attack.log 'refused:') refused, $(count nfs-attack.log '^    open:') read -- want all refused, 0 read"
 # Last: it takes every macOS guest slot, so mac-0 goes first.

@@ -42,6 +42,7 @@ Run on the M4 Max / macOS 26.6.2 host in the README, with a 26.6.2 guest.
 | `run-macos-volumes.sh`, `run-macos-pvc.sh`, `run-macos-subpath.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods; subPath |
 | `run-macos-stats.sh` | container CPU and memory through the summary API |
 | `run-macos-oom.sh` | a pod over its memory limit is OOMKilled; one within it runs |
+| `run-macos-restart.sh` | a crash loop and a liveness failure both restart the container in place |
 | `ferry-darwin/cmd/nfsprobe`, `run-nfs-attack.sh` | one pod's attempt to read another's volumes over NFS, and its refusal |
 | `run-macos-vm.sh`, `rebuild-mode2.sh` | mode 1: a pod that is its own macOS VM, root, single-use |
 | `run-macos-autoscale.sh`, `run-macos-interop.sh` | macOS machines on demand; traffic among macOS pods, Linux pod VMs and Linux machines |
@@ -848,6 +849,29 @@ has to a working set. `ListContainerStats`, `PodSandboxStats` and
 (there is no pod process to measure, only its containers'). This is the first
 cgo in the runtime, so `ferry-darwin` is now built with `CGO_ENABLED=1` -- the
 default when building on the Mac for the Mac, which the bake already does.
+
+### Self-healing: container restart and liveness
+
+`run-macos-restart.sh`:
+
+```
+=== flaky: restartPolicy Always, crashes every ~4 s
+    restartCount=2, IP 10.190.66.7 -> 10.190.66.7 (want: climbing, IP unchanged)
+    verdict: ok
+=== live: a failing liveness probe restarts the container
+    Killing   Container c failed liveness probe, will be restarted
+    restartCount=2, phase=Running
+    verdict: ok
+```
+
+Nothing new was needed -- it is the CRI working as the kubelet expects. A
+container that exits is restarted in the **same sandbox**: the kubelet calls
+`RemoveContainer` then `CreateContainer` + `StartContainer` again, and because
+the sandbox (with its address and uid) outlives the container, the pod keeps its
+IP across restarts. A liveness probe is `ExecSync` in the container; when it
+fails the kubelet drives the same path. So a crash loop and an unhealthy pod both
+recover the way they would on Linux -- confirmation that the sandbox/container
+split is right, not that new code was written.
 
 ### Memory limits, without cgroups
 
