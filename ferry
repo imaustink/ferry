@@ -1885,6 +1885,7 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     --memory-ledger "$MACHINE_MEMORY_LEDGER" \
+    ${FERRY_MAC_IMAGE:+--mac-image "$FERRY_MAC_IMAGE"} \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2001,6 +2002,15 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
+    # macOS machines, only where there is a macOS image to make them from
+    # (experiment 39). Without one a macOS pod stays Pending, as it would with
+    # no pool at all, rather than failing a Machine it cannot boot.
+    if [ -n "${FERRY_MAC_IMAGE:-}" ]; then
+      kube apply -f "$dir/macos-nodepool.yaml" -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
+        || warn "could not install the macOS NodePools; macOS machines must be declared by hand"
+    else
+      kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
+    fi
     # The apply above has just put the NodePool back as the file has it,
     # without the default runtime's taint.
     ferry_apply_default_runtime

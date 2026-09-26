@@ -1,0 +1,29 @@
+# Whether Apple's own binaries can run inside a container root on a macOS node
+# with SIP off. On the host, with SIP on, a copy of /bin/echo was SIGKILLed
+# (a platform binary is trusted where the OS put it). If copies run here, a
+# macOS pod could have a shell.
+#
+# Run as the node (ferry.dev/debug-host), building a root of hard links to the
+# runtime's OS base plus copies of /bin/sh and /bin/ls.
+apiVersion: v1
+kind: Pod
+metadata: {name: shell-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command:
+        - /bin/sh
+        - -c
+        - |
+          R=/private/var/tmp/ferry-shell-probe; OS=/private/var/ferry/darwin/os
+          rm -rf "$R"; mkdir -p "$R/usr/lib" "$R/System/Library/dyld" "$R/bin"
+          ln "$OS/usr/lib/dyld" "$R/usr/lib/dyld"
+          for f in "$OS"/System/Library/dyld/*; do ln "$f" "$R/System/Library/dyld/"; done
+          cp /bin/sh /bin/bash /bin/zsh /bin/ls "$R/bin/"
+          echo "csrutil: $(csrutil status | sed 's/.*: //')"
+          /usr/sbin/chroot "$R" /bin/sh -c 'echo "a copied /bin/sh ran, as $0, pid $$"; /bin/ls /'
+          echo "exit $?"
+          rm -rf "$R"

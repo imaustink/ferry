@@ -1,0 +1,13 @@
+# What is still mounted under the runtime's pod roots, and how many roots are
+# left on disk: after the volume test's pods are deleted, both should be only
+# this probe's own. Run as the node (ferry.dev/debug-host).
+apiVersion: v1
+kind: Pod
+metadata: {name: mounts-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command: [/bin/sh, -c, 'echo "mounts under pod roots: $(mount | grep -c /private/var/ferry/darwin/pods/)"; mount | grep /private/var/ferry/darwin/pods/ | sed "s/ (.*//"; echo "roots on disk: $(ls -d /private/var/ferry/darwin/pods/*/ctr-* 2>/dev/null | wc -l | tr -d " ")"']

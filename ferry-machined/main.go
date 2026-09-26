@@ -33,6 +33,7 @@ var (
 	kubeconfig = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
 	kernel     = flag.String("kernel", "", "guest kernel every machine boots")
 	baseImage  = flag.String("image", "", "node disk image machines are cloned from")
+	macImage   = flag.String("mac-image", "", "macOS golden VM bundle a spec.os: darwin machine is cloned from")
 	stateDir   = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
 	apiServer  = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
 	caFile     = flag.String("ca", "", "cluster CA the machines must trust")

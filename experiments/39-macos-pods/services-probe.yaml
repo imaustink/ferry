@@ -1,0 +1,12 @@
+# What the service table is on the node, and in each container root: run as
+# the node itself (ferry.dev/debug-host).
+apiVersion: v1
+kind: Pod
+metadata: {name: services-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command: [/bin/sh, -c, "for f in /private/var/ferry/darwin/pods/*/*/lib/ferry-services; do echo \"== $f\"; cat \"$f\"; done"]

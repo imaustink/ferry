@@ -54,3 +54,37 @@ scheduling:
   # The mirror of the one above: a default of ferry-vm taints the machines.
   tolerations:
     - {key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}
+---
+# macOS pods (experiment 39), the same two modes for Darwin:
+#
+#   runtimeClassName: ferry-macos-vm      a macOS VM of its own, own XNU kernel
+#   runtimeClassName: ferry-macos-shared  a process on a macOS machine, shared kernel
+#
+# Both run on macOS machines -- Machines with spec.os: darwin, which Karpenter
+# makes from the macos and macos-vm NodePools when this Mac has a macOS image
+# (FERRY_MAC_IMAGE) -- and ferry-darwin serves both. What differs is the
+# machine: a macos-vm one is registered with maxPods 1, so its pod is the only
+# thing its kernel runs. The Mac runs two macOS guests at most, whichever kind.
+# macOS machines are always tainted, under every default, so these tolerations
+# are the only way onto one. Inert on a Mac with no macOS image.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ferry-macos-shared
+  labels: {app.kubernetes.io/managed-by: ferry}
+handler: ferry-darwin
+scheduling:
+  nodeSelector: {ferry.dev/mode: shared-macos}
+  tolerations:
+    - {key: ferry.dev/mode, operator: Equal, value: shared-macos, effect: NoSchedule}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ferry-macos-vm
+  labels: {app.kubernetes.io/managed-by: ferry}
+handler: ferry-darwin
+scheduling:
+  nodeSelector: {ferry.dev/mode: macos-vm}
+  tolerations:
+    - {key: ferry.dev/mode, operator: Equal, value: macos-vm, effect: NoSchedule}

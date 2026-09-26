@@ -1,0 +1,26 @@
+# The same lookups run as the node itself (ferry.dev/debug-host), against the
+# image's probe binary and the system's own tools, and what the resolver
+# configuration looks like right now.
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-host-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", command: [podsrv], args: [dns, kubernetes.default.svc.cluster.local]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-host-dscacheutil, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", command: [/usr/bin/dscacheutil, -q, host, -a, name, kubernetes.default.svc.cluster.local]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-host-scutil, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", command: [/usr/sbin/scutil, --dns]}]

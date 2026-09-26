@@ -1,0 +1,35 @@
+# What name resolution has inside a macOS pod: the resolver socket, and three
+# names -- one getaddrinfo answers itself, one on the internet, one only
+# cluster DNS knows. Four pods, taking away one piece at a time with
+# ferry-darwin's debug annotations, to find which one refuses.
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-probe, labels: {experiment: "39"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", args: [dns, localhost, apple.com, kubernetes.default.svc.cluster.local]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-probe-root, labels: {experiment: "39"}, annotations: {ferry.dev/debug-root: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", args: [dns, localhost, apple.com, kubernetes.default.svc.cluster.local]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-probe-nochroot, labels: {experiment: "39"}, annotations: {ferry.dev/debug-no-chroot: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", args: [dns, localhost, apple.com, kubernetes.default.svc.cluster.local]}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: dns-probe-both, labels: {experiment: "39"}, annotations: {ferry.dev/debug-root: "true", ferry.dev/debug-no-chroot: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers: [{name: probe, image: "example.com/podsrv-darwin:3", args: [dns, localhost, apple.com, kubernetes.default.svc.cluster.local]}]

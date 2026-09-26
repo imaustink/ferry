@@ -1,0 +1,645 @@
+package main
+
+// The CRI RuntimeService, run on a macOS node.
+//
+// A sandbox is an address, a uid and a directory. A container is a process:
+// chrooted into a root of hard links (the node's dyld and shared cache, the
+// image's files, the address shim), running as the pod's uid, with
+// podnet.dylib putting its wildcard binds and outbound connections on the
+// pod's address. Its output is written in the CRI log format to the path the
+// kubelet names, which is all `kubectl logs` needs.
+//
+// The listings honour their filters, as fakecri's did: the kubelet derives
+// which containers belong to which pod from them.
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubelet/pkg/cri/streaming"
+)
+
+const handler = "ferry-darwin"
+
+type sandbox struct {
+	id     string
+	meta   *runtimeapi.PodSandboxMetadata
+	labels map[string]string
+	anns   map[string]string
+	logDir string
+	addr   podAddr
+	made   int64
+	ready  bool
+}
+
+type container struct {
+	id        string
+	sandboxID string
+	meta      *runtimeapi.ContainerMetadata
+	image     *image
+	labels    map[string]string
+	anns      map[string]string
+	logPath   string
+	root      string
+	argv      []string
+	env       []string
+	workdir   string
+	mounts    []volumeMount
+	// As the kubelet sent them: returned in ContainerStatus, which is where it
+	// looks up the host path of /dev/termination-log to read a message from.
+	criMounts []*runtimeapi.Mount
+	// stdio, for kubectl attach: what the pod asked for, and what it got.
+	tty, openStdin, stdinOnce bool
+	stdin                     io.WriteCloser
+	pty                       *os.File
+	fan                       fanout
+
+	mu       sync.Mutex
+	state    runtimeapi.ContainerState
+	made     int64
+	started  int64
+	finished int64
+	exit     int32
+	reason   string
+	message  string
+	cmd      *exec.Cmd
+	done     chan struct{}
+}
+
+type runtimeSvc struct {
+	runtimeapi.UnimplementedRuntimeServiceServer
+	node   *node
+	images *imageSvc
+	mu     sync.Mutex
+	sboxes map[string]*sandbox
+	ctrs   map[string]*container
+	n      int
+	// podVMOwner is the uid of the one pod a -pod-vm machine is for.
+	podVMOwner string
+	services   *serviceTable // nil when not given an API server
+	streaming  streaming.Server
+	// The kubelet's pods directory, exported over NFS; empty leaves volumes off.
+	volumesRoots []string
+	nfsReady     chan struct{} // closed once nfsd serves volumesRoots
+	nfsErr       error
+	// The Mac's PersistentVolume share, served per volume by pv.
+	hostVolumes string
+	pv          pvServers
+}
+
+// roots is every container root, for the service table to be written into.
+func (r *runtimeSvc) roots() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, c := range r.ctrs {
+		out = append(out, c.root)
+	}
+	return out
+}
+
+func (r *runtimeSvc) nextID(prefix string) string {
+	r.n++
+	return fmt.Sprintf("%s-%06d", prefix, r.n)
+}
+
+func (r *runtimeSvc) Version(_ context.Context, _ *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
+	return &runtimeapi.VersionResponse{Version: "0.1.0", RuntimeName: "ferry-darwin", RuntimeVersion: "0.1.0", RuntimeApiVersion: "v1"}, nil
+}
+
+func (r *runtimeSvc) Status(_ context.Context, _ *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
+	// Not network-ready until the node has its slice of the pod network, so
+	// the kubelet holds pods back rather than have them fail for an address --
+	// the same signal a Linux node's CNI gives before its config exists.
+	network := &runtimeapi.RuntimeCondition{Type: runtimeapi.NetworkReady, Status: r.node.networkReady()}
+	if !network.Status {
+		network.Reason, network.Message = "NoPodCIDR", "waiting for this node's pod CIDR"
+	}
+	return &runtimeapi.StatusResponse{
+		Status: &runtimeapi.RuntimeStatus{Conditions: []*runtimeapi.RuntimeCondition{
+			{Type: runtimeapi.RuntimeReady, Status: true},
+			network,
+		}},
+		RuntimeHandlers: []*runtimeapi.RuntimeHandler{{Name: handler, Features: &runtimeapi.RuntimeHandlerFeatures{}}},
+	}, nil
+}
+
+// MARK: sandboxes
+
+func (r *runtimeSvc) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSandboxRequest) (*runtimeapi.RunPodSandboxResponse, error) {
+	// The CRI says an unknown handler is refused; a Linux pod that reached
+	// this node would otherwise be unpacked and fail at exec.
+	if h := req.RuntimeHandler; h != "" && h != handler {
+		return nil, fmt.Errorf("this macOS node serves RuntimeClass handler %q, not %q", handler, h)
+	}
+	r.mu.Lock()
+	// A pod's VM runs one pod, ever: the second would inherit what the first
+	// did as root. ferry-machined taints the node once a pod is bound to it;
+	// this is for a pod bound in the moment before that. The same pod again --
+	// the kubelet recreating its sandbox -- is still its own.
+	if r.node.podVM && req.Config != nil && req.Config.Metadata != nil {
+		uid := req.Config.Metadata.Uid
+		if r.podVMOwner != "" && r.podVMOwner != uid {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("this macOS VM was pod %s's, and runs no other pod", r.podVMOwner)
+		}
+		r.podVMOwner = uid
+	}
+	id := r.nextID("sandbox")
+	r.mu.Unlock()
+	addr, err := r.node.allocate(id)
+	if err != nil {
+		return nil, err
+	}
+	s := &sandbox{id: id, addr: addr, made: time.Now().UnixNano(), ready: true}
+	if c := req.Config; c != nil {
+		s.meta, s.labels, s.anns, s.logDir = c.Metadata, c.Labels, c.Annotations, c.LogDirectory
+	}
+	if err := os.MkdirAll(filepath.Join(r.node.state, "pods", id), 0o755); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	r.sboxes[id] = s
+	r.mu.Unlock()
+	if s.meta != nil {
+		log.Printf("sandbox %s: pod %s/%s at %s, uid %d", id, s.meta.Namespace, s.meta.Name, addr.ip, addr.uid)
+	}
+	return &runtimeapi.RunPodSandboxResponse{PodSandboxId: id}, nil
+}
+
+func (r *runtimeSvc) sandboxState(s *sandbox) runtimeapi.PodSandboxState {
+	if s.ready {
+		return runtimeapi.PodSandboxState_SANDBOX_READY
+	}
+	return runtimeapi.PodSandboxState_SANDBOX_NOTREADY
+}
+
+func (r *runtimeSvc) PodSandboxStatus(_ context.Context, req *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.sboxes[req.PodSandboxId]
+	if !ok {
+		return nil, fmt.Errorf("sandbox %q not found", req.PodSandboxId)
+	}
+	return &runtimeapi.PodSandboxStatusResponse{Status: &runtimeapi.PodSandboxStatus{
+		Id: s.id, Metadata: s.meta, State: r.sandboxState(s), CreatedAt: s.made,
+		Network: &runtimeapi.PodSandboxNetworkStatus{Ip: s.addr.ip},
+		Linux:   &runtimeapi.LinuxPodSandboxStatus{Namespaces: &runtimeapi.Namespace{Options: &runtimeapi.NamespaceOption{}}},
+		Labels:  s.labels, Annotations: s.anns, RuntimeHandler: handler,
+	}}, nil
+}
+
+func (r *runtimeSvc) ListPodSandbox(_ context.Context, req *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f := req.GetFilter()
+	var items []*runtimeapi.PodSandbox
+	for _, s := range r.sboxes {
+		st := r.sandboxState(s)
+		if f != nil {
+			if f.Id != "" && f.Id != s.id {
+				continue
+			}
+			if w := f.GetState(); w != nil && w.State != st {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, s.labels) {
+				continue
+			}
+		}
+		items = append(items, &runtimeapi.PodSandbox{
+			Id: s.id, Metadata: s.meta, State: st, CreatedAt: s.made,
+			Labels: s.labels, Annotations: s.anns, RuntimeHandler: handler,
+		})
+	}
+	return &runtimeapi.ListPodSandboxResponse{Items: items}, nil
+}
+
+func (r *runtimeSvc) StopPodSandbox(_ context.Context, req *runtimeapi.StopPodSandboxRequest) (*runtimeapi.StopPodSandboxResponse, error) {
+	r.mu.Lock()
+	s, ok := r.sboxes[req.PodSandboxId]
+	var ctrs []*container
+	for _, c := range r.ctrs {
+		if c.sandboxID == req.PodSandboxId {
+			ctrs = append(ctrs, c)
+		}
+	}
+	r.mu.Unlock()
+	for _, c := range ctrs {
+		c.stop(10 * time.Second)
+	}
+	if ok && s.ready {
+		r.node.release(s.id)
+		s.ready = false
+	}
+	return &runtimeapi.StopPodSandboxResponse{}, nil
+}
+
+func (r *runtimeSvc) RemovePodSandbox(ctx context.Context, req *runtimeapi.RemovePodSandboxRequest) (*runtimeapi.RemovePodSandboxResponse, error) {
+	_, _ = r.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: req.PodSandboxId})
+	r.mu.Lock()
+	var ctrs []string
+	for id, c := range r.ctrs {
+		if c.sandboxID == req.PodSandboxId {
+			ctrs = append(ctrs, id)
+		}
+	}
+	r.mu.Unlock()
+	for _, id := range ctrs {
+		_, _ = r.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: id})
+	}
+	r.mu.Lock()
+	delete(r.sboxes, req.PodSandboxId)
+	r.mu.Unlock()
+	_ = os.RemoveAll(filepath.Join(r.node.state, "pods", req.PodSandboxId))
+	return &runtimeapi.RemovePodSandboxResponse{}, nil
+}
+
+// MARK: containers
+
+func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateContainerRequest) (*runtimeapi.CreateContainerResponse, error) {
+	cfg := req.Config
+	r.mu.Lock()
+	s, ok := r.sboxes[req.PodSandboxId]
+	id := r.nextID("ctr")
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("sandbox %q not found", req.PodSandboxId)
+	}
+	img := r.images.lookup(cfg.GetImage().GetImage())
+	if img == nil {
+		return nil, fmt.Errorf("image %q is not on this node", cfg.GetImage().GetImage())
+	}
+	mounts, err := r.planMounts(cfg.Mounts)
+	if err != nil {
+		return nil, err
+	}
+
+	// The root: the node's OS files and the image's, hard links both, plus a
+	// /dev and a /tmp of its own.
+	root := filepath.Join(r.node.state, "pods", s.id, id)
+	if err := linkTree(filepath.Join(r.node.state, "os"), root); err != nil {
+		return nil, fmt.Errorf("root: os: %w", err)
+	}
+	if err := linkTree(img.rootfs, root); err != nil {
+		return nil, fmt.Errorf("root: image: %w", err)
+	}
+	for _, d := range []string{"dev", "tmp"} {
+		_ = os.MkdirAll(filepath.Join(root, d), 0o755)
+	}
+	_ = os.Chmod(filepath.Join(root, "tmp"), 0o1777)
+	// Name resolution. libSystem's resolver asks mDNSResponder over a UNIX
+	// socket at /var/run/mDNSResponder, and inside a chroot that path is
+	// missing -- so a pod could reach a Service by address and not resolve its
+	// name, while the node resolved the same name fine. A hard link to the
+	// socket is the socket, so the pod asks the node's resolver, and cluster
+	// names go to cluster DNS by /etc/resolver. If mDNSResponder restarts it
+	// makes a new socket and this link goes stale; not handled.
+	_ = os.MkdirAll(filepath.Join(root, "var", "run"), 0o755)
+	if err := os.Link("/private/var/run/mDNSResponder", filepath.Join(root, "var", "run", "mDNSResponder")); err != nil {
+		log.Printf("container %s: no name resolution: %v", id, err)
+	}
+	if r.services != nil {
+		r.services.install(root)
+	}
+
+	// Kubernetes' command replaces the entrypoint and its args replace the
+	// cmd, as for any image.
+	argv := append(append([]string{}, img.entrypoint...), img.cmd...)
+	if len(cfg.Command) > 0 {
+		argv = append(append([]string{}, cfg.Command...), cfg.Args...)
+	} else if len(cfg.Args) > 0 {
+		argv = append(append([]string{}, img.entrypoint...), cfg.Args...)
+	}
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("container %s has no command and its image no entrypoint", cfg.GetMetadata().GetName())
+	}
+	env := append([]string{"PATH=/bin:/usr/bin", "HOME=/tmp", "TMPDIR=/tmp"}, img.env...)
+	for _, kv := range cfg.Envs {
+		env = append(env, kv.Key+"="+kv.Value)
+	}
+	env = append(env, "DYLD_INSERT_LIBRARIES=/"+shimInRoot, "FERRY_POD_IP="+s.addr.ip)
+	if cc := r.node.clusterCIDR; cc != nil {
+		env = append(env, "FERRY_CLUSTER_CIDR="+cc.String())
+	}
+	workdir := img.workdir
+	if cfg.WorkingDir != "" {
+		workdir = cfg.WorkingDir
+	}
+	if workdir == "" {
+		workdir = "/"
+	}
+
+	c := &container{
+		id: id, sandboxID: s.id, meta: cfg.Metadata, image: img, labels: cfg.Labels, anns: cfg.Annotations,
+		logPath: filepath.Join(s.logDir, cfg.LogPath), root: root, argv: argv, env: env, workdir: workdir,
+		mounts: mounts, criMounts: cfg.Mounts,
+		tty: cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
+		state: runtimeapi.ContainerState_CONTAINER_CREATED, made: time.Now().UnixNano(),
+	}
+	r.mu.Lock()
+	r.ctrs[id] = c
+	r.mu.Unlock()
+	log.Printf("container %s: %s in %s, %v", id, cfg.GetMetadata().GetName(), s.id, argv)
+	return &runtimeapi.CreateContainerResponse{ContainerId: id}, nil
+}
+
+// resolve finds argv[0] inside the root the way a shell would, since the
+// kernel resolves the path after chroot but exec needs a path to hand it.
+func (c *container) resolve() (string, error) {
+	name := c.argv[0]
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+	for _, dir := range []string{"/bin", "/usr/bin", "/usr/local/bin"} {
+		if st, err := os.Stat(filepath.Join(c.root, dir, name)); err == nil && !st.IsDir() {
+			return dir + "/" + name, nil
+		}
+	}
+	return "", fmt.Errorf("%s: not found in the image", name)
+}
+
+func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartContainerRequest) (*runtimeapi.StartContainerResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	var s *sandbox
+	if ok {
+		s = r.sboxes[c.sandboxID]
+	}
+	r.mu.Unlock()
+	if !ok || s == nil {
+		return nil, fmt.Errorf("container %q not found", req.ContainerId)
+	}
+	path, err := c.resolve()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.volumesUp(c.mounts); err != nil {
+		return nil, err
+	}
+	if err := r.mountVolumes(c.root, c.mounts); err != nil {
+		unmountVolumes(c.root, c.mounts)
+		return nil, err
+	}
+	if err := makeDev(filepath.Join(c.root, "dev")); err != nil {
+		return nil, err
+	}
+	if err := linkDevFiles(c.root, c.mounts); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(c.logPath), 0o755); err != nil {
+		return nil, err
+	}
+	logf, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := &exec.Cmd{Path: path, Args: c.argv, Env: c.env, Dir: c.workdir}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Chroot:     c.root,
+		Credential: &syscall.Credential{Uid: uint32(s.addr.uid), Gid: uint32(s.addr.uid)},
+		Setpgid:    true,
+	}
+	// Debugging knobs, by pod annotation, for telling which of the pieces a
+	// failure comes from. Not a feature: each one takes an isolation away.
+	if s.anns["ferry.dev/debug-root"] == "true" {
+		cmd.SysProcAttr.Credential = nil
+	}
+	if s.anns["ferry.dev/debug-no-chroot"] == "true" {
+		cmd.SysProcAttr.Chroot = ""
+		cmd.Path = filepath.Join(c.root, path)
+		cmd.Dir = c.root
+		cmd.Env = append(cmd.Env, "DYLD_INSERT_LIBRARIES="+filepath.Join(c.root, shimInRoot))
+	}
+	// The command as the node's own root process would run it: no chroot, no
+	// uid, no shim, the runtime's environment. An absolute argv[0] is a node
+	// path; a relative one is the image's binary.
+	if s.anns["ferry.dev/debug-host"] == "true" {
+		cmd.SysProcAttr.Chroot, cmd.SysProcAttr.Credential = "", nil
+		cmd.Path, cmd.Dir, cmd.Env = c.argv[0], "/", os.Environ()
+		if !strings.HasPrefix(c.argv[0], "/") {
+			cmd.Path = filepath.Join(c.root, "bin", c.argv[0])
+		}
+	}
+	w := &criLog{f: logf}
+	c.cmd = cmd
+	outputs, err := c.startStdio(cmd.Start, func() {
+		// A terminal makes the process a session leader, which a process
+		// group of its own already is; the two cannot both be asked for.
+		cmd.SysProcAttr.Setpgid = false
+		cmd.SysProcAttr.Setsid, cmd.SysProcAttr.Setctty = true, true
+	})
+	if err != nil {
+		logf.Close()
+		return nil, fmt.Errorf("start %v: %w", c.argv, err)
+	}
+	c.mu.Lock()
+	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
+	c.mu.Unlock()
+	log.Printf("container %s: started pid %d as uid %d at %s (tty %v, stdin %v)", c.id, cmd.Process.Pid, s.addr.uid, s.addr.ip, c.tty, c.openStdin)
+
+	var streams sync.WaitGroup
+	for i, r := range outputs {
+		stream := "stdout"
+		if i == 1 {
+			stream = "stderr"
+		}
+		streams.Add(1)
+		go func(stream string, r io.Reader) { w.pump(stream, r, &c.fan); streams.Done() }(stream, r)
+	}
+	go func() {
+		streams.Wait()
+		err := cmd.Wait()
+		logf.Close()
+		c.mu.Lock()
+		c.state, c.finished = runtimeapi.ContainerState_CONTAINER_EXITED, time.Now().UnixNano()
+		c.exit = int32(cmd.ProcessState.ExitCode())
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			c.exit = 128 + int32(ws.Signal())
+		}
+		// No message of the runtime's own: the kubelet fills an empty one
+		// from the container's termination-log file, and "exit status 3"
+		// here would be what the user reads instead of what the container
+		// wrote.
+		c.reason = "Completed"
+		if c.exit != 0 {
+			c.reason = "Error"
+		}
+		_ = err
+		close(c.done)
+		c.mu.Unlock()
+		unmountDev(c.root)
+		log.Printf("container %s: exited %d", c.id, c.exit)
+	}()
+	return &runtimeapi.StartContainerResponse{}, nil
+}
+
+// criLog writes a container's output in the format the kubelet reads back for
+// `kubectl logs`: "<RFC3339Nano> <stream> F <line>".
+type criLog struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+func (c *container) stop(timeout time.Duration) {
+	c.mu.Lock()
+	cmd, done, running := c.cmd, c.done, c.state == runtimeapi.ContainerState_CONTAINER_RUNNING
+	c.mu.Unlock()
+	if !running || cmd == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+	}
+}
+
+func (r *runtimeSvc) StopContainer(_ context.Context, req *runtimeapi.StopContainerRequest) (*runtimeapi.StopContainerResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	r.mu.Unlock()
+	if ok {
+		t := time.Duration(req.Timeout) * time.Second
+		if t <= 0 {
+			t = 2 * time.Second
+		}
+		c.stop(t)
+	}
+	return &runtimeapi.StopContainerResponse{}, nil
+}
+
+func (r *runtimeSvc) RemoveContainer(_ context.Context, req *runtimeapi.RemoveContainerRequest) (*runtimeapi.RemoveContainerResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	delete(r.ctrs, req.ContainerId)
+	r.mu.Unlock()
+	if ok {
+		c.stop(2 * time.Second)
+		// /dev is unmounted before the tree goes: removing a root with devfs
+		// still on it would walk into the node's device nodes.
+		unmountDev(c.root)
+		unmountVolumes(c.root, c.mounts)
+		if out, err := exec.Command("mount").Output(); err == nil && strings.Contains(string(out), c.root) {
+			return nil, fmt.Errorf("container %s: %s is still mounted", c.id, c.root)
+		}
+		_ = os.RemoveAll(c.root)
+	}
+	return &runtimeapi.RemoveContainerResponse{}, nil
+}
+
+func (r *runtimeSvc) status(c *container) *runtimeapi.ContainerStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return &runtimeapi.ContainerStatus{
+		Id: c.id, Metadata: c.meta, State: c.state,
+		CreatedAt: c.made, StartedAt: c.started, FinishedAt: c.finished, ExitCode: c.exit,
+		Reason: c.reason, Message: c.message,
+		Image: &runtimeapi.ImageSpec{Image: c.image.id}, ImageRef: c.image.id, ImageId: c.image.id,
+		Labels: c.labels, Annotations: c.anns, LogPath: c.logPath, Mounts: c.criMounts,
+	}
+}
+
+func (r *runtimeSvc) ContainerStatus(_ context.Context, req *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("container %q not found", req.ContainerId)
+	}
+	return &runtimeapi.ContainerStatusResponse{Status: r.status(c)}, nil
+}
+
+func (r *runtimeSvc) ListContainers(_ context.Context, req *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+	r.mu.Lock()
+	var all []*container
+	for _, c := range r.ctrs {
+		all = append(all, c)
+	}
+	r.mu.Unlock()
+	f := req.GetFilter()
+	var out []*runtimeapi.Container
+	for _, c := range all {
+		st := r.status(c)
+		if f != nil {
+			if f.Id != "" && f.Id != c.id {
+				continue
+			}
+			if f.PodSandboxId != "" && f.PodSandboxId != c.sandboxID {
+				continue
+			}
+			if w := f.GetState(); w != nil && w.State != st.State {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, c.labels) {
+				continue
+			}
+		}
+		out = append(out, &runtimeapi.Container{
+			Id: c.id, PodSandboxId: c.sandboxID, Metadata: c.meta,
+			Image: st.Image, ImageRef: st.ImageRef, ImageId: st.ImageId,
+			State: st.State, CreatedAt: c.made, Labels: c.labels, Annotations: c.anns,
+		})
+	}
+	return &runtimeapi.ListContainersResponse{Containers: out}, nil
+}
+
+// UpdateRuntimeConfig is how the kubelet passes on the pod CIDR
+// kube-controller-manager gave this node.
+func (r *runtimeSvc) UpdateRuntimeConfig(_ context.Context, req *runtimeapi.UpdateRuntimeConfigRequest) (*runtimeapi.UpdateRuntimeConfigResponse, error) {
+	if err := r.node.setPodCIDR(req.GetRuntimeConfig().GetNetworkConfig().GetPodCidr()); err != nil {
+		return nil, err
+	}
+	return &runtimeapi.UpdateRuntimeConfigResponse{}, nil
+}
+
+func (r *runtimeSvc) RuntimeConfig(_ context.Context, _ *runtimeapi.RuntimeConfigRequest) (*runtimeapi.RuntimeConfigResponse, error) {
+	return &runtimeapi.RuntimeConfigResponse{}, nil
+}
+
+func (r *runtimeSvc) ReopenContainerLog(_ context.Context, _ *runtimeapi.ReopenContainerLogRequest) (*runtimeapi.ReopenContainerLogResponse, error) {
+	return &runtimeapi.ReopenContainerLogResponse{}, nil
+}
+
+// Stats are empty: there is no per-pod accounting without cgroups. The
+// kubelet tolerates it, as it did fakecri's.
+func (r *runtimeSvc) ContainerStats(_ context.Context, _ *runtimeapi.ContainerStatsRequest) (*runtimeapi.ContainerStatsResponse, error) {
+	return &runtimeapi.ContainerStatsResponse{}, nil
+}
+func (r *runtimeSvc) ListContainerStats(_ context.Context, _ *runtimeapi.ListContainerStatsRequest) (*runtimeapi.ListContainerStatsResponse, error) {
+	return &runtimeapi.ListContainerStatsResponse{}, nil
+}
+func (r *runtimeSvc) PodSandboxStats(_ context.Context, _ *runtimeapi.PodSandboxStatsRequest) (*runtimeapi.PodSandboxStatsResponse, error) {
+	return &runtimeapi.PodSandboxStatsResponse{}, nil
+}
+func (r *runtimeSvc) ListPodSandboxStats(_ context.Context, _ *runtimeapi.ListPodSandboxStatsRequest) (*runtimeapi.ListPodSandboxStatsResponse, error) {
+	return &runtimeapi.ListPodSandboxStatsResponse{}, nil
+}
+func (r *runtimeSvc) ListMetricDescriptors(_ context.Context, _ *runtimeapi.ListMetricDescriptorsRequest) (*runtimeapi.ListMetricDescriptorsResponse, error) {
+	return &runtimeapi.ListMetricDescriptorsResponse{}, nil
+}
+func (r *runtimeSvc) ListPodSandboxMetrics(_ context.Context, _ *runtimeapi.ListPodSandboxMetricsRequest) (*runtimeapi.ListPodSandboxMetricsResponse, error) {
+	return &runtimeapi.ListPodSandboxMetricsResponse{}, nil
+}
+
+func matchLabels(want, have map[string]string) bool {
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
+}

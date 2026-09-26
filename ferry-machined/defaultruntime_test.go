@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -58,6 +59,49 @@ func TestDefaultRuntimeTaintsTheOtherKind(t *testing.T) {
 		}
 		if got := modeTaintOf(t, c, "m0"); got != tc.machine {
 			t.Errorf("policy %q: machine taint %q, want %q", tc.policy, got, tc.machine)
+		}
+	}
+}
+
+// A macOS machine is tainted under every policy, and gets its taint back if
+// something takes it off: the default chooses between the Linux-running kinds,
+// and a pod that names no RuntimeClass must never land on XNU.
+func TestMacOSMachineKeepsItsTaint(t *testing.T) {
+	for _, policy := range []string{runtimeVM, runtimeShared, "", "something-else"} {
+		c := &controller{kube: fake.NewSimpleClientset(
+			policyMap(policy), node("mac", modeVMPerPod), node("darwin-0", modeSharedMacOS),
+			node("darwin-vm-0", modeMacOSVM))}
+		c.reconcileDefaultRuntime(context.Background())
+		if got := modeTaintOf(t, c, "darwin-0"); got != "shared-macos;" {
+			t.Errorf("policy %q: macOS machine taint %q, want shared-macos;", policy, got)
+		}
+		if got := modeTaintOf(t, c, "darwin-vm-0"); got != "macos-vm;" {
+			t.Errorf("policy %q: macOS VM machine taint %q, want macos-vm;", policy, got)
+		}
+	}
+}
+
+func TestMachineOSAndMode(t *testing.T) {
+	for _, tc := range []struct{ os, isolation, wantOS, wantMode string }{
+		{"", "", "linux", modeShared},
+		{"linux", "", "linux", modeShared},
+		{"linux", "vm", "linux", modeShared}, // isolation is a macOS field
+		{"darwin", "", "darwin", modeSharedMacOS},
+		{"darwin", "shared", "darwin", modeSharedMacOS},
+		{"darwin", "vm", "darwin", modeMacOSVM},
+	} {
+		item := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
+		if tc.os != "" {
+			item.Object["spec"].(map[string]any)["os"] = tc.os
+		}
+		if tc.isolation != "" {
+			item.Object["spec"].(map[string]any)["isolation"] = tc.isolation
+		}
+		if got := machineOS(item); got != tc.wantOS {
+			t.Errorf("spec.os %q: machineOS %q, want %q", tc.os, got, tc.wantOS)
+		}
+		if got := modeFor(item); got != tc.wantMode {
+			t.Errorf("spec.os %q: modeFor %q, want %q", tc.os, got, tc.wantMode)
 		}
 	}
 }
