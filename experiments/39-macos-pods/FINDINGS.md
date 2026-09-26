@@ -39,7 +39,7 @@ Run on the M4 Max / macOS 26.6.2 host in the README, with a 26.6.2 guest.
 | `macos-node/`, `bake-macos-node.sh` | the macOS machine image: boot daemon, kubelet config, baked OS base |
 | `macos-machine.yaml`, `run-macos-machine.sh`, `cycle-macos-machine.sh`, `machines-on.sh` | a macOS Machine through ferry-machined and ferry-node, and traffic to and from mode 1 |
 | `run-macos-exec.sh`, `run-macos-attach.sh` | exec, port-forward, probes, a shell; attach, stdin, a terminal |
-| `run-macos-volumes.sh`, `run-macos-pvc.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods |
+| `run-macos-volumes.sh`, `run-macos-pvc.sh`, `run-macos-subpath.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods; subPath |
 | `run-macos-stats.sh` | container CPU and memory through the summary API |
 | `run-macos-oom.sh` | a pod over its memory limit is OOMKilled; one within it runs |
 | `ferry-darwin/cmd/nfsprobe`, `run-nfs-attack.sh` | one pod's attempt to read another's volumes over NFS, and its refusal |
@@ -1033,8 +1033,14 @@ root can bind a reserved port, and a pod's processes are not root; the runtime's
 own mounts are the kernel's NFS client, which is. After the fix the same attack
 reads nothing.
 
-Not done: `subPath`, fsGroup and ownership semantics beyond `-mapall=root`, and
-block volumes.
+**subPath works unchanged** (`run-macos-subpath.sh`): the kubelet resolves the
+subPath before the CRI and passes the joined path as the mount source, so a
+single ConfigMap key lands at an exact file (hard-linked, and its siblings do
+not appear beside it) and a subdirectory of an emptyDir mounts alone (NFS). No
+runtime code was needed.
+
+Not done: fsGroup and ownership semantics beyond `-mapall=root`, and block
+volumes.
 
 ### All three kinds of pod, one network
 
