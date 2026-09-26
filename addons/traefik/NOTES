@@ -1,0 +1,15 @@
+Traefik answers on this Mac's ports 80 and 443, at localhost and at the Mac's
+LAN address, with no root. An Ingress reaches it with a Host header:
+
+  curl -H 'Host: your.host' http://localhost/
+  curl -k -H 'Host: your.host' https://localhost/
+
+or with a line in /etc/hosts for that name. HTTPS uses the Secret an Ingress
+names under spec.tls, and Traefik's own certificate otherwise. Its
+IngressClass, traefik, is the default, so an Ingress that names no class is
+served here.
+
+Only one ferry cluster on this Mac -- and one controller in it -- can have
+port 80. With ingress-nginx enabled too, whichever came second says PortInUse
+(kubectl -n traefik describe svc traefik) and is reached on its node port, and
+an Ingress that names no class goes to whichever was enabled last.
