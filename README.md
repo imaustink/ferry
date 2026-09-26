@@ -425,6 +425,7 @@ tests/                               run.sh: shell, Go and Swift tests, no clust
 docs/                                HANDOFF.md (the full picture), INSTALL.md,
                                      RUNTIMES.md (choosing ferry-vm or ferry-shared),
                                      MACHINES.md (mode 2), SERVICES.md,
+                                     EXTERNAL-ACCESS.md (routers, several Macs),
                                      BENCHMARKING.md (how to measure this honestly)
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
 experiments/02-node-registration/    the Mac as a node, against the real API
