@@ -41,6 +41,13 @@ let package = Package(
             plugins: [
                 .plugin(name: "GRPCProtobufGenerator", package: "grpc-swift-protobuf")
             ]
-        )
+        ),
+        // `swift test`, run by tests/run.sh. An executable target can be
+        // imported @testable on macOS, so the tests reach the runtime's own
+        // types without a library split.
+        .testTarget(
+            name: "ferry-cri-tests",
+            dependencies: ["ferry-cri"]
+        ),
     ]
 )

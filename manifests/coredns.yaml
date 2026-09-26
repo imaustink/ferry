@@ -90,6 +90,11 @@ spec:
       # is its .2 -- and a runtime can only hand out its own node's. Scheduled
       # anywhere else CoreDNS lands on that node's .2, which nothing asks.
       nodeSelector: {kubernetes.io/hostname: "__DNS_NODE__"}
+      # A default runtime of ferry-shared taints the Macs so a pod that names
+      # nothing goes to a machine. This is the one pod that has to stay: the
+      # address every Mac kubelet was told is DNS is on this node.
+      tolerations:
+        - {key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}
       containers:
         - name: coredns
           image: __COREDNS_IMAGE__

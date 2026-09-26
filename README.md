@@ -34,7 +34,7 @@ with the others shut down — and with Docker Desktop stopped for ferry's runs,
 because ferry does not use it and leaving 15.6 GiB of idle VM on the machine
 is not the baseline ferry actually has.
 
-| | ferry | ferry `relaxed` | mode 2 | mode 2 `relaxed` | kind | minikube |
+| | ferry | ferry `disposable` | mode 2 | mode 2 `disposable` | kind | minikube |
 |:--|--:|--:|--:|--:|--:|--:|
 | a pod is | its own VM | its own VM | a container | a container | a container | a container |
 | needs Docker Desktop | **no** | **no** | **no** | **no** | yes | yes |
@@ -49,12 +49,13 @@ is not the baseline ferry actually has.
 | idle CPU | **2.7%** | **2.6%** | 8.3% | 6.8% | 29.4% | 27.8% |
 | per pod | 240 MiB | 239 MiB | **14 MiB** | **14 MiB** | 20 MiB | 20 MiB |
 
-`relaxed` is `ferry up --durability relaxed`, explained below. The four ferry
+`disposable` is `ferry up --disposable` — durability `process-crash`, which
+used to be called `relaxed` — explained below. The four ferry
 columns are two choices, not four products: a pod is either its own VM or a
 container on a shared one, and writes either reach the disk before they are
 acknowledged or they do not.
 
-**Relaxed buys mode 2 a great deal and mode 1 almost nothing.** A 20-pod
+**Disposable buys mode 2 a great deal and mode 1 almost nothing.** A 20-pod
 burst goes 1.19 s to 0.77 s on mode 2 and 3.39 s to 3.27 s on mode 1. That is
 the honest shape of it: mode 1's pod start is a virtual machine booting, and
 no disk barrier was ever the thing holding it up. If you want the fast numbers
@@ -111,12 +112,12 @@ one guest, while mode 2's guest holds only the node, its control plane being
 the native processes already counted in the host row.
 
 **Where ferry is slower, it is slower.** kind starts 20 pods faster than
-ferry mode 2 at full durability — 0.89 s against 1.19 s — and deletes a
+ferry mode 2 at `power-loss` durability — 0.89 s against 1.19 s — and deletes a
 cluster a shade faster than mode 2 does. Mode 2 also takes twice as long as
 mode 1 to create, because it is a mode 1 control plane with a Linux node
-booted on top of it. Relaxed durability turns the burst around (0.77 s) and
-is the setting to reach for if that row is the one you care about, but at full
-durability the row belongs to kind.
+booted on top of it. `--disposable` turns the burst around (0.77 s) and
+is the setting to reach for if that row is the one you care about, but at
+`power-loss` durability the row belongs to kind.
 
 Deleting used to be on that list and is not any more, which took three
 rounds. Both it and mode 2's creation were mostly waiting rather than work:
@@ -146,7 +147,7 @@ background, and karpenter's port is shifted with the rest.
 The row that says **writes survive power loss** is the one to read first,
 because it is the only row where kind and minikube have no answer.
 
-`ferry up` defaults to **full** durability: every etcd commit reaches the SSD
+`ferry up` defaults to durability **`power-loss`**: every etcd commit reaches the SSD
 before it is acknowledged. Nothing else in this table does that. kind and
 minikube run etcd inside Docker Desktop's Linux VM, where the same call
 reaches a disk image on the host — acknowledged, not yet durable. Pull the
@@ -155,11 +156,11 @@ power mid-write and they can lose commits the API server already confirmed.
 That guarantee is not free, and it is not always wanted:
 
 ```sh
-ferry up                        # full durability, the default
-ferry up --durability relaxed   # speed instead, remembered for this cluster
+ferry up                        # durability power-loss, the default
+ferry up --disposable           # durability process-crash: speed instead, remembered
 ```
 
-| | mode 2 `full` | mode 2 `relaxed` | mode 1 `full` | mode 1 `relaxed` |
+| | mode 2 `power-loss` | mode 2 `process-crash` | mode 1 `power-loss` | mode 1 `process-crash` |
 |:--|--:|--:|--:|--:|
 | start one pod | 0.57 s | **0.52 s** | 0.46 s | 0.40 s |
 | start 10 | 0.85 s | **0.60 s** | 1.70 s | 0.63 s |
@@ -176,7 +177,14 @@ worth reaching for on mode 2 and close to pointless on mode 1.
 It is the right setting for a cluster you recreate from a script, and the
 wrong one for a cluster holding something you would have to rebuild by hand.
 `ferry status` says which one you are on, and `ferry up` warns every time it
-starts a relaxed cluster, so it cannot become a thing you forgot.
+starts a `process-crash` cluster, so it cannot become a thing you forgot.
+
+**The names say what survives.** `power-loss` keeps every acknowledged write
+through a pulled plug. `process-crash` keeps them through etcd or ferry
+crashing, because they are in the OS's cache by then, but not through a kernel
+panic or a power loss. They were `full` and `relaxed`, which said how hard ferry
+tried rather than what you keep; both old names are still accepted, and a
+cluster that recorded one keeps meaning the same thing.
 
 **Why the gap exists at all.** macOS has two durability calls: `fsync(2)`
 hands the data to the OS, and `fcntl(F_FULLFSYNC)` flushes the drive's own
@@ -230,10 +238,12 @@ found wrong with the previous one. Each is now recorded per stack in
 - **Durability has to be passed, not inherited.** `ferry up` remembers the
   setting per cluster and `ferry down --purge` does not clear it, so an
   unflagged run silently takes the last one's. Measured that way, all four
-  ferry columns came out `relaxed` and mode 2's 20-pod burst read 0.64 s
+  ferry columns came out `relaxed` (now `process-crash`) and mode 2's 20-pod burst read 0.64 s
   instead of 1.19 s — a number that would have had mode 2 beating kind on a
   row it loses. The harness now passes `--durability` every time and records
-  what `ferry status` reports back.
+  what `ferry status` reports back. The setting now lives in a config file
+  that `ferry up` names every time it starts, rather than a marker nothing
+  mentioned.
 - **An unreadable VM is not a free one.** `vmmap` occasionally returns nothing
   for a process, and the footprint helper used to skip it silently, so a mode 2
   cluster reported 670.8 MiB across two VMs where every comparable run reported
@@ -252,7 +262,7 @@ container, no network namespace plumbing.
 None of that changes if you want density instead. A `Machine` is a Linux node VM
 whose pods are ordinary containers sharing its kernel — ~45ms to start one
 against ~300ms for a pod VM — and a pod picks with
-`nodeSelector: {ferry.dev/mode: shared}` or `vm-per-pod`. It is still nothing to
+`runtimeClassName: ferry-shared` or `ferry-vm` ([docs/RUNTIMES.md](docs/RUNTIMES.md)). It is still nothing to
 size up front, and not because sizing is easy here — because you never do it. A
 pod that fits nowhere causes a machine shaped to fit it, and an idle machine is
 taken away again — which is what returns its memory, since a VM that keeps
@@ -360,8 +370,9 @@ cost time.
   stopped, `Node` removed, disk cleaned up behind a finalizer. Pods on two
   machines reach each other, each node routing to the others' pod CIDR slices.
   A pod chooses between the modes with
-  `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}`, which is node selection
-  rather than a new concept.
+  `runtimeClassName: ferry-shared | ferry-vm`, which is node selection
+  underneath — `nodeSelector: {ferry.dev/mode: shared | vm-per-pod}` still
+  works and means the same.
 
   Nobody declares that `Machine` in the ordinary case. A pending pod that fits
   no existing node creates one sized to fit it, and an empty machine is
@@ -409,8 +420,10 @@ patches/kubelet-vX.Y/                per-minor shims, laid over the shared tree
 control-plane/                       PKI + up/down for the native control plane
 manifests/                           CoreDNS, rendered at 'ferry up'
 manifests/machines/                  kube-proxy and CoreDNS for mode 2's machines
-tests/                               what can be checked without a cluster
+tests/                               run.sh: shell, Go and Swift tests, no cluster;
+                                     e2e/: against a throwaway cluster. See tests/README.md
 docs/                                HANDOFF.md (the full picture), INSTALL.md,
+                                     RUNTIMES.md (choosing ferry-vm or ferry-shared),
                                      MACHINES.md (mode 2), SERVICES.md,
                                      BENCHMARKING.md (how to measure this honestly)
 experiments/01-kubelet-cri-surface/  fake CRI runtime + harness
@@ -464,6 +477,11 @@ curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=
 A release also carries **mode 2** — the node as the VM, pods sharing its kernel
 ([docs/MACHINES.md](docs/MACHINES.md)) — off until `ferry machines enable`.
 
+Not sure which setup you want? `ferry init` asks what the cluster is for — a
+laptop you develop on, clusters a script creates and deletes, or an always-on
+node — and writes the answers to a config file that `ferry config` explains and
+every `ferry up` names. See [Configuration](docs/INSTALL.md#configuration).
+
 Details, the environment variables, and how to uninstall are in
 [docs/INSTALL.md](docs/INSTALL.md). To build ferry instead of installing it, see
 [Building from source](#building-from-source).
@@ -489,6 +507,23 @@ kubectl exec probe -- wget -qO- http://web
 ferry status
 ferry down
 ```
+
+With machines on (`ferry machines enable`), a pod chooses between its own VM
+and a container on a shared kernel with `runtimeClassName`:
+
+```sh
+kubectl run isolated --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-vm"}}' -- sleep 3600
+kubectl run dense --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-shared"}}' -- sleep 3600
+
+kubectl get pods -o wide              # isolated on the Mac, dense on a machine
+kubectl get nodes -L ferry.dev/mode   # the machine was made for it
+```
+
+[docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
+Jobs, what a pod that names neither gets, and what to do when one will not
+start.
 
 `ferry doctor` explains what is missing if the machine is not ready.
 
@@ -659,6 +694,11 @@ git clone https://github.com/imaustink/ferry && cd ferry
   anything — a 6.3 driver reading 6.4 module interfaces, or a `swift-package`
   that dies in dyld before it reads a manifest. `ferry doctor` checks for this
   by running SwiftPM rather than by asking it its version.
+
+To test a change, `./tests/run.sh` runs everything that needs no cluster —
+the shell suites, then Go and Swift unit tests — and `tests/e2e/` holds the
+tests that bring one up. [tests/README.md](tests/README.md) says what each
+covers and needs.
 
 Most of this was developed on macOS 15. What actually needs 26 is routable
 per-pod addressing (`VZVmnetNetworkDeviceAttachment`) and the toolchain Apple's

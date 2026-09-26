@@ -34,6 +34,10 @@ struct MachineSpec: Codable {
     /// spelling. Optional, because a machine written by hand has none and an
     /// older ferry-machined does not send the field at all.
     let taints: [String]?
+    /// The root disk's barrier -- none, fsync or full -- from the Machine's
+    /// spec.durability. Optional for the same reason: absent means the
+    /// server's FERRY_NODE_DISK_SYNC, which is the cluster's default.
+    let diskSync: String?
 }
 
 /// What this reports back about a machine it is running.
@@ -335,7 +339,7 @@ func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
         address: address, gateway: gateway, podCIDR: spec.podCIDR, clusterDNS: clusterDNS,
         clusterCIDR: clusterCIDR, taints: spec.taints ?? [],
         interface: interface, console: console, podNIC: podNIC,
-        volumesDir: volumesDir)
+        volumesDir: volumesDir, diskSync: spec.diskSync)
 
     let queue = DispatchQueue(label: "ferry.node.\(spec.name)")
     let vm = VZVirtualMachine(configuration: config, queue: queue)

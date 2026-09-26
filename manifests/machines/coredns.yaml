@@ -97,6 +97,10 @@ spec:
       # CoreDNS for an audience that cannot reach it, next to the CoreDNS that
       # already serves mode 1.
       nodeSelector: {ferry.dev/mode: shared}
+      # And allowed there when a default runtime of ferry-vm has tainted the
+      # machines so a pod that names nothing stays on the Mac.
+      tolerations:
+        - {key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}
       serviceAccountName: coredns-machines
       # Its own resolution must not depend on itself.
       dnsPolicy: Default

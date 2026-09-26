@@ -141,6 +141,82 @@ PORT_SHIFT=$(( PROFILE_INDEX * 1000 ))
 # Cluster state that should survive a restart: certificates and etcd.
 FERRY_HOME="${FERRY_HOME:-$HOME/.ferry$SUFFIX}"
 
+# What this cluster is configured to be, as a file you can read.
+#
+# ferry's choices used to live in two places nobody looks: environment
+# variables, which a login agent does not inherit, and marker files written by
+# flags and read back silently on the next start. That second one bit: the
+# benchmark harness passed --durability once, `ferry down --purge` kept the
+# marker, and every later run inherited it unasked -- four columns measured
+# on a setting nobody had chosen for them (README, "Durability has to be
+# passed, not inherited").
+#
+# So the choices are a file, shaped like the configuration files Kubernetes
+# components read (KubeletConfiguration, kind's Cluster): versioned, one per
+# cluster, beside its state. `ferry init` writes it, `ferry config` shows it
+# and says where each value came from, and `ferry up` names it every time it
+# starts. The precedence is the usual one -- a flag for this run, then an
+# environment variable for this run, then this file, then the default -- and a
+# flag that is meant to be remembered (--durability, `machines enable`) writes
+# here rather than to a marker.
+#
+# Deliberately a flat mapping of scalars, so it can be read without a YAML
+# library: this script runs from a LaunchAgent with almost no environment,
+# and a parser it has to find is a parser that is sometimes missing.
+FERRY_CONFIG="${FERRY_CONFIG:-$FERRY_HOME/config.yaml}"
+FERRY_CONFIG_API="ferry.dev/v1alpha1"
+# One value, or nothing. A trailing comment and surrounding quotes are not
+# part of it.
+ferry_config_get() { # key [file]
+  awk -v k="$1" '
+    /^[A-Za-z][A-Za-z0-9]*:/ {
+      key = $0; sub(/:.*/, "", key)
+      if (key != k) next
+      v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+      if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
+      print v; exit
+    }' "${2:-$FERRY_CONFIG}" 2>/dev/null
+}
+# Change one value in place, keeping every other line -- comments included --
+# as it was. A key that is not there yet is added at the end.
+ferry_config_set() { # key value
+  mkdir -p "$(dirname "$FERRY_CONFIG")" 2>/dev/null
+  [ -f "$FERRY_CONFIG" ] || printf 'apiVersion: %s\nkind: FerryConfig\n' "$FERRY_CONFIG_API" > "$FERRY_CONFIG"
+  local tmp="$FERRY_CONFIG.tmp.$$"
+  awk -v k="$1" -v v="$2" '
+    /^[A-Za-z][A-Za-z0-9]*:/ && !done {
+      key = $0; sub(/:.*/, "", key)
+      if (key == k) { print k ": " v; done = 1; next }
+    }
+    { print }
+    END { if (!done) print k ": " v }' "$FERRY_CONFIG" > "$tmp" && mv "$tmp" "$FERRY_CONFIG"
+}
+ferry_config_unset() { # key
+  [ -f "$FERRY_CONFIG" ] || return 0
+  local tmp="$FERRY_CONFIG.tmp.$$"
+  awk -v k="$1" '
+    /^[A-Za-z][A-Za-z0-9]*:/ { key = $0; sub(/:.*/, "", key); if (key == k) next }
+    { print }' "$FERRY_CONFIG" > "$tmp" && mv "$tmp" "$FERRY_CONFIG"
+}
+# The settings that are one environment variable each. Read here, before
+# anything below consults the variable, and only where the environment has not
+# already said: `FERRY_POD_MEMORY_MIB=1024 ferry up` still means this run.
+FERRY_CONFIG_ENV="podMemoryMiB=FERRY_POD_MEMORY_MIB podCPUs=FERRY_POD_CPUS maxPods=FERRY_MAX_PODS machineLimitCPUs=FERRY_MACHINE_LIMIT_CPUS machineLimitMemoryGi=FERRY_MACHINE_LIMIT_MEMORY_GI"
+# Which of them the environment set, so `ferry config` can say a value is this
+# run's rather than the file's.
+FERRY_CONFIG_FROM_ENV=""
+ferry_config_env() {
+  local pair key var v
+  for pair in $FERRY_CONFIG_ENV; do
+    key="${pair%%=*}"; var="${pair#*=}"
+    if [ -n "${!var:-}" ]; then FERRY_CONFIG_FROM_ENV="$FERRY_CONFIG_FROM_ENV $key"; continue; fi
+    v="$(ferry_config_get "$key")"
+    [ -n "$v" ] && export "$var=$v"
+  done
+  return 0
+}
+ferry_config_env
+
 # How fast a kubelet may talk to the API server.
 #
 # Upstream defaults to 50 QPS with a burst of 100, sized for a node that is
@@ -322,15 +398,29 @@ FERRY_INSTALL_URL="${FERRY_INSTALL_URL:-https://get.ferry.kurpuis.com}"
 # daemons and holding a vmnet network on every cluster, including the ones that
 # will never declare a Machine, is not a fair default for that.
 #
-# The marker is in FERRY_HOME so the choice outlives a restart: 'ferry up' and
-# the login agent bring machines back for a cluster that had them.
+# Remembered as `machines: true` in the config file, so the choice outlives a
+# restart: 'ferry up' and the login agent bring machines back for a cluster
+# that had them. It used to be a marker file, which is still read for a
+# cluster that has not been migrated yet (ferry_config_migrate).
 MACHINES_MARKER="$FERRY_HOME/machines-enabled"
-machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
+machines_enabled() {
+  case "$(ferry_config_get machines)" in
+    true) return 0 ;;
+    false) return 1 ;;
+  esac
+  [ -f "$MACHINES_MARKER" ]
+}
 
-# How hard this cluster tries not to lose a write.
+# How hard this cluster tries not to lose a write, named for what it survives.
 #
-#   full      every etcd commit reaches the SSD before it is acknowledged
-#   relaxed   it reaches the OS, and the SSD when the OS gets to it
+#   power-loss      every etcd commit reaches the SSD before it is acknowledged
+#   process-crash   it reaches the OS, and the SSD when the OS gets to it: a
+#                   crashed etcd or ferry loses nothing, a kernel panic or a
+#                   pulled plug can lose what the API server already confirmed
+#
+# These were 'full' and 'relaxed', which said how hard ferry tried and not what
+# you get. Both old names are still accepted, on the flag, in the environment
+# and in an existing cluster's recorded setting, and mean exactly what they did.
 #
 # The difference is one syscall and it is not small. Go's os.File.Sync() is
 # fcntl(F_FULLFSYNC) on darwin -- a flush of the drive's own write cache --
@@ -339,24 +429,90 @@ machines_enabled() { [ -f "$MACHINES_MARKER" ]; }
 # cheap one for free. On this Mac: 0.031ms against 3.961ms, and every pod
 # status update is an etcd write.
 #
-# 'relaxed' gives that up deliberately. A cluster you recreate on demand
-# loses nothing it minds losing, and a 20-pod burst goes from 1.16s to
-# 0.39s. A cluster holding something you would have to rebuild by hand
-# should stay 'full', which is the default and what you get by saying
-# nothing.
+# 'process-crash' gives that up deliberately. A cluster you recreate on demand
+# loses nothing it minds losing, and a 20-pod burst on machines goes from
+# 1.19s to 0.77s. A cluster holding something you would have to rebuild by
+# hand should stay 'power-loss', which is the default and what you get by
+# saying nothing. `ferry up --disposable` is the same choice, said as intent.
 #
-# In FERRY_HOME so the choice outlives a restart, the same way machines does:
-# a cluster brought back by the login agent keeps the durability it was
-# created with rather than silently changing character.
+# In the config file so the choice outlives a restart, the same way machines
+# does: a cluster brought back by the login agent keeps the durability it was
+# created with rather than silently changing character. The marker file it
+# used to be in is still read until ferry_config_migrate moves it.
 DURABILITY_MARKER="$FERRY_HOME/durability"
+# The one spelling of each level, from any spelling of it. Empty for anything
+# that is not a level at all, so a caller can refuse it.
+durability_normalize() { # value
+  case "$1" in
+    power-loss|full) echo power-loss ;;
+    process-crash|relaxed) echo process-crash ;;
+  esac
+}
 ferry_durability() {
   # The environment wins, for a one-off run that does not want to change the
   # cluster's recorded setting.
-  if [ -n "${FERRY_DURABILITY:-}" ]; then echo "$FERRY_DURABILITY"; return; fi
-  local v; v="$(cat "$DURABILITY_MARKER" 2>/dev/null)"
-  case "$v" in relaxed|full) echo "$v" ;; *) echo full ;; esac
+  local v
+  if [ -n "${FERRY_DURABILITY:-}" ]; then v="$FERRY_DURABILITY"
+  else v="$(ferry_config_get durability)"
+       [ -n "$v" ] || v="$(cat "$DURABILITY_MARKER" 2>/dev/null)"; fi
+  v="$(durability_normalize "$v")"
+  echo "${v:-power-loss}"
 }
-durability_is_relaxed() { [ "$(ferry_durability)" = relaxed ]; }
+durability_is_process_crash() { [ "$(ferry_durability)" = process-crash ]; }
+
+# What a machine's disk barrier is, for a Machine that does not say
+# (spec.durability). machineDurability in the config file when set; otherwise
+# it follows the cluster's durability as it always has -- fsync for
+# power-loss, which is os-crash in a machine's terms, and none for
+# process-crash -- so mode 2 does not quietly keep a guarantee mode 1 gave up.
+# A disk has one level more than the cluster: fsync(2) reaches the SSD without
+# flushing its cache, which survives the Mac crashing but not losing power.
+ferry_machine_durability() {
+  local v="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}"
+  case "$v" in
+    power-loss|os-crash|process-crash) echo "$v" ;;
+    *) durability_is_process_crash && echo process-crash || echo os-crash ;;
+  esac
+}
+machine_disk_sync() {
+  case "$(ferry_machine_durability)" in
+    power-loss) echo full ;; process-crash) echo none ;; *) echo fsync ;;
+  esac
+}
+
+# Where a pod that names no RuntimeClass lands: ferry-vm (a VM of its own),
+# ferry-shared (a container on a machine), or none -- wherever it fits, which
+# is what every cluster did before this and is still the default. See
+# ferry-machined/defaultruntime.go for how it is enforced, and why by taints.
+ferry_default_runtime() {
+  local v="${FERRY_DEFAULT_RUNTIME:-$(ferry_config_get defaultRuntime)}"
+  case "$v" in ferry-vm|ferry-shared) echo "$v" ;; *) echo none ;; esac
+}
+# What can actually be honoured. A ferry-shared default with no machines would
+# taint every node that can run a pod, so it is none until machines run.
+ferry_default_runtime_effective() {
+  local want; want="$(ferry_default_runtime)"
+  if [ "$want" = ferry-shared ] && ! machines_enabled; then echo none; else echo "$want"; fi
+}
+
+# Move what the marker files recorded into the config file, once, and remove
+# them, so there is one place a setting lives. Only fills keys the file does
+# not already have: a file someone wrote wins over a marker nobody remembers.
+ferry_config_migrate() {
+  local v
+  if [ -f "$DURABILITY_MARKER" ]; then
+    if [ -z "$(ferry_config_get durability)" ]; then
+      v="$(durability_normalize "$(cat "$DURABILITY_MARKER" 2>/dev/null)")"
+      [ -n "$v" ] && ferry_config_set durability "$v"
+    fi
+    rm -f "$DURABILITY_MARKER"
+  fi
+  if [ -f "$MACHINES_MARKER" ]; then
+    [ -n "$(ferry_config_get machines)" ] || ferry_config_set machines true
+    rm -f "$MACHINES_MARKER"
+  fi
+  return 0
+}
 # Where the node image lives in a checkout and in a release. 'ferry node-image'
 # writes it; release/build.sh ships it.
 NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
@@ -472,8 +628,13 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node-image  build the mode 2 node image (slow, needs docker)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
+  ferry init        choose what this cluster is for, and write its config file
+                    (asks; --purpose dev|ci|node --yes to answer from flags)
+  ferry config      show the settings the next 'ferry up' uses, and why
+                    set <key> <value>, unset <key>, get <key>, path
   ferry up          start the cluster
-                    --durability relaxed to trade crash-safety for speed
+                    --disposable to trade surviving a power loss for speed
+                    (--durability power-loss|process-crash, remembered)
   ferry down        stop the cluster (--purge to drop its data as well)
   ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
@@ -1026,7 +1187,7 @@ start_control_plane() { # version
     ETCD_CLIENT_PORT="$(( 2379 + PORT_SHIFT ))" ETCD_PEER_PORT="$(( 2380 + PORT_SHIFT ))" \
     CONTROLLER_PORT="$(( 10257 + PORT_SHIFT ))" SCHEDULER_PORT="$(( 10259 + PORT_SHIFT ))" \
     SERVICE_NODE_PORT_RANGE="$(( 30000 + PROFILE_INDEX * 200 ))-$(( 30199 + PROFILE_INDEX * 200 ))" \
-    FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed && echo 1 || true)" \
+    FERRY_ETCD_NO_FSYNC="$(durability_is_process_crash && echo 1 || true)" \
     FERRY_KEEP_ETCD="${FERRY_KEEP_ETCD:-}" FERRY_HANDOVER="${FERRY_HANDOVER:-}" \
     FERRY_HANDOVER_BIN="$here/bin/ferry-handover" \
     "$here/control-plane/up.sh" >"$FERRY_RUN/logs/control-plane.log" 2>&1
@@ -1046,23 +1207,32 @@ start_control_plane() { # version
 }
 
 cmd_up() {
-  # --durability full|relaxed, remembered for this cluster. Parsed before
-  # anything starts, because it decides how etcd and the machine disks are
-  # opened and those happen early.
-  local want_durability=""
+  # --durability power-loss|process-crash, remembered for this cluster.
+  # Parsed before anything starts, because it decides how etcd and the machine
+  # disks are opened and those happen early.
+  #
+  # --disposable says the same thing as intent: this is a cluster you
+  # recreate from a script. --fast was the first spelling of it and still
+  # works, but it named the gain and hid the cost. 'full' and 'relaxed' are
+  # the old names of the two levels and are accepted and translated.
+  local want_durability="" asked_durability=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --durability) want_durability="${2:-}"; shift 2 ;;
-      --durability=*) want_durability="${1#*=}"; shift ;;
-      --fast) want_durability=relaxed; shift ;;
+      --durability) asked_durability="${2:-}"; shift 2 ;;
+      --durability=*) asked_durability="${1#*=}"; shift ;;
+      --disposable) asked_durability=process-crash; shift ;;
+      --fast) asked_durability=process-crash
+              warn "--fast is now --disposable: the same setting, named for what it gives up"
+              shift ;;
       *) shift ;;
     esac
   done
-  case "$want_durability" in
-    "") ;;
-    full|relaxed) : ;;
-    *) bad "--durability $want_durability: expected 'full' or 'relaxed'"; return 2 ;;
-  esac
+  if [ -n "$asked_durability" ]; then
+    want_durability="$(durability_normalize "$asked_durability")"
+    [ -n "$want_durability" ] || {
+      bad "--durability $asked_durability: expected 'power-loss' or 'process-crash'"
+      return 2; }
+  fi
 
   for required in "$here/bin/kubelet" "$here/bin/ferry-cri" "$here/bin/ferry-cni" "$KERNEL"; do
     [ -e "$required" ] || { bad "missing $(basename "$required") -- run: ferry build"; return 1; }
@@ -1094,16 +1264,26 @@ cmd_up() {
   # Which kind of node this Mac is, for the login agent to read after a reboot.
   # A server can be started again from FERRY_HOME alone; a worker cannot.
   echo server > "$FERRY_HOME/role"
-  [ -n "$want_durability" ] && printf '%s\n' "$want_durability" > "$DURABILITY_MARKER"
+  ferry_config_migrate
+  [ -n "$want_durability" ] && ferry_config_set durability "$want_durability"
 
   bold "starting ferry"
+  # Which file this start is following, every time, for the same reason the
+  # durability warning below is repeated: the question "why is my cluster
+  # like this" should be answered by the scrollback of the start that made it.
+  if [ -f "$FERRY_CONFIG" ]; then
+    echo "  config $FERRY_CONFIG"
+  else
+    echo "  config none -- defaults; 'ferry init' to choose"
+  fi
   # Said every time, not only when it changes: someone reading this scrollback
   # to work out why a cluster lost data should not have to remember which day
   # they passed the flag.
-  if durability_is_relaxed; then
-    warn "durability: relaxed -- writes are acknowledged before they reach the disk"
-    echo "      Fine for a cluster you recreate. A hard power loss can leave"
-    echo "      etcd needing a restore. 'ferry up --durability full' to change it."
+  if durability_is_process_crash; then
+    warn "durability: process-crash -- a crashed process loses nothing, a power loss can"
+    echo "      Writes are acknowledged before they reach the disk. Fine for a"
+    echo "      cluster you recreate; a power loss or kernel panic can leave etcd"
+    echo "      needing a restore. 'ferry up --durability power-loss' to change it."
   fi
 
   start_gpud
@@ -1253,6 +1433,11 @@ EOF
   if [ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; then
     ok "node $NODE_NAME Ready"
     ensure_mode_label "$NODE_NAME"
+    install_runtime_classes
+    ferry_config_publish
+    ferry_apply_default_runtime
+    [ "$(ferry_default_runtime_effective)" = none ] \
+      || ok "pods that name no RuntimeClass run as $(ferry_default_runtime_effective)"
   else
     bad "node did not become Ready"; tail -5 "$FERRY_RUN/logs/kubelet.log"; return 1
   fi
@@ -1524,6 +1709,87 @@ ensure_mode_label() { # node
   kube label node "$1" "ferry.dev/host=$NODE_NAME" --overwrite >/dev/null 2>&1 || true
 }
 
+# The two RuntimeClasses, ferry-vm and ferry-shared: the Kubernetes spelling of
+# the choice the mode label above already expresses. See
+# manifests/runtimeclasses.yaml. On every start, because they live in etcd.
+#
+# ferry-vm carries a pod overhead: what a pod VM costs the Mac before its
+# workload does anything, so the scheduler counts it against the node's memory
+# like any other request. The figure is the one maxPods is derived from, and
+# follows it -- a checkout on an older kernel pays more (pod_overhead_mib).
+install_runtime_classes() {
+  sed "s/__POD_OVERHEAD_MIB__/$pod_overhead_mib/" "$here/manifests/runtimeclasses.yaml" \
+    | kube apply -f - >/dev/null 2>&1 \
+    || { warn "could not install the ferry-vm and ferry-shared RuntimeClasses"; return 1; }
+}
+
+# The config file, copied into the cluster where a controller can read it and
+# kubectl can show it: kube-system/ferry-config.
+#
+# A copy, not a second source. The file is what `ferry up` follows, since most
+# of it -- durability above all -- has to be known before there is an API
+# server to ask; etcd cannot read its own fsync setting out of etcd. So this is
+# written from the file at every start and every `ferry config set`, and an
+# edit made here is overwritten by the next one. What reads it is
+# ferry-machined, for the default runtime, which is a setting about nodes that
+# arrive long after `ferry up` has finished.
+ferry_config_publish() {
+  kube apply -f - >/dev/null 2>&1 <<EOF || warn "could not publish kube-system/ferry-config; the default runtime will not follow it"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferry-config
+  namespace: kube-system
+  labels: {app.kubernetes.io/managed-by: ferry}
+  annotations:
+    ferry.dev/source: "$FERRY_CONFIG"
+    ferry.dev/note: "A copy of the file named in ferry.dev/source, rewritten by every ferry up and ferry config set. Edit that file instead."
+data:
+  defaultRuntime: "$(ferry_default_runtime_effective)"
+  durability: "$(ferry_durability)"
+  machines: "$(machines_enabled && echo true || echo false)"
+  purpose: "$(ferry_config_get purpose)"
+EOF
+}
+
+# Put the default's taints where they belong now, rather than waiting a tick
+# for ferry-machined -- which is not running at all when machines are off, and
+# then the only thing left to do is take a ferry-shared default's taint back
+# off the Macs. Karpenter's NodePool gets the machines' taint too: it simulates
+# whether a pending pod would fit a machine it could make, and a machine it
+# does not know is tainted is one it would make for a pod that cannot use it.
+ferry_apply_default_runtime() {
+  local want effective
+  want="$(ferry_default_runtime)"; effective="$(ferry_default_runtime_effective)"
+  if [ "$want" != "$effective" ]; then
+    warn "defaultRuntime ferry-shared needs machines; pods that name nothing stay on the Mac"
+    echo "      ferry machines enable     to turn them on"
+  fi
+  local mac_taint="" machine_taint=""
+  case "$effective" in
+    ferry-vm)     machine_taint=1 ;;
+    ferry-shared) mac_taint=1 ;;
+  esac
+  if [ -n "$mac_taint" ]; then
+    kube taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode=vm-per-pod:NoSchedule --overwrite >/dev/null 2>&1
+  else
+    kube taint nodes -l ferry.dev/mode=vm-per-pod ferry.dev/mode:NoSchedule- >/dev/null 2>&1
+  fi
+  if [ -n "$machine_taint" ]; then
+    kube taint nodes -l ferry.dev/mode=shared ferry.dev/mode=shared:NoSchedule --overwrite >/dev/null 2>&1
+  else
+    kube taint nodes -l ferry.dev/mode=shared ferry.dev/mode:NoSchedule- >/dev/null 2>&1
+  fi
+  if kube get nodepool default >/dev/null 2>&1; then
+    local taints=null
+    [ -n "$machine_taint" ] && taints='[{"key":"ferry.dev/mode","value":"shared","effect":"NoSchedule"}]'
+    kube patch nodepool default --type merge \
+      -p "{\"spec\":{\"template\":{\"spec\":{\"taints\":$taints}}}}" >/dev/null 2>&1 \
+      || warn "could not give the default NodePool the default runtime's taint"
+  fi
+  return 0
+}
+
 start_machines() {
   machines_ready || return 1
 
@@ -1536,6 +1802,7 @@ start_machines() {
   # enabled, purged and brought back.
   kube apply -f "$here/ferry-machined/crd.yaml" >/dev/null 2>&1 \
     || { bad "could not install the Machine CRD"; return 1; }
+  install_runtime_classes
   install_machine_dns || return 1
 
   mkdir -p "$FERRY_HOME/machined" "$FERRY_RUN/machines"
@@ -1544,7 +1811,9 @@ start_machines() {
   mkdir -p "$FERRY_HOME/volumes"
 
   # The machine's disk barrier follows the cluster's durability, so mode 2
-  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept.
+  # does not quietly keep a guarantee mode 1 gave up -- or lose one it kept --
+  # unless machineDurability says otherwise; see ferry_machine_durability. It
+  # is the default for a Machine with no spec.durability of its own.
   #
   # Keep these assignments directly above the command. A comment or a command
   # between them and it ends the line, and they become shell variables that
@@ -1554,7 +1823,7 @@ start_machines() {
   # The registry port is passed only when the registry is on, and blank
   # otherwise, so a FERRY_MACHINE_REGISTRY_PORT set on its own does not point
   # machines at a registry that is not running.
-  FERRY_NODE_DISK_SYNC="$(durability_is_relaxed && echo none || echo fsync)" \
+  FERRY_NODE_DISK_SYNC="$(machine_disk_sync)" \
   FERRY_NODE_REGISTRY_PORT="$(machine_registry_enabled && echo "$MACHINE_REGISTRY_PORT")" \
   FERRY_NODE_USB="$(kernel_attaches_disks && echo 1)" \
   "$here/bin/ferry-node" serve \
@@ -1724,6 +1993,9 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
+    # The apply above has just put the NodePool back as the file has it,
+    # without the default runtime's taint.
+    ferry_apply_default_runtime
   fi
 
   # Settings through the environment, the command line left to Karpenter.
@@ -1755,6 +2027,7 @@ start_provisioner() {
   FERRY_MACHINE_LIMIT_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_NODE_DISK="$NODE_DISK" \
+  FERRY_MACHINE_DURABILITY="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}" \
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
@@ -1764,7 +2037,7 @@ start_provisioner() {
   sleep 2
   if running ferry-karpenter; then
     ok "provisioning on demand, up to $MACHINE_LIMIT_CPUS cpus and ${MACHINE_LIMIT_MEMORY_GI}Gi of machines"
-    echo "      a pod with nodeSelector ferry.dev/mode=shared makes the node it needs"
+    echo "      a pod with runtimeClassName: ferry-shared makes the node it needs"
   else
     warn "ferry-karpenter did not start; machines must be declared by hand"
     tail -3 "$FERRY_RUN/logs/ferry-karpenter.log" 2>/dev/null | sed 's/^/      /'
@@ -3910,6 +4183,8 @@ cmd_addons() {
       done
       [ "${#names[@]}" -gt 0 ] || { bad "usage: ferry addons $action <name>... [--no-wait]"; return 2; }
       kubectl get --raw /readyz >/dev/null 2>&1 || { bad "ferry is not up"; return 1; }
+      # The registry addon names runtimeClassName: ferry-vm; see ferry_builder_up.
+      [ "$action" = enable ] && install_runtime_classes >/dev/null 2>&1
       local name failed=0
       for name in "${names[@]}"; do
         if [ "$action" = enable ]; then addon_enable "$name" $no_wait || failed=1
@@ -4106,6 +4381,11 @@ ferry_builder_up() {
     --from-file=tls.key="$pki/server.key" >/dev/null 2>&1 \
     || { bad "could not store the builder certificates"; return 1; }
 
+  # The pod names runtimeClassName: ferry-vm, and a cluster started by a ferry
+  # from before the class existed does not have it until its next 'ferry up'.
+  # Quietly, because a joined Mac's credentials cannot install it and a
+  # control plane that is current already has.
+  install_runtime_classes >/dev/null 2>&1
   echo "  starting the builder ($cpus cpu, ${mem} GiB)"
   # The policy goes on with the pod, in one apply, so there is no window where
   # the builder is up and unprotected.
@@ -4154,6 +4434,10 @@ metadata:
 spec:
   # Nothing in the cluster should evict the thing the person is waiting on.
   priorityClassName: system-node-critical
+  # A VM of its own, whatever the cluster's default: buildkitd is privileged,
+  # and a privileged pod on a machine shares that machine's kernel with every
+  # other pod on it. It is also sized from the Mac, not from a machine.
+  runtimeClassName: ferry-vm
   containers:
     - name: buildkitd
       image: $FERRY_BUILDKIT_IMAGE
@@ -4654,15 +4938,20 @@ cmd_down() {
     # Purging the cluster has to take them, because nothing else ever will.
     [ -n "${FERRY_HOME:-}" ] && [ "$FERRY_HOME" != "/" ] && [ "$FERRY_HOME" != "$HOME" ] \
       && rm -rf "${FERRY_HOME:?}/machined"
-    # And the setting that brought them up. It is a file rather than anything in
-    # etcd, so it outlived the cluster it was set for, and the next 'ferry up'
-    # -- of what was meant to be a new, mode 1 cluster -- started ferry-machined,
-    # ferry-node and the provisioner anyway.
-    if machines_enabled; then
+    # The marker that brought them up, on a cluster not yet migrated to a config
+    # file. It outlived the cluster it was set for, and the next 'ferry up' --
+    # of what was meant to be a new, mode 1 cluster -- started ferry-machined,
+    # ferry-node and the provisioner anyway, because nothing said it would.
+    if [ -f "$MACHINES_MARKER" ]; then
       rm -f "$MACHINES_MARKER"
       echo "  machines are off again; 'ferry machines enable' after the next 'ferry up'"
     fi
     ok "cluster data purged"
+    # The config file is the other kind of thing: not the cluster's data but
+    # what it is meant to be, written on purpose and named by every start. So
+    # it stays, and says so, which is the difference from the marker above.
+    [ -f "$FERRY_CONFIG" ] \
+      && echo "  $FERRY_CONFIG is kept; the next 'ferry up' follows it ('ferry config' shows it)"
   fi
   # The peers file is deliberately not removed: it is what tells the next
   # 'ferry up' that this cluster has other nodes, before there is an API server
@@ -4735,7 +5024,11 @@ cmd_machines_enable() {
   else
     start_machines || return 1
   fi
-  : > "$MACHINES_MARKER"
+  ferry_config_migrate
+  ferry_config_set machines true
+  # A ferry-shared default waits for machines; now there are some.
+  ferry_config_publish
+  ferry_apply_default_runtime
   echo
   bold "machines are on"
   echo "  They come back with the cluster; 'ferry machines disable' turns them off."
@@ -4755,15 +5048,24 @@ cmd_machines_enable() {
   echo "    kubectl get machines"
   echo "    kubectl get nodes -L ferry.dev/mode"
   echo
-  echo "  Pods choose with nodeSelector: {ferry.dev/mode: shared}"
+  echo "  Pods choose with a RuntimeClass:"
+  echo "    runtimeClassName: ferry-shared   # dense, one kernel for many pods"
+  echo "    runtimeClassName: ferry-vm       # a kernel each"
 }
 
 cmd_machines_disable() {
   bold "turning off machines"
-  # The marker first, so a crash between here and the kills does not leave a
+  # The setting first, so a crash between here and the kills does not leave a
   # cluster that restarts machines its operator just turned off.
-  rm -f "$MACHINES_MARKER"
+  ferry_config_migrate
+  ferry_config_set machines false
   stop_machines
+  # A ferry-shared default tainted the Macs so pods would go to machines; with
+  # none left, that taint would leave nothing able to run a pod.
+  if have_cluster; then
+    ferry_config_publish
+    ferry_apply_default_runtime
+  fi
   echo
   echo "  Machine objects and the CRD are left alone; deleting a Machine is how"
   echo "  its node and disk go away. The node image and $NODE_DISK are kept."
@@ -5357,10 +5659,16 @@ cmd_status() {
   else
     echo "  kubernetes ${cluster:-${active:-not built}}"
   fi
-  if durability_is_relaxed; then
-    echo "  durability relaxed -- writes acknowledged before they reach the disk"
+  if [ -f "$FERRY_CONFIG" ]; then echo "  config     $FERRY_CONFIG"
+  else echo "  config     none -- defaults; 'ferry init' to choose"; fi
+  case "$(ferry_default_runtime_effective)" in
+    none) echo "  runtime    no default -- a pod that names no RuntimeClass goes wherever it fits" ;;
+    *)    echo "  runtime    $(ferry_default_runtime_effective) for a pod that names no RuntimeClass" ;;
+  esac
+  if durability_is_process_crash; then
+    echo "  durability process-crash -- survives a crashed process, not a power loss"
   else
-    echo "  durability full -- every etcd commit reaches the disk first"
+    echo "  durability power-loss -- every etcd commit reaches the disk first"
   fi
   for component in ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud kubelet ferry-proxy; do
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
@@ -5406,6 +5714,371 @@ cmd_status() {
   fi
 }
 
+# --- configuration: ferry config, ferry init ---------------------------------
+#
+# The file itself, and why it exists, is described where FERRY_CONFIG is set.
+
+# Every key the file may carry, in the order `ferry config` shows them.
+FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
+
+# A value as it should be written, or a failure: 1 for a value the key does
+# not take, 2 for a key there is no such thing as.
+ferry_config_check() { # key value
+  case "$1" in
+    purpose)    case "$2" in dev|ci|node) echo "$2" ;; *) return 1 ;; esac ;;
+    durability) local v; v="$(durability_normalize "$2")"; [ -n "$v" ] || return 1; echo "$v" ;;
+    machines)   case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
+    defaultRuntime) case "$2" in ferry-vm|ferry-shared|none) echo "$2" ;; *) return 1 ;; esac ;;
+    machineDurability) case "$2" in power-loss|os-crash|process-crash) echo "$2" ;; *) return 1 ;; esac ;;
+    podMemoryMiB|podCPUs|maxPods|machineLimitCPUs|machineLimitMemoryGi)
+                case "$2" in ''|*[!0-9]*|0) return 1 ;; *) echo "$2" ;; esac ;;
+    *) return 2 ;;
+  esac
+}
+ferry_config_values() { # key
+  case "$1" in
+    purpose)    echo "dev | ci | node" ;;
+    durability) echo "power-loss | process-crash" ;;
+    machines)   echo "true | false" ;;
+    defaultRuntime) echo "ferry-vm | ferry-shared | none" ;;
+    machineDurability) echo "power-loss | os-crash | process-crash" ;;
+    *)          echo "a whole number" ;;
+  esac
+}
+
+# What is in effect for a key, and where it came from.
+ferry_config_effective() { # key -> "value<TAB>source"
+  local key="$1" file_value var pair
+  file_value="$(ferry_config_get "$key")"
+  case "$key" in
+    purpose)
+      if [ -n "$file_value" ]; then printf '%s\tfile\n' "$file_value"
+      else printf -- '-\tnot set\n'; fi ;;
+    durability)
+      if [ -n "${FERRY_DURABILITY:-}" ]; then printf '%s\tFERRY_DURABILITY, this run only\n' "$(ferry_durability)"
+      elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_durability)"
+      elif [ -f "$DURABILITY_MARKER" ]; then printf '%s\tolder marker file; the next up moves it here\n' "$(ferry_durability)"
+      else printf 'power-loss\tdefault\n'; fi ;;
+    defaultRuntime)
+      local want effective note=""
+      want="$(ferry_default_runtime)"; effective="$(ferry_default_runtime_effective)"
+      [ "$want" != "$effective" ] && note="; ferry-shared waits for machines"
+      if [ -n "${FERRY_DEFAULT_RUNTIME:-}" ]; then printf '%s\tFERRY_DEFAULT_RUNTIME, this run only%s\n' "$want" "$note"
+      elif [ -n "$file_value" ]; then printf '%s\tfile%s\n' "$want" "$note"
+      else printf 'none\tdefault: wherever a pod fits\n'; fi ;;
+    machineDurability)
+      if [ -n "${FERRY_MACHINE_DURABILITY:-}" ]; then printf '%s\tFERRY_MACHINE_DURABILITY, this run only\n' "$(ferry_machine_durability)"
+      elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_machine_durability)"
+      else printf '%s\tdefault: follows durability\n' "$(ferry_machine_durability)"; fi ;;
+    machines)
+      local on; machines_enabled && on=true || on=false
+      if [ -n "$file_value" ]; then printf '%s\tfile\n' "$on"
+      elif [ -f "$MACHINES_MARKER" ]; then printf '%s\tolder marker file; the next up moves it here\n' "$on"
+      else printf 'false\tdefault\n'; fi ;;
+    *)
+      for pair in $FERRY_CONFIG_ENV; do [ "${pair%%=*}" = "$key" ] && var="${pair#*=}"; done
+      local value
+      case "$key" in
+        podMemoryMiB) value="$POD_MEMORY_MIB" ;; podCPUs) value="$POD_CPUS" ;;
+        maxPods) value="$MAX_PODS" ;; machineLimitCPUs) value="$MACHINE_LIMIT_CPUS" ;;
+        machineLimitMemoryGi) value="$MACHINE_LIMIT_MEMORY_GI" ;;
+      esac
+      case " $FERRY_CONFIG_FROM_ENV " in
+        *" $key "*) printf '%s\t%s, this run only\n' "$value" "$var" ;;
+        *) if [ -n "$file_value" ]; then printf '%s\tfile\n' "$value"
+           else printf '%s\tdefault\n' "$value"; fi ;;
+      esac ;;
+  esac
+}
+
+cmd_config() {
+  local tab=$'\t'
+  case "${1:-show}" in
+    show|"")
+      bold "ferry config"
+      if [ -f "$FERRY_CONFIG" ]; then echo "  file  $FERRY_CONFIG"
+      else echo "  file  none yet -- 'ferry init' writes one, 'ferry config set' starts one"; fi
+      echo
+      local key line
+      for key in $FERRY_CONFIG_KEYS; do
+        line="$(ferry_config_effective "$key")"
+        printf '  %-22s %-16s %s\n' "$key" "${line%%"$tab"*}" "${line#*"$tab"}"
+      done
+      ;;
+    path) echo "$FERRY_CONFIG" ;;
+    get)
+      [ -n "${2:-}" ] || { bad "usage: ferry config get <key>"; return 2; }
+      local line; line="$(ferry_config_effective "$2")"
+      [ -n "$line" ] || { bad "no setting called $2"; return 2; }
+      echo "${line%%"$tab"*}" ;;
+    set)
+      [ $# -eq 3 ] || { bad "usage: ferry config set <key> <value>"; return 2; }
+      local key="$2" value rc
+      value="$(ferry_config_check "$key" "$3")"; rc=$?
+      if [ "$rc" -eq 2 ]; then
+        bad "no setting called $key"; echo "    settings: $FERRY_CONFIG_KEYS"; return 2
+      elif [ "$rc" -ne 0 ]; then
+        bad "$key $3: expected $(ferry_config_values "$key")"; return 2
+      fi
+      ferry_config_migrate
+      ferry_config_set "$key" "$value"
+      ok "$key: $value  ($FERRY_CONFIG)"
+      ferry_config_takes_effect "$key" ;;
+    unset)
+      [ -n "${2:-}" ] || { bad "usage: ferry config unset <key>"; return 2; }
+      ferry_config_check "$2" x >/dev/null; [ $? -eq 2 ] && { bad "no setting called $2"; return 2; }
+      ferry_config_unset "$2"
+      ok "$2 unset; the default applies"
+      ferry_config_takes_effect "$2" ;;
+    *) bad "usage: ferry config [show|get <key>|set <key> <value>|unset <key>|path]"; return 2 ;;
+  esac
+}
+
+# Said after a change, because "I set it and nothing happened" is the other
+# half of a setting nobody can see.
+ferry_config_takes_effect() { # key
+  running kubelet || return 0
+  case "$1" in
+    machines) echo "    the cluster is up: 'ferry machines enable' or 'disable' changes it now" ;;
+    purpose)  ferry_config_publish ;;
+    # Applied to the running cluster at once: it is taints and a ConfigMap,
+    # and nothing about it needs a restart.
+    defaultRuntime)
+      ferry_config_publish
+      ferry_apply_default_runtime
+      echo "    applied to the running cluster" ;;
+    *)        echo "    the cluster is up: this takes effect at the next 'ferry restart'" ;;
+  esac
+}
+
+# Whether mode 2 can run here at all, without the side effects of
+# machines_ready -- which unpacks a 400 MB disk to find out.
+machines_available() {
+  [ -x "$here/bin/ferry-machined" ] && [ -x "$here/bin/ferry-node" ] && [ -d "$NODE_IMAGE_LAYOUT" ]
+}
+
+# A menu on stderr, the chosen value on stdout. Options are "value|what it
+# means"; an empty answer takes the default.
+ferry_choose() { # question default option...
+  local question="$1" default="$2"; shift 2
+  local i=1 option answer
+  printf '\n\033[1m%s\033[0m\n' "$question" >&2
+  for option in "$@"; do
+    printf '  %d) %s%s\n' "$i" "${option#*|}" "$([ "${option%%|*}" = "$default" ] && echo "  (default)")" >&2
+    i=$((i + 1))
+  done
+  while :; do
+    printf '  choice: ' >&2
+    read -r answer || answer=""
+    [ -z "$answer" ] && { echo "$default"; return; }
+    i=1
+    for option in "$@"; do
+      if [ "$answer" = "$i" ] || [ "$answer" = "${option%%|*}" ]; then echo "${option%%|*}"; return; fi
+      i=$((i + 1))
+    done
+    printf '  one of 1-%d\n' "$#" >&2
+  done
+}
+ferry_yes() { # question default(y|n)
+  local answer hint; [ "$2" = y ] && hint="Y/n" || hint="y/N"
+  printf '\n\033[1m%s\033[0m [%s] ' "$1" "$hint" >&2
+  read -r answer || answer=""
+  case "${answer:-$2}" in y|Y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+# The file `ferry init` writes: every choice, with what it means beside it, so
+# the file explains itself to whoever opens it next.
+ferry_config_write() { # purpose durability machines default-runtime
+  mkdir -p "$(dirname "$FERRY_CONFIG")"
+  cat > "$FERRY_CONFIG" <<EOF
+# ferry's configuration for the $PROFILE cluster, written by 'ferry init'.
+#
+# 'ferry config' shows what is in effect and where each value came from;
+# 'ferry config set <key> <value>' changes one line and keeps the rest. A flag
+# or FERRY_* environment variable still overrides a value for a single run.
+apiVersion: $FERRY_CONFIG_API
+kind: FerryConfig
+
+# What this cluster is for: dev (a laptop), ci (recreated by a script), or
+# node (always on, holding what you would have to rebuild by hand). Recorded,
+# not acted on: the choices below are what it decided.
+purpose: $1
+
+# What a write the API server has acknowledged survives. power-loss: every
+# etcd commit is on the SSD first. process-crash: a crashed process loses
+# nothing, a power loss or kernel panic can -- and pods start faster, most of
+# all on machines. The old names, full and relaxed, still work.
+durability: $2
+
+# Whether mode 2 runs: machines, Linux node VMs whose pods share a kernel.
+machines: $3
+
+# Where a pod that names no RuntimeClass runs: ferry-vm (a VM of its own),
+# ferry-shared (a container on a machine; needs machines), or none (wherever
+# it fits). A pod that names one -- runtimeClassName: ferry-vm or ferry-shared
+# -- gets what it names either way. Applied as taints on the other kind of
+# node, so a pod that picks by nodeSelector alone needs the RuntimeClass.
+defaultRuntime: $4
+
+# What a machine's disk survives, for a Machine whose spec does not say:
+# power-loss, os-crash or process-crash. Unset follows durability above --
+# os-crash for power-loss, process-crash for process-crash.
+# machineDurability: os-crash
+
+# One environment variable each, for when a default is not right here. The
+# values shown are what this Mac gets without them: memory per pod VM
+# (FERRY_POD_MEMORY_MIB), CPUs per pod VM (FERRY_POD_CPUS), pods advertised,
+# derived from memory (FERRY_MAX_PODS), and what all machines together may use
+# (FERRY_MACHINE_LIMIT_CPUS, FERRY_MACHINE_LIMIT_MEMORY_GI).
+# podMemoryMiB: 512
+# podCPUs: 2
+# maxPods: $MAX_PODS
+# machineLimitCPUs: $MACHINE_LIMIT_CPUS
+# machineLimitMemoryGi: $MACHINE_LIMIT_MEMORY_GI
+EOF
+}
+
+cmd_init() {
+  local purpose="" durability="" machines="" default_runtime="" force="" interactive=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purpose) purpose="${2:-}"; shift 2 ;;
+      --purpose=*) purpose="${1#*=}"; shift ;;
+      --durability) durability="${2:-}"; shift 2 ;;
+      --durability=*) durability="${1#*=}"; shift ;;
+      --disposable) durability=process-crash; shift ;;
+      --machines) machines="${2:-}"; shift 2 ;;
+      --machines=*) machines="${1#*=}"; shift ;;
+      --default-runtime) default_runtime="${2:-}"; shift 2 ;;
+      --default-runtime=*) default_runtime="${1#*=}"; shift ;;
+      --force) force=1; shift ;;
+      --yes|-y) interactive=no; shift ;;
+      *) bad "unknown option $1"
+         echo "    usage: ferry init [--purpose dev|ci|node] [--durability power-loss|process-crash]"
+         echo "                      [--machines true|false] [--default-runtime ferry-vm|ferry-shared|none]"
+         echo "                      [--yes] [--force]"
+         return 2 ;;
+    esac
+  done
+  # Checked before a single question is asked: finding out after five answers
+  # that one of the flags was misspelled is the worst order to learn it in.
+  if [ -n "$purpose" ]; then
+    purpose="$(ferry_config_check purpose "$purpose")" \
+      || { bad "--purpose: expected $(ferry_config_values purpose)"; return 2; }
+  fi
+  if [ -n "$durability" ]; then
+    durability="$(ferry_config_check durability "$durability")" \
+      || { bad "--durability: expected $(ferry_config_values durability)"; return 2; }
+  fi
+  if [ -n "$machines" ]; then
+    machines="$(ferry_config_check machines "$machines")" \
+      || { bad "--machines: expected $(ferry_config_values machines)"; return 2; }
+  fi
+  if [ -n "$default_runtime" ]; then
+    default_runtime="$(ferry_config_check defaultRuntime "$default_runtime")" \
+      || { bad "--default-runtime: expected $(ferry_config_values defaultRuntime)"; return 2; }
+  fi
+  if [ -f "$FERRY_CONFIG" ] && [ -z "$force" ]; then
+    bad "this cluster is already configured: $FERRY_CONFIG"
+    echo "    'ferry config' shows it, 'ferry config set' changes one value,"
+    echo "    'ferry init --force' starts again from the questions."
+    return 1
+  fi
+  # Questions only for a person. A script, a pipe or --yes gets the answers
+  # its flags and the purpose's defaults give, and no prompt to hang on.
+  [ -z "$interactive" ] && { [ -t 0 ] && interactive=yes || interactive=no; }
+
+  local have_machines=""; machines_available && have_machines=1
+
+  bold "ferry init -- choosing what this cluster is for"
+  echo "  profile $PROFILE, config $FERRY_CONFIG"
+  if [ -z "$have_machines" ]; then
+    echo "  mode 2 is not available here ($(is_release && echo "this release has no node image" \
+      || echo "no node image or machine binaries; 'ferry build' and 'ferry node-image'")),"
+    echo "  so every pod will be its own VM."
+  fi
+
+  if [ -z "$purpose" ]; then
+    if [ "$interactive" = yes ]; then
+      purpose="$(ferry_choose "What is this cluster for?" dev \
+        "dev|local development on this Mac" \
+        "ci|tests and scripts that create and delete it" \
+        "node|an always-on node, holding things you would rebuild by hand")"
+    else
+      purpose=dev
+    fi
+  fi
+
+  # What each purpose starts from. Every one of these is still asked about
+  # below when there is someone to ask.
+  local want_machines want_durability want_runtime
+  case "$purpose" in
+    dev)  want_machines=true;  want_durability=power-loss;    want_runtime=ferry-vm ;;
+    ci)   want_machines=true;  want_durability=process-crash; want_runtime=ferry-shared ;;
+    node) want_machines=false; want_durability=power-loss;    want_runtime=ferry-vm ;;
+  esac
+  [ -n "$have_machines" ] || want_machines=false
+
+  if [ -z "$machines" ]; then
+    if [ -n "$have_machines" ] && [ "$interactive" = yes ]; then
+      if ferry_yes "Run machines as well (mode 2), so pods can share a kernel for density?" \
+           "$([ "$want_machines" = true ] && echo y || echo n)"; then machines=true; else machines=false; fi
+    else
+      machines="$want_machines"
+    fi
+  fi
+  if [ "$machines" = true ] && [ -z "$have_machines" ]; then
+    bad "--machines true: mode 2 is not available here"; return 1
+  fi
+
+  # Only a question when there are two kinds of node to choose between.
+  # Without machines every pod is a VM, and ferry-vm says so.
+  if [ "$machines" = false ]; then
+    [ "$default_runtime" = ferry-shared ] && {
+      bad "--default-runtime ferry-shared needs machines, which this cluster will not run"; return 1; }
+    [ -n "$default_runtime" ] || default_runtime=ferry-vm
+  elif [ -z "$default_runtime" ]; then
+    if [ "$interactive" = yes ]; then
+      default_runtime="$(ferry_choose "Where should a pod that names no RuntimeClass run?" "$want_runtime" \
+        "ferry-vm|its own VM, with its own kernel: isolation (runtimeClassName: ferry-shared to opt out)" \
+        "ferry-shared|a container on a machine: density and speed (runtimeClassName: ferry-vm to opt out)" \
+        "none|wherever it fits, either kind -- what ferry did before this choice existed")"
+    else
+      default_runtime="$want_runtime"
+    fi
+  fi
+
+  if [ -z "$durability" ]; then
+    if [ "$interactive" = yes ]; then
+      echo >&2
+      echo "  power-loss keeps every acknowledged write through a pulled plug; process-crash" >&2
+      echo "  keeps them through a crash but not a power loss, and starts a 20-pod burst on" >&2
+      echo "  machines in 0.77s instead of 1.19s." >&2
+      if ferry_yes "Could you recreate this cluster from a script if it were lost?" \
+           "$([ "$want_durability" = process-crash ] && echo y || echo n)"; then
+        durability=process-crash
+      else
+        durability=power-loss
+      fi
+    else
+      durability="$want_durability"
+    fi
+  fi
+
+  ferry_config_write "$purpose" "$durability" "$machines" "$default_runtime"
+  # Whatever the markers said is superseded by what was just chosen.
+  rm -f "$DURABILITY_MARKER" "$MACHINES_MARKER"
+  echo
+  ok "wrote $FERRY_CONFIG"
+  sed -n '/^[a-zA-Z]/p' "$FERRY_CONFIG" | grep -v '^apiVersion\|^kind' | sed 's/^/      /'
+  echo
+  if running kubelet; then
+    echo "  The cluster is up with its old settings. 'ferry restart' applies these."
+  else
+    echo "  'ferry up' starts a cluster with these settings."
+  fi
+}
+
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
@@ -5431,6 +6104,8 @@ case "${1:-}" in
               "$here/kernel/build-kernel.sh" "$@" ;;
   build)      shift; cmd_build "$@" ;;
   up)         shift; cmd_up "$@" ;;
+  init)       shift; cmd_init "$@" ;;
+  config)     shift; cmd_config "$@" ;;
   profile)    shift; cmd_profile ;;
   addons)     shift; cmd_addons "$@" ;;
   image)      shift

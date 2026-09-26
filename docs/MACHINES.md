@@ -113,6 +113,29 @@ that vocabulary is deliberate: it is the model people already know from managed
 Kubernetes, and it leaves the door open to being a real CAPI provider later
 without redesigning the resource.
 
+### A machine chooses what its disk survives
+
+**Built.** `spec.durability` takes the cluster's words for one machine's root
+disk, plus the level only a disk has:
+
+| | the disk's barrier | survives |
+|---|---|---|
+| `power-loss` | `full` | the SSD losing power mid-write |
+| `os-crash` | `fsync` | the Mac crashing, not a power loss: `fsync(2)` on macOS reaches the drive without flushing its cache |
+| `process-crash` | `none` | `ferry-node` crashing, nothing more |
+
+Omitted, a machine takes the cluster's default, which is what every machine
+had before it could choose: `os-crash` under a `power-loss` cluster and
+`process-crash` under a `process-crash` one, or `machineDurability` from
+ferry's config when that is set. It is immutable with the rest of the spec, for
+the same reason — Virtualization.framework fixes a disk's barrier when the VM
+boots — and a FerryNodeClass `durability` that no longer matches a provisioned
+machine is drift, replaced the way an image change is.
+
+This used to be `FERRY_NODE_DISK_SYNC`, one value for every machine on the Mac,
+set on `ferry-node serve`. It still is the default; it is no longer the only
+answer.
+
 ### Resources are immutable
 
 [Experiment 14](../experiments/14-balloon/FINDINGS.md) measured what can be
@@ -417,6 +440,9 @@ the default. The Mac node is where the provisioner runs.
 
 ## How a pod chooses
 
+How to use this is [RUNTIMES.md](RUNTIMES.md); what follows is how it came to
+be built this way.
+
 It does not need a new concept. The Mac is a node and each machine is a node,
 so isolation becomes node selection — which Kubernetes already expresses:
 
@@ -426,9 +452,38 @@ nodeSelector: {ferry.dev/mode: vm-per-pod}  # one kernel per pod
 ```
 
 Taint the Mac node so pods land on machines by default and opt in to
-VM-per-pod, or the reverse, per cluster. This is better than the `RuntimeClass`
-split considered earlier: no new admission behaviour, no runtime negotiation,
-and `kubectl get nodes` shows the truth.
+VM-per-pod, or the reverse, per cluster. This was argued as better than the
+`RuntimeClass` split considered earlier: no new admission behaviour, no runtime
+negotiation, and `kubectl get nodes` shows the truth.
+
+**Corrected: the RuntimeClass goes on top of the label, not instead of it.**
+Both objections turned out to be cheaper than they looked. The RuntimeClass
+admission plugin is built into the API server and on by default, so there is no
+new admission behaviour to run; the "negotiation" is ferry-cri comparing one
+string. And a RuntimeClass's `scheduling` is a `nodeSelector` and tolerations
+merged into the pod at admission, so it selects the same label — `kubectl get
+nodes -L ferry.dev/mode` still shows the truth, because the truth did not move.
+
+```yaml
+runtimeClassName: ferry-shared   # = nodeSelector {ferry.dev/mode: shared}
+runtimeClassName: ferry-vm       # = nodeSelector {ferry.dev/mode: vm-per-pod}
+```
+
+What the labels alone could not do, and the classes can:
+
+- **Be the spelling people already know.** Kata and gVisor users ask for
+  isolation with `runtimeClassName`; so can a ferry user now.
+- **Carry a toleration.** Which is what makes a *default* possible: taint one
+  kind of node and let the other class tolerate it. See "A default for pods
+  that do not choose" below.
+- **Refuse the wrong node.** Each class names a handler — `ferry-vm` for
+  ferry-cri, `runc` for the machines' containerd — and the CRI says a runtime
+  refuses one it does not serve. ferry-cri ignored the field until this, so a
+  pod that asked for a shared kernel and reached the Mac quietly became a VM.
+- **Price the pod VM.** `overhead.podFixed` on `ferry-vm` lets the scheduler
+  count what a pod VM costs before its workload does anything.
+
+`manifests/runtimeclasses.yaml` has both; `ferry up` applies them.
 
 **Built.** The Mac node's kubelet registers `ferry.dev/mode=vm-per-pod`, and
 `ferry-machined` labels each machine `shared` once its node appears —
@@ -446,8 +501,10 @@ reconcile interval where the node is Ready and unlabelled, and a pod selecting
 missing rather than wrong, so the scheduler declines to place the pod rather
 than placing it somewhere it does not belong.
 
-Nothing balances between the two. A pod with no selector goes wherever it fits,
-which is milestone 4's job to make deliberate.
+Nothing balances between the two. A pod with no selector goes wherever it fits
+— measured as an even 5/5 split of a ten-replica Deployment (docs/BENCHMARKING.md,
+"With mode 2 on, an unpinned pod is not a mode-2 pod"). `defaultRuntime` in
+ferry's config is what makes that deliberate; see below.
 
 **Volumes.** A PersistentVolumeClaim for a pod on a machine is a directory in
 the Mac's volumes folder, which `ferry-node` shares into every machine at boot
@@ -482,6 +539,49 @@ moved from the Mac to a machine: cordoning the Mac leaves it Pending with
 local volume is anywhere. To move it, delete its claims and let them be made
 again on the machine — which starts it with empty volumes — or give it
 ReadWriteMany claims, which are the shared directory on both.
+
+### A default for pods that do not choose
+
+**Built.** Kubernetes has no default RuntimeClass, so the default is made the
+way Kubernetes makes every "not here unless you ask": a taint. `defaultRuntime`
+in ferry's config file picks which kind of node gets one.
+
+```
+defaultRuntime: ferry-vm       machines tainted ferry.dev/mode=shared:NoSchedule
+defaultRuntime: ferry-shared   Macs tainted ferry.dev/mode=vm-per-pod:NoSchedule
+defaultRuntime: none           neither; a pod goes wherever it fits
+```
+
+Each RuntimeClass tolerates its own nodes' taint, so a pod that names one gets
+it whatever the default is, and a pod that names nothing can only go to the
+untainted kind. ferry's own pods that belong somewhere particular say so: mode
+1's CoreDNS tolerates the Macs' taint, machine CoreDNS the machines', and the
+builder and the registry addon name `ferry-vm`.
+
+The policy lives in the config file and reaches the cluster as
+`kube-system/ferry-config`, which `ferry up` and `ferry config set` rewrite from
+the file. `ferry-machined` reads it every reconcile, and does two things with
+it: a machine created under `ferry-vm` registers with the taint — the same
+race-free route the provisioner's taints already take — and every labelled
+node's `ferry.dev/mode` taint is made to match, which covers a Mac that joins
+after `ferry up` and a default changed on a running cluster. Karpenter's
+NodePool is given the machines' taint under `ferry-vm`, or it would make a
+machine for a pending pod that cannot use it. Changing the default to or from
+`ferry-vm` therefore changes the NodePool's template, which Karpenter treats
+as drift: each provisioned machine is replaced by one made under the new
+default, its pods moved as consolidation would move them. Seen on a live
+cluster: switching to `ferry-shared` marked the one machine drifted and a
+replacement was Ready within seconds.
+
+`ferry-shared` is refused in effect, not in the file, while machines are off:
+tainting every Mac with nothing untainted to go to would leave no node that runs
+a pod. `ferry machines disable` takes the Macs' taint back off for the same
+reason.
+
+The cost is the `nodeSelector` spelling. A pod that picks `shared` by selector
+alone has no toleration for a `ferry-vm` default's taint and stays Pending; it
+needs `runtimeClassName: ferry-shared`. The default is `none` for every existing
+cluster, so nothing moves until someone chooses one — `ferry init` asks.
 
 ## Milestones
 

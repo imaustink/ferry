@@ -60,6 +60,35 @@ type machineSpec struct {
 	// once it is already schedulable -- see ensureProviderID for why the same
 	// argument did not win for the mode label.
 	Taints []string `json:"taints,omitempty"`
+	// The root disk's barrier, from spec.durability; see diskSync. Empty
+	// leaves it to ferry-node's own default, which is the cluster's.
+	DiskSync string `json:"diskSync,omitempty"`
+}
+
+// diskSync is what a durability level means for a machine's root disk, in
+// Virtualization.framework's terms:
+//
+//	power-loss     full   every guest flush is a full barrier on the Mac's SSD
+//	os-crash       fsync  every guest flush is an fsync(2): survives the Mac
+//	                      crashing, not the SSD losing power mid-write
+//	process-crash  none   flushes return before the data leaves the Mac's
+//	                      cache: survives ferry-node crashing, nothing more
+//
+// The same words as the cluster's own durability, plus the level between them
+// that only a disk has: macOS's fsync(2) reaches the drive without flushing
+// its cache, which is exactly what a machine got before it could choose.
+func diskSync(durability string) (string, error) {
+	switch durability {
+	case "":
+		return "", nil
+	case "power-loss":
+		return "full", nil
+	case "os-crash":
+		return "fsync", nil
+	case "process-crash":
+		return "none", nil
+	}
+	return "", fmt.Errorf("spec.durability %q: expected power-loss, os-crash or process-crash", durability)
 }
 
 // machineStatus is what it writes back.
@@ -80,9 +109,15 @@ type controller struct {
 	kube     kubernetes.Interface
 	dynamic  dynamic.Interface
 	machines map[string]*machine
+	// The cluster's default runtime as last read; see defaultruntime.go.
+	policy string
 }
 
 func (c *controller) reconcileAll(ctx context.Context) error {
+	// First, so a machine created below is born with the taint the current
+	// default asks for rather than getting it a tick later.
+	c.reconcileDefaultRuntime(ctx)
+
 	list, err := c.dynamic.Resource(machineGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -174,9 +209,22 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	// belongs to the process that made it (experiment 19), so every machine has
 	// to be hosted by the same one or they land on networks vmnet keeps apart.
 	taints, _, _ := unstructured.NestedStringSlice(item.Object, "spec", "node", "taints")
+	// At registration rather than patched on afterwards, for the reason the
+	// taints field exists at all: a pod that names no RuntimeClass must not
+	// get onto a machine in the moment before its taint arrives.
+	taints = withRegistrationTaint(taints, c.policy)
+	durability, _, _ := unstructured.NestedString(item.Object, "spec", "durability")
+	sync, err := diskSync(durability)
+	if err != nil {
+		// The CRD's enum refuses this before it gets here; an older CRD
+		// does not, and a disk opened with the wrong barrier is not a
+		// thing to find out about later.
+		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
+		return err
+	}
 	spec := machineSpec{
 		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
-		Token: token, Taints: taints,
+		Token: token, Taints: taints, DiskSync: sync,
 	}
 	body, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
@@ -188,8 +236,11 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 
 	m := &machine{name: name, token: token}
 	c.machines[name] = m
-	log.Printf("machine %s: asked for %d cpu, %d MiB, disk from %s",
-		name, cpus, memoryMiB, image)
+	if durability == "" {
+		durability = "the cluster's"
+	}
+	log.Printf("machine %s: asked for %d cpu, %d MiB, disk from %s, durability %s",
+		name, cpus, memoryMiB, image, durability)
 
 	return c.updateStatus(ctx, item, m)
 }

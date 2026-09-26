@@ -1,0 +1,56 @@
+# The two ways a ferry pod can run, named the way Kubernetes names runtimes.
+#
+#   runtimeClassName: ferry-vm       a virtual machine of its own, own kernel
+#   runtimeClassName: ferry-shared   a container on a machine, shared kernel
+#
+# Neither replaces the node label underneath. The Mac's kubelet registers
+# ferry.dev/mode=vm-per-pod and ferry-machined labels each machine
+# ferry.dev/mode=shared, and a RuntimeClass's `scheduling` is merged into the
+# pod at admission -- so `runtimeClassName: ferry-shared` and
+# `nodeSelector: {ferry.dev/mode: shared}` place a pod identically, and
+# `kubectl get nodes -L ferry.dev/mode` still shows where everything can go.
+# What the RuntimeClass adds is the spelling Kata and gVisor users already
+# reach for, a toleration for the default the cluster sets (defaultRuntime in
+# ferry's config), and a handler the runtime checks: ferry-cri refuses a
+# sandbox asked for with any handler but its own, so a pod that reaches the
+# wrong node fails loudly instead of quietly becoming the other kind.
+#
+# Applied by every 'ferry up', like the Machine CRD, because they live in etcd
+# and go with it on --purge.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ferry-vm
+  labels: {app.kubernetes.io/managed-by: ferry}
+# What ferry-cri answers to. An empty handler is accepted as well, which is
+# every pod that names no RuntimeClass.
+handler: ferry-vm
+# What a pod VM costs the Mac before its workload does anything -- its own
+# kernel and guest agent, measured at 133 MiB idle whatever it runs
+# (experiment 32). Counted by the scheduler on top of the pod's own requests,
+# so memory, not a pod count, is what fills the Mac. Only a pod that names this
+# class is charged it; maxPods stays as the ceiling for the ones that do not.
+# `ferry up` fills in the figure it derives maxPods from.
+overhead:
+  podFixed: {memory: __POD_OVERHEAD_MIB__Mi}
+scheduling:
+  nodeSelector: {ferry.dev/mode: vm-per-pod}
+  # Only matters when the cluster's default is ferry-shared, which taints the
+  # Macs so that a pod naming nothing lands on a machine. A toleration for a
+  # taint no node carries is inert.
+  tolerations:
+    - {key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ferry-shared
+  labels: {app.kubernetes.io/managed-by: ferry}
+# containerd's own default runtime inside the node image, which is named runc
+# there. Naming it directly means the node image needs no change to serve this.
+handler: runc
+scheduling:
+  nodeSelector: {ferry.dev/mode: shared}
+  # The mirror of the one above: a default of ferry-vm taints the machines.
+  tolerations:
+    - {key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}

@@ -248,6 +248,91 @@ A node VM on this Mac whose pods are ordinary Linux containers sharing its
 kernel. `kubectl delete machine worker-0` takes it away — VM stopped, Node
 removed, disk cleaned up. See [Machines — mode 2](#machines--mode-2).
 
+## Configuration
+
+What a cluster is meant to be lives in one file beside its state,
+`~/.ferry<-profile>/config.yaml`, shaped like the configuration files
+Kubernetes components read:
+
+```yaml
+apiVersion: ferry.dev/v1alpha1
+kind: FerryConfig
+purpose: dev              # dev | ci | node -- recorded, not acted on
+durability: power-loss    # power-loss | process-crash
+machines: true            # whether mode 2 runs
+defaultRuntime: ferry-vm  # ferry-vm | ferry-shared | none
+```
+
+`ferry init` asks what the cluster is for and writes it. Each purpose starts
+from sensible answers and every one is asked about:
+
+| purpose | machines | durability | defaultRuntime | for |
+|---|---|---|---|---|
+| `dev` | on, where available | `power-loss` | `ferry-vm` | a laptop you develop on |
+| `ci` | on, where available | `process-crash` | `ferry-shared` | clusters a script creates and deletes |
+| `node` | off | `power-loss` | `ferry-vm` | an always-on node holding what you would rebuild by hand |
+
+`ferry init --purpose ci --yes` answers from flags alone, for a script.
+
+```sh
+ferry config                         # every setting, its value, and where it came from
+ferry config set durability process-crash
+ferry config unset podMemoryMiB      # back to the default
+```
+
+The precedence is the usual one: a flag, for this run; a `FERRY_*` variable,
+for this run; the file; the default. A flag that is meant to be remembered —
+`ferry up --durability`, `ferry machines enable` — writes the file, and `ferry
+up` names the file every time it starts, so a setting is never somewhere you
+cannot see it. `ferry down --purge` deletes the cluster's data and keeps its
+config, which is the point of having one; `ferry init --force` starts again.
+
+**`defaultRuntime`** is where a pod that names no RuntimeClass runs. Without
+one — `none`, and every cluster from before this setting — such a pod goes
+wherever it fits, and a ten-replica Deployment was measured splitting 5/5
+between the Mac and a machine. `ferry-vm` keeps it on the Mac; `ferry-shared`
+sends it to a machine, and waits for machines to be on before it does
+anything. It is applied as a taint on the other kind of node — the machines
+for `ferry-vm`, the Macs for `ferry-shared` — which each RuntimeClass
+tolerates, so `runtimeClassName` always gets a pod what it names. A pod that
+picks by `nodeSelector` alone does not carry the toleration, and needs the
+RuntimeClass once a default is set. `ferry config set defaultRuntime …`
+applies to a running cluster at once; switching to or from `ferry-vm` changes
+Karpenter's NodePool, so provisioned machines are replaced with ones made under
+the new default.
+
+It reaches the cluster as `kube-system/ferry-config`, a copy of the file that
+`ferry up` and `ferry config set` rewrite, which `ferry-machined` reads to taint
+machines as they are made and Macs as they join. The file is the source: an
+edit to the ConfigMap lasts until the next rewrite.
+
+**`machineDurability`** is what a machine's disk survives, for a Machine
+whose spec does not say. A disk has one level more than the cluster: `os-crash`
+is an `fsync(2)`, which reaches the SSD without flushing its cache, so it
+survives the Mac crashing but not losing power. Unset, it follows the cluster
+— `os-crash` for `power-loss`, which is what machines always had, and
+`process-crash` for `process-crash`. One machine can choose its own:
+
+```yaml
+apiVersion: ferry.dev/v1alpha1
+kind: Machine
+metadata: {name: db-0}
+spec: {cpus: 2, memory: 4Gi, durability: power-loss}
+```
+
+Besides the settings above, the file takes a few that are one
+environment variable each: `podMemoryMiB` (`FERRY_POD_MEMORY_MIB`), `podCPUs`
+(`FERRY_POD_CPUS`), `maxPods` (`FERRY_MAX_PODS`), `machineLimitCPUs`
+(`FERRY_MACHINE_LIMIT_CPUS`) and `machineLimitMemoryGi`
+(`FERRY_MACHINE_LIMIT_MEMORY_GI`).
+
+**Before this file** the same choices were marker files — `durability` and
+`machines-enabled` in `~/.ferry` — written by flags and read back without a
+word. They are still read, and the first `ferry up`, `ferry config set` or
+`ferry machines` moves them into the file and removes them. A ferry from before
+this change does not read the file, so going back to one loses those two
+settings.
+
 ## Parameters
 
 Everything below is an environment variable. The installer's are read by
@@ -277,6 +362,7 @@ not in the installer.
 |---|---|---|
 | `FERRY_PROFILE` | `default`, or the worktree's name | which cluster this is; decides ports, state and pod network |
 | `FERRY_HOME` | `~/.ferry<-profile>` | etcd, PKI, kubeconfigs, logs — survives a restart |
+| `FERRY_CONFIG` | `$FERRY_HOME/config.yaml` | this cluster's settings; see [Configuration](#configuration) |
 | `FERRY_RUN` | `/tmp/ferry-run<-profile>` | sockets, pid files, per-run state. Under `/tmp` because macOS caps a unix socket path near 104 bytes |
 | `FERRY_PROFILES` | `~/.ferry-profiles` | the register mapping profile names to index numbers |
 | `FERRY_NODE_NAME` | `ferry-mac<-profile>` | this node's name |
@@ -303,15 +389,15 @@ not in the installer.
 
 ### Durability and speed
 
-`ferry up --durability relaxed` sets the first two together and is the
+`ferry up --disposable` (durability `process-crash`) sets the first two together and is the
 supported way in; the rest are here because the code reads them and are worth
 knowing when one of them is the thing you want to change on its own.
 
 | | default | |
 |---|---|---|
-| `FERRY_DURABILITY` | `full` | `relaxed` to acknowledge writes before they reach the disk. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered |
-| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `relaxed`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
-| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you by `relaxed` |
+| `FERRY_DURABILITY` | `power-loss` | `process-crash` to acknowledge writes before they reach the disk: a crashed process loses nothing, a power loss or kernel panic can. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered. `full` and `relaxed`, the old names, still work |
+| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `process-crash`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
+| `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you from `machineDurability`, or from the cluster's durability when that is unset; a Machine's own `spec.durability` overrides it for that machine |
 | `FERRY_BUILDER_CPUS` | half the Mac's cores, at least 2 | CPUs for the `ferry image build` builder pod. buildkit on the pod default of 2 is roughly half the speed of 8 |
 | `FERRY_BUILDER_MEMORY_GIB` | a quarter of the Mac's memory, 2–8 | memory for the builder pod |
 | `FERRY_BUILDER_POD` | `ferry-builder` | the builder pod's name |
@@ -354,6 +440,8 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_NODE_IMAGE` | `<root>/node-image/oci` | the OCI layout machines are built from |
 | `FERRY_NODE_DISK` | `$FERRY_HOME/node.ext4` | the disk unpacked from it, cloned per machine |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
+| `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
+| `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
 | `FERRY_MACHINE_LIMIT_CPUS` | half the Mac's cores | total cpus the provisioner may commit to machines |
@@ -532,23 +620,41 @@ missing directory. Mode 1 is unaffected either way.
 
 ### Choosing a mode
 
-A pod picks with a node selector, which is what `kubectl get nodes` already
-shows:
+[RUNTIMES.md](RUNTIMES.md) is the guide: workload examples, defaults, and what
+to do when a pod will not start. In short, a pod picks with a RuntimeClass, the
+way it would pick Kata or gVisor:
+
+```yaml
+runtimeClassName: ferry-shared   # dense, one kernel for many pods
+runtimeClassName: ferry-vm       # a kernel each
+```
+
+Each class is a node selector underneath, on the label `kubectl get nodes`
+already shows, so the older spelling still works and places a pod identically:
 
 ```sh
 kubectl get nodes -L ferry.dev/mode
 ```
 
 ```yaml
-nodeSelector: {ferry.dev/mode: shared}       # dense, one kernel for many pods
-nodeSelector: {ferry.dev/mode: vm-per-pod}   # a kernel each
+nodeSelector: {ferry.dev/mode: shared}       # same as ferry-shared
+nodeSelector: {ferry.dev/mode: vm-per-pod}   # same as ferry-vm
 ```
 
 The Mac node sets `vm-per-pod` on its own kubelet; `ferry-machined` labels each
-machine `shared` once its node registers. Nothing balances between them: the
-scheduler places a pod wherever it fits unless the pod says. Provisioning a
-machine because a pod needs one, and removing it when it does not, are
-MACHINES.md milestones 4 and 5.
+machine `shared` once its node registers. `ferry up` installs both classes
+(`manifests/runtimeclasses.yaml`). ferry-cri refuses a sandbox whose handler is
+not its own, so a `ferry-shared` pod that somehow reaches the Mac fails with a
+reason rather than quietly becoming a VM.
+
+A pod that names neither goes wherever it fits unless the cluster has a
+default; see `defaultRuntime` under [Configuration](#configuration).
+
+`ferry-vm` also carries a pod overhead: the ~133 MiB a pod VM costs before its
+workload does anything, counted by the scheduler on top of the pod's requests.
+Only a pod that names the class is charged it — Kubernetes has no default
+RuntimeClass to charge the rest — so the memory-derived `maxPods` stays as the
+ceiling for pods that do not.
 
 ### Cluster DNS inside machines
 

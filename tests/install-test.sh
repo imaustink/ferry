@@ -430,7 +430,7 @@ contains "starting machines installs the CRD, on every start" \
 # Enabling has to survive a restart, or a cluster comes back in mode 1 only and
 # the machines that were running are simply gone.
 contains "and 'machines enable' records the choice, so the cluster comes back with them" \
-  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "MACHINES_MARKER"
+  "$(sed -n '/^cmd_machines_enable/,/^}/p' "$repo/ferry")" "ferry_config_set machines true"
 contains "'ferry up' starts them for a cluster that asked" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "machines_enabled"
 # A release built without the image should say so rather than fail obscurely on
@@ -499,6 +499,88 @@ contains "and 'ferry up' asserts it once the node is Ready" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" 'ensure_mode_label "$NODE_NAME"'
 contains "and it is applied where the controller already has the Node" \
   "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
+
+# The same choice, spelled the way Kubernetes spells a runtime. Each class
+# selects the label above rather than replacing it, so the two spellings place
+# a pod identically.
+runtimeclasses="$(cat "$repo/manifests/runtimeclasses.yaml")"
+contains "a ferry-vm RuntimeClass exists" "$runtimeclasses" "name: ferry-vm"
+contains "  handled by ferry-cri under that name" "$runtimeclasses" "handler: ferry-vm"
+contains "  and scheduled onto the vm-per-pod label" "$runtimeclasses" "nodeSelector: {ferry.dev/mode: vm-per-pod}"
+contains "a ferry-shared RuntimeClass exists" "$runtimeclasses" "name: ferry-shared"
+# containerd's default runtime in the node image is called runc; naming any
+# other handler would need a node image rebuilt to serve it.
+contains "  handled by the machine's own containerd runtime" "$runtimeclasses" "handler: runc"
+contains "  and scheduled onto the shared label" "$runtimeclasses" "nodeSelector: {ferry.dev/mode: shared}"
+contains "'ferry up' installs them once the node is Ready" \
+  "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+contains "  and so does starting machines, which a purge would otherwise leave without" \
+  "$(sed -n '/^start_machines/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+# The CRI says an unknown handler is refused. Ignoring it meant a pod asking
+# for a shared kernel that reached the Mac became a VM without a word.
+cri_service="$(cat "$repo/ferry-cri/Sources/ferry-cri/RuntimeService.swift")"
+contains "ferry-cri checks the handler a sandbox is asked for" "$cri_service" \
+  "RuntimeHandlers.refusal(for: request.runtimeHandler)"
+contains "  and refuses one it does not serve" "$cri_service" "code: .invalidArgument, message: refusal"
+contains "  while a pod naming no RuntimeClass still runs" "$cri_service" 'static let served = ["", vm]'
+contains "  and says which it serves, for node.status.runtimeHandlers" "$cri_service" "response.runtimeHandlers"
+
+# --- a default for pods that name no RuntimeClass -------------------------
+#
+# Kubernetes has none, so it is a taint on the other kind of node. A
+# Deployment with no selector split 5/5 between the modes without one.
+printf '\033[1m%s\033[0m\n' "a default runtime for pods that do not choose"
+# What the functions below do is tested against a recording kubectl in
+# cli-test.sh; what is checked here is that they are called where they must be.
+contains "each class tolerates the taint its own nodes get as a default" "$runtimeclasses" \
+  "{key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}"
+contains "  both of them" "$runtimeclasses" "{key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}"
+contains "the NodePool gets the default's taint back after every apply of the NodePool file" \
+  "$(sed -n '/^start_provisioner()/,/^}/p' "$repo/ferry")" "ferry_apply_default_runtime"
+contains "turning machines off takes a ferry-shared default's taint off the Macs" \
+  "$(sed -n '/^cmd_machines_disable()/,/^}/p' "$repo/ferry")" "ferry_apply_default_runtime"
+up_src="$(sed -n '/^cmd_up()/,/^}/p' "$repo/ferry")"
+contains "'ferry up' publishes the config into the cluster" "$up_src" "ferry_config_publish"
+contains "  and applies the default" "$up_src" "ferry_apply_default_runtime"
+contains "ferry-machined reads the same ConfigMap, so nodes that arrive later are covered" \
+  "$(cat "$repo/ferry-machined/defaultruntime.go")" 'configName        = "ferry-config"'
+contains "  and applies on every reconcile" "$(cat "$repo/ferry-machined/reconcile.go")" "c.reconcileDefaultRuntime(ctx)"
+contains "  and a machine is born with the taint, not patched after" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" "withRegistrationTaint(taints, c.policy)"
+# ferry's own pods that belong somewhere particular must say so, or a default
+# moves them: DNS off the node every kubelet was told it is on, the registry
+# off the Mac its hostPort is served from.
+contains "mode 1 CoreDNS stays on its Mac under a ferry-shared default" \
+  "$(cat "$repo/manifests/coredns.yaml")" "{key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}"
+contains "machine CoreDNS stays on machines under a ferry-vm default" \
+  "$(cat "$repo/manifests/machines/coredns.yaml")" "{key: ferry.dev/mode, operator: Equal, value: shared, effect: NoSchedule}"
+contains "the builder is always a VM of its own" \
+  "$(sed -n '/^ferry_builder_up()/,/^}/p' "$repo/ferry")" "runtimeClassName: ferry-vm"
+contains "  with the class installed first, for a cluster started before it existed" \
+  "$(sed -n '/^ferry_builder_up()/,/^}/p' "$repo/ferry")" "install_runtime_classes"
+contains "the registry addon stays on the Mac its hostPort is served from" \
+  "$(cat "$repo/addons/registry/registry.yaml")" "runtimeClassName: ferry-vm"
+
+# --- a machine's own durability -------------------------------------------
+printf '\033[1m%s\033[0m\n' "a machine can choose what its disk survives"
+machine_crd="$(cat "$repo/ferry-machined/crd.yaml")"
+contains "the Machine CRD has spec.durability" "$machine_crd" "enum: [power-loss, os-crash, process-crash]"
+contains "  shown with -o wide" "$machine_crd" "{name: Durability, type: string, jsonPath: .spec.durability, priority: 1}"
+contains "ferry-machined hands ferry-node the barrier it means" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" 'DiskSync string `json:"diskSync,omitempty"`'
+node_src="$(cat "$repo/experiments/18-node-image/Sources/ferry-node/main.swift")"
+# Which barrier wins is ferry-node's DiskSyncTests; this is that it is used.
+contains "ferry-node opens the disk with the machine's own, else the server's" \
+  "$node_src" 'diskSynchronizationMode(
+        diskSync, serverDefault: ProcessInfo.processInfo.environment["FERRY_NODE_DISK_SYNC"])'
+contains "  which serve passes through from the spec" \
+  "$(cat "$repo/experiments/18-node-image/Sources/ferry-node/Serve.swift")" "diskSync: spec.diskSync"
+contains "a provisioned machine carries its NodeClass's durability" \
+  "$(cat "$repo/ferry-karpenter/provider.go")" '"spec", "durability"'
+contains "  set from ferry's config" \
+  "$(sed -n '/^start_provisioner()/,/^}/p' "$repo/ferry")" 'FERRY_MACHINE_DURABILITY="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}"'
+contains "  and the FerryNodeClass CRD accepts it" \
+  "$(cat "$repo/manifests/machines/karpenter/crds/ferrynodeclass.yaml")" "enum: [power-loss, os-crash, process-crash]"
 
 # --- cluster DNS for machines ---------------------------------------------
 #
@@ -655,7 +737,7 @@ succeeds "  behind an environment variable, not by default" \
 succeeds "the node disk's barrier is a knob" \
   grep -q 'FERRY_NODE_DISK_SYNC' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
 succeeds "  still .fsync unless asked otherwise" \
-  grep -q 'default:     sync = .fsync' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
+  grep -q 'default:     return .fsync' "$repo/experiments/18-node-image/Sources/ferry-node/main.swift"
 # "${a[@]}" with set -u on bash 3.2 -- which is the bash macOS ships -- is an
 # unbound variable, so the control plane would not start with the flag off.
 succeeds "  and an empty flag list does not break bash 3.2" \
@@ -724,22 +806,29 @@ succeeds "karpenter's health probe port is shifted like the rest" \
 # Durability, as a flag rather than two environment variables nobody finds.
 # Full is the default because it is the guarantee kind and minikube cannot
 # offer at all; relaxed is worth 3x on a pod start and is the caller's call.
+# The levels are named for the failure they survive -- power-loss and
+# process-crash -- because 'full' and 'relaxed' said how hard ferry tried and
+# not what was kept.
 succeeds "durability is a flag on ferry up" \
-  grep -q 'durability relaxed to trade crash-safety for speed' "$repo/ferry"
+  grep -q -- '--disposable to trade surviving a power loss for speed' "$repo/ferry"
 succeeds "  validated rather than trusted" \
-  grep -q "expected 'full' or 'relaxed'" "$repo/ferry"
+  grep -q "expected 'power-loss' or 'process-crash'" "$repo/ferry"
+succeeds "  the old names still mean what they did" \
+  grep -q 'power-loss|full) echo power-loss' "$repo/ferry"
 succeeds "  remembered for the cluster, the way machines is" \
   grep -q 'DURABILITY_MARKER=' "$repo/ferry"
 succeeds "  and it reaches etcd" \
-  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_relaxed' "$repo/ferry"
+  grep -q 'FERRY_ETCD_NO_FSYNC="$(durability_is_process_crash' "$repo/ferry"
 succeeds "  and the machine disks, so mode 2 does not disagree with mode 1" \
-  grep -q 'FERRY_NODE_DISK_SYNC="$(durability_is_relaxed' "$repo/ferry"
-# A relaxed cluster that looks like a full one is the failure mode worth
-# preventing: it is only ever discovered after something is lost.
-succeeds "  a relaxed cluster says so every time it starts" \
-  grep -q 'writes are acknowledged before they reach the disk' "$repo/ferry"
+  grep -q 'durability_is_process_crash && echo process-crash || echo os-crash' "$repo/ferry"
+succeeds "  through the one function that decides a machine's barrier" \
+  grep -q 'FERRY_NODE_DISK_SYNC="$(machine_disk_sync)"' "$repo/ferry"
+# A process-crash cluster that looks like a power-loss one is the failure mode
+# worth preventing: it is only ever discovered after something is lost.
+succeeds "  a process-crash cluster says so every time it starts" \
+  grep -q 'Writes are acknowledged before they reach the disk' "$repo/ferry"
 succeeds "  and ferry status says which one you are on" \
-  test "$(grep -c 'durability_is_relaxed' "$repo/ferry")" -ge 4
+  test "$(grep -c 'durability_is_process_crash' "$repo/ferry")" -ge 4
 
 # --purge destroys the cluster, so the control plane does not have to wait
 # its turn behind the components -- nothing between them needs an API server.
