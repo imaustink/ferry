@@ -61,7 +61,8 @@ spec:
               echo "booted \$(sysctl -n kern.boottime | sed 's/.*} //')"
               m=\$(sysctl -n kern.maxfilesperproc)
               sysctl -w kern.maxfilesperproc=\$m >/dev/null && echo "sysctl -w: allowed" || echo "sysctl -w: refused"
-              renice -n -5 -p \$\$ >/dev/null && echo "renice -5: allowed" || echo "renice -5: refused"
+              # \$\$\$\$: Kubernetes reads \$\$ in args as an escaped \$.
+              renice -n -5 -p \$\$\$\$ >/dev/null && echo "renice -5: allowed" || echo "renice -5: refused"
               sleep 40
 EOF
 echo "=== 1. a Job of two macOS VM pods: kubectl apply at 0 s"
@@ -77,7 +78,7 @@ metadata: {name: macvm-third, labels: {experiment: "39", exp: macvm}}
 spec:
   runtimeClassName: ferry-macos-vm
   restartPolicy: Never
-  containers: [{name: c, image: $img, command: [/bin/sh, -c, 'echo "uid \$(id -u), kernel boot session \$(sysctl -n kern.bootsessionuuid)"; ls /private/tmp']}]
+  containers: [{name: c, image: $img, command: [/bin/sh, -c, 'echo "uid \$(id -u), kernel boot session \$(sysctl -n kern.bootsessionuuid)"; echo "/private/tmp: \$(ls -a /private/tmp | tr "\n" " ")"']}]
 EOF
 sleep 15
 echo "    macvm-third: $(k get pod macvm-third -o jsonpath='{.status.phase}') on '$(k get pod macvm-third -o jsonpath='{.spec.nodeName}')'"

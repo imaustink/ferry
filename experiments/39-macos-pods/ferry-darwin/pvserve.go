@@ -14,6 +14,12 @@ package main
 // and the container root mounts it like any other volume. A pod sees its own
 // claim and nothing else of the share, which a single mount of the whole share
 // into the root would not give.
+//
+// The servers take no credentials, so what keeps one pod out of another's
+// claim is who may connect: only from a reserved port, below 1024, which only
+// root can bind -- the kernel's NFS client, mounting with resvport -- and a
+// pod's processes are not root. Without it, a pod on a shared machine could
+// speak NFS from userspace to 127.0.0.1 and read any claim mounted there.
 
 import (
 	"fmt"
@@ -38,10 +44,11 @@ func (p *pvServers) portFor(dir string) (int, error) {
 	if port, ok := p.byPath[dir]; ok {
 		return port, nil
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
 	}
+	ln := reservedOnly{tcp}
 	fs := osfs.New(dir, osfs.WithBoundOS())
 	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(fs), 4096)
 	go func() {
@@ -49,7 +56,7 @@ func (p *pvServers) portFor(dir string) (int, error) {
 			log.Printf("volumes: the NFS server for %s stopped: %v", dir, err)
 		}
 	}()
-	port := ln.Addr().(*net.TCPAddr).Port
+	port := tcp.Addr().(*net.TCPAddr).Port
 	if p.byPath == nil {
 		p.byPath = map[string]int{}
 	}
@@ -64,9 +71,27 @@ func (p *pvServers) mountPV(dir, target string, readOnly bool) error {
 	if err != nil {
 		return err
 	}
-	opts := fmt.Sprintf("vers=3,tcp,port=%d,mountport=%d,locallocks,nobrowse,nosuid,nodev", port, port)
+	opts := fmt.Sprintf("vers=3,tcp,resvport,port=%d,mountport=%d,locallocks,nobrowse,nosuid,nodev", port, port)
 	if readOnly {
 		opts += ",rdonly"
 	}
 	return run("mount_nfs", "-o", opts, "127.0.0.1:/", target)
+}
+
+// reservedOnly refuses a connection from an unreserved port: see the top of
+// this file.
+type reservedOnly struct{ net.Listener }
+
+func (l reservedOnly) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if a, ok := c.RemoteAddr().(*net.TCPAddr); ok && a.Port < 1024 {
+			return c, nil
+		}
+		log.Printf("volumes: refused an NFS connection from %s: not a reserved port, so not root", c.RemoteAddr())
+		c.Close()
+	}
 }

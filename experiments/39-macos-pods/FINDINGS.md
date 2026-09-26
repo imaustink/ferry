@@ -145,6 +145,11 @@ scheduling:
     - {key: ferry.dev/mode, operator: Equal, value: shared-macos, effect: NoSchedule}
 ```
 
+*(This was the plan. Mode 1 was ultimately built the other way -- as a macOS
+Machine that runs one pod, reusing the mode-2 path with `maxPods: 1` rather than
+a `MacPod` inside ferry-cri. See "Mode 1, built" below for what shipped and why.
+The design here is kept as the road not taken.)*
+
 **Mode 1, in `ferry-cri`:**
 
 - `RuntimeHandlers.served` gains `ferry-macos-vm`, and `runPodSandbox` branches
@@ -720,7 +725,7 @@ is no bridge to cross. `run-macos-exec.sh`:
   try timed out: connecting to one of its own aliases, the kernel picked the
   pod's address as the source, and pf refused it -- that address carries
   traffic only for the pod's uid, and the runtime is root.
-- **Attach is not built**; `kubectl logs -f` reads the same output.
+- **Attach is built too** (see below): `kubectl attach`, stdin, and a terminal.
 
 **macOS pods have a shell.** An image still cannot carry Apple's binaries --
 on a Mac with SIP on, a copy is killed before it runs -- but on a node with
@@ -740,10 +745,75 @@ pod -- zsh`, `command: [/bin/sh, -c, ...]` -- and it cost two things to find:
   so a scripted test of `-t` tests nothing; `script(1)` gives it one.
 
 Tools are copied with their permission bits only, so `sudo`, `su` and the
-rest are not setuid in a pod root. What a pod does not get is the OS's
-`/etc` -- no passwd entries for pod uids, so `id -un` has no name -- nor
-`/usr/sbin`, `/usr/libexec` or `/Applications`; Xcode would be a mount or an
-image of its own.
+rest are not setuid in a pod root. `/sbin` and `/usr/sbin` were added for the
+macOS-VM pods below -- `sysctl`, `ifconfig`, `mount` -- and the pod's `PATH`
+and argv[0] lookup are macOS's own (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`)
+so a tool is found where a Mac's shell finds it. What a pod does not get is the
+OS's `/etc` -- no passwd entries for pod uids, so `id -un` has no name -- nor
+`/usr/libexec` or `/Applications`; Xcode would be a mount or an image of its
+own.
+
+### kubectl attach, stdin and a terminal
+
+`run-macos-attach.sh`, four cases:
+
+```
+=== kubectl attach ticker, for four seconds
+    tick 1
+    tick 2
+    tick 3
+=== echo ... | kubectl attach -i catter   (stdin, stdinOnce)
+    catter: Succeeded, log: hello through attach
+=== kubectl attach -it termy   (a terminal)
+    shell on /dev/ttys000, 40 80 rows/cols
+=== kubectl run -i --rm   (attach underneath)
+    run -i read: a line for run, on macOS 26.6.2
+```
+
+A container's output used to go one way, into its log. For attach it has to
+reach whoever is attached as well, as it arrives, so each container's output
+is read in chunks: the chunk fans out to every attached client and its lines
+go to the log in the kubelet's format. `stdin: true` gives the container a pipe
+attach writes into, closed after the first client when it asked `stdinOnce`;
+`tty: true` runs it on a pseudo-terminal attach reads, writes and resizes.
+`kubectl run -i --rm` and `kubectl exec -i` are the same fan-out and pipe. Input
+typed before attach has the terminal in raw mode is lost to the shell's line
+editor, as it would be typing ahead of a prompt at a real keyboard, so the test
+types after a pause.
+
+### PersistentVolumes, shared with Linux pods
+
+`run-macos-pvc.sh` -- a claim written by a macOS pod, read after it is gone by a
+second macOS pod, then by a Linux pod VM, then on the Mac itself:
+
+```
+=== a macOS pod writes to the claim
+    pv-writer: Succeeded on mac-0
+    written on macOS 26.6.2 by uid 1006
+    claim bound to pvc-af8b7dd2-..., a hostPath at ~/.ferry-.../volumes/pvc-af8b7dd2-...
+=== a second macOS pod, after the first is gone
+    written on macOS 26.6.2 by uid 1006
+=== a Linux pod VM on the Mac, the same claim
+    read on Linux 6.18.5-ferry:
+    written on macOS 26.6.2 by uid 1006
+    and on the Mac itself: written on macOS 26.6.2 by uid 1006
+```
+
+ferry-storage makes a PersistentVolume a directory on the Mac, and ferry-node
+shares the Mac's whole volumes directory into the machine over virtiofs at the
+same path. The kernel's `nfsd` mounts a node-disk directory into a container
+root (above), but **it would not export a directory on a virtiofs mount** -- it
+left the share out of its exports and said nothing, the way it does for a
+filesystem it does not like. So each PersistentVolume a container mounts gets a
+**userspace NFS server of its own** (`go-nfs`) on a loopback port, rooted at
+that volume's directory -- bound, so a symlink cannot lead out of it -- and the
+container root mounts that. A pod sees its own claim and nothing else of the
+share, which one mount of the whole share would not give. The same directory is
+the Mac's, a Linux pod VM's `hostPath` mount, and a macOS pod's NFS mount at
+once, so a claim moves between all three kinds of pod.
+
+That userspace server had to be shut to other pods; the reserved-port finding
+below is what closed it.
 
 ### macOS machines on demand
 
@@ -876,9 +946,23 @@ what a Linux node's masquerade does. `/private/etc/ssl` joined the OS base, and
 pod's processes are not root, which is what keeps it out; macOS's devfs has no
 per-mount rules to hide them the way FreeBSD's `devfs.rules` would.
 
-Not done: PersistentVolumes (ferry-storage's directory volumes are a virtiofs
-share of the Mac's own directory, which would need its own export), `subPath`,
-fsGroup and ownership semantics beyond `-mapall=root`, and block volumes.
+**nfsd takes requests only from reserved ports**, or a pod could read every
+pod's volumes. The exports go to 127.0.0.1 with `-mapall=root`, and a pod's
+processes are on 127.0.0.1 too -- so an ordinary pod could speak NFS from
+userspace to `nfsd` and to the per-PV servers and read another pod's Secrets,
+tokens and claim, as root. `run-nfs-attack.sh` did exactly that: a pod at uid
+1004 beside a victim, before the fix, read the victim's PVC (`open: port 55628:
+victims-file`). The kernel's `mountd` already refused it a mount of the pods
+directory -- macOS requires reserved ports for MOUNT by default -- but the
+userspace per-PV servers had no such rule. Now the node sets
+`vfs.generic.nfs.server.require_resv_port=1`, the per-PV servers accept a
+connection only from a port below 1024, and both mount with `resvport`. Only
+root can bind a reserved port, and a pod's processes are not root; the runtime's
+own mounts are the kernel's NFS client, which is. After the fix the same attack
+reads nothing.
+
+Not done: `subPath`, fsGroup and ownership semantics beyond `-mapall=root`, and
+block volumes.
 
 ### All three kinds of pod, one network
 
@@ -927,6 +1011,72 @@ macOS to Linux worked at once; Linux to macOS took two fixes, each found by
 its destination per datagram, so the shim now rewrites and source-binds there
 too. DNS itself is unaffected -- it goes through mDNSResponder.
 
+### Mode 1, built: a pod that is its own macOS VM
+
+The plan above put mode 1 inside `ferry-cri` on the Mac -- a `MacPod` holding a
+booted guest, containers as processes in it. What is built instead reuses the
+mode-2 machinery: **a macOS pod's VM is a macOS Machine that runs one pod.** A
+Machine gains `spec.isolation: vm`; ferry-machined boots it exactly like a
+shared macOS machine but registers it `ferry.dev/mode=macos-vm` with the
+kubelet's `maxPods: 1`, so the scheduler puts one pod on it and no more. The pod
+runs as **root** (`ferry-darwin -pod-vm`): a uid of its own is what keeps pods
+that share a kernel apart, and here there is no other pod, so it would only keep
+the pod from what a VM of its own is for. `run-macos-vm.sh`, nothing declared:
+
+```
+=== 1. a Job of two macOS VM pods
+    both Running after 35 s
+    macos-vm-grdt8   ferry-macvm-4cpu-4gi   1     (PODS capacity: 1)
+    macos-vm-2ng4j   ferry-macvm-4cpu-4gi   1
+=== what each pod saw
+    uid 0, kernel boot session 1A2F29BF-...   booted Sat Sep 26 22:33:37 2026
+    sysctl -w: allowed    renice -5: allowed
+    uid 0, kernel boot session 49B3D5A7-...   booted Sat Sep 26 22:33:39 2026
+    sysctl -w: allowed    renice -5: allowed
+=== 2. a third ferry-macos-vm pod
+    macvm-third: Pending
+    macos-vm-grdt8   ferry.dev/mode,ferry.dev/spent      (both slots full)
+    macos-vm-2ng4j   ferry.dev/mode,ferry.dev/spent
+=== 3. the Job is done: its machines go, and the third pod gets a fresh one
+    macvm-third: Succeeded on macos-vm-q72fh (the Job's were: macos-vm-grdt8 macos-vm-2ng4j)
+    uid 0, kernel boot session EFD4C420-...   /private/tmp: . ..
+    no machines after 207 s
+```
+
+- **Each pod is a kernel of its own.** Distinct boot-session UUIDs, and the
+  third pod's `/private/tmp` is empty where the Job's pods had written -- a
+  fresh clone of the golden image, nothing of the pod before it.
+- **The pod is root, and it is real root.** `sysctl -w` and `renice -5`, which a
+  shared-macos pod's uid is refused, both succeed. That is the point of paying
+  for a whole guest: a CI step that wants to install a kext, change a system
+  setting or run under `sudo` can.
+- **A VM is single-use.** `maxPods: 1` alone is not: a finished pod stops
+  counting, so the next pod would land in the guest the last one had root in.
+  ferry-machined taints the node `ferry.dev/spent` (its own key, so the
+  default-runtime reconciler never removes it) once a pod is bound to it, and
+  `ferry-darwin` refuses a second pod for the moment before that taint lands. So
+  the machine is empty when its pod ends, Karpenter takes it away, and the next
+  pod gets a clone.
+- **Two slots, shared with shared-macos machines.** ferry-karpenter offers
+  `ferry-macvm-*` shapes (pods capacity 1) from a `macos-vm` NodePool, only
+  while one of the Mac's two macOS guests is free -- the same count mode-2
+  machines draw on. Two Job pods took both; the third waited Pending with a
+  reason until a slot freed, then got its own.
+- **RuntimeClass `ferry-macos-vm`** carries `nodeSelector: {ferry.dev/mode:
+  macos-vm}` and the toleration for its taint, beside `ferry-macos-shared`.
+  Both are shipped in `manifests/runtimeclasses.yaml`, inert on a Mac with no
+  macOS image.
+
+What this costs over a `MacPod` in ferry-cri is a whole node -- a kubelet, a
+registration, a Karpenter round trip -- per pod, and a slower start (35 s to two
+pods Running here, against ~10 s to boot a bare guest) because the kubelet and
+CRI come up inside it. What it buys is that mode 1 is mode 2 with `maxPods: 1`:
+no second guest-managing path, no `MacPod` type, the same boot, network,
+Services, volumes and streaming a shared macOS machine already has. The kubelet
+running inside the pod's own VM does mean a root pod can reach that node's
+kubelet credentials -- acceptable because the VM is thrown away after the one
+pod, but noted.
+
 ## Also possible, not asked: the Mac node itself
 
 The Seatbelt runtime needs no VM at all. The Mac is already a darwin node, so
@@ -937,14 +1087,19 @@ the user.
 
 ## What this does not establish
 
-- Pod networking for macOS guests was NAT, not ferry's `VmnetNetwork`; routable
-  per-pod addresses for macOS guests are untested.
-- Mode 2 runs from a Machine on ferry's networks, provisioned on demand, with
-  Services, cluster DNS, TCP and UDP between it, the Mac's pod VMs and a Linux
-  machine. The slot count covers macOS machines only: mode 1 macOS pod VMs
-  would draw on the same two and are not built, and any other macOS VM on the
-  Mac is invisible to it.
-- virtiofs volumes, exec/attach/logs through the agent, and Xcode in a guest
-  were not tried. Xcode is not in the golden image and would dominate its size.
+- Both modes are built: shared-macos (a kernel shared between pods) and macos-vm
+  (a pod that is its own VM), the second as a Machine with `maxPods: 1` rather
+  than the `MacPod`-in-ferry-cri plan above. The slot count is one ledger for
+  both kinds of macOS guest -- Karpenter counts every `spec.os: darwin` Machine
+  against the two -- but any macOS VM on the Mac that is not a Machine is
+  invisible to it.
+- The early Mode 1 measurements (boot time, memory, the two-guest ceiling) were
+  taken with the standalone `macvm` prototype, not through Kubernetes; the
+  macos-vm path re-measured start (35 s to two pods Running) but not idle memory
+  per guest, which is still one reading of one 4 GiB guest.
+- Xcode in a guest was not tried; it is not in the golden image and would
+  dominate its size.
 - Why clone boots split between ~10 s and ~20 s is a guess.
-- Idle memory is one reading of one 4 GiB guest.
+- Mode-1's kubelet runs inside the pod's own VM, so a root pod can read that
+  node's kubelet credentials. It is acceptable only because the VM is discarded
+  after the one pod.

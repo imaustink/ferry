@@ -298,6 +298,11 @@ func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateCo
 		_ = os.MkdirAll(filepath.Join(root, d), 0o755)
 	}
 	_ = os.Chmod(filepath.Join(root, "tmp"), 0o1777)
+	// On a Mac /tmp is a link to /private/tmp, and tools that resolve paths
+	// (or print them) use the second; here the other way round, to the same
+	// directory.
+	_ = os.MkdirAll(filepath.Join(root, "private"), 0o755)
+	_ = os.Symlink("../tmp", filepath.Join(root, "private", "tmp"))
 	// Name resolution. libSystem's resolver asks mDNSResponder over a UNIX
 	// socket at /var/run/mDNSResponder, and inside a chroot that path is
 	// missing -- so a pod could reach a Service by address and not resolve its
@@ -324,7 +329,7 @@ func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateCo
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("container %s has no command and its image no entrypoint", cfg.GetMetadata().GetName())
 	}
-	env := append([]string{"PATH=/bin:/usr/bin", "HOME=/tmp", "TMPDIR=/tmp"}, img.env...)
+	env := append([]string{"PATH=" + defaultPath, "HOME=/tmp", "TMPDIR=/tmp"}, img.env...)
 	for _, kv := range cfg.Envs {
 		env = append(env, kv.Key+"="+kv.Value)
 	}
@@ -361,7 +366,7 @@ func (c *container) resolve() (string, error) {
 	if strings.Contains(name, "/") {
 		return name, nil
 	}
-	for _, dir := range []string{"/bin", "/usr/bin", "/usr/local/bin"} {
+	for _, dir := range strings.Split(defaultPath, ":") {
 		if st, err := os.Stat(filepath.Join(c.root, dir, name)); err == nil && !st.IsDir() {
 			return dir + "/" + name, nil
 		}
@@ -643,3 +648,7 @@ func matchLabels(want, have map[string]string) bool {
 	}
 	return true
 }
+
+// defaultPath is macOS's own, from /etc/paths: a pod whose image sets no
+// PATH finds sysctl and ifconfig where a Mac's shell does.
+const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

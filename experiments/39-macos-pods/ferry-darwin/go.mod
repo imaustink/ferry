@@ -6,6 +6,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/willscott/go-nfs v0.0.4
+	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
 	google.golang.org/grpc v1.72.1
 	k8s.io/client-go v0.34.0
 	k8s.io/cri-api v0.34.0
@@ -29,7 +30,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
-	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/net v0.56.0 // indirect

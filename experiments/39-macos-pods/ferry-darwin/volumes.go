@@ -19,7 +19,8 @@ package main
 //	               it projects as root -- a ServiceAccount token is 0600 root --
 //	               so without this a pod could not read its own token. It is
 //	               the pod's own volumes that are mounted, and a pod's uid cannot
-//	               mount anything else.
+//	               mount anything else -- nor speak NFS to nfsd from userspace,
+//	               which takes requests only from reserved ports, root's.
 //	nosuid,nodev   so a volume the pod can write as root is not a way to plant
 //	               a setuid binary or a device.
 //
@@ -63,6 +64,14 @@ func startNFS(roots []string) ([]string, error) {
 	}
 	if err := os.WriteFile("/etc/exports", []byte(lines.String()), 0o644); err != nil {
 		return nil, err
+	}
+	// Only from a reserved port, which only root can bind. The exports go to
+	// 127.0.0.1 with -mapall=root, and a pod's processes are on 127.0.0.1 too:
+	// with macOS's default of 0 a pod could speak NFS from userspace and read
+	// every pod's volumes, Secrets included, as root. mount_nfs uses a
+	// reserved port, so the runtime's own mounts are unaffected.
+	if out, err := exec.Command("sysctl", "-w", "vfs.generic.nfs.server.require_resv_port=1").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("nfsd: requiring reserved ports: %v: %s", err, out)
 	}
 	start := time.Now()
 	_ = exec.Command("nfsd", "enable").Run()
@@ -178,7 +187,7 @@ func (r *runtimeSvc) mountVolumes(root string, mounts []volumeMount) error {
 			}
 			continue
 		}
-		opts := "vers=3,locallocks,nobrowse,nosuid,nodev"
+		opts := "vers=3,resvport,locallocks,nobrowse,nosuid,nodev"
 		if v.readOnly {
 			opts += ",rdonly"
 		}
