@@ -23,7 +23,8 @@ machine, so the pod count is the cost.
 | addon | version | pods | Mac memory | verified by |
 |---|---|--:|--:|---|
 | metrics-server | v0.7.2 | 1 | 318 MiB | `kubectl top nodes` answering |
-| ingress-nginx | v1.11.3 | 1 | 359 MiB | an Ingress with a host rule answering 200 through the node port |
+| ingress-nginx | v1.15.1 | 1 | 237 MiB | an Ingress naming no class answering 200 at `localhost` and the LAN address on 80 and 443, and at the node port; 404 for another host |
+| traefik | v3.7.13 | 1 | 293 MiB | the same, plus an Ingress's own TLS Secret served on 443 and the Mac's address written back to the Ingress |
 | registry | 3.1.1 | 1 | 306 MiB | `crane copy` to localhost:5001, a pod pulling `localhost:5001/…` and running it; images still there after the pod and the cluster were restarted |
 | dashboard | v2.7.0 | 2 | 549 MiB | port-forward, the dashboard's own API listing kube-system's pods with the token, 401 without |
 | headlamp | v0.45.0 | 1 | 373 MiB | port-forward, namespaces listed through Headlamp with the token, 403 without |
@@ -44,7 +45,17 @@ Leaner is chosen over complete wherever the two differ, because of that last
 column. The dashboard is 2.7.0, the last release with a plain manifest -- 7.x is
 five pods behind Kong -- and the one minikube still ships; the project itself
 was retired in 2026 in favour of Headlamp, which is one pod. The prometheus addon
-is one Prometheus, not kube-prometheus's dozen pods.
+is one Prometheus, not kube-prometheus's dozen pods. Traefik is only its
+Ingress provider -- one pod and no CRDs -- where upstream's chart installs a
+stack of its own resource types beside it; Gateway API is envoy-gateway's.
+
+ingress-nginx is kept at its last release, v1.15.1: the project was retired in
+March 2026. Traefik reads the same Ingresses and is maintained. Both mark
+their IngressClass as the default, and with both enabled Kubernetes gives an
+Ingress that names no class to whichever was enabled last -- measured on
+v1.37, where it no longer refuses such an Ingress. Only one of them can have
+the Mac's port 80; the other reports `PortInUse` and is reached at its node
+port, and takes 80 and 443 by itself once the first is disabled.
 
 Some things are absent because they cannot work here rather than because nobody
 wrote them. Anything that is a DaemonSet reading the node's kernel --
@@ -130,6 +141,11 @@ pulled. From localhost a pull takes 13 to 60 ms, and a fresh image pushed with
 
 ## Found on the way
 
+- **ingress-nginx's NOTES told everyone they needed root.** They said 80
+  and 443 stayed `<pending>` unless ferry-proxy ran as root, which experiment
+  27 had made untrue; the address was answering on 80 all along. The addon was also v1.11.3, from before the fix for
+  CVE-2025-1974, and its IngressClass was not the default, so an Ingress
+  without `ingressClassName` was ignored in silence.
 - **A hostPort in front of a different containerPort reached the pod's own
   port.** With `hostPort: 5001, containerPort: 5000`, a request to
   `localhost:5001` arrived in the pod on 5001 -- where registry:3's debug server

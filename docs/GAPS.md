@@ -27,7 +27,7 @@ The last revision's lesson holds: two observations can be consistent with a theo
 | every node on one Mac moves together | each node runs its kubelet from its own version directory | 28 |
 | an image is loaded per node | a loaded or built image reaches every node on the Mac, every machine, and other Macs through their registries, with mutual TLS | [33](../experiments/33-cluster-images-and-volumes/FINDINGS.md) |
 | `chown` refused, and no real ReadWriteOnce, on mode 2 volumes | `storageClassName: ferry-local-block` is an ext4 disk attached to the machine over USB: ownership is kept, pods on one machine share it, and it moves between machines | 33 |
-| two addons | ten, each enabled, used and disabled on a cluster: metrics-server, ingress-nginx, registry, dashboard, headlamp, cert-manager, gateway-api, envoy-gateway, kube-state-metrics, prometheus | [addons/README.md](../addons/README.md) |
+| two addons | eleven, each enabled, used and disabled on a cluster: metrics-server, ingress-nginx, traefik, registry, dashboard, headlamp, cert-manager, gateway-api, envoy-gateway, kube-state-metrics, prometheus | [addons/README.md](../addons/README.md) |
 | `medium: Memory` is disk | a tmpfs in the pod VM, sized from `sizeLimit` or the pod limit, charged to the container's cgroup, and carried over any VM replacement | [30](../experiments/30-volumes-and-logs/FINDINGS.md) |
 | a late subPath is `0755 root` | a late subPath gets the volume root's mode, as on Linux | 30 |
 | `kubectl logs --previous` fails after each crash | 0 of 932 polls failed, against 255 of 921 before. The window was 12–32 s, not "a few seconds". | 30 |

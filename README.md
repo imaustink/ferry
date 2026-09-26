@@ -587,9 +587,9 @@ crane copy busybox:1.36 localhost:5001/busybox:1.36
 kubectl run hi --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
 ```
 
-Ten, each pinned to a version that has been run here and checked for what it is
-for, not only for its pods going Ready: metrics-server, ingress-nginx, a
-registry, the Kubernetes Dashboard and Headlamp, cert-manager, the Gateway API
+Eleven, each pinned to a version that has been run here and checked for what it is
+for, not only for its pods going Ready: metrics-server, ingress-nginx and
+Traefik, a registry, the Kubernetes Dashboard and Headlamp, cert-manager, the Gateway API
 CRDs and Envoy Gateway, kube-state-metrics and a single Prometheus. `enable`
 waits until the addon works and says why when it does not; `disable` removes
 exactly what was applied. Upstream manifests are fetched by sha256 and cached,
