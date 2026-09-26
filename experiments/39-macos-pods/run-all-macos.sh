@@ -28,7 +28,11 @@ echo "stats: $(grep -oE 'verdict: [a-zA-Z]+' "$b/stats.log" | awk '{print $2}') 
 "$here/run-macos-oom.sh" > "$b/oom.log" 2>&1
 echo "memory limits: $(count oom.log 'verdict: ok') of 2 (a pod over its limit OOMKilled, one within it running)"
 "$here/run-macos-cpu.sh" > "$b/cpu.log" 2>&1
-echo "cpu limits: $(grep -oE 'verdict: [a-zA-Z]+' "$b/cpu.log" | awk '{print $2}') ($(grep -oE 'capped: [0-9.]+ cores' "$b/cpu.log"); $(grep -oE 'uncapped: [0-9.]+ cores' "$b/cpu.log"))"
+# The two "N cores over" lines are capped then uncapped, in order; "uncapped"
+# contains "capped", so match the numbers, not the word.
+cpu_v=$(grep -oE 'verdict: [a-zA-Z]+' "$b/cpu.log" | awk '{print $2}')
+cpu_n=$(grep -oE '[0-9.]+ cores' "$b/cpu.log")
+echo "cpu limits: ${cpu_v:-?} (capped $(echo "$cpu_n" | sed -n 1p), uncapped $(echo "$cpu_n" | sed -n 2p))"
 "$here/run-macos-restart.sh" > "$b/restart.log" 2>&1
 echo "restart: $(count restart.log 'verdict: ok') of 2 (a crash loop and a liveness failure both restart in place)"
 "$here/run-macos-subpath.sh" > "$b/subpath.log" 2>&1
