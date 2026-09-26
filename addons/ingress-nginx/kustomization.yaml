@@ -1,0 +1,16 @@
+# Upstream's manifest, pinned in addon.conf, with its IngressClass made the
+# default: an Ingress that names no class -- most tutorials, and many charts --
+# is otherwise ignored by every controller, with nothing said about why.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ingress-nginx.yaml
+patches:
+- target: {kind: IngressClass, name: nginx}
+  patch: |-
+    apiVersion: networking.k8s.io/v1
+    kind: IngressClass
+    metadata:
+      name: nginx
+      annotations:
+        ingressclass.kubernetes.io/is-default-class: "true"
