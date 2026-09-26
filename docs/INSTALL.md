@@ -445,7 +445,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
 | `FERRY_MACHINE_LIMIT_CPUS` | half the Mac's cores | total cpus the provisioner may commit to machines |
-| `FERRY_MACHINE_LIMIT_MEMORY_GI` | a quarter of the Mac's memory | total memory it may commit. Past this, a pod stays `Pending` with a reason rather than the Mac swapping |
+| `FERRY_MACHINE_LIMIT_MEMORY_GI` | a quarter of the Mac's memory | total memory it may commit. Past this, a pod stays `Pending` with a reason rather than the Mac swapping. It is also held to what the Mac's own pods leave: machines and pod VMs share one ledger, and the Mac node advertises its memory minus what machines hold ([MACHINES.md](MACHINES.md#the-host-budget-is-the-real-constraint)) |
 | `FERRY_MACHINE_MIN_CPUS` / `FERRY_MACHINE_MAX_CPUS` | `2` / `8` | how small and how large one provisioned machine may be |
 | `FERRY_MACHINE_MIN_MEMORY_GI` / `FERRY_MACHINE_MAX_MEMORY_GI` | `2` / the total memory limit | the same for memory. The max is held to the total by default, since one machine cannot exceed what every machine may be |
 | `FERRY_MACHINE_RELAY_PORT` | `8700` + profile shift | where machines join ferry's pod network. `ferry-node` holds this end of the switch and `ferry-cri` the other, both on loopback, so machines and mode 1 pods land on one segment. Clear of `FERRY_RELAY_PORT`, which is a range rather than a port: node N's switch is `FERRY_RELAY_PORT` + N |

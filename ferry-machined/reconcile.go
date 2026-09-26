@@ -123,6 +123,15 @@ func (c *controller) reconcileAll(ctx context.Context) error {
 		return err
 	}
 
+	// Before any machine is created below, so the Mac node stops advertising
+	// the memory a new machine is about to take no later than the machine
+	// starts taking it.
+	if *memoryLedger != "" {
+		if err := writeLedger(*memoryLedger, committedMemory(list.Items)); err != nil {
+			log.Printf("%v", err)
+		}
+	}
+
 	seen := map[string]bool{}
 	for i := range list.Items {
 		item := &list.Items[i]

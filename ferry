@@ -569,6 +569,13 @@ image_mirror_flag() { machine_registry_enabled && echo "--image-mirror 127.0.0.1
 # implement because a region does not run out when you ask for one more node.
 MACHINE_LIMIT_CPUS="${FERRY_MACHINE_LIMIT_CPUS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
 MACHINE_LIMIT_MEMORY_GI="${FERRY_MACHINE_LIMIT_MEMORY_GI:-$(( $(sysctl -n hw.memsize) / 1073741824 / 4 ))}"
+# The memory machines hold, in bytes, which the Mac's own nodes reserve out of
+# what they advertise. The Mac node and its machines are one pool of RAM that
+# the scheduler sees as separate nodes; without this each side could promise
+# memory the other had. ferry-machined writes it, the Mac's kubelets read it,
+# and ferry-karpenter keeps the other direction by counting the Mac's pods
+# before it makes a machine. See ferry-machined/ledger.go.
+MACHINE_MEMORY_LEDGER="$FERRY_RUN/machines-memory"
 MACHINE_KUBE_PROXY_IMAGE="${FERRY_KUBE_PROXY_IMAGE:-registry.k8s.io/kube-proxy:v1.34.11}"
 
 STOPPED_MARKER="$FERRY_HOME/stopped"
@@ -1877,6 +1884,7 @@ start_machines() {
     --machines "$FERRY_RUN/machines" \
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
+    --memory-ledger "$MACHINE_MEMORY_LEDGER" \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2028,6 +2036,7 @@ start_provisioner() {
   FERRY_MACHINE_MAX_MEMORY_GI="$MACHINE_LIMIT_MEMORY_GI" \
   FERRY_NODE_DISK="$NODE_DISK" \
   FERRY_MACHINE_DURABILITY="${FERRY_MACHINE_DURABILITY:-$(ferry_config_get machineDurability)}" \
+  FERRY_HOST_NODE="$NODE_NAME" \
   "$here/bin/ferry-karpenter" \
     --disable-leader-election \
     --metrics-port 0 \
@@ -3236,7 +3245,12 @@ start_kubelet() { # name run-dir kubeconfig pidfile logfile [bootstrap-kubeconfi
   # kernel of its own and a shared one -- and that selector matched nothing,
   # because no node carried the label on either side. A Mac node is always
   # vm-per-pod: that is what ferry-cri does.
+  #
+  # FERRY_MACHINE_MEMORY_FILE is the Mac's, not the node's: every node on this
+  # Mac shares its RAM with the machines it hosts, so each reserves what they
+  # hold. A Mac that joined has no machines and no file, and reserves nothing.
   FERRY_CONTAINER_LOGS_DIR="$run/containerlogs" \
+  FERRY_MACHINE_MEMORY_FILE="$MACHINE_MEMORY_LEDGER" \
   "$kubelet" \
     --config="$run/kubelet.yaml" \
     ${bootstrap:+--bootstrap-kubeconfig="$bootstrap"} \
@@ -5125,6 +5139,10 @@ stop_machines() {
     ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
     ok "$component stopped"
   done
+  # Stopped machines hold no memory, so the Mac's nodes stop reserving it. The
+  # Machine objects are still in etcd, and ferry-machined writes the ledger
+  # again when it brings them back.
+  rm -f "$MACHINE_MEMORY_LEDGER"
 }
 
 cmd_machines_status() {

@@ -46,6 +46,9 @@ var (
 	// ferry-storage can pin a volume to "anywhere on this Mac" -- the Mac and
 	// its machines share one volumes directory -- rather than to one node.
 	hostNode = flag.String("host-node", "", "the Mac's own node name, labelled on each machine as ferry.dev/host")
+	// What machines hold, for the Mac's kubelet to reserve out of its own
+	// allocatable. See ledger.go.
+	memoryLedger = flag.String("memory-ledger", "", "file to write the bytes of memory committed to machines to")
 )
 
 func main() {

@@ -139,3 +139,30 @@ func (b bounds) fits(committed shape, next shape) bool {
 	}
 	return true
 }
+
+// host is the other half of the Mac's memory: what its own nodes have promised
+// their pods, against what the Mac has.
+//
+// The limit above bounds machines against each other. It says nothing about
+// the pod VMs the Mac node is running from the same RAM, and the Mac node
+// cannot see machines either -- so each side could spend memory the other had
+// already promised. The Mac's kubelet reserves what machines hold out of its
+// allocatable (ferry-machined's ledger.go); this is the provisioner declining a
+// machine whose memory the Mac's pods already hold. Both count the same
+// promises the scheduler counts: machines by spec.memory, pods by their
+// requests plus the RuntimeClass overhead.
+type host struct {
+	// Unknown when there is no Mac node to read -- one not registered yet, or a
+	// provisioner started without being told its name. Then only the limit
+	// applies, which is what applied before there was a host to count.
+	known     bool
+	capacity  int64 // bytes of memory the Mac node reports
+	podMemory int64 // bytes requested by pods on the Mac's own nodes
+}
+
+func (h host) fits(committed shape, next shape) bool {
+	if !h.known {
+		return true
+	}
+	return (committed.memoryGi+next.memoryGi)*gibibyte+h.podMemory <= h.capacity
+}

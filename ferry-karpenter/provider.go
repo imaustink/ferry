@@ -28,6 +28,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	resourcehelper "k8s.io/component-helpers/resource"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -60,6 +62,11 @@ type Provider struct {
 	// Held across the whole of Create: read the budget, decide, write the
 	// Machine. See the comment there.
 	creating sync.Mutex
+	// The Mac's own node, and a reader for it and its pods, so a machine is
+	// not made from memory the Mac's pod VMs already hold. Either unset leaves
+	// only the machine limit; see host in shapes.go.
+	kube     client.Reader
+	hostNode string
 }
 
 func NewProvider(d dynamic.Interface, n *FerryNodeClass) *Provider {
@@ -87,6 +94,10 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 	if err != nil {
 		return nil, err
 	}
+	h, err := p.host(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []*cloudprovider.InstanceType
 	for _, s := range b.shapes() {
@@ -94,7 +105,7 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 		// had right now, with availability expressed on the offering. That is
 		// what lets it explain "this pod does not fit" rather than behaving as
 		// though the shape never existed.
-		available := b.fits(committed, s)
+		available := b.fits(committed, s) && h.fits(committed, s)
 		out = append(out, &cloudprovider.InstanceType{
 			Name:         s.name(),
 			Capacity:     s.capacity(p.nodeClass.maxPods()),
@@ -146,8 +157,12 @@ func requirementsFor(s shape) scheduling.Requirements {
 }
 
 const (
-	modeLabel  = "ferry.dev/mode"
-	modeShared = "shared"
+	modeLabel    = "ferry.dev/mode"
+	modeShared   = "shared"
+	modeVMPerPod = "vm-per-pod"
+	// Which Mac a node runs on: the Mac's own node name, on the Mac node and on
+	// every machine it hosts.
+	hostLabel = "ferry.dev/host"
 )
 
 // --- the budget -----------------------------------------------------------
@@ -180,6 +195,62 @@ func machineShape(m *unstructured.Unstructured) (cpus, memoryGi int64) {
 	return cpus, memoryGi
 }
 
+// host reads what the Mac's own nodes have promised their pods, and what the
+// Mac has to promise.
+//
+// "The Mac's own nodes" is every vm-per-pod node carrying this Mac's name in
+// ferry.dev/host: its first node and any `ferry node add` put beside it, which
+// share its RAM. A Mac that joined labels its nodes with its own name, so its
+// pods are not counted against this one.
+//
+// Read through Karpenter's cache, which already holds every node and pod and
+// indexes pods by node, so this costs no API round trip however often
+// Karpenter asks for instance types.
+func (p *Provider) host(ctx context.Context) (host, error) {
+	if p.kube == nil || p.hostNode == "" {
+		return host{}, nil
+	}
+	var mac corev1.Node
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: p.hostNode}, &mac); err != nil {
+		if apierrors.IsNotFound(err) {
+			return host{}, nil
+		}
+		return host{}, fmt.Errorf("reading the Mac's node %s: %w", p.hostNode, err)
+	}
+	capacity, ok := mac.Status.Capacity[corev1.ResourceMemory]
+	if !ok {
+		return host{}, nil
+	}
+
+	var nodes corev1.NodeList
+	if err := p.kube.List(ctx, &nodes, client.MatchingLabels{
+		hostLabel: p.hostNode, modeLabel: modeVMPerPod,
+	}); err != nil {
+		return host{}, fmt.Errorf("listing the Mac's nodes: %w", err)
+	}
+	var requested int64
+	for _, node := range nodes.Items {
+		var pods corev1.PodList
+		if err := p.kube.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+			return host{}, fmt.Errorf("listing pods on %s: %w", node.Name, err)
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			// A finished pod's VM is gone, and the scheduler stops counting it.
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				continue
+			}
+			// Requests plus overhead: the figure the scheduler charged the node
+			// with. ferry-vm's overhead is the pod VM itself.
+			req := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+			if mem, ok := req[corev1.ResourceMemory]; ok {
+				requested += mem.Value()
+			}
+		}
+	}
+	return host{known: true, capacity: capacity.Value(), podMemory: requested}, nil
+}
+
 // --- the lifecycle --------------------------------------------------------
 
 func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
@@ -209,6 +280,10 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 	if err != nil {
 		return nil, err
 	}
+	h, err := p.host(ctx)
+	if err != nil {
+		return nil, err
+	}
 	b := p.nodeClass.bounds()
 
 	// The cheapest candidate that still fits, not the first one.
@@ -221,12 +296,20 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 	// defaults that happens to be the smallest shape; with FERRY_MACHINE_MIN_CPUS=4
 	// it is ferry-4cpu-16gi, and a pod asking for 100m and 128Mi would take the
 	// largest machine in the catalogue and the whole budget with it.
-	s, ok := cheapestThatFits(b, committed, candidates)
+	s, ok := cheapestThatFits(b, h, committed, candidates)
 	if !ok {
 		// The error that matters. Karpenter treats this as "that shape is not
 		// available right now", marks it unavailable for a while and stops
 		// asking; any other error is a failure it retries, which against a
 		// hypervisor is a loop that makes and destroys nothing at speed.
+		//
+		// Which of the two refused, since the fixes differ: the limit is a
+		// setting, and the Mac's own pods are a workload to move or shrink.
+		if b.fits(committed, candidates[0]) {
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
+				"the Mac has %d GiB of memory, its own pods have requested %d MiB of it and machines hold %d GiB; %s would exceed it",
+				h.capacity/gibibyte, h.podMemory/(1024*1024), committed.memoryGi, candidates[0].name()))
+		}
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
 			"the Mac has committed %d cpus and %d GiB to machines; %s would exceed the limit of %d cpus and %d GiB",
 			committed.cpus, committed.memoryGi, candidates[0].name(),
@@ -412,9 +495,9 @@ func shapesFromRequirements(claim *karpv1.NodeClaim) []shape {
 // budget can still afford. Ordered rather than filtered-then-minimised because
 // the caller wants the answer and the name of the shape it wanted when there
 // is none.
-func cheapestThatFits(b bounds, committed shape, candidates []shape) (shape, bool) {
+func cheapestThatFits(b bounds, h host, committed shape, candidates []shape) (shape, bool) {
 	for _, s := range candidates {
-		if b.fits(committed, s) {
+		if b.fits(committed, s) && h.fits(committed, s) {
 			return s, true
 		}
 	}
