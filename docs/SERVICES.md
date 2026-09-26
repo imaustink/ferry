@@ -148,6 +148,10 @@ descriptors: 850 MB resident and an empty reply, measured.
 The edge also holds its clients to NetworkPolicy by their real address, because
 the pod only ever sees the Mac; see [NETWORK-POLICY.md](NETWORK-POLICY.md).
 
+Forwarding a router to the cluster, and keeping a LoadBalancer reachable when a
+cluster spans several Macs and one of them goes away, are in
+[EXTERNAL-ACCESS.md](EXTERNAL-ACCESS.md).
+
 ## SCTP
 
 The guest kernel has SCTP (`CONFIG_IP_SCTP=y`, conntrack and NAT for it), and
