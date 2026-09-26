@@ -6,8 +6,8 @@ network between them is the whole problem.
 ## Nodes are cheap
 
 In ferry the Mac is the node and the kubelet is a native process, so a second
-node is a second kubelet with its own CRI runtime -- not a VM, not a container,
-not a distribution. Done by hand against a running cluster:
+node is a second kubelet with its own CRI runtime. It is not a VM, a container,
+or a distribution. Done by hand against a running cluster:
 
 ```
 NAME          STATUS   ROLES    AGE   VERSION
@@ -43,20 +43,19 @@ A pod on one node cannot reach a pod on another:
 
 This is not a misconfiguration. `net.inet.ip.forwarding` is already 1, both
 networks are directly connected to the Mac (`bridge100` at .64.1, `bridge101` at
-.65.1), and routes for both exist. The packets are dropped by vmnet, which
-isolates shared-mode networks from one another while still NATing them out to the
-world. Note the third row: the pod cannot reach the Mac at `192.168.64.1` but can
+.65.1), and routes for both exist. vmnet drops the packets. It isolates
+shared-mode networks from one another while still NATing them out to the world. Note the third row: the pod cannot reach the Mac at `192.168.64.1` but can
 reach the same Mac at `192.168.1.29`.
 
-Letting vmnet choose the subnets instead of pinning them does not change it --
-`vmnet.h` suggests unpinned shared networks can talk to each other, and measured,
+Letting vmnet choose the subnets instead of pinning them does not change it.
+`vmnet.h` suggests unpinned shared networks can talk to each other, but measured,
 they cannot.
 
 ## Bridged mode would have solved it, and is closed
 
 Every pod is a VM with its own NIC, so bridging pods onto the physical LAN would
-make pods on different Macs directly reachable with no overlay at all -- something
-kind and minikube cannot do, because their pods are not VMs. vmnet offers
+make pods on different Macs directly reachable with no overlay at all. kind and
+minikube cannot do that, because their pods are not VMs. vmnet offers
 `VMNET_BRIDGED_MODE` and names `en0` and `en7` as bridgeable here.
 
 It is refused:
@@ -68,23 +67,24 @@ bridgeable interfaces: 2
 bridged config refused with vmnet_return_t(rawValue: 1001)
 ```
 
-`vmnet_network_create` does not do bridged mode -- the header describes bridging
-as a property of `vmnet_start_interface` -- and the entitlement that governs it,
+`vmnet_network_create` does not do bridged mode. The header describes bridging
+as a property of `vmnet_start_interface`, and the entitlement that governs it,
 `com.apple.vm.networking`, is restricted: an ad-hoc signed binary claiming it is
 killed at launch. Docker reaches it through a privileged signed helper.
 
 ## One vmnet network can be shared between processes
 
 `vmnet_network_copy_serialization` and `vmnet_network_create_with_serialization`
-exist precisely for this, and what comes back is not a mach port or a descriptor
--- it is a dictionary holding 120 bytes:
+exist for this, and what comes back is not a mach port or a descriptor. It is a
+dictionary holding 120 bytes:
 
 ```
 xpc type    : dictionary
 contents    = "networkSerialization" => <data>: { length = 120 bytes }
 ```
 
-Bytes travel. Written to a file by one process and read by others:
+Bytes can be copied anywhere. One process writes them to a file and others read
+it:
 
 ```
 owner:  network up, 120 bytes written, holding
@@ -97,24 +97,24 @@ joiner: rehydrated 192.168.57.1 in a separate process
 A plain create of that subnet is still refused while the reservation lives, so
 serialization is the sanctioned way in rather than a hole.
 
-**This settles multi-node on one Mac.** Every node's `ferry-cri` shares one vmnet
+This settles multi-node on one Mac. Every node's `ferry-cri` shares one vmnet
 network and allocates from its own slice of the subnet, so pods reach each other
-the way they already do within a node. No overlay, no routing, no root, and no
-restructuring -- each node keeps its own runtime process.
+the way they already do within a node. There is no overlay, no routing, no root,
+and no restructuring. Each node keeps its own runtime process.
 
 ## Across machines: measured on two Macs
 
 Bridged is out, and the header says so rather than leaving it to measurement:
 *"Using a VZBridgedNetworkDeviceAttachment requires the app to have the
-com.apple.vm.networking entitlement"* -- restricted, and an ad-hoc signed binary
-is killed for claiming it. Settled.
+com.apple.vm.networking entitlement"*. That entitlement is restricted, and an
+ad-hoc signed binary is killed for claiming it.
 
-What was not settled was routing, so it was tried on a second Mac.
+Routing was still open, so it was tried on a second Mac.
 
 ### Inbound works, with real pod addresses
 
-One host route on the other Mac -- `route add -net 192.168.77.0/24 192.168.1.29`
--- and a pod inside the first Mac's vmnet network answers:
+With one host route on the other Mac, `route add -net 192.168.77.0/24
+192.168.1.29`, a pod inside the first Mac's vmnet network answers:
 
 ```
 ping  : reachable
@@ -123,7 +123,8 @@ path  : 1  192.168.1.29      <- the Mac
         2  192.168.77.4      <- the pod inside it
 ```
 
-No overlay, no entitlement, no datapath work. Two hops, real pod address.
+No overlay, no entitlement and no datapath work. Two hops, to the real pod
+address.
 
 ### Outbound is NATed, and cannot be turned off
 
@@ -148,49 +149,50 @@ bridge for .77       : (none)
 host route           : (none)
 ```
 
-NAT44 is not merely address translation here -- it is what attaches the host to
-the network at all. Removing it leaves an isolated L2 segment with no gateway.
+NAT44 is not only address translation here. It is what attaches the host to the
+network at all. Removing it leaves an isolated L2 segment with no gateway.
 
 ### Where that leaves it
 
 **Routed, accepting NAT on egress.** Everything works and pods reach each other
 across Macs, but a pod sees its peer as the peer's *host* address. That breaks
-the Kubernetes network model and anything reading a source address. Cheap --
-essentially a route per node and `podCIDR` on the Node object -- and honest only
-if the limitation is documented loudly.
+the Kubernetes network model and anything reading a source address. It is cheap,
+a route per node and `podCIDR` on the Node object, and honest only if the docs
+state the limitation clearly.
 
 **Own the datapath.** `VZFileHandleNetworkDeviceAttachment` carries raw
 link-layer frames over a datagram socket and mentions no entitlement at all. ferry
 attaches every pod VM to a socket, is its own switch, and spans machines by
-relaying frames. Correct source addresses, and it dissolves every vmnet limit in
-these experiments -- the 32-network ceiling, the minute-long reservation, the
-isolation between networks. The cost is that every packet crosses userspace and
+relaying frames. Source addresses are correct, and it removes every vmnet limit
+in these experiments: the 32-network ceiling, the minute-long reservation, and
+the isolation between networks. The cost is that every packet crosses userspace and
 that DHCP, NAT and gateway become ferry's to provide. This is what socket_vmnet
 and gvisor-tap-vsock do.
 
 **WireGuard in the guest kernel.** ferry builds its own guest kernel, so pods can
 carry a cluster interface natively. Local traffic stays on vmnet's kernel
 datapath and only cross-machine traffic is tunnelled, which performs best of the
-three and works beyond one LAN. Most to build: keys, per-pod configuration,
-routes.
+three and works beyond one LAN. It is the most to build: keys, per-pod
+configuration, and routes.
 
-## A trap worth recording
+## A trap
 
-`one.swift` answers "is this subnet free?" by creating the network and releasing
-it -- and releasing starts a fresh reservation of about a minute. A retry loop
-around it therefore never terminates: every check re-reserves exactly what it is
-waiting for. It cost ten minutes of a spinning loop before anyone noticed. A
-probe with a side effect is not a probe.
+[`one.swift`](../07-vmnet-leak/one.swift) answers "is this subnet free?" by
+creating the network and releasing it, and releasing starts a fresh reservation
+of about a minute. A retry loop around it therefore never terminates, because
+every check re-reserves exactly what it is waiting for. It cost ten minutes of a
+spinning loop before anyone noticed. A check with a side effect cannot answer
+the question it asks.
 
 ## Running it: a node must outlive the session that started it
 
-Both halves work, but a node started over SSH fails in a way worth recording,
-because nothing about the error points at the cause.
+Both halves work, but a node started over SSH fails, and nothing about the error
+points at the cause.
 
 macOS grants access to the local network per launching session. An SSH session
 ends when the command returns, and the kubelet it left behind loses the grant
-with it -- while `ping` still answers, `/usr/bin/curl` to the same address still
-returns 200, the route is correct, and a ferry binary run fresh *in a live
+with it. Meanwhile `ping` still answers, `/usr/bin/curl` to the same address
+still returns 200, the route is correct, and a ferry binary run fresh *in a live
 session* reaches the API immediately. Only the long-running process is cut off,
 and what it reports is `connect: no route to host`.
 
@@ -209,7 +211,7 @@ The same mechanism explains an earlier red herring: the join itself always
 succeeded, certificate and all, because the session was still alive for those few
 seconds.
 
-Unrelated but found on the way, and also worth fixing: a login shell on macOS
-allows about a million open files and an SSH session allows 256. A kubelet wants
+Unrelated but found on the way: a login shell on macOS allows about a million
+open files and an SSH session allows 256. A kubelet wants
 thousands, so ferry raises the limit itself rather than inheriting whatever it
 was started with.

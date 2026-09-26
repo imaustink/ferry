@@ -1,7 +1,7 @@
-# Experiment 13 — What does a kernel per pod cost?
+# Experiment 13: What does a kernel per pod cost?
 
 **Question.** Ferry gives every pod its own virtual machine. That boundary is
-the whole design, but nobody had priced it. Is there a world where one shared
+the whole design, but nobody had measured its cost. Is there a world where one shared
 VM for all the pods is the better machine to build?
 
 **Method.** Drive ferry's own CRI runtime into the two shapes and measure the
@@ -9,25 +9,27 @@ difference:
 
 | shape | what it is |
 |---|---|
-| `vm-per-pod` | N sandboxes, one container each — ferry today |
-| `shared-vm` | 1 sandbox, N containers — one kernel, N workloads |
+| `vm-per-pod` | N sandboxes, one container each, as ferry does today |
+| `shared-vm` | 1 sandbox, N containers: one kernel, N workloads |
 
 Both run the same image and the same command, so the only variable is whether
 each container gets its own kernel. The runtime is a `ferry-cri` of the
 experiment's own, on its own socket, state directory and pod subnet, driven by
-a CRI client rather than a kubelet: nothing reconciles behind the measurement.
+a CRI client rather than a kubelet, so nothing reconciles behind the
+measurement.
 
-Memory is macOS's `phys_footprint` for the VM processes — resident minus the
-shared framework pages every VM maps a copy of. Ownership is settled by which
-VM process holds a rootfs under this experiment's state directory, because a
-cluster running on the same Mac starts pods mid-run and a naive process diff
-counts them as ours. (It did, once, before this was fixed.)
+Memory is macOS's `phys_footprint` for the VM processes: resident minus the
+shared framework pages every VM maps a copy of. A VM process belongs to the
+experiment if it holds a rootfs under this experiment's state directory,
+because a cluster running on the same Mac starts pods mid-run and a naive
+process diff counts them as ours. (It did, once, before this was fixed.)
 
-Run on macOS 26.6.2, Apple M1 Max, 10 cores, 32 GiB, against `ferry-cri` at 0.45.0.
+Run on macOS 26.6.2, Apple M1 Max, 10 cores, 32 GiB, against a `ferry-cri`
+built on Containerization 0.45.0.
 
 ## Results
 
-### A kernel costs 225 MiB, and that is the whole prize
+### A kernel costs 225 MiB, and that is all a shared kernel saves
 
 Idle Alpine pods, doing nothing but existing:
 
@@ -40,27 +42,28 @@ Idle Alpine pods, doing nothing but existing:
 
 225 MiB per pod, flat across 8, 20 and 24 pods (224.8 / 225.3 / 225.5 in three
 independent runs). Inside an already-running VM the marginal container costs
-about **2.4 MiB**.
+about 2.4 MiB.
 
 The cost does not come from the memory the pod was given. At
 `--pod-memory-mib` 256, 512 and 1024 the resident size per VM was 285, 289 and
-331 MiB — nearly flat. **This is the fixed price of a kernel and a hypervisor,
-not a pod using its allotment**, so it cannot be right-sized away.
+331 MiB, nearly flat. This is the fixed price of a kernel and a hypervisor, not
+a pod using its allotment, so it cannot be right-sized away.
 
 Experiment 03 measured 12.5 MiB per VM and concluded density was free. That
-was a 1.6 MiB initramfs with a sleeping init. A real pod — OCI rootfs, vminitd,
-a network interface, cgroups — costs **18x** that.
+was a 1.6 MiB initramfs with a sleeping init. A real pod, with an OCI rootfs,
+vminitd, a network interface and cgroups, costs 18x that.
 
-At Kubernetes' default `maxPods` of 110, the tax is **~24 GiB — on this 32 GiB
-machine, three quarters of its memory spent on kernels before a workload runs.**
+At Kubernetes' default `maxPods` of 110, the cost is ~24 GiB. On this 32 GiB
+machine, that is three quarters of its memory spent on kernels before a
+workload runs.
 The pod ceiling here is therefore memory, not the hypervisor's 128-VM cap:
 around 60-80 pods with nothing left over, against a `maxPods` that claims 110.
-At a realistic 20-30 pods it is 4.5-6.75 GiB, which is 14-21% of the machine.
+At a realistic 20-30 pods it is 4.4-6.6 GiB, which is 14-21% of the machine.
 
 ### The saving is a fixed amount per pod, not a fraction
 
-Sized fairly — the shared VM given N x 512 MiB, what the pods it replaces would
-have had between them, which costs nothing since guest memory is lazily backed:
+Sized fairly, the shared VM gets N x 512 MiB, what the pods it replaces would
+have had between them. That costs nothing, since guest memory is lazily backed:
 
 | workload | n | vm-per-pod | shared-vm | ratio |
 |---|---|---|---|---|
@@ -72,20 +75,19 @@ have had between them, which costs nothing since guest memory is lazily backed:
 | touch python:3.12 | 8 | 4308 MiB | 4096 MiB | **1.05x** |
 
 Every row is the same arithmetic: the shared VM pays the pods' working sets
-plus **one** 225 MiB kernel, and `vm-per-pod` pays the same working sets plus
-**N** of them. The ratio looks dramatic when the working set is small and
-vanishes when it is large. It is not a percentage — it is 225 MiB per pod,
-whatever the pod is doing.
+plus *one* 225 MiB kernel, and `vm-per-pod` pays the same working sets plus
+*N* of them. The ratio is large when the working set is small and vanishes
+when it is large. It is not a percentage. It is 225 MiB per pod, whatever the
+pod is doing.
 
 (The python row is both shapes hitting their memory ceiling rather than either
-shape's demand — 512 MiB per pod against 4 GiB shared. The next section runs it
-with room to breathe, and the arithmetic holds there too.)
+shape's demand: 512 MiB per pod against 4 GiB shared. The next section runs it
+with spare memory, and the arithmetic holds there too.)
 
-Which means the shared kernel is worth most exactly where pods are cheapest:
-idle system daemons, sidecars, CI shells. It is worth almost nothing for the
-workloads a Mac is interesting for — the moment a pod's own working set is
-measured in gigabytes, 225 MiB is rounding, and a fat pod amortises its own
-boundary.
+So the shared kernel is worth most exactly where pods are cheapest: idle
+system daemons, sidecars, CI shells. It is worth almost nothing for the
+workloads a Mac is interesting for. Once a pod's own working set is measured in
+gigabytes, 225 MiB is rounding, and a fat pod amortises its own boundary.
 
 ### One kernel does not share the image cache
 
@@ -93,12 +95,12 @@ boundary.
 > This section is right about ferry-cri and wrong about shared kernels. The
 > duplication measured below comes from the ext4-per-container stand-in used
 > here, not from sharing a kernel: with a real containerd on overlayfs, eight
-> containers reading the same image cost exactly what one costs — a slope of
+> containers reading the same image cost exactly what one costs, a slope of
 > zero against the 1267 MiB per container measured below. The rest of this
 > experiment stands; this inference does not.
 
 The python row above says the shared kernel saved 5%, but both shapes were
-capacity-bound there — 512 MiB per pod against 4 GiB shared — so neither was
+capacity-bound there (512 MiB per pod against 4 GiB shared), so neither was
 showing demand. Giving each shape more memory than it can want settles it.
 One container's unconstrained demand is `D`; eight should cost `D` if the cache
 is shared and `8D` if it is not:
@@ -109,15 +111,15 @@ is shared and `8D` if it is not:
 | shared | 8 | 12288 MiB | **10138 MiB** | 1267 MiB |
 
 `8D` is 10713 MiB after amortising the one kernel the eight now share. The
-measurement is 10138. **The cache is not shared — it is duplicated eight
-times, in one kernel.**
+measurement is 10138. The cache is not shared. It is duplicated eight times,
+in one kernel.
 
 Ferry clones an ext4 per container, so N containers in one VM are N block
 devices holding identical bytes, and a page cache is per device. Sharing the
 kernel shares the cache *pool*, not the cache *entries*. What each container
 saved was its own copy of the kernel, and nothing else.
 
-Image-layer sharing — overlayfs over a shared read-only lower — is a separate
+Image-layer sharing, overlayfs over a shared read-only lower, is a separate
 piece of work, and for fat images it is worth far more than the kernel: 7.5 GiB
 of the 10.1 GiB above is the same python image, cached eight times. It is also
 the piece `vm-per-pod` can never have, because separate kernels cannot share a
@@ -136,7 +138,7 @@ cache at all.
 
 The same class of limit as the 128-VM ceiling, one level down: each container
 is a block device, and `Virtualization.framework` will only take so many. A
-shared-kernel node would hit this at 23 pods — well under `maxPods` 110 —
+shared-kernel node would hit this at 23 pods, well under `maxPods` 110,
 unless containers stop being block devices, which is the same overlayfs work.
 
 ### Pod start: 0.31s each, or 0.06s each
@@ -161,38 +163,38 @@ containers each writing and re-reading a 128 MiB blob in one 512 MiB VM:
 | shared-vm (512 MiB total) | 0.8-1.6 GB/s |
 | shared-vm (4096 MiB total) | 22-28 GB/s |
 
-Sized fairly the collapse disappears, so this is not an argument against
-sharing — it is an argument that a shared node VM has to be sized for the sum
+Sized fairly, the collapse disappears, so this is not an argument against
+sharing. It is an argument that a shared node VM has to be sized for the sum
 of its pods, and that one pod's working set can evict another's. Under
 `vm-per-pod` a pod's cache is its own, and no neighbour can take it.
 
 ### CPU is not a factor
 
-An idle pod VM sits at ~0.1% of a core. Twenty of them is ~2% — real, and not
-worth a design decision.
+An idle pod VM sits at ~0.1% of a core. Twenty of them is ~2%, which is real
+and not worth a design decision.
 
 ## What this means for ferry
 
 The measurement does not support replacing the VM boundary, and it does not
 support pretending the boundary is free either.
 
-- **The boundary costs 225 MiB per pod.** Flat, unavoidable by tuning, and the
-  only thing a shared kernel actually recovers.
-- **That is worth recovering for small pods and not for large ones.** Which is
+- **The boundary costs 225 MiB per pod.** It is flat, tuning cannot remove it,
+  and it is the only thing a shared kernel actually recovers.
+- **That is worth recovering for small pods and not for large ones.** That is
   a per-workload judgement, and Kubernetes already has the vocabulary for it:
-  `RuntimeClass`. Default stays VM-per-pod; an opt-in class lands a pod in a
-  shared node VM. Kata and runc coexist in production clusters this way.
+  `RuntimeClass`. The default stays VM-per-pod, and an opt-in class lands a pod
+  in a shared node VM. Kata and runc coexist in production clusters this way.
 - **The first customers are ferry's own system pods.** CoreDNS and DaemonSets
-  are trusted, idle, and per-node — the exact shape where 225 MiB is most of
-  the cost, and where a kernel boundary buys nothing.
+  are trusted, idle, and per-node. That is the exact shape where 225 MiB is
+  most of the cost, and where a kernel boundary buys nothing.
 - **A shared-kernel node would be capped at 22 pods** until containers stop
   being one block device each.
-- **The bigger efficiency lever is image-layer sharing, not the kernel.** A fat
-  pod's cost is its page cache, duplicated per container today in either shape.
-  Fixing that helps the shared VM enormously and `vm-per-pod` not at all, which
-  is worth knowing before choosing where to spend effort.
+- **Image-layer sharing saves more than the kernel.** A fat pod's cost is its
+  page cache, duplicated per container today in either shape. Fixing that
+  helps the shared VM a great deal and `vm-per-pod` not at all, which matters
+  when choosing where to spend effort.
 
-## Caveats — do not over-read these numbers
+## Caveats: do not over-read these numbers
 
 - **`shared-vm` is not a node VM.** It is N containers in one pod VM: one
   network stack, no per-pod netns, no in-guest image store. A real shared-kernel
@@ -206,10 +208,11 @@ support pretending the boundary is free either.
   whichever binds first. Both python cells were capacity-bound, which is why
   the dedup question needed its own run (`dedup.sh`).
 - **One machine, one image pair.** Alpine is a floor and python:3.12 a
-  mid-weight ceiling; a 4 GiB ML image would move the fat-pod row further
+  mid-weight ceiling. A 4 GiB ML image would move the fat-pod row further
   against the shared kernel, not for it.
-- **The runtime is ferry's, so its choices are in the numbers** — notably the
-  ext4-clone-per-container, which is exactly what the cache finding is about.
+- **The runtime is ferry's, so its choices are in the numbers.** The main one
+  is the ext4 clone per container, which is exactly what the cache finding is
+  about.
 
 ## Reproduce
 

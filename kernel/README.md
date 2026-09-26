@@ -16,8 +16,8 @@ iptables -t nat -A OUTPUT ...
 ```
 
 A pod that cannot do NAT cannot program its own Service rules, which is what
-forces ClusterIP routing onto the host -- and with it the root requirement and
-an extra hop through the Mac for every Service connection.
+forces ClusterIP routing onto the host. That brings the root requirement and an
+extra hop through the Mac for every Service connection.
 
 ## What this builds
 
@@ -32,26 +32,30 @@ The configuration is fetched rather than vendored, so it tracks what the
 framework expects. The script refuses to build if those symbols are missing,
 since a kernel without them would not fix anything.
 
-On top of it, two things of ferry's own, both there because a pod VM's memory
-is what bounds how many pods a Mac holds
+On top of it, three things of ferry's own. The first is `usb-storage.config`,
+appended to Apple's configuration: USB mass storage, the one way a disk reaches
+a VM that is already running, which is how a `ferry-local-block` claim reaches
+a machine. The drivers probe only when there is a USB controller, and only
+machines get one. The other two are there because a pod VM's memory is what
+bounds how many pods a Mac holds
 ([experiments/32-pod-memory-footprint](../experiments/32-pod-memory-footprint/FINDINGS.md)):
 
-- `patches/` — applied to the source after Apple's build unpacks it. One so
+- `patches/` are applied to the source after Apple's build unpacks it. One so
   far: virtio disks are not rotational, which takes read-ahead from 8 MiB to
   the kernel's 128 KiB and an idle pod from 226 MiB of host memory to 150.
-- `slim.config` — appended to Apple's configuration: no display stack, no KVM,
+- `slim.config` is appended to Apple's configuration: no display stack, no KVM,
   no hibernation or kexec, one NUMA node, a 128 KiB log buffer. The image goes
   from 27.8 MiB to 19.5, and it is paid for twice per pod, once in the guest
   and once in Virtualization.framework's copy of it: 150 MiB to 131.
 
 The kernel records what it was built from in `vmlinux-arm64.inputs`. When a
-patch or the configuration changes, `ferry kernel` rebuilds rather than
+patch, either configuration fragment or the build script changes, `ferry kernel` rebuilds rather than
 reporting the kernel present, `ferry doctor` warns, and `release/build.sh`
 refuses to ship the old one.
 
 The build runs in a Linux container for the cross toolchain. Apple drives it
-with their `container` CLI; this uses Docker, which is equivalent and is
-generally already installed.
+with their `container` CLI; this uses Docker, which does the same job and is
+usually already installed.
 
 ```sh
 ./kernel/build-kernel.sh      # or: ferry kernel

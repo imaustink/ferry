@@ -13,16 +13,16 @@ kubernetes API: gitVersion
 
 ## How
 
-kube-proxy cannot run on a Mac: it programs netfilter, and macOS has none. But
+kube-proxy cannot run on a Mac. It programs netfilter, and macOS has none. But
 every ferry pod is a virtual machine with its own Linux kernel, so the rules are
-wanted -- just not on the host.
+wanted, only not on the host.
 
 `ferry-proxyd` runs kube-proxy's own rule generation natively on macOS against a
 rendering backend, and serves the ruleset it would have applied. `ferry-cri`
 loads that into each pod with `nft`, which is mounted in alongside its own musl
 loader so the pod's base image is irrelevant.
 
-Everything that makes Service behaviour correct therefore comes from upstream,
+Everything that makes Service behaviour correct comes from upstream,
 unmodified: reject rules for Services with no endpoints, hairpin masquerade,
 rejection of traffic to a valid ClusterIP on the wrong port, endpoint selection,
 session affinity. None of it is reimplemented.
@@ -36,8 +36,8 @@ changes, in the same shape as the kubelet patches:
 | change | size |
 |---|---|
 | widen `pkg/proxy/nftables` to `linux \|\| darwin` | build tag |
-| `ferry_conntrack_darwin.go` -- macOS has no connection table | ~25 lines |
-| `ferry_backend_{linux,darwin}.go` -- real kernel, or the fake | ~20 lines each |
+| `ferry_conntrack_darwin.go`, because macOS has no connection table | ~25 lines |
+| `ferry_backend_{linux,darwin}.go`, the real kernel or the fake | ~20 lines each |
 
 `proxier.go` is otherwise untouched and the Linux build is unchanged.
 
@@ -50,19 +50,19 @@ a binary ferry ships and runs and the workload keeps the default set.
 ## Why not a kube-proxy in every pod
 
 It would work, and the NAT-capable kernel allows it. The cost falls in the worst
-place for this design: a process and an API watch per pod, tens of megabytes
-each, and a kube-proxy that must start and sync before the pod can reach a
-Service. Pod start is ferry's best number -- roughly a third of a second -- and
-that would multiply it.
+place for this design. It is a process and an API watch per pod, tens of
+megabytes each, and a kube-proxy that must start and sync before the pod can
+reach a Service. Pod start is ferry's best number, roughly a third of a second,
+and that would multiply it.
 
 Generating once on the host and applying gives the same rules for one process.
 
 ## Why not our own rule generator
 
 ferry did have one, `ferry-netd`, about 150 lines against kube-proxy's 1900. It
-routed ClusterIPs correctly and was wrong in ways that were quiet: a Service
-with no ready endpoints hung instead of refusing, a pod reaching its own Service
-broke for want of masquerade, and traffic to a valid ClusterIP on a wrong port
+routed ClusterIPs correctly and failed quietly. A Service with no ready
+endpoints hung instead of refusing, a pod reaching its own Service broke for
+want of masquerade, and traffic to a valid ClusterIP on a wrong port
 hung. Every further Service feature would have been ferry's to write and keep
 correct against an evolving API.
 
@@ -77,8 +77,8 @@ connection hairpins through the host.
 
 Nothing polls. The proxier says when it has applied a transaction, which is the
 only moment the rendered ruleset can differ, and `ferry-proxyd` re-renders then.
-A pod asks for something newer than the generation it holds -- `GET
-/ruleset?after=N` -- and the request is held open until there is one.
+`ferry-cri` asks for something newer than the generation it holds, with `GET
+/ruleset?after=N`, and `ferry-proxyd` holds the request open until there is one.
 
 The fetch runs off the runtime actor. It blocks for as long as the cluster is
 quiet, and the actor has pods to start and stop in the meantime.
@@ -90,9 +90,9 @@ of which is `kubectl exec` starting a process in a VM.
 
 These are listeners on the Mac, in `ferry-proxy`, forwarding to a ready pod. None
 of them needs root, **80 and 443 included**. macOS has not reserved ports below
-1024 on the wildcard address since Mojave -- only on a particular one. Measured
-as uid 501: `0.0.0.0:80` and `[::]:80` bind, TCP and UDP; `192.168.1.29:80` is
-`EACCES`. So a LoadBalancer listens on the wildcard and answers only
+1024 on the wildcard address since Mojave, only on a particular one. Measured
+as uid 501, `0.0.0.0:80` and `[::]:80` bind, TCP and UDP, and `192.168.1.29:80`
+is `EACCES`. So a LoadBalancer listens on the wildcard and answers only
 connections that arrived at the Mac's LAN address or at loopback, and refuses
 the rest (the vmnet gateway, say) with a reset. A UDP LoadBalancer reads each
 datagram's destination (`IP_RECVDSTADDR`) to do the same, and replies from it.
@@ -105,8 +105,8 @@ ingress-nginx-controller   LoadBalancer   192.168.1.29   80:34280/TCP,443:34370/
 ferry-proxy: uid 501
 ```
 
-`localhost:80` works the way it does under Docker Desktop, which it did not
-before: a LoadBalancer bound the LAN address alone.
+`localhost:80` works the way it does under Docker Desktop. It did not before,
+when a LoadBalancer bound the LAN address alone.
 
 Two collisions are handled rather than hit:
 
@@ -114,10 +114,10 @@ Two collisions are handled rather than hit:
   and `*:7000`. A particular address is still free beside it, and the more
   specific listener wins the connection, so at 1024 and above ferry falls back
   to binding the LAN address and loopback one by one, and says so on the
-  Service (`PortShared`). Measured on port 5000 with AirPlay on: LAN, `127.0.0.1`
+  Service (`PortShared`). Measured on port 5000 with AirPlay on, LAN, `127.0.0.1`
   and `localhost` all reach the Service. Below 1024 there is no fallback, since
-  a particular address is root's; UDP 53 is held by a root process on macOS, so
-  a DNS LoadBalancer on 53 reports `PortInUse` -- 853 works.
+  a particular address is root's. UDP 53 is held by a root process on macOS, so
+  a DNS LoadBalancer on 53 reports `PortInUse`. 853 works.
 - **Two of ferry's own Services on one port.** The second is refused
   (`PortInUse`) before the kernel is asked, so it cannot fall back onto the
   first one's addresses and quietly take its traffic.
@@ -126,27 +126,28 @@ A hostPort with an empty hostIP is a wildcard listener as before; one with a
 particular hostIP below 1024 is the narrowed wildcard. It forwards to the pod at
 the **container** port. It used to forward at the host port and rely on the
 pod's own `portmap` rule to rewrite it, which only worked when the two were
-equal: `portmap` runs `nft` by PATH, the `nft` ferry ships needs its own loader
-and library path, and the rule was never written -- so hostPort 5001 for
+equal. `portmap` runs `nft` by PATH, the `nft` ferry ships needs its own loader
+and library path, and the rule was never written, so hostPort 5001 for
 containerPort 80 arrived at 5001 and was reset.
 
 The `nft` itself was also fixed, because `portmap` needs it for the pod's own
 addresses. `guest/build-nft.sh` has always meant to bake the loader's path into
 the binary, but it kept any bundle that existed, and bundles packaged before
-that step still named `/lib/ld-musl-aarch64.so.1`: in-pod `portmap` failed on
+that step still named `/lib/ld-musl-aarch64.so.1`. In-pod `portmap` failed on
 every pod with `fork/exec /.ferry/nft: no such file or directory`. The script
 now repackages such a bundle and `release/build.sh` refuses one. Measured
-with `experiments/11-cni-on-macos/try-hostport.sh`: before, no chain and no
-answer at the pod's address; after, `tcp dport 18134 dnat to <pod>:80` and
-`hello from a pod VM` at both the pod's address and the Mac's.
+with `experiments/11-cni-on-macos/try-hostport.sh`, there was no chain and no
+answer at the pod's address before. After, there is
+`tcp dport 18134 dnat to <pod>:80`, and `hello from a pod VM` answers at both
+the pod's address and the Mac's.
 
 A NodePort whose pod is on **another node on this Mac** is dialled directly. It
-used to be handed to that node's node port -- which, on the same Mac, is this
-process's own listener -- and forwarded to itself until it ran out of file
-descriptors: 850 MB resident and an empty reply, measured.
+used to be handed to that node's node port, which on the same Mac is this
+process's own listener, and forwarded to itself until it ran out of file
+descriptors. Measured, that was 850 MB resident and an empty reply.
 
 The edge also holds its clients to NetworkPolicy by their real address, because
-the pod only ever sees the Mac; see [NETWORK-POLICY.md](NETWORK-POLICY.md).
+the pod only ever sees the Mac. See [NETWORK-POLICY.md](NETWORK-POLICY.md#clients-from-outside-the-cluster).
 
 Forwarding a router to the cluster, and keeping a LoadBalancer reachable when a
 cluster spans several Macs and one of them goes away, are in
@@ -155,8 +156,8 @@ cluster spans several Macs and one of them goes away, are in
 ## SCTP
 
 The guest kernel has SCTP (`CONFIG_IP_SCTP=y`, conntrack and NAT for it), and
-kube-proxy's rules carry it, so SCTP works **inside the cluster** -- between pods
-and through a ClusterIP, with the client's address preserved:
+kube-proxy's rules carry it, so SCTP works **inside the cluster**, between pods
+and through a ClusterIP, with the client's address preserved.
 
 ```
                          same node              across nodes
@@ -166,30 +167,31 @@ by name                  18 ms (DNS)            18 ms
 ClusterIP, wrong port    refused                refused
 ```
 
-Same node needed one rule. vmnet does not carry IP protocol 132: two pods on one
+Same node needed one rule. vmnet does not carry IP protocol 132. Two pods on one
 node timed out on the same association that crossed nodes in a millisecond, and
 worked over loopback and over `eth1`. So `ferry-cri` gives every pod a netdev
 egress rule that hands SCTP for the cluster network from `eth0` to `eth1`,
 ferry's own switch, which never looks above the Ethernet header. The first
 association to a peer on the same node waits one INIT retransmission (3 s,
-`net.sctp.rto_initial`) while `eth1` resolves the neighbour; after that it is
-the half millisecond above. The rule costs TCP nothing measurable: pod-to-pod
+`net.sctp.rto_initial`) while `eth1` resolves the neighbour. After that it is
+the half millisecond above. The rule costs TCP nothing measurable. Pod-to-pod
 throughput on `eth0` was 4.0-5.7 GB/s with it and 4.1-5.7 GB/s without.
 
 There is **no SCTP at the edge**. macOS has no SCTP sockets (`socket(AF_INET,
 SOCK_STREAM, 132)` is `EPROTONOSUPPORT`), a raw socket for protocol 132 is
-`EPERM` without root, and `/dev/bpf*` is `root:wheel 0600` -- so there is no
+`EPERM` without root, and `/dev/bpf*` is `root:wheel 0600`, so there is no
 unprivileged way to receive an SCTP packet on the Mac at all. A NodePort or
 LoadBalancer for SCTP puts `SCTPNotServed` on the Service rather than being
 skipped in silence, and an SCTP hostPort is logged and not served.
 
 ## Known limits
 
-- **UDP is verified at the edge and in the pods; SCTP inside the cluster
+- **UDP is verified at the edge and in the pods, and SCTP inside the cluster
   only.** See above.
 - **Conntrack is not reconciled.** kube-proxy clears stale entries against a live
   connection table; the host has none, and the entries that matter are in each
   pod's kernel. Traffic can keep flowing to a removed endpoint until entries age
   out.
-- **NodePort is rendered but has nowhere to land** -- there are no nodes.
+- **NodePort is rendered in the pods' rules but has nowhere to land there.**
+  The node ports themselves are `ferry-proxy`'s listeners on the Mac, above.
 - **Session affinity is rendered but not verified.**

@@ -685,7 +685,7 @@ Environment:
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
-  FERRY_HOST_CLUSTER_IPS 1 to bind ClusterIPs on the Mac too, so the API server
+  FERRY_HOST_CLUSTER_IPS true to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
   FERRY_RELAY_PORT       udp port the pod switch uses, default 8472. The base of
                          a range: an added node uses this plus its index

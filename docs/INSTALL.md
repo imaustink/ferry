@@ -5,9 +5,9 @@ curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 One line, no `sudo`, no toolchain. This is deliberately the k3s shape, because
-it is the shape people already know, and because the alternative — clone, install
-Swift 6.4, install Go, compile a kubelet from a patched Kubernetes tree, build a
-guest kernel under Docker — is a reasonable thing to ask of someone changing
+it is the shape people already know. The alternative is to clone, install Swift
+6.4, install Go, compile a kubelet from a patched Kubernetes tree and build a
+guest kernel under Docker. That is a reasonable thing to ask of someone changing
 ferry and an unreasonable thing to ask of someone trying it.
 
 ## What it does
@@ -23,20 +23,20 @@ ferry and an unreasonable thing to ask of someone trying it.
    `~/.local/bin`, and says so if that directory is not on your `PATH`.
 5. Installs a matching `kubectl` there if you do not already have one.
 6. Registers a LaunchAgent so the cluster starts at login.
-7. Runs `ferry up` — or `ferry join`, if `FERRY_URL` and `FERRY_TOKEN` are set.
+7. Runs `ferry up`, or `ferry join` if `FERRY_URL` and `FERRY_TOKEN` are set.
 
 ## The install paths
 
 Every way in, and what each is for.
 
-### Install and run — the default
+### Install and run
 
 ```sh
 curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
-Downloads the latest release, verifies it, links `ferry` and `kubectl`,
-registers the login agent, and starts a cluster.
+The default. Downloads the latest release, verifies it, links `ferry` and
+`kubectl`, registers the login agent, and starts a cluster.
 
 ### Install without starting anything
 
@@ -45,8 +45,8 @@ curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 FERRY_SKIP_SERVICE=
 ```
 
 Nothing binds a port, claims a vmnet subnet, or touches `~/.ferry`. Useful on a
-Mac that already runs a cluster from a checkout, and for looking before leaping:
-`ferry doctor` afterwards says whether this machine can run it.
+Mac that already runs a cluster from a checkout, or to check before starting
+anything: `ferry doctor` afterwards says whether this machine can run it.
 
 ### A particular version
 
@@ -56,9 +56,9 @@ curl -sfL https://get.ferry.kurpuis.com | FERRY_VERSION=v0.1.0 sh -
 
 Releases are listed at
 [github.com/imaustink/ferry/releases](https://github.com/imaustink/ferry/releases).
-Without this the installer asks the API for the latest **published** release —
-deliberately the API rather than the `/latest` redirect, so a draft the
-maintainer has not finished is never installed.
+Without this the installer asks the API for the latest **published** release.
+It asks the API rather than following the `/latest` redirect on purpose, so a
+draft the maintainer has not finished is never installed.
 
 ### From a mirror, an air-gapped copy, or a release you built
 
@@ -86,7 +86,7 @@ over SSH.
 
 ### Build from source
 
-For changing ferry. Needs Swift 6.4, Go 1.24+, and Docker for the guest kernel
+For changing ferry. Needs Swift 6.4, Go 1.26+, and Docker for the guest kernel
 and the mode 2 node image.
 
 ```sh
@@ -148,10 +148,10 @@ capacity.
 **Each node has its own credential.** `ferry node add` signs the node a kubelet
 client certificate with the cluster CA, `CN=system:node:<name>` in
 `O=system:nodes`, kept in `~/.ferry/pki/nodes/<name>.{crt,key,conf}`. A Mac
-that joined gets its node's the Kubernetes way, a bootstrap token and a CSR
-the control plane approves. Either way the Node authorizer and the
-NodeRestriction admission plugin give a node its own Node, its own pods and
-what they mount, and nothing of anyone else's: as any node,
+that joined gets its node's certificate the Kubernetes way, from a bootstrap
+token and a CSR the control plane approves. Either way the Node authorizer and
+the NodeRestriction admission plugin give a node its own Node, its own pods and
+what they mount, and nothing of anyone else's. As any node,
 `kubectl auth can-i list secrets -A` and `list pods -A` both say `no`, and
 changing another node or deleting its pods is refused. Nodes can read the Node
 list, Services and EndpointSlices (upstream's `system:node-proxier`, bound as
@@ -159,8 +159,8 @@ list, Services and EndpointSlices (upstream's `system:node-proxier`, bound as
 
 A cluster made before this bound the whole `system:node` role to every node
 (`ferry:system-nodes`), because added nodes all ran on the first node's
-certificate. The next `ferry up` or `ferry upgrade apply` deletes that binding,
-and first restarts the kubelet of any added node still on the first node's
+certificate. The next `ferry up` or `ferry upgrade apply` deletes that binding.
+First it restarts the kubelet of any added node still on the first node's
 certificate onto one of its own; its runtime and pods stay up. `ferry node rm`
 deletes the node's key.
 
@@ -172,7 +172,7 @@ On the Mac already running the cluster:
 ferry token create
 ```
 
-It prints the exact line to run on the other Mac — the installer with
+It prints the exact line to run on the other Mac. That is the installer with
 `FERRY_URL` and `FERRY_TOKEN` set, or `ferry join` if that Mac already has
 ferry:
 
@@ -189,16 +189,15 @@ hours** and is reusable.
 F10<64 hex of the CA's public key>::<id>.<secret>
 ```
 
-The hash is not a secret — it is a fingerprint of a public key, published in
-`kube-public` for anyone to read. It rides along because the joining Mac fetches
-the CA over a connection it cannot yet verify and has to pin what it gets
-against something; a token that carries the pin is a token that cannot be used
-without it. This is kubeadm's discovery, and k3s' token shape, for the same
-reasons.
+The hash is not a secret. It is a fingerprint of a public key, published in
+`kube-public` for anyone to read. The token carries it because the joining Mac
+fetches the CA over a connection it cannot yet verify, and has to pin what it
+gets against something. A token that carries the pin cannot be used without it.
+This is kubeadm's discovery, and k3s' token shape, for the same reasons.
 
-A truncated paste does not parse. That matters more than it looks: if it did
-parse, the pin would be checked against a short hash, fail, and report a CA
-mismatch — a security-shaped error for a copy-and-paste mistake.
+A truncated paste does not parse. If it did, the pin would be checked against a
+short hash, fail, and report a CA mismatch: a security error for a
+copy-and-paste mistake.
 
 The older three-flag form still works, for a token minted by an older ferry:
 
@@ -211,7 +210,7 @@ its node index, and two nodes on the same index hand out the same pod addresses.
 A joining Mac picks a free one itself by reading the other nodes'
 `ferry.dev/node-index` labels. A kubelet only registers that label when it
 *creates* the Node object, so nodes from a cluster built before the label
-existed never carry one; with more than one such node ferry declines to guess
+existed never carry one. With more than one such node, ferry declines to guess
 and asks for `--node-index`:
 
 ```sh
@@ -220,19 +219,19 @@ ferry join --server host:6443 --token F10… --node-index 3
 ```
 
 **Not over SSH.** macOS grants local network access per session, and a node
-started from a session that ends loses the network about twenty seconds later —
-"no route to host" against an address that answers ping. `ferry join` refuses an
-SSH session and explains it; `FERRY_ALLOW_SSH_JOIN=1` overrides it, knowing the
-node will stop working when the session closes.
+started from a session that ends loses the network about twenty seconds later.
+It fails with "no route to host" against an address that answers ping. `ferry
+join` refuses an SSH session and explains why. `FERRY_ALLOW_SSH_JOIN=1`
+overrides it, knowing the node will stop working when the session closes.
 
 **Removing a Mac.** Run `ferry down` on it, then `kubectl delete node <name>`
 from the cluster. `ferry down` stops processes; it does not leave the cluster.
 
-**What a joined Mac does not do:** come back on its own after a reboot. A
-worker's kubelet certificate and kubeconfig live under `/tmp`, so rejoin it with
-a fresh token. See [Starting at login](#starting-at-login).
+**A joined Mac does not come back on its own after a reboot.** A worker's
+kubelet certificate and kubeconfig live under `/tmp`, so rejoin it with a fresh
+token. See [Starting at login](#starting-at-login).
 
-### A machine — mode 2
+### A mode 2 machine
 
 ```sh
 ferry machines enable
@@ -245,8 +244,8 @@ EOF
 ```
 
 A node VM on this Mac whose pods are ordinary Linux containers sharing its
-kernel. `kubectl delete machine worker-0` takes it away — VM stopped, Node
-removed, disk cleaned up. See [Machines — mode 2](#machines--mode-2).
+kernel. `kubectl delete machine worker-0` takes it away: it stops the VM,
+removes the Node and cleans up the disk. See [Mode 2 machines](#mode-2-machines).
 
 ## Configuration
 
@@ -263,8 +262,8 @@ machines: true            # whether mode 2 runs
 defaultRuntime: ferry-vm  # ferry-vm | ferry-shared | none
 ```
 
-`ferry init` asks what the cluster is for and writes it. Each purpose starts
-from sensible answers and every one is asked about:
+`ferry init` asks what the cluster is for and writes it. Each purpose supplies
+default answers, and `ferry init` still asks about every one:
 
 | purpose | machines | durability | defaultRuntime | for |
 |---|---|---|---|---|
@@ -281,36 +280,36 @@ ferry config unset podMemoryMiB      # back to the default
 ```
 
 The precedence is the usual one: a flag, for this run; a `FERRY_*` variable,
-for this run; the file; the default. A flag that is meant to be remembered —
-`ferry up --durability`, `ferry machines enable` — writes the file, and `ferry
-up` names the file every time it starts, so a setting is never somewhere you
-cannot see it. `ferry down --purge` deletes the cluster's data and keeps its
+for this run; the file; the default. A flag that is meant to be remembered,
+such as `ferry up --durability` or `ferry machines enable`, writes the file.
+`ferry up` names the file every time it starts, so a setting is never somewhere
+you cannot see it. `ferry down --purge` deletes the cluster's data and keeps its
 config, which is the point of having one; `ferry init --force` starts again.
 
-**`defaultRuntime`** is where a pod that names no RuntimeClass runs. Without
-one — `none`, and every cluster from before this setting — such a pod goes
-wherever it fits, and a ten-replica Deployment was measured splitting 5/5
-between the Mac and a machine. `ferry-vm` keeps it on the Mac; `ferry-shared`
+**`defaultRuntime`** is where a pod that names no RuntimeClass runs. With
+`none`, which is also what every cluster from before this setting has, such a
+pod goes wherever it fits: a ten-replica Deployment was measured splitting 5/5
+between the Mac and a machine. `ferry-vm` keeps it on the Mac. `ferry-shared`
 sends it to a machine, and waits for machines to be on before it does
-anything. It is applied as a taint on the other kind of node — the machines
-for `ferry-vm`, the Macs for `ferry-shared` — which each RuntimeClass
-tolerates, so `runtimeClassName` always gets a pod what it names. A pod that
-picks by `nodeSelector` alone does not carry the toleration, and needs the
-RuntimeClass once a default is set. `ferry config set defaultRuntime …`
-applies to a running cluster at once; switching to or from `ferry-vm` changes
-Karpenter's NodePool, so provisioned machines are replaced with ones made under
-the new default.
+anything. It is applied as a taint on the other kind of node, the machines for
+`ferry-vm` and the Macs for `ferry-shared`. Each RuntimeClass tolerates that
+taint, so `runtimeClassName` always gets a pod what it names. A pod that picks
+by `nodeSelector` alone does not carry the toleration, and needs the
+RuntimeClass once a default is set. `ferry config set defaultRuntime …` applies
+to a running cluster at once. Switching to or from `ferry-vm` changes
+Karpenter's NodePool, so Karpenter replaces provisioned machines with ones made
+under the new default.
 
 It reaches the cluster as `kube-system/ferry-config`, a copy of the file that
-`ferry up` and `ferry config set` rewrite, which `ferry-machined` reads to taint
+`ferry up` and `ferry config set` rewrite. `ferry-machined` reads it to taint
 machines as they are made and Macs as they join. The file is the source: an
 edit to the ConfigMap lasts until the next rewrite.
 
 **`machineDurability`** is what a machine's disk survives, for a Machine
 whose spec does not say. A disk has one level more than the cluster: `os-crash`
 is an `fsync(2)`, which reaches the SSD without flushing its cache, so it
-survives the Mac crashing but not losing power. Unset, it follows the cluster
-— `os-crash` for `power-loss`, which is what machines always had, and
+survives the Mac crashing but not losing power. Unset, it follows the cluster:
+`os-crash` for `power-loss`, which is what machines always had, and
 `process-crash` for `process-crash`. One machine can choose its own:
 
 ```yaml
@@ -326,8 +325,8 @@ environment variable each: `podMemoryMiB` (`FERRY_POD_MEMORY_MIB`), `podCPUs`
 (`FERRY_MACHINE_LIMIT_CPUS`) and `machineLimitMemoryGi`
 (`FERRY_MACHINE_LIMIT_MEMORY_GI`).
 
-**Before this file** the same choices were marker files — `durability` and
-`machines-enabled` in `~/.ferry` — written by flags and read back without a
+**Before this file** the same choices were two marker files in `~/.ferry`,
+`durability` and `machines-enabled`, written by flags and read back without a
 word. They are still read, and the first `ferry up`, `ferry config set` or
 `ferry machines` moves them into the file and removes them. A ferry from before
 this change does not read the file, so going back to one loses those two
@@ -335,24 +334,24 @@ settings.
 
 ## Parameters
 
-Everything below is an environment variable. The installer's are read by
-`install.sh` at install time; the rest are read by `ferry` every time it runs, so
-they belong in the shell that runs `ferry up`, `ferry join` or the login agent —
-not in the installer.
+Everything below is an environment variable. `install.sh` reads the
+installer's at install time. `ferry` reads the rest every time it runs, so they
+belong in the shell that runs `ferry up`, `ferry join` or the login agent, not
+in the installer.
 
 ### Installing
 
 | | default | |
 |---|---|---|
 | `FERRY_VERSION` | latest published | the release to install |
-| `FERRY_URL` | — | an existing cluster's API server; makes this a join |
-| `FERRY_TOKEN` | — | the token from `ferry token create` |
+| `FERRY_URL` | unset | an existing cluster's API server; makes this a join |
+| `FERRY_TOKEN` | unset | the token from `ferry token create` |
 | `FERRY_NODE_NAME` | the Mac's short hostname | what to call this node |
 | `FERRY_INSTALL_DIR` | `~/.ferry-dist` | where releases are unpacked |
 | `FERRY_BIN_DIR` | `/usr/local/bin`, else `~/.local/bin` | where `ferry` is linked |
-| `FERRY_SKIP_START` | — | `1` to install without starting a cluster |
-| `FERRY_SKIP_SERVICE` | — | `1` to not register the login agent |
-| `FERRY_SKIP_KUBECTL` | — | `1` to not install kubectl even if missing |
+| `FERRY_SKIP_START` | unset | `1` to install without starting a cluster |
+| `FERRY_SKIP_SERVICE` | unset | `1` to not register the login agent |
+| `FERRY_SKIP_KUBECTL` | unset | `1` to not install kubectl even if missing |
 | `FERRY_DOWNLOAD_BASE` | the release's GitHub URL | where to fetch the tarball; needs `FERRY_VERSION` |
 | `FERRY_REPO` | `imaustink/ferry` | which repository to install from |
 
@@ -361,7 +360,7 @@ not in the installer.
 | | default | |
 |---|---|---|
 | `FERRY_PROFILE` | `default`, or the worktree's name | which cluster this is; decides ports, state and pod network |
-| `FERRY_HOME` | `~/.ferry<-profile>` | etcd, PKI, kubeconfigs, logs — survives a restart |
+| `FERRY_HOME` | `~/.ferry<-profile>` | etcd, PKI, kubeconfigs and logs, which survive a restart |
 | `FERRY_CONFIG` | `$FERRY_HOME/config.yaml` | this cluster's settings; see [Configuration](#configuration) |
 | `FERRY_RUN` | `/tmp/ferry-run<-profile>` | sockets, pid files, per-run state. Under `/tmp` because macOS caps a unix socket path near 104 bytes |
 | `FERRY_PROFILES` | `~/.ferry-profiles` | the register mapping profile names to index numbers |
@@ -378,7 +377,7 @@ not in the installer.
 | `FERRY_MAX_PODS` | derived from RAM, capped at 110 | how many pods this Mac advertises. An idle pod VM costs ~133 MiB whatever the workload does, so half of memory is budgeted for that |
 | `FERRY_EVICTION_DISK` | `4Gi` | free disk below which pods stop scheduling |
 | `FERRY_EVICTION_MEMORY` | `500Mi` | free memory below which the kubelet evicts |
-| `FERRY_INSECURE_REGISTRIES` | — | registries pods may pull from over plain HTTP, comma separated, `host` or `host:port`. Loopback and this Mac's own addresses always are, which is what makes `ferry addons enable registry`'s `localhost:5001` work; everything else is HTTPS. Read by `ferry-cri` when ferry starts |
+| `FERRY_INSECURE_REGISTRIES` | unset | registries pods may pull from over plain HTTP, comma separated, `host` or `host:port`. Loopback and this Mac's own addresses always are, which is what makes `ferry addons enable registry`'s `localhost:5001` work; everything else is HTTPS. Read by `ferry-cri` when ferry starts |
 
 ### Addons
 
@@ -389,14 +388,15 @@ not in the installer.
 
 ### Durability and speed
 
-`ferry up --disposable` (durability `process-crash`) sets the first two together and is the
-supported way in; the rest are here because the code reads them and are worth
-knowing when one of them is the thing you want to change on its own.
+`ferry up --disposable` (durability `process-crash`) sets the first two together
+and is the supported way in. The rest are listed because the code reads them,
+and are worth knowing when one of them is the thing you want to change on its
+own.
 
 | | default | |
 |---|---|---|
 | `FERRY_DURABILITY` | `power-loss` | `process-crash` to acknowledge writes before they reach the disk: a crashed process loses nothing, a power loss or kernel panic can. Overrides what the cluster was created with, for one run, without changing it. `ferry up --durability` is the same choice, remembered. `full` and `relaxed`, the old names, still work |
-| `FERRY_ETCD_NO_FSYNC` | — | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `process-crash`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache — 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
+| `FERRY_ETCD_NO_FSYNC` | unset | `1` to start etcd with `--unsafe-no-fsync`. Set for you by `process-crash`. On macOS Go's `os.File.Sync()` is `fcntl(F_FULLFSYNC)`, a flush of the drive's own write cache: 3.96ms here against 0.031ms for plain `fsync(2)`, and every pod status update is an etcd write |
 | `FERRY_NODE_DISK_SYNC` | `fsync` | `none` to drop the barrier on a machine's virtual disk, `full` for the strictest. Set for you from `machineDurability`, or from the cluster's durability when that is unset; a Machine's own `spec.durability` overrides it for that machine |
 | `FERRY_BUILDER_CPUS` | half the Mac's cores, at least 2 | CPUs for the `ferry image build` builder pod. buildkit on the pod default of 2 is roughly half the speed of 8 |
 | `FERRY_BUILDER_MEMORY_GIB` | a quarter of the Mac's memory, 2–8 | memory for the builder pod |
@@ -405,7 +405,7 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_BUILDKIT_IMAGE` | `moby/buildkit:v0.29.0` | the buildkit image it runs |
 | `FERRY_BUILDER_CN` | `ferry-builder` | the name in the builder's TLS certificate, which `buildctl --tlsservername` verifies against |
 | `FERRY_NODE_USB` | set by ferry | `1` boots machines with a USB controller and attaches the disk images listed in `<machines-dir>/<name>.usb`, which `ferry-machined` writes for `ferry-local-block` claims. ferry sets it when the kernel carries usb-storage (every kernel `ferry kernel` builds now does); see `experiments/33-cluster-images-and-volumes` |
-| `FERRY_BLOCK_CLASS` | `ferry-local-block` | the StorageClass whose ReadWriteOnce claims are disks on machines too -- attached over USB after boot, so `chown` works -- rather than directories in the virtiofs share. Offered only when the kernel carries usb-storage, and needs a node image with its `ferry.dev/block` driver (`ferry node-image`). Synced small writes are about a third as fast as the share's |
+| `FERRY_BLOCK_CLASS` | `ferry-local-block` | the StorageClass whose ReadWriteOnce claims are disks on machines too, attached over USB after boot so `chown` works, rather than directories in the virtiofs share. Offered only when the kernel carries usb-storage, and needs a node image with its `ferry.dev/block` driver (`ferry node-image`). Synced small writes are about a third as fast as the share's |
 | `FERRY_KUBE_API_QPS` | `500` | how fast a kubelet may talk to the API server. Upstream's 50 paces a 20-pod burst at 40ms a pod, with every container already running |
 | `FERRY_KUBE_API_BURST` | `1000` | the burst that goes with it |
 | `FERRY_KUBELET_V` | `2` | klog level for both kubelets. At `4` the kubelet logs its own per-pod phase boundaries, which is what `experiments/24-benchmark-harness/syncphases.py` reads |
@@ -427,8 +427,8 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_NETPOL_PEER_PORT` | `6444` + profile shift | on the control plane's Mac: the TLS port its ferry-netpol serves the other Macs' nodes their own pods' NetworkPolicy rules on. Only a kubelet client certificate the cluster CA signed, in `system:nodes`, is answered, and only with that node's pods |
 | `FERRY_NETPOL_UPSTREAM` | the join address's host, its port + 1 | on a joined Mac: where to follow the control plane's ferry-netpol, for a control plane whose peer port is not one above its API server's |
 | `FERRY_PEERS` | read from `$FERRY_HOME/peers` | the other Macs' relay endpoints |
-| `FERRY_ALLOW_OFF_SLICE` | — | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
-| `FERRY_HOST_CLUSTER_IPS` | `false` | `1` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |
+| `FERRY_ALLOW_OFF_SLICE` | unset | `1` to start when vmnet will not give this node its slice. Other nodes will not reach these pods; without it ferry refuses rather than partition silently |
+| `FERRY_HOST_CLUSTER_IPS` | `false` | `true` to bind ClusterIPs on the Mac too, so the API server reaches aggregated APIs. Needs sudo |
 | `FERRY_STREAM_ADDR` | `127.0.0.1:10350` + shift | where the streaming server listens |
 | `FERRY_CNI_CONFLIST` | ferry's own | a CNI conflist to use instead |
 | `SERVICE_CIDR` | `10.96.0.0/16` | the Service network. Read by `control-plane/up.sh` |
@@ -450,18 +450,18 @@ knowing when one of them is the thing you want to change on its own.
 | `FERRY_MACHINE_MIN_MEMORY_GI` / `FERRY_MACHINE_MAX_MEMORY_GI` | `2` / the total memory limit | the same for memory. The max is held to the total by default, since one machine cannot exceed what every machine may be |
 | `FERRY_MACHINE_RELAY_PORT` | `8700` + profile shift | where machines join ferry's pod network. `ferry-node` holds this end of the switch and `ferry-cri` the other, both on loopback, so machines and mode 1 pods land on one segment. Clear of `FERRY_RELAY_PORT`, which is a range rather than a port: node N's switch is `FERRY_RELAY_PORT` + N |
 | `FERRY_MACHINE_MAX_PODS` | `110` | pods a provisioned machine advertises. Kubernetes' own default, not mode 1's memory-derived number: pods in a machine share its kernel |
-| `FERRY_MACHINE_IMAGE` | — | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
-| `FERRY_NODE_VERBOSE` | — | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
-| `FERRY_NODE_NO_CONFIG` | — | set to boot a machine without its generated config disk. For debugging the image itself |
+| `FERRY_MACHINE_IMAGE` | unset | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
+| `FERRY_NODE_VERBOSE` | unset | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
+| `FERRY_NODE_NO_CONFIG` | unset | set to boot a machine without its generated config disk. For debugging the image itself |
 | `FERRY_MACHINE_REGISTRY` | `1` | `0` to stop sharing loaded images between nodes. With it on, `ferry-registry` keeps what `ferry image load` and `ferry image build` load in `$FERRY_HOME/registry` and serves it read-only to every node that is not the one it was loaded on: `ferry-cri` on every node of this Mac asks it before the real registry, every machine's containerd does the same at the machine network's gateway, and it asks the other Macs' registries for any name it does not hold. Anything not stored falls through to the real registry. `ferry image load` also loads into the other nodes on this Mac, so `imagePullPolicy: Never` works on them; machines and other Macs need `IfNotPresent` |
 | `FERRY_MACHINE_REGISTRY_PORT` | `5050` + profile shift | the port it serves this Mac on: loopback and the machine network only. Not 5000, which macOS's AirPlay receiver holds |
 | `FERRY_REGISTRY_PEER_PORT` | `5051` + profile shift | the port it serves the cluster's other Macs on, over TLS. Both ends present their node's kubelet certificate, and only a certificate the cluster CA signed in group `system:nodes` is answered, so the LAN and pods are refused. The same number on every Mac of a cluster: each works out the others' from its own |
 | `FERRY_NODE_REGISTRY_PORT` | set by ferry | what `ferry-node` reads to put `ferry.registry=<port>` on a machine's command line. ferry sets it from the two above, and blanks it when the registry is off; not meant to be set by hand |
 
 The two `MIN`/`MAX` pairs bound one machine; the two `LIMIT`s bound all of them
-together. They are separate numbers on purpose — collapsing them gives either a
-single machine that can eat the whole budget, or a budget that silently caps how
-large any one machine can be. Between them they decide the shapes the
+together. They are separate numbers on purpose. Collapsing them gives either a
+single machine that can take the whole budget, or a budget that silently caps
+how large any one machine can be. Between them they decide the shapes the
 provisioner offers: powers of two within the cpu range, each with memory at 1×,
 2× and 4× its cores, clipped to the memory range.
 
@@ -484,7 +484,7 @@ an empty machine is reclaimed about a minute later.
 | `K8S_CONTROL_PLANE_VERSION` | pinned per minor | the darwin control plane build, when ferry's pin is not published |
 | `ETCD_VERSION` | paired with the Kubernetes | the etcd to fetch |
 | `K8S_SRC` | under `$TMPDIR` | where the Kubernetes source tree is checked out |
-| `FERRY_REBUILD` | — | `1` to rebuild rather than reuse what is built |
+| `FERRY_REBUILD` | unset | `1` to rebuild rather than reuse what is built |
 
 ### Upgrades and joining
 
@@ -492,12 +492,12 @@ an empty machine is reclaimed about a minute later.
 |---|---|---|
 | `FERRY_KUBECONFIG` | the admin one | admin credentials, for upgrading a Mac that joined and so has only its kubelet's certificate |
 | `FERRY_DRAIN_TIMEOUT` | `300s` | how long to wait for a node to drain |
-| `FERRY_SKIP_SNAPSHOT` | — | `1` to skip the etcd snapshot an upgrade takes first. Do not |
-| `FERRY_ALLOW_REMOVED_APIS` | — | `1` to upgrade although something is still asking for an API the target removes |
-| `FERRY_RECORD_SIGNATURES` | — | `1` to have `build-kubelet.sh` record the constructors a newly ported `patches/kubelet-vX.Y/` is written against |
+| `FERRY_SKIP_SNAPSHOT` | unset | `1` to skip the etcd snapshot an upgrade takes first. Do not |
+| `FERRY_ALLOW_REMOVED_APIS` | unset | `1` to upgrade although something is still asking for an API the target removes |
+| `FERRY_RECORD_SIGNATURES` | unset | `1` to have `build-kubelet.sh` record the constructors a newly ported `patches/kubelet-vX.Y/` is written against |
 | `FERRY_WATCH_GRACE` | `2s` | how long a stopping API server gives its watches to end before it exits |
 | `FERRY_KEEP_ETCD`, `FERRY_HANDOVER`, `FERRY_HANDOVER_BIN` | set by `upgrade` | how `control-plane/up.sh` replaces a running control plane: keep etcd, and hold the API server's port with `bin/ferry-handover` while one API server hands over to the next |
-| `FERRY_ALLOW_SSH_JOIN` | — | `1` to join over SSH, knowing the node loses the network when the session ends |
+| `FERRY_ALLOW_SSH_JOIN` | unset | `1` to join over SSH, knowing the node loses the network when the session ends |
 | `FERRY_INSTALL_URL` | `https://get.ferry.kurpuis.com` | the installer URL ferry prints in `token create` |
 
 ### Internal
@@ -514,11 +514,12 @@ to.
 
 ### Keeping this list honest
 
-These are not all read in the same place, which is why the list drifted before:
-most are read by `ferry` and `install.sh` in shell, `SERVICE_CIDR` and the etcd
-ports by `control-plane/up.sh`, and `FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`,
-`FERRY_NODE_VERBOSE` and `FERRY_NODE_NO_CONFIG` by the Swift binaries through
-`ProcessInfo.environment` — where no amount of grepping the shell finds them.
+These are not all read in the same place, which is why the list drifted before.
+`ferry` and `install.sh` read most of them in shell, `control-plane/up.sh` reads
+`SERVICE_CIDR` and the etcd ports, and the Swift binaries read
+`FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`, `FERRY_NODE_VERBOSE` and
+`FERRY_NODE_NO_CONFIG` through `ProcessInfo.environment`, where grepping the
+shell does not find them.
 
 To check nothing has been added without being written down:
 
@@ -538,7 +539,7 @@ ferry service uninstall
 ```
 
 The installer registers this for you. It is a LaunchAgent, not a LaunchDaemon,
-and that is not a detail:
+for two reasons:
 
 - `Virtualization.framework` will not create a VM from a process outside a user
   session, so a daemon running before login could not start a pod.
@@ -547,33 +548,33 @@ and that is not a detail:
 
 So the cluster comes up at **login**, not at boot. On a Mac that is logged in and
 stays logged in, the difference is invisible. On one that reboots to the login
-window, the cluster waits there — which is the honest behaviour rather than a
-daemon that starts and then cannot make a VM.
+window, the cluster waits there. That is better than a daemon that starts and
+then cannot make a VM.
 
 `launchd` restarts the cluster if it falls over, and does not restart one that
-was stopped on purpose. It cannot tell those apart by itself — both end with the
-processes gone — so `ferry down` leaves a marker in `~/.ferry/stopped` and
-`ferry up` clears it. Without that, `ferry down` stopped the cluster and launchd
-started it again five seconds later, and there was no way to turn ferry off at
-all while the agent was registered.
+was stopped on purpose. It cannot tell those apart by itself, since both end
+with the processes gone, so `ferry down` leaves a marker in `~/.ferry/stopped`
+and `ferry up` clears it. Without that, `ferry down` stopped the cluster and
+launchd started it again five seconds later, and there was no way to turn ferry
+off at all while the agent was registered.
 
 The marker means *this session*, not forever: after a reboot the agent starts
 the cluster again.
 
-Registering the agent starts the cluster too — `RunAtLoad` does that — so
+Registering the agent starts the cluster too, because of `RunAtLoad`, so
 `ferry service install` on a Mac with a cluster already up holds the one that is
 running rather than starting a second.
 
 The agent's log is `~/.ferry/logs/service.log`.
 
 **A Mac that joined another cluster does not come back on its own.** A worker's
-kubelet certificate and kubeconfig live under `/tmp`, which is where they have to
-be — macOS caps a unix socket path near 104 bytes and the kubelet builds its
-podresources socket beneath `--root-dir`. Those do not survive a reboot, so the
-agent says what happened and leaves it alone rather than starting a control
-plane on a machine that is meant to be a worker. Rejoin with a fresh token.
+kubelet certificate and kubeconfig live under `/tmp`, and they have to: macOS
+caps a unix socket path near 104 bytes, and the kubelet builds its podresources
+socket beneath `--root-dir`. Those do not survive a reboot, so the agent says
+what happened and leaves it alone rather than starting a control plane on a
+machine that is meant to be a worker. Rejoin with a fresh token.
 
-## Machines — mode 2
+## Mode 2 machines
 
 A release carries mode 2, where the node is the VM and pods inside it are
 ordinary Linux containers sharing its kernel ([MACHINES.md](MACHINES.md)). It is
@@ -590,27 +591,26 @@ EOF
 kubectl get machines
 ```
 
-Off by default because of what mode 2 does *today*: it is complete through
-milestone 3 — a `Machine` becomes a node, and pods on two machines reach each
-other — but provisioning, consolidation and mixed-cluster scheduling are not
-built. Starting two more daemons and holding a vmnet network on every cluster,
-including the ones that will never declare a `Machine`, is not a fair default
-for that. Enabling is remembered per cluster, so `ferry up` and the login agent
-bring machines back.
+Mode 2 is built through milestone 6: a `Machine` becomes a node, a pod that fits
+no node provisions a machine and consolidation reclaims it, and pods reach each
+other across both modes. It is off by default because it starts three more
+daemons and holds a vmnet network on every cluster, including the ones that
+will never run a machine, and because making it the default would change where
+every existing cluster's pods land. Enabling is remembered per cluster, so
+`ferry up` and the login agent bring machines back.
 
 The release ships the node image as an **OCI layout**, not as a disk. The first
-`ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB) using
-`ferry-node`'s own unpacker — so Docker is not needed on the installing Mac.
-It unpacks again whenever the layout changes, which means on every upgrade to a
-release with a different node image, and after any `ferry node-image` — so the
-~400 MB is paid once per node image rather than once per Mac. Machines that
-already exist keep the disk they were given; delete and re-apply a `Machine` to
-move it onto a new image.
-Docker is only needed to *create* the layout, which happens on the machine
-cutting the release:
+`ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB) with
+`ferry-node`'s own unpacker, so the installing Mac does not need Docker. It
+unpacks again whenever the layout changes: on every upgrade to a release with a
+different node image, and after any `ferry node-image`. The ~400 MB is paid
+once per node image rather than once per Mac. Machines that already exist keep
+the disk they were given; delete and re-apply a `Machine` to move it onto a new
+image. Docker is only needed to *create* the layout, which happens on the
+machine cutting the release:
 
 ```sh
-./ferry build         # adds ferry-machined and ferry-node
+./ferry build         # adds ferry-machined, ferry-karpenter and ferry-node
 ./ferry node-image    # the node image itself (slow, needs docker)
 ```
 
@@ -652,27 +652,27 @@ default; see `defaultRuntime` under [Configuration](#configuration).
 
 `ferry-vm` also carries a pod overhead: the ~133 MiB a pod VM costs before its
 workload does anything, counted by the scheduler on top of the pod's requests.
-Only a pod that names the class is charged it — Kubernetes has no default
-RuntimeClass to charge the rest — so the memory-derived `maxPods` stays as the
-ceiling for pods that do not.
+Only a pod that names the class is charged it, because Kubernetes has no
+default RuntimeClass to charge the rest. The memory-derived `maxPods` stays as
+the ceiling for pods that do not.
 
 ### Cluster DNS inside machines
 
 Machines resolve through their own CoreDNS, behind `kube-dns` at `10.96.0.10`,
 with kube-proxy running on each machine to answer that address. `ferry machines
-enable` installs both, pinned to `ferry.dev/mode: shared`; they stay `Pending`
-until a machine exists to run them on.
+enable` installs both as DaemonSets pinned to `ferry.dev/mode: shared`, so they
+run no pods until a machine exists.
 
-Mode 1's CoreDNS cannot serve machines. It is a `ferry-cri` pod on the Mac's
-vmnet network, machines are on a vmnet network of their own, and vmnet keeps its
-networks apart — so a pod inside a machine has no route to it. Each mode
-resolving through its own CoreDNS is the honest arrangement until cross-mode pod
-routing exists, which is milestone 6. Nothing here changes mode 1: its kubelet
-is told CoreDNS's pod address directly and never consults this Service.
+Mode 1's CoreDNS is a `ferry-cri` pod on the Mac. Machines once had no route to
+it; since milestone 6 they do, and the split stays by choice: DNS on each
+machine answers locally and keeps working when no other node is up
+([MACHINES.md](MACHINES.md#cluster-dns-is-per-mode-for-now)). Nothing here
+changes mode 1: its kubelet is told CoreDNS's pod address directly and never
+consults this Service.
 
 `FERRY_MACHINE_DNS_IP` moves the address. A `kube-dns` Service that already
-exists somewhere else is reported rather than applied over — a ClusterIP cannot
-be changed once set.
+exists somewhere else is reported rather than applied over, because a ClusterIP
+cannot be changed once set.
 
 ## kubeconfig
 
@@ -686,23 +686,22 @@ its own cluster, user and context name (`ferry-e2e` for the `e2e` profile), so
 two clusters on one Mac cannot end up sharing one API server's entry.
 
 Merging is offered rather than done. `~/.kube/config` usually points at clusters
-that matter, and an installer that rewrites it uninvited eventually ruins
-somebody's afternoon. `--merge` backs the file up first, and uses kubectl's own
-merge.
+that matter, and an installer that rewrites it uninvited will eventually break
+one. `--merge` backs the file up first, and uses kubectl's own merge.
 
 ## Upgrading ferry
 
 Run the installer again. It unpacks the new release beside the old one and moves
 `~/.ferry-dist/current`, so every launcher and the LaunchAgent follow without
-being relinked — which is why `current` exists and why ferry deliberately stops
-resolving symlinks there rather than pinning itself to the version directory.
+being relinked. That is why `current` exists, and why ferry stops resolving
+symlinks there rather than pinning itself to the version directory.
 
 That also moves **Kubernetes**, because a release carries one: the kubelet,
-`ferry-proxyd`, the control plane and etcd built and tested as a set. This is
-k3s' model, and it is not a choice so much as a consequence — `ferry upgrade
-apply` compiles a kubelet from a patched Kubernetes tree, and a release carries
-neither the tree nor a toolchain. `ferry upgrade` says so and stops, rather than
-finding out several minutes in.
+`ferry-proxyd`, the control plane and etcd, built and tested as a set. This is
+k3s' model, and here it is forced: `ferry upgrade apply` compiles a kubelet
+from a patched Kubernetes tree, and a release carries neither the tree nor a
+toolchain. In a release, `ferry upgrade` says so and stops, rather than finding
+out several minutes in.
 
 In a checkout, where any version is a build input,
 `ferry upgrade plan|apply|nodes|rollback` works as documented in
@@ -726,9 +725,10 @@ executing out of it at the time.
 
 GitHub Pages, published from `main` by
 [`.github/workflows/pages.yml`](../.github/workflows/pages.yml) whenever
-`install.sh` changes. The script is served at `/` and at `/install.sh`; the
-workflow runs `sh -n` on it first, because a syntax error here is a broken
-install command for every new user on a path no test of ferry would catch.
+`install.sh`, `CNAME` or the workflow changes. The script is served at `/` and
+at `/install.sh`. The workflow runs `sh -n` on it first, because a syntax error
+here is a broken install command for every new user, on a path no test of ferry
+would catch.
 
 Publishing from `main` rather than keeping a copy on a `gh-pages` branch is the
 point: a copy drifts, and the installer people run would slowly stop being the
@@ -738,8 +738,8 @@ one in this repository with nothing saying so.
 in this tree:
 
 1. **DNS.** A `CNAME` record for `get.ferry.kurpuis.com` pointing at
-   `imaustink.github.io`. Not an `A` record and not the apex — a nested
-   subdomain as a `CNAME` is exactly the supported case. This one is declared
+   `imaustink.github.io`. Not an `A` record and not the apex: a nested
+   subdomain as a `CNAME` is the case GitHub supports. This one is declared
    in the homelab repository as an ExternalName Service that ExternalDNS turns
    into the record.
 2. **Pages source.** In the repository's Settings → Pages, set the source to
@@ -748,7 +748,7 @@ in this tree:
    enabled"* until it is set.
 3. Push to `main`, or run the workflow by hand.
 4. Once DNS resolves, tick **Enforce HTTPS**. GitHub issues a Let's Encrypt
-   certificate for the subdomain automatically; it cannot do that until the
+   certificate for the subdomain automatically. It cannot do that until the
    `CNAME` record is in place, so this step comes last.
 
 ### The domain is two files that have to agree
@@ -757,18 +757,18 @@ The [`CNAME`](../CNAME) file at the root of this repository holds the domain,
 and the workflow copies it into the published site. That copy is what binds the
 domain on GitHub's side, and it has to match the DNS record pointing at Pages.
 
-Keeping the domain in a tracked file rather than in a workflow step is so that
-losing it takes deleting something on purpose. It does **not** remove the
-dependency on the workflow: with the Pages source set to GitHub Actions, the
-published site is only what the job uploads, so nothing in this repository is
-served by itself. A deployment whose artifact lacks `CNAME` resets the domain
-to `imaustink.github.io`, and the site stays up while every install command in
-these docs stops working — which is why a test asserts the file exists, names
-the same host as `install.sh`, and is copied into `_site`.
+The domain is in a tracked file rather than in a workflow step so that losing it
+takes deleting something on purpose. It does **not** remove the dependency on
+the workflow: with the Pages source set to GitHub Actions, the published site is
+only what the job uploads, so nothing in this repository is served by itself. A
+deployment whose artifact lacks `CNAME` resets the domain to
+`imaustink.github.io`, and the site stays up while every install command in
+these docs stops working. That is why a test asserts the file exists, names the
+same host as `install.sh`, and is copied into `_site`.
 
 Serving the file directly, with no workflow at all, would mean switching Pages
-to *Deploy from a branch*. That also needs the served content committed — an
-`index.html` holding a second copy of `install.sh` — which is the drift this
+to *Deploy from a branch*. That also needs the served content committed, an
+`index.html` holding a second copy of `install.sh`, which is the drift this
 arrangement exists to avoid.
 
 Until all of that is done, the installer still works by naming the release
@@ -786,7 +786,7 @@ and in its release-guard messages, for anyone serving the installer elsewhere.
 ## Notes
 
 **Gatekeeper.** `curl` does not set `com.apple.quarantine`, so a piped install is
-not blocked. A browser does, so the installer clears the flag anyway — a
+not blocked. A browser does, so the installer clears the flag anyway. A
 quarantined binary is killed at launch with nothing useful said about why.
 
 **Size.** The tarball is a few hundred megabytes. It carries a kubelet, three

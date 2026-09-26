@@ -49,23 +49,22 @@ processes rather than a migration. This is the whole reason an in-place upgrade
 is possible.
 
 **A node's runtime carries no Kubernetes version.** `ferry-cri` is ferry's own
-code, so the kubelet is replaced without stopping the runtime. Pods that drain
-did not move — a DaemonSet pod, anything that tolerates the drain — keep running
+code, so the kubelet is replaced without stopping the runtime. Pods the drain
+did not move, such as a DaemonSet pod or anything that tolerates the drain, keep running
 across the swap, because they are VMs the runtime owns and not something the
 kubelet holds open.
 
 **Each node runs its own version.** A node's kubelet is started out of its
 version's directory in the store, not out of `bin/kubelet`, and the version is
-recorded in `$FERRY_HOME/node-versions/<name>` -- in `FERRY_HOME` because the
-run directory is under `/tmp` and a reboot is exactly what the record has to
-outlive. `ferry up`, `ferry node add` under a name used before and the login
+recorded in `$FERRY_HOME/node-versions/<name>`. It is in `FERRY_HOME` because the
+run directory is under `/tmp` and the record has to outlive a reboot. `ferry up`, `ferry node add` under a name used before and the login
 agent all start a node as what it last was, so a restart is never an upgrade.
 Two nodes on one Mac have run v1.34.0 and v1.35.8 side by side. A second Mac is
 a second checkout with its own store, and is upgraded from that Mac.
 
 **`apply` touches no node.** It moves only the control plane's links in `bin/`.
-It used to move every link, `bin/kubelet` included, so each node's next restart
--- a crash, a reboot -- would have been an unplanned upgrade without a drain.
+It used to move every link, `bin/kubelet` included, so each node's next restart,
+from a crash or a reboot, would have been an unplanned upgrade without a drain.
 
 **kube-proxy moves with the Mac.** `ferry-proxyd` is one per Mac however many
 nodes it runs, so it follows the Mac's own node, index 0, and is restarted at
@@ -94,20 +93,20 @@ bin/kubelet -> versions/v1.34.0/kubelet
 starts at when the cluster's own version has no kubelet in the store. Nothing
 runs it by that name any more.
 
-ferry's own binaries — `ferry-cri`, `ferry-cni`, the daemons — are not in the
+ferry's own binaries, `ferry-cri`, `ferry-cni` and the daemons, are not in the
 store. They are the checkout's code rather than Kubernetes', and rolling the
 cluster back to an older Kubernetes should not roll back the runtime with it.
 
 The indirection is a symlink rather than a copy for two reasons. Rollback
 becomes a flip rather than a rebuild. And nothing is ever written over a binary
-that is running — which on macOS leaves that file permanently unrunnable, killed
+that is running. On macOS that leaves the file permanently unrunnable, killed
 at launch with a bare `Killed: 9` and a signature that still verifies. `ferry
 doctor` has a check for exactly that failure; the store is built so it cannot
 happen.
 
 A checkout from before the store is adopted rather than rebuilt: `bin/kubelet`
-and `bin/.kubelet-version` are a version directory with one binary in it, and
-they are moved — `mv`, so the inode survives and a kubelet running right now
+and `bin/.kubelet-version` become a version directory with one binary in it.
+ferry moves them with `mv`, so the inode survives and a kubelet running right now
 stays runnable.
 
 ### Two versions, not one
@@ -115,8 +114,8 @@ stays runnable.
 A cluster's version and a checkout's version are different facts and can
 disagree.
 
-- `bin/.active-version` — what this checkout has built, and what `bin/` points at.
-- `$FERRY_HOME/version` — what the running cluster actually is.
+- `bin/.active-version` is what this checkout has built, and what `bin/` points at.
+- `$FERRY_HOME/version` is what the running cluster actually is.
 
 A build moves the first and leaves the second alone. `ferry up` starts the
 cluster at *its* recorded version, not at whatever was last built, so a build
@@ -144,7 +143,7 @@ etcd is paired the same way, and `ETCD_VERSION` overrides it.
 ### What a fresh checkout builds
 
 `FERRY_DEFAULT_K8S_VERSION` in `lib/versions.sh` is the version a checkout
-builds when nothing says otherwise -- v1.37.0. It lives there, and not in each
+builds when nothing says otherwise: v1.37.0. It lives there, and not in each
 script, because ferry, `build-kubelet.sh` and both control-plane scripts each
 used to carry the literal separately; a default bumped in three of the four is
 the split-version bug the store was built to end.
@@ -152,14 +151,14 @@ the split-version bug the store was built to end.
 It only decides where a *new* checkout starts. ferry reads
 `ferry_active_version` first, so a checkout that has built something stays on it
 until asked to move, and raising the default cannot upgrade a running cluster
-behind its back -- `ferry upgrade` still refuses to cross more than one minor at
+behind its back. `ferry upgrade` still refuses to cross more than one minor at
 a time, so a v1.34 cluster reaches v1.37 in three steps or not at all.
 
 ### What the store may lose
 
-`ferry upgrade prune` lists the versions nothing references -- not the
-cluster's, not rollback's, not what `bin/` points at, not any node's record on
-this Mac, not ferry-proxyd's -- and not any a process is running from, whatever
+`ferry upgrade prune` lists the versions nothing references. That excludes the
+cluster's, rollback's, what `bin/` points at, any node's record on
+this Mac, ferry-proxyd's, and any a process is running from, whatever
 the records say. `--yes` removes them.
 
 ## How the API server is replaced
@@ -171,7 +170,7 @@ the kubernetes Service's endpoint.
 
 **It used to take twenty seconds, not a few.** The API server stops listening
 at once on SIGTERM and then waits for its HTTP/2 streams to finish, and watches
-never do, so it sat out its 60s request timeout -- measured, 60.2s -- until
+never do, so it sat out its 60s request timeout, measured at 60.2s, until
 down.sh killed it at ten. `--shutdown-watch-termination-grace-period=2s` has it
 end them itself: 1.15s. That is also most of what `ferry down` was waiting on;
 it takes 2.0s now.
@@ -184,7 +183,7 @@ does not across v1.34 to v1.37.
 lets them share the port. macOS does not balance a shared port: every
 connection goes to whichever listener bound first. And an API server's
 post-start hooks call it back through a loopback client that dials
-`[::1]:port` with a certificate it generated moments earlier -- beside the old
+`[::1]:port` with a certificate it generated moments earlier. Beside the old
 one, those calls reach the old one and fail verification, and the new one
 exits. Both were measured, not assumed.
 
@@ -192,8 +191,8 @@ exits. Both were measured, not assumed.
 Mac has on the API port. macOS always prefers a listener on a specific address
 to a wildcard one, and an IPv4 socket binds beside the API server's dual-stack
 `[::]` without either setting anything, being a different family. Every client
-arrives over IPv4 -- kubeconfigs say 127.0.0.1, other Macs and pods through
-10.96.0.1 arrive at the LAN address -- and the bridge splices each connection
+arrives over IPv4: kubeconfigs say 127.0.0.1, and other Macs and pods through
+10.96.0.1 arrive at the LAN address. The bridge splices each connection
 through to `[::1]`, retrying while nothing is there. `[::1]` stays the API
 server's own, which is what its loopback client needs. The old one is told to
 stop, the new one starts the moment the old one has let go of the port, the
@@ -209,7 +208,7 @@ from a control plane started before this is handed over too.
 
 **The kubernetes Service is written by ferry.** An API server's endpoint
 reconciler takes its address out of the Service as it stops, and with one API
-server at one address that emptied it -- 1.1–1.3s of refused connections to
+server at one address that emptied it. The result was 1.1–1.3s of refused connections to
 10.96.0.1 after every restart, and one refused connection from a pod in the
 first live upgrade. The API server runs with `--endpoint-reconciler-type=none`
 and up.sh writes the Endpoints and EndpointSlice on every start.
@@ -222,21 +221,21 @@ then start, and `plan` says which.
 Every switch that could touch the cluster's state takes an etcd snapshot first,
 into `$FERRY_HOME/backups/`.
 
-This is not belt and braces. Once an API server has started at a newer version
-it may have written storage the older one cannot read, and at that point
-flipping the binaries back is not a rollback — it is an API server that will not
+The snapshot is required. Once an API server has started at a newer version
+it may have written storage the older one cannot read. At that point
+flipping the binaries back is not a rollback. It gives an API server that will not
 start, over the only copy of the data. `tests/etcd-snapshot-test.sh` checks that
 the snapshot ferry takes actually restores, with the flags ferry passes, into a
 directory the etcd `control-plane/up.sh` starts will accept.
 
-Where the etcd *minor* changes — v1.33 to v1.34 crosses 3.5 to 3.6 — the data
-directory is migrated and etcd does not support going back down by swapping the
+Where the etcd *minor* changes, as v1.33 to v1.34 crosses 3.5 to 3.6, etcd
+migrates the data directory and does not support going back down by swapping the
 binary. `ferry upgrade plan` says so before you start.
 
 **A restore moves etcd's revision forward.** A snapshot's revision is older
-than the one every watcher in the cluster last saw -- 1338 against 1682 on the
-live rollback -- and a watch resumed from a revision etcd has not reached yet
-simply waits for it, then carries on from there. Every kubelet, ferry-proxyd
+than the one every watcher in the cluster last saw: 1338 against 1682 on the
+live rollback. A watch resumed from a revision etcd has not reached yet
+waits for it, then carries on from there. Every kubelet, ferry-proxyd
 and controller kept the world as it was before the restore: node objects
 showed their restored status and pods showed Running that did not exist.
 `etcd_restore` now passes `--bump-revision 1000000000 --mark-compacted`, which
@@ -259,14 +258,14 @@ Goes back to the version before the last `apply`, which is recorded in
   `apply`'s checks;
 - **restores the pre-upgrade snapshot whenever the Kubernetes minor changes**,
   not only the etcd minor. An API server that has run at a newer minor may have
-  written objects at storage versions the older one has never heard of -- an
+  written objects at storage versions the older one has never heard of: an
   API that went GA and moved its storage version, a field the older one drops
-  on its next write, a resource it does not serve -- and upstream does not
+  on its next write, a resource it does not serve. Upstream does not
   support downgrading a control plane in place for that reason. The only state
   the older one is known to read is the one it left. It says when the snapshot
-  was taken and what is lost -- every object created, changed or deleted since,
-  and a pod whose object is gone is stopped by its kubelet -- and asks, unless
-  `--yes`;
+  was taken and what is lost, which is every object created, changed or deleted
+  since, and asks unless `--yes`. A pod whose object is gone is stopped by its
+  kubelet;
 - keeps the data directory instead with `--keep-data`, across a Kubernetes
   minor only: across an etcd minor there is no such choice;
 - refuses across a minor when the snapshot is gone, unless `--keep-data`;
@@ -280,7 +279,7 @@ Goes back to the version before the last `apply`, which is recorded in
 
 A restore stops etcd, so it is stop then start: 2.8s of refused connections on
 the live rollback. `apply` runs the same path by itself if the new control
-plane does not come up, unless the new API server never started at all -- then
+plane does not come up, unless the new API server never started at all. In that case
 the old one never stopped serving and nothing is put back.
 
 ## Upgrading a node
@@ -289,13 +288,13 @@ the old one never stopped serving and nothing is put back.
 ferry upgrade node ferry-mac
 ```
 
-Drains with eviction, so PodDisruptionBudgets are honoured — upstream's
+Drains with eviction, so PodDisruptionBudgets are honoured. That is upstream's
 machinery, working here unchanged because the API server is upstream's. Pods
 with no controller are not evicted without `--force`, which deletes them
 outright; ferry says so rather than hanging, and uncordons the node again if the
 drain fails.
 
-Then it stops that node's kubelet — and only the kubelet — starts the new one on
+Then it stops that node's kubelet, and only the kubelet, starts the new one on
 the same config out of the new version's directory, records it, waits for
 Ready, and uncordons. By default the new version is the cluster's own;
 `--to vX.Y.Z` names another, which is built first if the store does not have
@@ -312,8 +311,8 @@ from the process's start.
 The drain of the control plane Mac's own node leaves CoreDNS where it is. It
 claims the address ferry reserves for cluster DNS, which belongs to that node's
 pod subnet and no other, so evicted to another node it came up at another
-address and cluster DNS was gone -- found by draining node 0 with a second node
-beside it. The runtime keeps its VM across the kubelet swap.
+address and cluster DNS was gone. Draining node 0 with a second node
+beside it found this. The runtime keeps its VM across the kubelet swap.
 
 `ferry upgrade nodes` does every node on this Mac in turn and stops at the first
 one that does not come back, leaving the rest on their old kubelet, which is a
@@ -337,7 +336,7 @@ FERRY_KUBECONFIG=/path/to/admin.conf ferry upgrade node <name>
 ## What is checked before anything happens
 
 `ferry upgrade plan` and the first phase of `apply` run the same preflight,
-cheapest check first — a release that does not exist should be found in a
+cheapest check first, so a release that does not exist is found in a
 second, not after twenty minutes of compiling a kubelet for it:
 
 - the target is a version, and is not the one already running;
@@ -347,15 +346,15 @@ second, not after twenty minutes of compiling a kubelet for it:
 - kubernetes has the tag to build the kubelet from;
 - there is disk for a source tree and a build;
 - **every node in the cluster**, read from the API's `nodeInfo.kubeletVersion`,
-  stays inside the skew against the new control plane -- and if one would not,
+  stays inside the skew against the new control plane. If one would not,
   `apply` refuses, where it used to check only this Mac's nodes, only in
   `plan`, and only warn. A kubelet three minors behind on another Mac would
   otherwise have been cut off from the API server by an upgrade that reported
   success;
 - this Mac's ferry-proxyd stays inside kube-proxy's skew, the same rule;
 - nothing is still asking for an API the target removes, from the API server's
-  `apiserver_requested_deprecated_apis` gauge. The objects themselves are safe
-  -- the API server converts them -- but the clients asking get 404s, so
+  `apiserver_requested_deprecated_apis` gauge. The objects themselves are safe,
+  since the API server converts them, but the clients asking get 404s, so
   `apply` refuses unless `FERRY_ALLOW_REMOVED_APIS=1`. The gauge only covers
   requests since the API server started, so an empty answer means nothing
   asked lately.
@@ -367,10 +366,10 @@ fails costs time and not a cluster.
 
 `patches/` is written against a particular tree, and nothing here can tell you
 in advance whether it applies to a version it has never seen.
-`build-kubelet.sh` asserts every textual seam it edits and fails loudly when one
-has moved — so a drifted tree fails during the build, which happens before
-anything is switched. `plan` warns when the target is a new minor for exactly
-this reason. That is the honest position, not a claim that any minor works.
+`build-kubelet.sh` asserts every textual seam it edits and fails when one
+has moved, so a drifted tree fails during the build, which happens before
+anything is switched. `plan` warns when the target is a new minor for this
+reason. ferry does not claim that any minor works.
 
 Every seam fails the build when the file it edits is not where it was. They
 used to be skipped quietly, each behind an `if [ -f ]`, which would have turned
@@ -382,9 +381,9 @@ Both are gone; ferry sets no `staticPodPath`, so nothing depended on them.
 
 Shims whose signatures move between minors live in `patches/kubelet-vX.Y/`,
 chosen by exact minor, and the build refuses before it clones if the minor being
-built has no directory. Each records, in `SIGNATURES`, the upstream signatures
-of the three constructors its shims stand in for -- `cadvisor.New`,
-`cm.NewContainerManager` and `nftables.NewProxier` -- and the build compares
+built has no directory. Each records in `SIGNATURES` the upstream signatures
+of `cadvisor.New`, `cm.NewContainerManager` and `nftables.NewProxier`, the
+three constructors its shims stand in for. The build compares
 them with the tree before applying anything. A moved constructor fails in a
 second, old and new side by side, rather than as "not enough arguments" several
 minutes in. Once the shim is ported, `FERRY_RECORD_SIGNATURES=1` records the
@@ -402,8 +401,8 @@ the one function rather than anywhere else.
 
 v1.37 is also the first minor to vendor knftables v0.0.22, which added
 `netlink.go` with no build tag. That file reaches the kernel through
-`github.com/google/nftables`, whose `xt` package reads `unix.NFPROTO_*` --
-constants darwin does not declare -- so the whole package stopped compiling and
+`github.com/google/nftables`, whose `xt` package reads `unix.NFPROTO_*`,
+constants darwin does not declare, so the whole package stopped compiling and
 took `ferry-proxyd`, and therefore Services, with it. `build-kubelet.sh` narrows
 the file to linux and the v1.37 overlay supplies a darwin stand-in for the two
 names `nftables.go` still refers to. Nothing is lost: `newNetlinkAdapter` is
@@ -416,7 +415,7 @@ Not a version upgrade, but it arrives with one, so it belongs here.
 On darwin, package `cm` compiles upstream's `helpers_unsupported.go`, where
 every CFS constant is `0` and both milli-CPU conversions return `0`. The kubelet
 was therefore telling the runtime that every container wanted `CpuShares: 0,
-CpuQuota: 0` — a CRI message that says no CPU limit at all, whatever the pod
+CpuQuota: 0`. That CRI message says no CPU limit at all, whatever the pod
 spec said. `lib/overlay.sh` now redirects those conversions to `cm.Ferry*`,
 which does upstream's real arithmetic.
 
@@ -428,17 +427,17 @@ always got four vCPUs.
 
 What changes is the cgroup *inside* that machine. With no quota in the CRI
 config, `ferry-cri` left the container's `resources.cpu` unset, so every
-container in a pod could use the whole VM whatever its own limit said — two
+container in a pod could use the whole VM whatever its own limit said. Two
 containers limited to `cpu: 2` each shared a 4-vCPU machine with neither bounded
 to its half. After a rebuild each is held to its limit. A container that has
-been quietly borrowing a sibling's headroom will stop, and if it was relying on
+been borrowing a sibling's headroom will stop, and if it was relying on
 that to keep up, it will now be throttled at the number its spec actually asks
 for. Containers with no CPU limit stay unbounded within their pod's machine,
-which is what Kubernetes means by Burstable and BestEffort — a request is a
-weight, not a ceiling, and is deliberately not turned into one here.
+which is what Kubernetes means by Burstable and BestEffort. A request is a
+weight, not a ceiling, and ferry does not turn it into one.
 
 Limits are rounded **up** to whole CPUs, because a cgroup inside the guest is
-the only lever and it takes whole CPUs. A container limited to `1500m` gets two
+the only control and it takes whole CPUs. A container limited to `1500m` gets two
 CPUs of quota rather than one; the VM is sized with the same rounding, so this
 can never ask for more than the machine has. A limit below `1` CPU lands on one.
 
@@ -455,37 +454,37 @@ out when you can watch it rather than alongside an unrelated upgrade.
 [tests/README.md](../tests/README.md) covers every kind; these are the
 upgrade ones.
 
-- `tests/versions-test.sh` — the store and the skew rules: version arithmetic,
+- `tests/versions-test.sh`: the store and the skew rules: version arithmetic,
   what each version is paired with, installing and flipping and listing,
   adopting a pre-store checkout (including that the inode survives), and the
   cluster-version bookkeeping rollback depends on.
-- `tests/upgrade-cli-test.sh` — the commands: dispatch, argument handling, and
+- `tests/upgrade-cli-test.sh`: the commands: dispatch, argument handling, and
   every refusal that happens before anything is touched, against a throwaway
   checkout with stub binaries and no cluster.
-- `tests/etcd-snapshot-test.sh` — a real save and restore with the real etcd
+- `tests/etcd-snapshot-test.sh`: a real save and restore with the real etcd
   from the store, on ports of its own. Skipped until something has been built.
-- `tests/overlay-test.sh` — the rewrites in `lib/overlay.sh`, against a fixture
+- `tests/overlay-test.sh`: the rewrites in `lib/overlay.sh`, against a fixture
   holding the lines upstream actually writes. It checks both that each rule
   fires and that `ferry_check_derived_darwin` notices when one stops firing, the
   second for every guard in the table rather than a chosen few. That matters
   most for the CFS conversions: a missed rewrite there still compiles, because
-  `cm.MilliCPUToShares` exists on darwin, and simply goes back to sending zero.
-  It covers the in-place rewrite too, which is how `kubelet_pods.go` -- the one
-  file that reads those constants without carrying a build tag -- gets the same
+  `cm.MilliCPUToShares` exists on darwin, and goes back to sending zero.
+  It covers the in-place rewrite too. That is how `kubelet_pods.go`, the one
+  file that reads those constants without carrying a build tag, gets the same
   rules and the same assertion as the derived ones.
-- `tests/upgrade-lib-test.sh` — `lib/upgrade.sh`: which version a node and
+- `tests/upgrade-lib-test.sh`: `lib/upgrade.sh`: which version a node and
   ferry-proxyd start at, and that a record whose kubelet has gone says so; when
   a rollback restores; which APIs a target removes, from a fixture of the
   gauge's real lines; what `prune` may take.
-- `tests/build-seams-test.sh` — signature extraction and comparison, that every
+- `tests/build-seams-test.sh`: signature extraction and comparison, that every
   `patches/kubelet-vX.Y/` records all three constructors and matches a cached
   tree of its minor when there is one, and that no seam in `build-kubelet.sh`
   is behind an `if [ -f ]` again.
-- `tests/control-plane-minor-test.sh` — a control plane walked v1.34 → v1.35 →
+- `tests/control-plane-minor-test.sh`: a control plane walked v1.34 → v1.35 →
   v1.36 → v1.37 with up.sh and the environment `apply` passes, on ports and a
   directory of its own, under the probe: each step answers at the new minor with
-  no failed request (0/71, 0/73, 0/81), the objects written at v1.34 -- a CRD and
-  its object, a Deployment, a Secret, a PDB, a Lease -- are the same UIDs with
+  no failed request (0/71, 0/73, 0/81). The objects written at v1.34, a CRD and
+  its object, a Deployment, a Secret, a PDB and a Lease, keep the same UIDs and
   the same data, and nothing fails to decode. Then v1.37 goes back to v1.36 by
   snapshot at a bumped revision, losing only what v1.37 wrote. 29 assertions in
   about 30 seconds; skipped until the store has a control plane for each minor.
@@ -514,14 +513,14 @@ ferry upgrade apply v1.34.11   # and forward again
 ferry upgrade nodes
 ```
 
-Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`
-— which started the cluster at its own recorded version and said so, rather
+Also exercised: `ferry down`, a rebuild at the *other* version, and `ferry up`,
+which started the cluster at its own recorded version and said so, rather
 than letting the build become an upgrade.
 
-The CPU change above was run the same way, on v1.36.4, against four builds — the
+The CPU change above was run the same way, on v1.36.4, against four builds: the
 one before it, the kubelet half alone, the first attempt at the runtime half,
-and what shipped — reading each container's `cpu.max` from inside its own VM and
-then loading it past its limit to see whether the quota bit. Before, every
+and what shipped. Each run read each container's `cpu.max` from inside its own VM and
+then loaded it past its limit to see whether the quota bit. Before, every
 container read `max`: no limit at all, whatever its spec said. After, a 100m
 container is throttled in every one of the fifty 100ms periods in five seconds
 and delivers exactly the one CPU it is allowed, while a BestEffort container is
@@ -541,7 +540,7 @@ instead of at `rollback`.
 
 ### A minor bump, on a running cluster
 
-Run on a two-node cluster -- the Mac's own node and one from `ferry node add` --
+Run on a two-node cluster, the Mac's own node and one from `ferry node add`,
 carrying a Deployment behind a Service with a PodDisruptionBudget, a Secret, a
 CRD and its object, a Lease, and a client pod reaching the Service and
 10.96.0.1 every 200ms, under the probe:

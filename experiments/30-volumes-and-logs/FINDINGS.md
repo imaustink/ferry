@@ -1,4 +1,4 @@
-# Experiment 30 — Memory emptyDirs, late subPaths and `kubectl logs --previous`
+# Experiment 30: memory emptyDirs, late subPaths and `kubectl logs --previous`
 
 **Question.** GAPS.md listed three things about volumes and logs as known and
 deliberate. Each came from a real constraint, and the question was whether that
@@ -31,7 +31,7 @@ same, including the kubelet. The scripts here are the whole experiment:
 Apple M4 Max, 16 cores, 128 GiB, macOS 26.6.2. Default pod VM 2 CPUs, 512 MiB.
 
 **One thing found on the way.** The kubelet binary the main checkout had built
-predated the fix to `SafeMakeDir` in `patches/kubelet/.../subpath_darwin.go`: it
+predated the fix to `SafeMakeDir` in `patches/kubelet/.../subpath_darwin.go`. It
 resolved the subPath against its working directory, so *any* subPath that did
 not exist yet failed with `subpath "late/sub" escapes volume`. Rebuilding the
 kubelet from the tree fixed it. Every number below is from the rebuilt kubelet,
@@ -39,7 +39,7 @@ on both sides of the A/B.
 
 ## 1. Memory emptyDir
 
-ferry-streamer already has the pod spec open for ferry-cri; it now also reports
+ferry-streamer already has the pod spec open for ferry-cri. It now also reports
 `memoryVolumes`, each memory emptyDir's name and sizeLimit. Those become a tmpfs
 pod volume, mounted at `/run/volumes/<name>` where the image would have been and
 bound into containers the same way, subPaths included.
@@ -57,18 +57,19 @@ sub-writable
 owned-writable
 ```
 
-`sizeLimit: 64Mi` is enforced by the tmpfs itself: a 48 MiB write, then another,
+The tmpfs itself enforces `sizeLimit: 64Mi`. A 48 MiB write, then another,
 stops at 16 MiB with the filesystem at 100%. On Linux the kubelet evicts a pod
-over its sizeLimit; here the host directory it measures is empty, so the limit
+over its sizeLimit. Here the host directory it measures is empty, so the limit
 is ENOSPC instead of eviction.
 
-**Size.** As the kubelet sizes one on Linux: the sizeLimit, capped at the pod's
-memory limit, or the pod's limit when there is no sizeLimit. With neither, the
-guest kernel's default, half the VM. `memlimit.yaml`: `limits.memory: 256Mi`, no
-sizeLimit, gives a 256 MiB tmpfs, and 128 MiB written into it shows up in the
-container's own cgroup, `135 MiB of 256` -- the same accounting as Linux.
+**Size.** ferry sizes it as the kubelet does on Linux: the sizeLimit, capped at
+the pod's memory limit, or the pod's limit when there is no sizeLimit. With
+neither, it is the guest kernel's default, half the VM. In `memlimit.yaml`,
+`limits.memory: 256Mi` with no sizeLimit gives a 256 MiB tmpfs, and 128 MiB
+written into it shows up in the container's own cgroup as `135 MiB of 256`,
+the same accounting as Linux.
 
-**The VM is grown by the tmpfs size**, on top of the limit and headroom. While
+**ferry-cri grows the VM by the tmpfs size**, on top of the limit and headroom. While
 one VM lasts that is more than needed, since the pages are charged to the
 container. But the contents carried into a replacement VM (below) are written
 by the guest agent, which no container limit covers, and the container can then
@@ -95,7 +96,7 @@ attempt 3 big=2b3e6ad2 mode=777
 
 The out direction is the guest gzipping (vminitd always compresses), about
 65 MB/s on incompressible data. It is paid on the restart path only, which the
-kubelet's crash backoff already spaces at 10 s or more; a pod with no memory
+kubelet's crash backoff already spaces at 10 s or more. A pod with no memory
 emptyDir pays nothing.
 
 **Writes,** `writebench.sh`, three runs, ms at 10 ms resolution:
@@ -106,22 +107,22 @@ emptyDir pays nothing.
 | 2000 small files + syncfs | 40 / 40 / 40 | 10 / 10 / 0 |
 | 500 × 4 KiB append + fsync | 210 / 430 / 370 | 70 / 80 / 70 |
 
-The last row is mostly 500 forks of `dd`; the difference, about 0.6 ms per
+The last row is mostly 500 forks of `dd`. The difference, about 0.6 ms per
 fsync, is the disk.
 
 ## 2. Late subPath
 
 vminitd's mkdir calls `FileManager.createDirectory` with no attributes, under a
-022 umask. Its copy RPC is better: a directory entry in the tar it extracts is
-made and then `fchmod`ed to the entry's mode, which is exactly what the kubelet
+022 umask. Its copy RPC does better. It makes a directory entry in the tar it
+extracts and then `fchmod`s it to the entry's mode, which is exactly what the kubelet
 does on Linux (`mkdirat`, then `fchmod` to the volume root's mode, because
 `mkdirat` was subject to the umask). So a missing subPath is now a stat, and a
-one-entry tar with the root's mode only if it is missing. Both are resolved by
-the agent inside the volume with symlinks confined to it. Building our own
-vminit was the alternative; it needs the Swift Static Linux SDK and an init
-image to host, for a result this gets from the stock agent.
+one-entry tar with the root's mode only if it is missing. The agent resolves
+both inside the volume, with symlinks confined to it. Building our own vminit
+was the alternative. It needs the Swift Static Linux SDK and an init image to
+host, for a result this gets from the stock agent.
 
-`latesubpath.sh`: the first pod formats the claim and makes `kept` 0700; the
+In `latesubpath.sh`, the first pod formats the claim and makes `kept` 0700. The
 second, uid 1000, mounts `new/dir`:
 
 | | main | this |
@@ -142,12 +143,12 @@ it globs `logPath*` and deletes those files (`container_log_manager.go` `Clean`)
 So a link somewhere else survives the kubelet's cleanup, and a status that
 points at it answers.
 
-As a container exits, its log is hard-linked to `<state>/logs/<id>.log`: one
-`link(2)`, no copy, no space until the kubelet deletes the original. When the
-kubelet removes an exited container, its record moves to a map that
-ContainerStatus still answers from, with `logPath` at the link, for 60 s, and
-that ListContainers never shows, so nothing the kubelet derives from the listing
-changes. Expiry unlinks.
+As a container exits, its log is hard-linked to `<state>/logs/<id>.log`. That is
+one `link(2)`, no copy, and no space until the kubelet deletes the original.
+When the kubelet removes an exited container, its record moves to a map for
+60 s. ContainerStatus still answers from that map, with `logPath` at the link,
+and ListContainers never shows it, so nothing the kubelet derives from the
+listing changes. Expiry unlinks the file.
 
 `previous.sh 240`, a container crashing every 2 s, five restarts in the window:
 
@@ -157,11 +158,11 @@ changes. Expiry unlinks.
 | this | 932 | **0** | none |
 
 The failures were all `unable to retrieve container logs for ferry://<id>`. The
-window was 12-32 s, not the few seconds GAPS.md said; under CrashLoopBackOff the
+window was 12-32 s, not the few seconds GAPS.md said. Under CrashLoopBackOff the
 kubelet's status update lags the removal by a sync period and more.
 
 **Container IDs** used to restart from zero with ferry-cri, while the kubelet
-remembers the IDs it saw -- a pod's status names its last container through a
+remembers the IDs it saw. A pod's status names its last container through a
 runtime restart. IDs now start from the boot time shifted past a 24-bit
 counter. The root filesystem clones a restart orphans, which reused IDs used to
 overwrite, are removed at start along with the retained logs.
@@ -177,11 +178,11 @@ overwrite, are removed at start along with the retained logs.
 | memory emptyDir | 0.91 s | 0.91 s |
 
 Every sample sits between 0.84 and 0.93 s, the kubelet's own cadence, so any
-difference in ferry-cri is below what this can see. What changed on that path:
-a memory emptyDir no longer creates and formats an image (a 16 MiB journal
-write); a pod with subPaths makes one stat per subPath where it made one mkdir,
-plus one stat of the volume root; a container exit adds one `link(2)`. A pod
-with none of these runs the code it ran before.
+difference in ferry-cri is below what this can see. Three things changed on
+that path. A memory emptyDir no longer creates and formats an image (a 16 MiB
+journal write). A pod with subPaths makes one stat per subPath where it made
+one mkdir, plus one stat of the volume root. A container exit adds one
+`link(2)`. A pod with none of these runs the code it ran before.
 
 ## What is left
 
@@ -193,7 +194,8 @@ with none of these runs the code it ran before.
 - **A VM that dies on its own takes its tmpfs with it,** as a node that loses
   power does on Linux. Only a rebuild ferry-cri does itself carries it.
 - **A sandbox the kubelet recreates starts with an empty tmpfs.** On Linux an
-  emptyDir outlives a sandbox; here the carry happens only within one.
+  emptyDir outlives a sandbox. Here the carry happens only within one.
 - **sizeLimit on a memory emptyDir is ENOSPC, not eviction.**
 - **If the pod spec could not be read at RunPodSandbox**, a memory emptyDir is an
-  ext4 image as before: correct, and on disk.
+  ext4 image as before. That is correct, and on disk.
+
