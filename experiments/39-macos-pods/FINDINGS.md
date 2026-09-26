@@ -42,6 +42,7 @@ Run on the M4 Max / macOS 26.6.2 host in the README, with a 26.6.2 guest.
 | `run-macos-volumes.sh`, `run-macos-pvc.sh`, `run-macos-subpath.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods; subPath |
 | `run-macos-stats.sh` | container CPU and memory through the summary API |
 | `run-macos-oom.sh` | a pod over its memory limit is OOMKilled; one within it runs |
+| `run-macos-cpu.sh` | a CPU-limited pod is duty-cycled to its ceiling; an uncapped one is not |
 | `run-macos-restart.sh` | a crash loop and a liveness failure both restart the container in place |
 | `ferry-darwin/cmd/nfsprobe`, `run-nfs-attack.sh` | one pod's attempt to read another's volumes over NFS, and its refusal |
 | `run-macos-vm.sh`, `rebuild-mode2.sh` | mode 1: a pod that is its own macOS VM, root, single-use |
@@ -831,9 +832,9 @@ the kubelet's summary API (what `kubectl top` and metrics-server read):
 
 ```
 === container stats for pod busy, from the summary API
-    t0: busy cpu_ns=1270214    mem_bytes=4148032
-    t1: busy cpu_ns=216357274  mem_bytes=83690560
-    verdict: ok: CPU rose 215 ms over 10 s, memory 79 MiB
+    t0: busy cpu_ns=42092291    mem_bytes=3623680
+    t1: busy cpu_ns=9073100625  mem_bytes=83690560
+    verdict: ok: CPU rose 9031 ms over 10 s, memory 79 MiB
 ```
 
 The stats CRI calls used to return empty -- "there is no per-pod accounting
@@ -841,10 +842,13 @@ without cgroups." There is, without them: a container is a **process group**
 (StartContainer sets `Setpgid`, so the group's id is the container's pid), so
 `ContainerStats` sums the group. `proc_listpids(PROC_PGRP_ONLY, pgid)` lists its
 processes and `proc_pid_rusage` reads each (cgo, `libproc`): `ri_user_time +
-ri_system_time` is cumulative CPU in nanoseconds -- exactly the counter
-`UsageCoreNanoSeconds` wants, which the kubelet differences into a rate --
-and `ri_phys_footprint` is the memory Activity Monitor shows, the closest macOS
-has to a working set. `ListContainerStats`, `PodSandboxStats` and
+ri_system_time` is cumulative CPU -- exactly the counter `UsageCoreNanoSeconds`
+wants, which the kubelet differences into a rate -- and `ri_phys_footprint` is
+the memory Activity Monitor shows, the closest macOS has to a working set. One
+trap: those times read as nanoseconds in the headers but come back in mach
+absolute-time units on Apple Silicon, ~42x smaller, so a pegged core first
+measured as 0.02 cores; they are converted through `mach_timebase_info`.
+`ListContainerStats`, `PodSandboxStats` and
 `ListPodSandboxStats` are the same, the pod's numbers its containers' summed
 (there is no pod process to measure, only its containers'). This is the first
 cgo in the runtime, so `ferry-darwin` is now built with `CGO_ENABLED=1` -- the
@@ -910,6 +914,29 @@ Two ways it differs from a cgroup, both noted in the code:
   would refuse the spike too; the difference is the poll catches it a beat later
   rather than at the faulting page. So the negative-case pod does no such
   allocation.
+
+### CPU limits, by duty cycle
+
+`run-macos-cpu.sh` -- two busy loops, one capped at 200m, one not, measured over
+6 s through the summary API:
+
+```
+=== CPU used while both busy-loop
+    capped: 0.21 cores over 6.1s
+    uncapped: 1.00 cores over 6.1s
+    verdict: ok (capped near 0.2, uncapped much higher)
+```
+
+The CFS quota has no macOS equivalent, so the runtime does what userspace
+`cpulimit` does: a watcher measures the group's CPU each 100 ms window and, when
+it has spent more than its share (`quota/period` cores), `SIGSTOP`s the whole
+group for long enough to bring the average back to the limit, then `SIGCONT`s.
+`StopContainer` sends `SIGCONT` before `SIGTERM` so a throttled container can
+still be told to stop. It is coarser than the kernel's per-runqueue throttling --
+a whole group pauses for tens of milliseconds at a time -- and being a poll it
+holds the *average* near the limit rather than the instantaneous rate; a pod
+under its limit is never signalled. With this, `limits.cpu` and `limits.memory`
+are both enforced on a shared macOS machine, which had neither before.
 
 ### macOS machines on demand
 
@@ -1214,8 +1241,9 @@ the user.
 - Container stats are the process group's (`proc_pid_rusage`), so a container
   that daemonizes out of its group, or re-parents to launchd, is undercounted;
   no workload here did. Network and filesystem-layer stats are not reported.
-- Only the memory limit is enforced, by polling. The CPU limit is not -- macOS
-  has no per-process CPU cap as cheap as the cgroup cpu controller (`nice` and
-  `taskpolicy` change priority, not a ceiling) -- so a shared macOS machine
-  gives fair-share CPU but not a hard CPU quota. Requests still schedule
-  correctly; limits on CPU are advisory here.
+- Memory and CPU limits are both enforced by polling watchers, not a cgroup:
+  memory by killing over the limit, CPU by SIGSTOP/SIGCONT duty cycle. Both hold
+  the average rather than the instant, so a sub-window burst can overshoot before
+  the watcher acts -- a cgroup enforces at the faulting page or runqueue tick.
+  Good enough that one pod cannot starve a shared machine; not a hard real-time
+  guarantee.

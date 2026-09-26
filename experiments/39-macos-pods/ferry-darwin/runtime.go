@@ -62,6 +62,10 @@ type container struct {
 	// enforce it, so a watcher kills the container when it is exceeded -- a
 	// poor man's OOM killer, so one pod cannot take a shared machine down.
 	memLimit int64
+	// The pod's CPU limit as a CFS quota and period (microseconds); the ceiling
+	// in cores is quota/period, 0 for none. No cgroup here either, so a watcher
+	// duty-cycles the group with SIGSTOP/SIGCONT to hold it near the limit.
+	cpuQuota, cpuPeriod int64
 	// stdio, for kubectl attach: what the pod asked for, and what it got.
 	tty, openStdin, stdinOnce bool
 	stdin                     io.WriteCloser
@@ -354,8 +358,10 @@ func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateCo
 		id: id, sandboxID: s.id, meta: cfg.Metadata, image: img, labels: cfg.Labels, anns: cfg.Annotations,
 		logPath: filepath.Join(s.logDir, cfg.LogPath), root: root, argv: argv, env: env, workdir: workdir,
 		mounts: mounts, criMounts: cfg.Mounts,
-		memLimit: cfg.GetLinux().GetResources().GetMemoryLimitInBytes(),
-		tty:      cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
+		memLimit:  cfg.GetLinux().GetResources().GetMemoryLimitInBytes(),
+		cpuQuota:  cfg.GetLinux().GetResources().GetCpuQuota(),
+		cpuPeriod: cfg.GetLinux().GetResources().GetCpuPeriod(),
+		tty:       cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
 		state: runtimeapi.ContainerState_CONTAINER_CREATED, made: time.Now().UnixNano(),
 	}
 	r.mu.Lock()
@@ -462,6 +468,9 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 	if c.memLimit > 0 {
 		go r.watchMemory(c, cmd.Process.Pid)
 	}
+	if c.cpuQuota > 0 && c.cpuPeriod > 0 {
+		go r.throttleCPU(c, cmd.Process.Pid)
+	}
 
 	var streams sync.WaitGroup
 	for i, r := range outputs {
@@ -519,6 +528,9 @@ func (c *container) stop(timeout time.Duration) {
 	if !running || cmd == nil {
 		return
 	}
+	// SIGCONT first: the CPU throttle may have the group SIGSTOP'd, and a
+	// stopped process does not act on SIGTERM until it is continued.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT)
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	select {
 	case <-done:
@@ -690,6 +702,67 @@ func (r *runtimeSvc) watchMemory(c *container, pgid int) {
 		log.Printf("container %s: OOMKilled -- %d MiB over its %d MiB limit", c.id, int64(mem)/(1<<20), c.memLimit/(1<<20))
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		return
+	}
+}
+
+// throttleCPU is the CFS quota macOS does not give a chroot. It measures the
+// group's CPU each window and, when it has spent more than its share, SIGSTOPs
+// the group for long enough to bring the average back to the limit, then
+// SIGCONTs -- the duty cycle userspace cpulimit uses. It is coarser than the
+// kernel's per-runqueue throttling (a whole group pauses for milliseconds at a
+// time) and, being a poll, holds the average near the limit rather than
+// enforcing it instant to instant. A container under its limit is never
+// signalled.
+func (r *runtimeSvc) throttleCPU(c *container, pgid int) {
+	cores := float64(c.cpuQuota) / float64(c.cpuPeriod)
+	if cores <= 0 {
+		return
+	}
+	const window = 100 * time.Millisecond
+	baseCPU, _, ok := procStats(pgid)
+	if !ok {
+		return
+	}
+	baseT := time.Now()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-time.After(window):
+		}
+		cpu, _, ok := procStats(pgid)
+		if !ok {
+			return
+		}
+		now := time.Now()
+		elapsed := now.Sub(baseT)
+		used := time.Duration(cpu - baseCPU) // CPU-nanoseconds since the baseline
+		baseCPU, baseT = cpu, now
+		budget := time.Duration(float64(elapsed) * cores)
+		if used <= budget || elapsed <= 0 {
+			continue
+		}
+		// Pause so that used / (elapsed + pause) == cores.
+		pause := time.Duration(float64(used)/cores) - elapsed
+		if pause <= 0 {
+			continue
+		}
+		if pause > time.Second {
+			pause = time.Second // a long pause is a stuck pod, not a throttle
+		}
+		_ = syscall.Kill(-pgid, syscall.SIGSTOP)
+		select {
+		case <-c.done:
+			_ = syscall.Kill(-pgid, syscall.SIGCONT)
+			return
+		case <-time.After(pause):
+		}
+		_ = syscall.Kill(-pgid, syscall.SIGCONT)
+		// Start the next window from here, so the stopped time is not counted
+		// against the group as idle-but-owed.
+		if cpu2, _, ok := procStats(pgid); ok {
+			baseCPU, baseT = cpu2, time.Now()
+		}
 	}
 }
 

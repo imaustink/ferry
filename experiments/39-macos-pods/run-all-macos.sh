@@ -27,6 +27,8 @@ echo "PVC: $(count pvc.log 'written on macOS') of 3 reads (macOS pod, Linux pod 
 echo "stats: $(grep -oE 'verdict: [a-zA-Z]+' "$b/stats.log" | awk '{print $2}') (container CPU and memory from the summary API)"
 "$here/run-macos-oom.sh" > "$b/oom.log" 2>&1
 echo "memory limits: $(count oom.log 'verdict: ok') of 2 (a pod over its limit OOMKilled, one within it running)"
+"$here/run-macos-cpu.sh" > "$b/cpu.log" 2>&1
+echo "cpu limits: $(grep -oE 'verdict: [a-zA-Z]+' "$b/cpu.log" | awk '{print $2}') ($(grep -oE 'capped: [0-9.]+ cores' "$b/cpu.log"); $(grep -oE 'uncapped: [0-9.]+ cores' "$b/cpu.log"))"
 "$here/run-macos-restart.sh" > "$b/restart.log" 2>&1
 echo "restart: $(count restart.log 'verdict: ok') of 2 (a crash loop and a liveness failure both restart in place)"
 "$here/run-macos-subpath.sh" > "$b/subpath.log" 2>&1

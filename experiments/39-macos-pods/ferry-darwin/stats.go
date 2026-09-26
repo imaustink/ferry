@@ -16,10 +16,15 @@ package main
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/resource.h>
+#include <mach/mach_time.h>
 #include <stdlib.h>
 
 // sumPgrp sums CPU (nanoseconds) and memory (bytes) over process group pgid,
 // and returns how many processes it found, or a negative number on error.
+//
+// ri_user_time and ri_system_time are documented as nanoseconds but are in mach
+// absolute-time units on Apple Silicon -- ~42x smaller than nanoseconds -- so a
+// busy core reads as 0.02 "cores" until converted through mach_timebase_info.
 static int sumPgrp(int pgid, unsigned long long *cpu, unsigned long long *mem) {
     int size = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, NULL, 0);
     if (size <= 0) return size;
@@ -39,7 +44,9 @@ static int sumPgrp(int pgid, unsigned long long *cpu, unsigned long long *mem) {
         }
     }
     free(pids);
-    *cpu = c;
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    *cpu = c * tb.numer / tb.denom; // mach units -> nanoseconds
     *mem = m;
     return count;
 }
