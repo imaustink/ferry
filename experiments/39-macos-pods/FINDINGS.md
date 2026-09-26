@@ -34,10 +34,17 @@ Run on the M4 Max / macOS 26.6.2 host in the README, with a 26.6.2 guest.
 | `podexec.c`, `podnet.c`, `podsrv.c`, `netpod-guest.sh`, `run-netpod.sh` | per-pod uid, address and pf on one macOS node |
 | `bind-rule-probe.sh` | what a Seatbelt bind rule can name |
 | `run-macos-node.sh`, `macos-node-guest.sh` | a macOS guest joined to the cluster as a node |
-| `ferry-darwin/` | a CRI runtime for that node: chroot, uid, address, pf per pod |
+| `ferry-darwin/` | a CRI runtime for that node: chroot, uid, address, pf, volumes, streaming, stats per pod |
 | `mkimage/`, `darwin-workload.sh` | a darwin OCI image, and ordinary Kubernetes objects run on it |
 | `macos-node/`, `bake-macos-node.sh` | the macOS machine image: boot daemon, kubelet config, baked OS base |
 | `macos-machine.yaml`, `run-macos-machine.sh`, `cycle-macos-machine.sh`, `machines-on.sh` | a macOS Machine through ferry-machined and ferry-node, and traffic to and from mode 1 |
+| `run-macos-exec.sh`, `run-macos-attach.sh` | exec, port-forward, probes, a shell; attach, stdin, a terminal |
+| `run-macos-volumes.sh`, `run-macos-pvc.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods |
+| `run-macos-stats.sh` | container CPU and memory through the summary API |
+| `ferry-darwin/cmd/nfsprobe`, `run-nfs-attack.sh` | one pod's attempt to read another's volumes over NFS, and its refusal |
+| `run-macos-vm.sh`, `rebuild-mode2.sh` | mode 1: a pod that is its own macOS VM, root, single-use |
+| `run-macos-autoscale.sh`, `run-macos-interop.sh` | macOS machines on demand; traffic among macOS pods, Linux pod VMs and Linux machines |
+| `run-all-macos.sh` | every suite above, one verdict each |
 
 ```sh
 ./build.sh
@@ -1129,3 +1136,12 @@ the user.
 - Mode-1's kubelet runs inside the pod's own VM, so a root pod can read that
   node's kubelet credentials. It is acceptable only because the VM is discarded
   after the one pod.
+- `ferry-darwin` keeps its sandboxes and containers in memory, so it does not
+  survive its own restart: the kubelet would find no sandboxes and recreate
+  them, orphaning the processes the old instance started. A Linux runtime
+  re-adopts from disk on start; that is not built here. In a shared-macos
+  machine it means a runtime crash needs the node drained; in macos-vm it does
+  not matter, since the guest is thrown away with its pod.
+- Container stats are the process group's (`proc_pid_rusage`), so a container
+  that daemonizes out of its group, or re-parents to launchd, is undercounted;
+  no workload here did. Network and filesystem-layer stats are not reported.
