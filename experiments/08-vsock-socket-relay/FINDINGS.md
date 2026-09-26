@@ -1,4 +1,4 @@
-# 08 — a unix socket from the Mac into a pod
+# 08: a unix socket from the Mac into a pod
 
 **A host socket reaches a process inside the pod VM, over vsock, scoped to the
 container that asked for it. The pod has no network interface at all.**
@@ -25,16 +25,16 @@ PASS: gpu.sock on the Mac is /run/ferry/gpu.sock in the pod,
 Every device-shaped thing on ferry is frozen at boot, because
 `Virtualization.framework` cannot hotplug. [docs/GPU.md](../../docs/GPU.md)
 proposes the one exception: a socket relay, carried over the pod's existing
-vsock device, as the way a pod reaches something only macOS can do -- Metal
-being the case that prompted it, since there is no GPU pass-through on Apple
-silicon and never has been.
+vsock device, as the way a pod reaches something only macOS can do. Metal is
+the case that prompted it, since there is no GPU pass-through on Apple silicon
+and never has been.
 
-The whole design rests on a relay that nothing in ferry uses yet. So: does it
-carry bytes, and is it scoped?
+The whole design rests on a relay that nothing in ferry uses yet. Does it carry
+bytes, and is it scoped?
 
 The host end upper-cases what it is given. `ferry` goes in, `FERRY` comes back,
-and only this process can produce capitals -- an echo that returned `ferry`
-would prove nothing.
+and only this process can produce capitals. An echo that returned `ferry` would
+prove nothing.
 
 ## What it takes
 
@@ -53,19 +53,19 @@ is the guest end and `UnixSocketRelayManager` the host end, both already shipped
 
 ## Findings
 
-**It works, and it is fast.** Round trip verified through two containers and a
-VM boot of 0.21–0.28s across runs -- the relay adds nothing measurable to boot.
+**It works, and it is fast.** The round trip held through two containers, with
+a VM boot of 0.21–0.28s across runs. The relay adds nothing measurable to boot.
 
-**It owes nothing to the pod network.** The pod is configured with
-`interfaces = []` -- no vmnet, no cluster segment, no address of any kind -- and
-the socket still works. This is the argument for the relay over a TCP listener
-on the pod gateway: the transport is not on the pod network, so it cannot be
-reached by pods that were not given it, and cannot break when the network moves.
-The cost, unchanged from the design: NetworkPolicy does not see it either.
+**It owes nothing to the pod network.** The pod has `interfaces = []`, meaning
+no vmnet, no cluster segment and no address of any kind, and the socket still
+works. This is the argument for the relay over a TCP listener on the pod
+gateway. The transport is not on the pod network, so pods that were not given
+it cannot reach it, and it cannot break when the network moves. The cost is
+unchanged from the design: NetworkPolicy does not see it either.
 
 **It is scoped to the container, not the pod.** A second container in the same
-VM, with no socket configured, finds nothing at the path -- confirmed as
-`absent`, not merely refused. Containers in a pod share a kernel and a network
+VM, with no socket configured, finds nothing at the path. The check reports it
+as `absent`, not merely refused. Containers in a pod share a kernel and a network
 stack, so this was not obvious, and the design depends on it: a pod's sidecar
 does not inherit the GPU its main container was granted.
 
@@ -80,11 +80,11 @@ around it.
 
 ## The one that cost time
 
-The first run of the sidecar check reported `True` — it could see
-`/run/ferry/gpu.sock`, which read as the relay leaking across containers in the
-pod and would have sunk the design.
+The first run of the sidecar check reported `True`. It could see
+`/run/ferry/gpu.sock`, which looked like the relay leaking across containers in
+the pod and would have sunk the design.
 
-It was not a leak. The inode was a **regular file**, not a socket, and
+It was not a leak. The inode was a regular file, not a socket, and
 connecting got `ConnectionRefusedError`. It was a stale mount point: creating a
 bind mount's destination writes into the container's root filesystem, and this
 probe had handed the probe container the *cached unpacked image* rather than a
@@ -92,7 +92,7 @@ clone of it. So run 1's container left `/run/ferry/gpu.sock` behind in the
 shared image, and the sidecar's clone in run 2 inherited an empty file at
 exactly the path under test.
 
-Two things worth keeping:
+Two things to keep:
 
 - **Clone per container, always.** `ferry-cri` already does
   (`PodRuntime.swift:727`); this probe reproduced, in about twenty lines, the
@@ -118,10 +118,10 @@ probe's echo server, and the guest asks for work rather than for capitals:
     side: sidecar sees /run/ferry/gpu.sock: False (absent)
 ```
 
-Same pod with no network interface, same relay, same per-container scoping --
-the only difference is what is listening on the Mac. `ferry-gpud` knows nothing
-about VMs, vsock or this probe: it binds a unix socket, and ferry decides who
-reaches it. The checksum matches a run made directly on the host, so the
+It is the same pod with no network interface, the same relay and the same
+per-container scoping. The only difference is what is listening on the Mac.
+`ferry-gpud` knows nothing about VMs, vsock or this probe. It binds a unix
+socket, and ferry decides who reaches it. The checksum matches a run made directly on the host, so the
 arithmetic crossing the boundary is the arithmetic that came back.
 
 ## What this does not show

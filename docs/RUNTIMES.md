@@ -1,7 +1,7 @@
 # Choosing where a pod runs
 
 A ferry cluster can run a pod two ways, and a pod picks one with
-`runtimeClassName` — the same field Kata Containers and gVisor users already
+`runtimeClassName`, the same field Kata Containers and gVisor users already
 know:
 
 | `runtimeClassName` | the pod is | it runs on | worth it for |
@@ -31,8 +31,8 @@ spec:
     - {name: api, image: myorg/api:1.2}
 ```
 
-On anything that makes pods — a Deployment, StatefulSet, DaemonSet, Job or
-CronJob — it goes in the **pod template**, not at the top of the object:
+On anything that makes pods, such as a Deployment, StatefulSet, DaemonSet, Job or
+CronJob, it goes in the **pod template**, not at the top of the object:
 
 ```yaml
 apiVersion: apps/v1
@@ -65,7 +65,7 @@ spec:
 ```
 
 A stack usually mixes them. The pieces that should not share a kernel with
-anything — a build step, a sandbox for user code — say `ferry-vm`; the many
+anything, such as a build step or a sandbox for user code, say `ferry-vm`. The many
 small services say `ferry-shared`, or say nothing and take the cluster's
 default.
 
@@ -75,33 +75,33 @@ Kubernetes merges the class's scheduling rules into the pod as it is created,
 so `kubectl get pod <name> -o yaml` shows them:
 
 - a `nodeSelector` of `ferry.dev/mode: vm-per-pod` or `shared`, which is the
-  label on the Mac and on each machine — `kubectl get nodes -L ferry.dev/mode`;
+  label on the Mac and on each machine, as `kubectl get nodes -L ferry.dev/mode` shows;
 - a toleration for that kind of node's taint, which matters when the cluster
   has a default (below);
 - for `ferry-vm`, `overhead: {memory: 133Mi}`, which the scheduler counts
   against the Mac's memory on top of the pod's own requests. That is what a pod
-  VM costs whatever runs in it, and counting it is what stops the Mac from
-  being promised pods it cannot hold.
+  VM costs whatever runs in it, and counting it stops the scheduler from
+  promising the Mac pods it cannot hold.
 
 Then:
 
 - **`ferry-vm`** is scheduled onto the Mac.
 - **`ferry-shared`** goes to a machine with room for it. If none has room,
-  ferry's provisioner (Karpenter) makes a machine shaped to fit — about fifteen
-  seconds to Ready — and takes it away again about a minute after it is empty.
+  ferry's provisioner (Karpenter) makes a machine shaped to fit, which takes about fifteen
+  seconds to reach Ready, and removes it about a minute after it is empty.
   You do not size or declare machines for this; the pod's requests are the
   size.
 
 ## Pods that do not name one
 
-Most manifests you did not write — Helm charts, addons, examples — will not
+Most manifests you did not write, such as Helm charts, addons and examples, do not
 name a RuntimeClass. Where those pods go is the cluster's `defaultRuntime`:
 
 | `defaultRuntime` | a pod that names no RuntimeClass |
 |---|---|
 | `none` | goes wherever it fits. With machines on, that can split one Deployment across the Mac and a machine |
 | `ferry-vm` | runs on the Mac |
-| `ferry-shared` | runs on a machine — while machines are on; otherwise on the Mac |
+| `ferry-shared` | runs on a machine while machines are on, otherwise on the Mac |
 
 `none` is what a cluster has until someone chooses; `ferry init` asks.
 
@@ -112,7 +112,7 @@ ferry config set defaultRuntime ferry-shared     # applies to the running cluste
 
 So pick the default that fits most of your workloads, and name the class only
 on the exceptions. With `defaultRuntime: ferry-shared`, everything is dense by
-default and the pods that need isolation say `ferry-vm`; with `ferry-vm`, the
+default and the pods that need isolation say `ferry-vm`. With `ferry-vm`, it is the
 reverse.
 
 Two things to know about changing it:
@@ -125,12 +125,12 @@ Two things to know about changing it:
 
 ### DaemonSets meant for every node
 
-A default is a `NoSchedule` taint on the other kind of node, and the DaemonSet
-controller only tolerates the taints Kubernetes itself puts on nodes
-(not-ready, unreachable, disk pressure and the like) — not `ferry.dev/mode`. So
-once a default is set, a DaemonSet meant to run everywhere — a logging or
-monitoring agent, node-exporter — **silently skips the tainted kind**. Nothing
-fails: its `DESIRED` count is just smaller than the number of nodes.
+A default is a `NoSchedule` taint on the other kind of node. The DaemonSet
+controller only tolerates the taints Kubernetes itself puts on nodes, such as
+not-ready, unreachable and disk pressure, and not `ferry.dev/mode`. So
+once a default is set, a DaemonSet meant to run everywhere, such as a logging or
+monitoring agent or node-exporter, **silently skips the tainted kind**. Nothing
+fails. Its `DESIRED` count is smaller than the number of nodes.
 
 `runtimeClassName` is not the fix here, because it pins a pod to one kind of
 node. Tolerate the taint whatever its value instead:
@@ -149,8 +149,8 @@ Mac is a pod VM of its own, and an agent that reads its node's kernel, files or
 network namespace would be reading that VM, not the Mac. Agents like that
 usually belong only on machines, which is `runtimeClassName: ferry-shared` again.
 
-How a default is made — Kubernetes has no default RuntimeClass, so ferry taints
-the other kind of node — is in
+Kubernetes has no default RuntimeClass, so ferry makes a default by tainting
+the other kind of node. The details are in
 [MACHINES.md](MACHINES.md#a-default-for-pods-that-do-not-choose).
 
 ## The older spelling: `nodeSelector`
@@ -173,7 +173,7 @@ prefer it.
 ## One particular machine
 
 The runtime picks the kind of node. To pick a node, add an ordinary selector
-beside it — for example a pod that should run on a Machine you declared with
+beside it. For example, a pod that should run on a Machine you declared with
 a stronger disk guarantee:
 
 ```yaml
@@ -192,7 +192,7 @@ spec:
     - {name: db, image: postgres:17}
 ```
 
-`durability` on a Machine is what its disk survives —
+`durability` on a Machine is what its disk survives.
 [INSTALL.md](INSTALL.md#configuration) has the levels.
 
 ## Checking where things landed
@@ -214,7 +214,7 @@ ferry status                                               # the default runtime
 | `untolerated taint {ferry.dev/mode: …}` | the pod picks a node kind by `nodeSelector`, and the cluster's default has tainted that kind | use `runtimeClassName` instead |
 | `didn't match Pod's node affinity/selector`, for a `ferry-shared` pod | no machines: mode 2 is off | `ferry machines enable` |
 | a DaemonSet's `DESIRED` is fewer than your nodes, with no error | the cluster's default has tainted one kind of node, and the DaemonSet does not tolerate it | add the toleration under [DaemonSets meant for every node](#daemonsets-meant-for-every-node) |
-| `RuntimeClass "…" not found` | the class does not exist in this cluster — usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
+| `RuntimeClass "…" not found` | the class does not exist in this cluster, usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
 | `Failed to create pod sandbox: … has no runtime handler "runc"` | a pod whose class is not `ferry-vm` was put on the Mac anyway, usually with `nodeName` | let the scheduler place it, or name `ferry-vm` |
 
 The last one is deliberate. ferry-cri runs every pod as a VM, and a pod that
@@ -227,6 +227,6 @@ asked for something else is refused rather than quietly made into a VM.
 - **`ferry-shared` without machines.** The pod waits in Pending until
   `ferry machines enable`.
 - **A default of `ferry-shared` with machines off.** It is kept in the config
-  file but not applied — tainting the Mac with nowhere else to go would leave
+  file but not applied, because tainting the Mac with nowhere else to go would leave
   no node that runs a pod. `ferry config` says `ferry-shared waits for
   machines` until they are on.

@@ -1,8 +1,10 @@
-# Ferry — state of play
+# Ferry: state of play
 
-Everything needed to pick this up cold. Written just before the macOS 26
-upgrade, with the control plane and kubelet working and the runtime not yet
-started.
+Everything needed to pick this up cold, as it stood then. Written just before
+the macOS 26 upgrade, with the control plane and kubelet working and the runtime
+not yet started, and last brought up to date when `ferry-cri` first ran real
+pods. It is a record of that point, not of today: much of "Next steps" and
+"Known gaps" has since been built. [GAPS.md](GAPS.md) says what is true now.
 
 ---
 
@@ -19,18 +21,19 @@ nothing nested, and no shared kernel between pods.
 |---|---|---|
 | Docker Desktop / colima / kind | one Linux VM, pods share a kernel | a VM you size up front |
 | kiac / Orchard | VM per **node**, pods share the node's kernel | 2–4 GB per node, idle or not |
-| **ferry** | VM per **pod** — every pod its own kernel | pods only |
+| **ferry** | VM per **pod**, every pod its own kernel | pods only |
 
-The load-bearing insight: **pod semantics fall out of the VM boundary.** One VM
+The key point: **pod semantics fall out of the VM boundary.** One VM
 is one network stack, so containers in a pod share localhost and IPC by
-construction. No pause container, no netns plumbing. Cleaner than Linux.
+construction. There is no pause container and no netns plumbing, which is
+simpler than Linux.
 
 ### Why the pieces land where they do
 
-Nothing in the control plane touches the kernel — it is a database and three
+Nothing in the control plane touches the kernel. It is a database and three
 programs that watch it. Only the kubelet, kube-proxy, and workloads need Linux.
 So the control plane runs natively and costs nothing, and Linux appears only
-inside per-pod VMs where it is genuinely needed.
+inside per-pod VMs where it is needed.
 
 This is also the managed-cloud topology: EKS/GKE/AKS all show workers only, with
 the control plane off-cluster and not a Node object. Ferry has **zero
@@ -46,7 +49,7 @@ etcd + kube-apiserver + kube-controller-manager + kube-scheduler as
 darwin/arm64 processes. `/version` reports `platform: darwin/arm64`. Reconciles
 Deployment → ReplicaSet → Pods, issues ServiceAccount tokens.
 
-### The kubelet works on macOS — ~450 lines of platform glue
+### The kubelet works on macOS with ~450 lines of platform glue
 
 | File | Lines | Purpose |
 |---|---|---|
@@ -81,7 +84,7 @@ controller chain all work. A 10-replica Deployment reaches 10/10.
 | + NIC | **128** | 0.063s |
 | + NIC + rootfs block device | **128** | 0.063s |
 
-- **128 concurrent VMs**, a hard cap in `Virtualization.framework` — identical
+- **128 concurrent VMs**, a hard cap in `Virtualization.framework`, identical
   at 128 MiB and 512 MiB per VM, so it is a VM-count limit, not resource
   exhaustion. Confirmed on both macOS 15.6.1 and 26.6.2. **The kubelet's default
   `maxPods` is 110**, so the ceiling clears the density Kubernetes already
@@ -91,7 +94,7 @@ controller chain all work. A 10-replica Deployment reaches 10/10.
   usable ceiling is `128 − (other VMs)`. Ferry should count live VMs and report
   real remaining capacity rather than letting pods fail at admission.
 - **0.12s** guest boot to userspace, cold. No degradation at VM 128.
-- **VM memory is lazily backed** — 128 VMs × 512 MiB (64 GiB configured) cost
+- **VM memory is lazily backed.** 128 VMs × 512 MiB (64 GiB configured) cost
   **1.6 GiB** resident. Density is bounded by the VM cap, not by summing pod
   limits.
 
@@ -131,7 +134,7 @@ docs/HANDOFF.md                      this file
 bin/                                 build output (gitignored)
 ```
 
-Patches are **whole files in an overlay**, not diffs — diffs against a tree that
+Patches are **whole files in an overlay**, not diffs, because diffs against a tree that
 size rot too fast. Build-tag edits are `sed` in `build-kubelet.sh`.
 
 ## Running what exists
@@ -168,7 +171,7 @@ Containerization framework. **Write it in Swift**, and build it on `LinuxPod`.
 
 This was the big discovery after the macOS 26 upgrade.
 `Sources/Containerization/LinuxPod.swift` is a first-class pod abstraction, and
-its shape is startlingly close to a Kubernetes PodSpec:
+its shape is close to a Kubernetes PodSpec:
 
 ```swift
 public final class LinuxPod: Sendable {
@@ -227,7 +230,7 @@ public struct VmnetNetwork: Network {
 }
 ```
 
-That is **IPAM** — per-pod address allocation from a routable subnet, with the
+That is **IPAM**: per-pod address allocation from a routable subnet, with the
 Mac as the gateway, attached via `VZVmnetNetworkDeviceAttachment`. So:
 
 - `RunPodSandbox` → `createInterface(podID)` → pass the result to
@@ -237,14 +240,14 @@ Mac as the gateway, attached via `VZVmnetNetworkDeviceAttachment`. So:
   reachable at the gateway address
 
 `Interface` is a pure value type describing guest-side IP config, so **ferry
-chooses each pod's address** — which is precisely a CNI's job.
+chooses each pod's address**, which is a CNI's job.
 
 ### Volumes
 
 `PodVolume.Source` is `.nbd`, `.diskImage`, or **`.tmpfs`**. The tmpfs case
-closes a gap recorded earlier: on Linux, projected ServiceAccount tokens live on
-tmpfs and never touch a disk. A pod-VM tmpfs restores exactly that property,
-inside the guest.
+closes a gap recorded earlier. On Linux, projected ServiceAccount tokens live on
+tmpfs and never touch a disk, and a pod-VM tmpfs restores that property inside
+the guest.
 
 ### Images
 
@@ -255,7 +258,7 @@ No containerd, no snapshotters.
 ### Entitlements
 
 Ad-hoc signing with `com.apple.security.virtualization` is sufficient and works
-unprivileged. **Do not add `com.apple.vm.networking`** — it is restricted, and an
+unprivileged. **Do not add `com.apple.vm.networking`.** It is restricted, and an
 ad-hoc binary claiming it is SIGKILLed at launch with no output. Sign the binary
 at its final path, not inside `.build` and then copy.
 
@@ -280,36 +283,36 @@ listings.
 pod-network gateway. What is left is everything a pod needs *around* the
 runtime.
 
-1. ~~Mounts.~~ **Done** — `ContainerConfig.mounts` become virtiofs shares.
-   ServiceAccount tokens, ConfigMaps and emptyDir verified, and a pod
-   authenticates to the API server with its own token. Note the tokens live on
+1. ~~Mounts.~~ **Done.** `ContainerConfig.mounts` become virtiofs shares.
+   ServiceAccount tokens, ConfigMaps and emptyDir are verified, and a pod
+   authenticates to the API server with its own token. The tokens live on
    the host filesystem and are shared in, rather than on tmpfs inside the guest;
    `PodVolume.Source.tmpfs` would be the stronger form.
 2. **DNS.** Small, independent, and unblocked: set
    `LinuxPod.Configuration.dns` to CoreDNS's *pod* IP. That works without a
    Service layer at all. See [SERVICES.md](SERVICES.md).
-3. **Services.** Designed, not built — three approaches compared in
-   [SERVICES.md](SERVICES.md). Recommendation is a userspace proxy on the Mac
+3. **Services.** Designed, not built. Three approaches are compared in
+   [SERVICES.md](SERVICES.md), and the recommendation is a userspace proxy on the Mac
    first, with ferry-cri programming guest nftables as the target.
 4. **Exec, attach, port-forward, logs.** `LinuxPod.execInContainer` exists;
-   wiring it to CRI's streaming endpoints is not done. Without this
+   wiring it to CRI's streaming endpoints is not done. Without it,
    `kubectl logs` and `kubectl exec` do not work.
 5. **Sidecars.** Two containers running at once in one pod is blocked by the
-   hypervisor -- see the hotplug note below. Init containers already work,
+   hypervisor; see the hotplug note below. Init containers already work,
    because each exits before the next is created and the VM is rebuilt in
    between. Concurrent containers would need the kubelet to be told the sandbox
    is not ready until the whole container set is known, or hotplug support.
 
 ---
 
-## Gotchas — the things that cost time
+## Gotchas: the things that cost time
 
 - **macOS caps unix socket paths at ~104 bytes.** The kubelet builds its
   podresources socket under `--root-dir`, so run dirs live under `/tmp`, not in
   the repo.
 - **`--advertise-address` may not be loopback.** The endpoint reconciler writes
   it into the `kubernetes` Endpoints that every in-cluster client resolves
-  `10.96.0.1` to. Must become the vmnet gateway.
+  `10.96.0.1` to. It must be the vmnet gateway.
 - **Default eviction thresholds are wrong for a laptop.** `imagefs.available<15%`
   on a 926 GB disk means holding 139 GB idle or the node taints itself
   NoSchedule. Both run scripts set `evictionHard` to 5%.
@@ -322,13 +325,13 @@ runtime.
   of the control plane, only kubectl. `fetch-binaries.sh` pulls from
   `kwok-ci/k8s`, explicitly dev/test only. Building from kubernetes source with
   `KUBE_BUILD_PLATFORMS=darwin/arm64` is the eventual fix.
-- **`ServiceAccount tokens land on disk, not tmpfs.** macOS has no tmpfs. They
+- **ServiceAccount tokens land on disk, not tmpfs.** macOS has no tmpfs. They
   are on a FileVault-encrypted volume and removed on teardown, but this is a
   real difference from Linux worth remembering.
 - **Virtualization.framework cannot hotplug.** A VM cannot gain a device once
   booted, so a pod's containers must all be added before `create()`. ferry-cri
   boots the VM lazily on the first `StartContainer`, and rebuilds it if a
-  container is added while nothing is running -- which is what makes init
+  container is added while nothing is running. That is what makes init
   containers work and what lets a pod recover from a failed container start.
 - **vmnet networks leak permanently.** A subnet can stay claimed with no process
   holding it. ferry-cri walks a candidate list and publishes the gateway it
@@ -338,7 +341,7 @@ runtime.
 - **The VM probe needs `com.apple.security.virtualization`.** `build.sh` ad-hoc
   signs it; without the entitlement the framework refuses to create a VM.
 - **Do not add `com.apple.vm.networking`.** It is restricted, it is *not*
-  required for vmnet, and an ad-hoc binary claiming it is SIGKILLed at launch —
+  required for vmnet, and an ad-hoc binary claiming it is SIGKILLed at launch:
   exit 137, no output, nothing in the log.
 - **Sign the binary at its final path.** Signing inside `.build` and copying
   afterwards produced binaries killed on launch.
@@ -348,7 +351,7 @@ runtime.
 
 ## Known gaps
 
-- `allocatableMemory.available` eviction signal cannot be constructed — it
+- `allocatableMemory.available` eviction signal cannot be constructed. It
   derives from the `pods` cgroup, which does not exist here. Node-level memory
   and disk signals work.
 - `kube-proxy` does not run on the Mac, so ClusterIPs (`10.96.0.0/16`) are not
@@ -356,4 +359,4 @@ runtime.
   to a pod VM, `kubectl port-forward`, or a small userspace proxy.
 - Host routes to pod CIDRs are not managed yet. Watching Nodes and running
   `route add/delete` per PodCIDR would make pod IPs directly reachable from
-  macOS — something Docker Desktop cannot do.
+  macOS, which Docker Desktop cannot do.

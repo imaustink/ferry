@@ -38,7 +38,7 @@ this differently:
 - **Clients on your LAN.** They use a local name or a Mac's address directly.
   Whatever they resolved or were given is what they keep using.
 
-On a single Mac none of this matters: forward to that Mac, done. Reserve its
+On a single Mac none of this matters. Forward to that Mac. Reserve its
 address in your router's DHCP so the forward does not go stale.
 
 ## The options
@@ -200,7 +200,7 @@ long LAN devices take to believe the ARP.
 
 | | failover | stale clients | extra hardware | root | ferry change | client address at the edge |
 |:--|:--|:--|:--|:--|:--|:--|
-| 1. pick a Mac | none | — | no | no | no | yes |
+| 1. pick a Mac | none | n/a | no | no | no | yes |
 | 2. router operator | detection + reconcile | none | no | no | yes | yes |
 | 3. DNS | detection + sync + caches | yes | no | no | yes | yes |
 | 4. front load balancer | seconds | none | yes | no | no | no, the LB's |
@@ -216,8 +216,8 @@ suits names used on the LAN, with caching understood.
 calls. Its speaker cannot do its job. L2 mode answers ARP on the node's
 interface, and a pod's interface is on a vmnet network whose only other member
 is the Mac; the Mac's Wi-Fi or Ethernet is not bridged to it, so the answer
-never reaches the LAN. In mode 1 there is no node network for a `hostNetwork`
-speaker to sit on at all. BGP mode tells a router to send an address to a node,
+never reaches the LAN. A `hostNetwork` speaker on a pod VM (`ferry-vm`) has no
+node network to join at all. BGP mode tells a router to send an address to a node,
 and pod addresses are reachable only from the Mac that has them
 ([POD-NETWORK.md](POD-NETWORK.md)).
 

@@ -73,7 +73,7 @@ The 3-hour run is in `results/soak-3h/`.
 
 The 3-hour run found two things that are not caused by this bug. Neither is fixed here.
 
-- **ferry-cri's memory grows linearly: 47 → 694 MiB.** It rises about 1.6 MiB per cycle after warm-up, or roughly 27 KB per pod, and was still rising at the end. Nothing else did. Every other component levelled off, and the kubelet, etcd and the API server leveled off after an early climb.
+- **ferry-cri's memory grows linearly: 47 → 694 MiB.** It rises about 1.6 MiB per cycle after warm-up, or roughly 27 KB per pod, and was still rising at the end. Nothing else did. Every other component levelled off, the kubelet, etcd and the API server after an early climb.
 - **Runtime files and logs grow.** Logs went 0 → 112 MiB (+0.5 MiB/cycle), and runtime files 101 → 313. Retained logs are hard links (`retainLog`), and they appear to outlive the containers they were kept for.
 
 ## What the harness got wrong along the way
