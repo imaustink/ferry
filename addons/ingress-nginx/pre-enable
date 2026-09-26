@@ -1,0 +1,9 @@
+#!/bin/sh
+# The admission webhook's certificate is made by two one-shot Jobs, and a Job's
+# pod template cannot be changed once it exists. v1.11.3's Jobs stayed after
+# they finished, so applying a newer release over them was refused and the
+# upgrade stopped half done. They have done their work -- the Secret they made
+# is kept -- so they are deleted and the new release runs its own. From v1.15.1
+# they delete themselves on finishing, and this has nothing to do.
+kubectl -n ingress-nginx delete job ingress-nginx-admission-create ingress-nginx-admission-patch \
+  --ignore-not-found >/dev/null
