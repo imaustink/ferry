@@ -123,6 +123,32 @@ Two things to know about changing it:
   `ferry-vm`, because the machines Karpenter makes carry the default's taint.
   Karpenter moves their pods as it would for any consolidation.
 
+### DaemonSets meant for every node
+
+A default is a `NoSchedule` taint on the other kind of node, and the DaemonSet
+controller only tolerates the taints Kubernetes itself puts on nodes
+(not-ready, unreachable, disk pressure and the like) — not `ferry.dev/mode`. So
+once a default is set, a DaemonSet meant to run everywhere — a logging or
+monitoring agent, node-exporter — **silently skips the tainted kind**. Nothing
+fails: its `DESIRED` count is just smaller than the number of nodes.
+
+`runtimeClassName` is not the fix here, because it pins a pod to one kind of
+node. Tolerate the taint whatever its value instead:
+
+```yaml
+spec:
+  template:
+    spec:
+      tolerations:
+        - {key: ferry.dev/mode, operator: Exists, effect: NoSchedule}
+```
+
+That is how ferry's own kube-proxy for machines is written. Before adding it,
+consider whether the agent should run on the Mac at all: a DaemonSet pod on the
+Mac is a pod VM of its own, and an agent that reads its node's kernel, files or
+network namespace would be reading that VM, not the Mac. Agents like that
+usually belong only on machines, which is `runtimeClassName: ferry-shared` again.
+
 How a default is made — Kubernetes has no default RuntimeClass, so ferry taints
 the other kind of node — is in
 [MACHINES.md](MACHINES.md#a-default-for-pods-that-do-not-choose).
@@ -187,6 +213,7 @@ ferry status                                               # the default runtime
 |---|---|---|
 | `untolerated taint {ferry.dev/mode: …}` | the pod picks a node kind by `nodeSelector`, and the cluster's default has tainted that kind | use `runtimeClassName` instead |
 | `didn't match Pod's node affinity/selector`, for a `ferry-shared` pod | no machines: mode 2 is off | `ferry machines enable` |
+| a DaemonSet's `DESIRED` is fewer than your nodes, with no error | the cluster's default has tainted one kind of node, and the DaemonSet does not tolerate it | add the toleration under [DaemonSets meant for every node](#daemonsets-meant-for-every-node) |
 | `RuntimeClass "…" not found` | the class does not exist in this cluster — usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
 | `Failed to create pod sandbox: … has no runtime handler "runc"` | a pod whose class is not `ferry-vm` was put on the Mac anyway, usually with `nodeName` | let the scheduler place it, or name `ferry-vm` |
 

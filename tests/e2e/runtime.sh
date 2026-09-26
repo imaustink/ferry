@@ -233,6 +233,36 @@ is "a Machine written by hand becomes Ready" "$(eventually 180 True ready_of han
 is "  registered with the default's taint" "$(taint_of hand-0)" shared
 is "machine CoreDNS runs on every tainted machine" \
   "$(eventually 120 Running sh -c "kubectl -n kube-system get pods -l k8s-app=kube-dns-machines -o jsonpath='{range .items[*]}{.status.phase}{\"\n\"}{end}' | sort -u")" Running
+# A DaemonSet meant for every node skips the tainted kind unless it tolerates
+# the taint (docs/RUNTIMES.md, "DaemonSets meant for every node").
+kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: c-ds-plain}
+spec:
+  selector: {matchLabels: {app: c-ds-plain}}
+  template:
+    metadata: {labels: {app: c-ds-plain}}
+    spec:
+      containers: [{name: c, image: busybox:1.36, command: [sleep, "3600"]}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: c-ds-everywhere}
+spec:
+  selector: {matchLabels: {app: c-ds-everywhere}}
+  template:
+    metadata: {labels: {app: c-ds-everywhere}}
+    spec:
+      tolerations:
+        - {key: ferry.dev/mode, operator: Exists, effect: NoSchedule}
+      containers: [{name: c, image: busybox:1.36, command: [sleep, "3600"]}]
+EOF
+ds_desired() { kubectl get ds "$1" -o jsonpath='{.status.desiredNumberScheduled}'; }
+ready_nodes="$(kubectl get nodes --no-headers | awk '$2 == "Ready"' | wc -l | tr -d ' ')"
+is "a DaemonSet with no toleration runs only on the untainted Mac" "$(eventually 60 1 ds_desired c-ds-plain)" 1
+is "  one that tolerates ferry.dev/mode runs on every node" "$(eventually 60 "$ready_nodes" ds_desired c-ds-everywhere)" "$ready_nodes"
+kubectl delete ds c-ds-plain c-ds-everywhere --wait=false >/dev/null
 
 # --- D: a Machine's durability ------------------------------------------------
 bold "D: a Machine's durability is its disk's barrier"
