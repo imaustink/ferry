@@ -815,6 +815,32 @@ once, so a claim moves between all three kinds of pod.
 That userspace server had to be shut to other pods; the reserved-port finding
 below is what closed it.
 
+### Container CPU and memory, without cgroups
+
+`run-macos-stats.sh` -- a pod that holds ~40 MB and spins a core, read through
+the kubelet's summary API (what `kubectl top` and metrics-server read):
+
+```
+=== container stats for pod busy, from the summary API
+    t0: busy cpu_ns=1270214    mem_bytes=4148032
+    t1: busy cpu_ns=216357274  mem_bytes=83690560
+    verdict: ok: CPU rose 215 ms over 10 s, memory 79 MiB
+```
+
+The stats CRI calls used to return empty -- "there is no per-pod accounting
+without cgroups." There is, without them: a container is a **process group**
+(StartContainer sets `Setpgid`, so the group's id is the container's pid), so
+`ContainerStats` sums the group. `proc_listpids(PROC_PGRP_ONLY, pgid)` lists its
+processes and `proc_pid_rusage` reads each (cgo, `libproc`): `ri_user_time +
+ri_system_time` is cumulative CPU in nanoseconds -- exactly the counter
+`UsageCoreNanoSeconds` wants, which the kubelet differences into a rate --
+and `ri_phys_footprint` is the memory Activity Monitor shows, the closest macOS
+has to a working set. `ListContainerStats`, `PodSandboxStats` and
+`ListPodSandboxStats` are the same, the pod's numbers its containers' summed
+(there is no pod process to measure, only its containers'). This is the first
+cgo in the runtime, so `ferry-darwin` is now built with `CGO_ENABLED=1` -- the
+default when building on the Mac for the Mac, which the bake already does.
+
 ### macOS machines on demand
 
 Nothing declared: a Deployment of `ferry-macos-shared` pods, and Karpenter

@@ -619,19 +619,153 @@ func (r *runtimeSvc) ReopenContainerLog(_ context.Context, _ *runtimeapi.ReopenC
 	return &runtimeapi.ReopenContainerLogResponse{}, nil
 }
 
-// Stats are empty: there is no per-pod accounting without cgroups. The
-// kubelet tolerates it, as it did fakecri's.
-func (r *runtimeSvc) ContainerStats(_ context.Context, _ *runtimeapi.ContainerStatsRequest) (*runtimeapi.ContainerStatsResponse, error) {
-	return &runtimeapi.ContainerStatsResponse{}, nil
+// containerStats reads a running container's process group: cumulative CPU and
+// current memory, the counters the summary API and metrics-server want. A
+// container that is not running reports its attributes and no numbers, which is
+// what a Linux runtime does for one whose cgroup is gone.
+func (r *runtimeSvc) containerStats(c *container) *runtimeapi.ContainerStats {
+	c.mu.Lock()
+	state, cmd := c.state, c.cmd
+	c.mu.Unlock()
+	now := time.Now().UnixNano()
+	stats := &runtimeapi.ContainerStats{
+		Attributes: &runtimeapi.ContainerAttributes{
+			Id: c.id, Metadata: c.meta, Labels: c.labels, Annotations: c.anns,
+		},
+		Cpu:    &runtimeapi.CpuUsage{Timestamp: now},
+		Memory: &runtimeapi.MemoryUsage{Timestamp: now},
+	}
+	if state == runtimeapi.ContainerState_CONTAINER_RUNNING && cmd != nil && cmd.Process != nil {
+		// The pid is the process group's id: StartContainer sets Setpgid, so
+		// the container leads its own group and everything it spawns is in it.
+		if cpu, mem, ok := procStats(cmd.Process.Pid); ok {
+			stats.Cpu.UsageCoreNanoSeconds = &runtimeapi.UInt64Value{Value: cpu}
+			stats.Memory.WorkingSetBytes = &runtimeapi.UInt64Value{Value: mem}
+			stats.Memory.UsageBytes = &runtimeapi.UInt64Value{Value: mem}
+		}
+	}
+	return stats
 }
-func (r *runtimeSvc) ListContainerStats(_ context.Context, _ *runtimeapi.ListContainerStatsRequest) (*runtimeapi.ListContainerStatsResponse, error) {
-	return &runtimeapi.ListContainerStatsResponse{}, nil
+
+func (r *runtimeSvc) ContainerStats(_ context.Context, req *runtimeapi.ContainerStatsRequest) (*runtimeapi.ContainerStatsResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("container %q not found", req.ContainerId)
+	}
+	return &runtimeapi.ContainerStatsResponse{Stats: r.containerStats(c)}, nil
 }
-func (r *runtimeSvc) PodSandboxStats(_ context.Context, _ *runtimeapi.PodSandboxStatsRequest) (*runtimeapi.PodSandboxStatsResponse, error) {
-	return &runtimeapi.PodSandboxStatsResponse{}, nil
+
+func (r *runtimeSvc) ListContainerStats(_ context.Context, req *runtimeapi.ListContainerStatsRequest) (*runtimeapi.ListContainerStatsResponse, error) {
+	r.mu.Lock()
+	var all []*container
+	for _, c := range r.ctrs {
+		all = append(all, c)
+	}
+	r.mu.Unlock()
+	f := req.GetFilter()
+	var out []*runtimeapi.ContainerStats
+	for _, c := range all {
+		if f != nil {
+			if f.Id != "" && f.Id != c.id {
+				continue
+			}
+			if f.PodSandboxId != "" && f.PodSandboxId != c.sandboxID {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, c.labels) {
+				continue
+			}
+		}
+		out = append(out, r.containerStats(c))
+	}
+	return &runtimeapi.ListContainerStatsResponse{Stats: out}, nil
 }
-func (r *runtimeSvc) ListPodSandboxStats(_ context.Context, _ *runtimeapi.ListPodSandboxStatsRequest) (*runtimeapi.ListPodSandboxStatsResponse, error) {
-	return &runtimeapi.ListPodSandboxStatsResponse{}, nil
+
+// podStats sums a sandbox's containers into pod-level CPU and memory. Without
+// cgroups there is no pod accounting of its own -- a pod is not a process here,
+// only its containers are -- so the pod's numbers are its containers' summed,
+// which for a macOS pod (usually one container) is the same thing.
+func (r *runtimeSvc) podStats(s *sandbox, ctrs []*container) *runtimeapi.PodSandboxStats {
+	now := time.Now().UnixNano()
+	var cpu, mem uint64
+	var have bool
+	containers := make([]*runtimeapi.ContainerStats, 0, len(ctrs))
+	for _, c := range ctrs {
+		cs := r.containerStats(c)
+		containers = append(containers, cs)
+		if cs.Cpu.GetUsageCoreNanoSeconds() != nil {
+			cpu += cs.Cpu.UsageCoreNanoSeconds.Value
+			have = true
+		}
+		if cs.Memory.GetWorkingSetBytes() != nil {
+			mem += cs.Memory.WorkingSetBytes.Value
+			have = true
+		}
+	}
+	linux := &runtimeapi.LinuxPodSandboxStats{
+		Cpu:        &runtimeapi.CpuUsage{Timestamp: now},
+		Memory:     &runtimeapi.MemoryUsage{Timestamp: now},
+		Containers: containers,
+	}
+	if have {
+		linux.Cpu.UsageCoreNanoSeconds = &runtimeapi.UInt64Value{Value: cpu}
+		linux.Memory.WorkingSetBytes = &runtimeapi.UInt64Value{Value: mem}
+		linux.Memory.UsageBytes = &runtimeapi.UInt64Value{Value: mem}
+	}
+	return &runtimeapi.PodSandboxStats{
+		Attributes: &runtimeapi.PodSandboxAttributes{
+			Id: s.id, Metadata: s.meta, Labels: s.labels, Annotations: s.anns,
+		},
+		Linux: linux,
+	}
+}
+
+// containersOf is a sandbox's containers, under the runtime lock.
+func (r *runtimeSvc) containersOf(sandboxID string) []*container {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*container
+	for _, c := range r.ctrs {
+		if c.sandboxID == sandboxID {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (r *runtimeSvc) PodSandboxStats(_ context.Context, req *runtimeapi.PodSandboxStatsRequest) (*runtimeapi.PodSandboxStatsResponse, error) {
+	r.mu.Lock()
+	s, ok := r.sboxes[req.PodSandboxId]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("sandbox %q not found", req.PodSandboxId)
+	}
+	return &runtimeapi.PodSandboxStatsResponse{Stats: r.podStats(s, r.containersOf(s.id))}, nil
+}
+
+func (r *runtimeSvc) ListPodSandboxStats(_ context.Context, req *runtimeapi.ListPodSandboxStatsRequest) (*runtimeapi.ListPodSandboxStatsResponse, error) {
+	r.mu.Lock()
+	var all []*sandbox
+	for _, s := range r.sboxes {
+		all = append(all, s)
+	}
+	r.mu.Unlock()
+	f := req.GetFilter()
+	var out []*runtimeapi.PodSandboxStats
+	for _, s := range all {
+		if f != nil {
+			if f.Id != "" && f.Id != s.id {
+				continue
+			}
+			if !matchLabels(f.LabelSelector, s.labels) {
+				continue
+			}
+		}
+		out = append(out, r.podStats(s, r.containersOf(s.id)))
+	}
+	return &runtimeapi.ListPodSandboxStatsResponse{Stats: out}, nil
 }
 func (r *runtimeSvc) ListMetricDescriptors(_ context.Context, _ *runtimeapi.ListMetricDescriptorsRequest) (*runtimeapi.ListMetricDescriptorsResponse, error) {
 	return &runtimeapi.ListMetricDescriptorsResponse{}, nil

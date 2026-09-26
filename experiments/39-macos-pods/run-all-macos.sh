@@ -23,6 +23,10 @@ echo "volumes: $(count volumes.log 'hello from a ConfigMap|hunter2|tick [0-9]|HT
 echo "attach: $(checks attach.log 'tick [0-9]' 'log: hello through attach' 'shell on /dev/tty' 'run -i read: a line') of 4 checks"
 "$here/run-macos-pvc.sh" > "$b/pvc.log" 2>&1
 echo "PVC: $(count pvc.log 'written on macOS') of 3 reads (macOS pod, Linux pod VM, the Mac)"
+"$here/run-macos-stats.sh" > "$b/stats.log" 2>&1
+echo "stats: $(grep -oE 'verdict: [a-zA-Z]+' "$b/stats.log" | awk '{print $2}') (container CPU and memory from the summary API)"
+"$here/run-nfs-attack.sh" > "$b/nfs-attack.log" 2>&1
+echo "NFS isolation: $(count nfs-attack.log 'refused:') refused, $(count nfs-attack.log '^    open:') read -- want all refused, 0 read"
 # Last: it takes every macOS guest slot, so mac-0 goes first.
 "$here/run-macos-vm.sh" > "$b/macvm.log" 2>&1
 echo "macOS VM pods: $(count macvm.log '^    uid 0') of 3 as root, $(count macvm.log 'sysctl -w: allowed') of 2 sysctl -w, $(grep -oE 'third pod on a fresh VM: [a-z]+' "$b/macvm.log")"
