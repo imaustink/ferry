@@ -32,23 +32,39 @@ cp -c "$(readlink -f "$repo/bin/kubelet")" "$share/kubelet"
 cp -c "$here/build/ferry-darwin" "$here/build/netpod/lib/podnet.dylib" \
     "$here/macos-node/ferry-macos-init.sh" "$here/macos-node/kubelet.yaml.in" \
     "$here/macos-node/dev.ferry.macos-node.plist" "$share/"
+printf '%s' "$update" > "$share/UPDATE"
 
-"$here/build/macvm" boot "$out" --share "$share" -- /bin/sh -c '
-UPDATE='"$update"'
+# The steps that run inside the guest, as a file in the share rather than a
+# single-quoted argument. Inline, an apostrophe in a comment (ferry-darwin's)
+# once closed the quote early and leaked the rest to the host, where it ran as
+# an unprivileged user against the host's own filesystem. A file has no such
+# trap, and a quoted heredoc keeps the host from expanding any of it.
+cat > "$share/bake-guest.sh" <<'GUEST'
+#!/bin/sh
 set -e
-S=/private/var/ferry/share; F=/usr/local/libexec/ferry
-mkdir -p "$S" "$F"; mount_virtiofs ferry "$S"
+S=/private/var/ferry/share
+F=/usr/local/libexec/ferry
+UPDATE=$(cat "$S/UPDATE" 2>/dev/null || echo 0)
+mkdir -p "$F"
 for f in kubelet ferry-darwin podnet.dylib ferry-macos-init.sh kubelet.yaml.in; do
     install -o root -g wheel -m 755 "$S/$f" "$F/$f"
 done
 install -o root -g wheel -m 644 "$S/dev.ferry.macos-node.plist" /Library/LaunchDaemons/dev.ferry.macos-node.plist
-[ "$UPDATE" != 1 ] && rm -rf /private/var/ferry/darwin
+# A fresh bake starts the OS base from nothing; an UPDATE keeps it. An if, not
+# `[ ] && rm`, because under `set -e` a false test is a failed command.
+if [ "$UPDATE" != 1 ]; then
+    rm -rf /private/var/ferry/darwin
+fi
 "$F/ferry-darwin" -prepare -state /private/var/ferry/darwin -shim "$F/podnet.dylib"
-# nfsd on at boot, so ferry-darwin's restart of it with the real exports is
-# not also its first start (20 s on a fresh machine).
+# nfsd on at boot, so ferry-darwin's restart of it with the real exports is not
+# also its first start (20 s on a fresh machine).
 nfsd enable 2>/dev/null || true
-umount "$S"
-echo "baked: $(ls $F | tr "\n" " ")"
+echo "baked: $(ls "$F" | tr '\n' ' ')"
 csrutil status
-'
+GUEST
+
+# A tiny bootstrap -- no apostrophes, nothing the host expands -- mounts the
+# share and runs the real script from it.
+"$here/build/macvm" boot "$out" --share "$share" -- \
+    /bin/sh -c 'set -e; S=/private/var/ferry/share; mkdir -p "$S"; mount_virtiofs ferry "$S"; sh "$S/bake-guest.sh"'
 du -sh "$out"
