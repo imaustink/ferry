@@ -41,6 +41,7 @@ Run on the M4 Max / macOS 26.6.2 host in the README, with a 26.6.2 guest.
 | `run-macos-exec.sh`, `run-macos-attach.sh` | exec, port-forward, probes, a shell; attach, stdin, a terminal |
 | `run-macos-volumes.sh`, `run-macos-pvc.sh` | ConfigMap/Secret/emptyDir/projected volumes; PersistentVolumes shared with Linux pods |
 | `run-macos-stats.sh` | container CPU and memory through the summary API |
+| `run-macos-oom.sh` | a pod over its memory limit is OOMKilled; one within it runs |
 | `ferry-darwin/cmd/nfsprobe`, `run-nfs-attack.sh` | one pod's attempt to read another's volumes over NFS, and its refusal |
 | `run-macos-vm.sh`, `rebuild-mode2.sh` | mode 1: a pod that is its own macOS VM, root, single-use |
 | `run-macos-autoscale.sh`, `run-macos-interop.sh` | macOS machines on demand; traffic among macOS pods, Linux pod VMs and Linux machines |
@@ -848,6 +849,44 @@ has to a working set. `ListContainerStats`, `PodSandboxStats` and
 cgo in the runtime, so `ferry-darwin` is now built with `CGO_ENABLED=1` -- the
 default when building on the Mac for the Mac, which the bake already does.
 
+### Memory limits, without cgroups
+
+`run-macos-oom.sh` -- one pod over its limit, one within it:
+
+```
+=== hog: limit 64Mi, tries to hold 256 MB
+    phase=Failed reason=OOMKilled exitCode=137
+    verdict: ok (killed at its limit)
+=== within: limit 256Mi, an ordinary pod
+    phase=Running restarts=0
+    verdict: ok (runs within its limit)
+    runtime: container ctr-000007: OOMKilled -- 70 MiB over its 64 MiB limit
+```
+
+A Linux runtime hands the limit to the cgroup memory controller and the kernel
+does the killing. There is no cgroup here, so **the runtime is the OOM killer**:
+a watcher started with each limited container polls its process group's
+`phys_footprint` (the stats path above) every 250 ms and, when it passes the
+limit, `SIGKILL`s the group and marks the container `OOMKilled`, exit 137 -- so
+the kubelet backs the pod off exactly as it would a cgroup kill, and one pod
+cannot take a shared machine down. This is the isolation shared-macos most
+plainly lacked: a uid keeps pods out of each other, but nothing kept one from
+eating all the memory.
+
+Two ways it differs from a cgroup, both noted in the code:
+
+- **It counts `phys_footprint`** -- a pod's anonymous, compressed and wired
+  pages, what it actually holds -- not page cache, and not the shared cache
+  and dyld every process maps (those are excluded from the footprint, so pods
+  are not each charged 6 GB for the OS they share).
+- **It polls, so it is not a hard barrier.** A burst faster than 250 ms can
+  overshoot before the kill lands -- and a transient spike is real: `hold=$(...)`
+  in a shell buffers the whole string several times over while reading it, so a
+  pod that settles at 80 MB can pass 500 MB for a second building it. A cgroup
+  would refuse the spike too; the difference is the poll catches it a beat later
+  rather than at the faulting page. So the negative-case pod does no such
+  allocation.
+
 ### macOS machines on demand
 
 Nothing declared: a Deployment of `ferry-macos-shared` pods, and Karpenter
@@ -1145,3 +1184,8 @@ the user.
 - Container stats are the process group's (`proc_pid_rusage`), so a container
   that daemonizes out of its group, or re-parents to launchd, is undercounted;
   no workload here did. Network and filesystem-layer stats are not reported.
+- Only the memory limit is enforced, by polling. The CPU limit is not -- macOS
+  has no per-process CPU cap as cheap as the cgroup cpu controller (`nice` and
+  `taskpolicy` change priority, not a ceiling) -- so a shared macOS machine
+  gives fair-share CPU but not a hard CPU quota. Requests still schedule
+  correctly; limits on CPU are advisory here.

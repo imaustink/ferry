@@ -25,6 +25,8 @@ echo "attach: $(checks attach.log 'tick [0-9]' 'log: hello through attach' 'shel
 echo "PVC: $(count pvc.log 'written on macOS') of 3 reads (macOS pod, Linux pod VM, the Mac)"
 "$here/run-macos-stats.sh" > "$b/stats.log" 2>&1
 echo "stats: $(grep -oE 'verdict: [a-zA-Z]+' "$b/stats.log" | awk '{print $2}') (container CPU and memory from the summary API)"
+"$here/run-macos-oom.sh" > "$b/oom.log" 2>&1
+echo "memory limits: $(count oom.log 'verdict: ok') of 2 (a pod over its limit OOMKilled, one within it running)"
 "$here/run-nfs-attack.sh" > "$b/nfs-attack.log" 2>&1
 echo "NFS isolation: $(count nfs-attack.log 'refused:') refused, $(count nfs-attack.log '^    open:') read -- want all refused, 0 read"
 # Last: it takes every macOS guest slot, so mac-0 goes first.

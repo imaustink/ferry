@@ -58,22 +58,27 @@ type container struct {
 	// As the kubelet sent them: returned in ContainerStatus, which is where it
 	// looks up the host path of /dev/termination-log to read a message from.
 	criMounts []*runtimeapi.Mount
+	// The pod's memory limit in bytes, 0 for none. macOS has no cgroup to
+	// enforce it, so a watcher kills the container when it is exceeded -- a
+	// poor man's OOM killer, so one pod cannot take a shared machine down.
+	memLimit int64
 	// stdio, for kubectl attach: what the pod asked for, and what it got.
 	tty, openStdin, stdinOnce bool
 	stdin                     io.WriteCloser
 	pty                       *os.File
 	fan                       fanout
 
-	mu       sync.Mutex
-	state    runtimeapi.ContainerState
-	made     int64
-	started  int64
-	finished int64
-	exit     int32
-	reason   string
-	message  string
-	cmd      *exec.Cmd
-	done     chan struct{}
+	mu        sync.Mutex
+	state     runtimeapi.ContainerState
+	made      int64
+	started   int64
+	finished  int64
+	exit      int32
+	reason    string
+	message   string
+	oomKilled bool
+	cmd       *exec.Cmd
+	done      chan struct{}
 }
 
 type runtimeSvc struct {
@@ -349,7 +354,8 @@ func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateCo
 		id: id, sandboxID: s.id, meta: cfg.Metadata, image: img, labels: cfg.Labels, anns: cfg.Annotations,
 		logPath: filepath.Join(s.logDir, cfg.LogPath), root: root, argv: argv, env: env, workdir: workdir,
 		mounts: mounts, criMounts: cfg.Mounts,
-		tty: cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
+		memLimit: cfg.GetLinux().GetResources().GetMemoryLimitInBytes(),
+		tty:      cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
 		state: runtimeapi.ContainerState_CONTAINER_CREATED, made: time.Now().UnixNano(),
 	}
 	r.mu.Lock()
@@ -453,6 +459,9 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
 	c.mu.Unlock()
 	log.Printf("container %s: started pid %d as uid %d at %s (tty %v, stdin %v)", c.id, cmd.Process.Pid, s.addr.uid, s.addr.ip, c.tty, c.openStdin)
+	if c.memLimit > 0 {
+		go r.watchMemory(c, cmd.Process.Pid)
+	}
 
 	var streams sync.WaitGroup
 	for i, r := range outputs {
@@ -480,6 +489,12 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 		c.reason = "Completed"
 		if c.exit != 0 {
 			c.reason = "Error"
+		}
+		// The kubelet reads OOMKilled and backs the pod off as it would a
+		// cgroup kill; without it a memory-killed container looks like any
+		// other non-zero exit.
+		if c.oomKilled {
+			c.reason = "OOMKilled"
 		}
 		_ = err
 		close(c.done)
@@ -645,6 +660,37 @@ func (r *runtimeSvc) containerStats(c *container) *runtimeapi.ContainerStats {
 		}
 	}
 	return stats
+}
+
+// watchMemory is the OOM killer macOS does not give a chroot: it polls the
+// container's process group and, when its footprint passes the pod's limit,
+// kills the group and marks it OOMKilled. cgroups would do this in the kernel
+// and count page cache; this counts phys_footprint (anonymous + compressed +
+// wired, what a pod actually holds) and polls, so a burst faster than the
+// interval can overshoot briefly -- enough to keep one pod from taking the
+// machine down, not a hard barrier.
+func (r *runtimeSvc) watchMemory(c *container, pgid int) {
+	const interval = 250 * time.Millisecond
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-time.After(interval):
+		}
+		_, mem, ok := procStats(pgid)
+		if !ok {
+			return // the group is gone; Wait will record the exit
+		}
+		if int64(mem) <= c.memLimit {
+			continue
+		}
+		c.mu.Lock()
+		c.oomKilled = true
+		c.mu.Unlock()
+		log.Printf("container %s: OOMKilled -- %d MiB over its %d MiB limit", c.id, int64(mem)/(1<<20), c.memLimit/(1<<20))
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return
+	}
 }
 
 func (r *runtimeSvc) ContainerStats(_ context.Context, req *runtimeapi.ContainerStatsRequest) (*runtimeapi.ContainerStatsResponse, error) {
