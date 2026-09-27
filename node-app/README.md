@@ -4,14 +4,12 @@ A production-shaped Node/Express service, built into a Linux image with
 `ferry image build` instead of `docker build` / `docker buildx build`, and
 deployed the way a real service is: a multi-replica `Deployment`, not a bare
 `Pod`, with health probes, resource limits, a non-root/read-only-rootfs
-security context, a `NetworkPolicy`, and a `PodDisruptionBudget`. A
-`.github/workflows/node-app.yml` CI job builds and deploys it on every
-change.
+security context, a `NetworkPolicy`, and a `PodDisruptionBudget`.
 
 This answers a specific question: a build pipeline that reaches for Docker
 only to build a Node image can drop Docker there, run `ferry image build`
-instead, and keep everything downstream (`Deployment`, probes, CI) exactly as
-a Kubernetes-native pipeline already expects. See
+instead, and keep everything downstream (`Deployment`, probes, rollout)
+exactly as a Kubernetes-native pipeline already expects. See
 [docs/RUNTIMES.md#building-an-image-without-docker](../docs/RUNTIMES.md#building-an-image-without-docker)
 for how the builder works, and
 [experiments/25-build-without-docker](../experiments/25-build-without-docker/FINDINGS.md)
@@ -35,19 +33,25 @@ node-app/
     kustomization.yaml
   run.sh                 apply, wait for the rollout, prove the Service
                           answers from inside the cluster, print logs
-../.github/workflows/node-app.yml   CI: build, deploy, verify, tear down
 ```
+
+## No CI yet, on purpose
+
+There is no `.github/workflows/` entry for this. `ferry` itself needs a
+self-hosted Apple-silicon runner to build or run anything here at all — a
+pod is a `Virtualization.framework` VM, and GitHub's hosted `macos-*`
+runners disable nested virtualization — and that runner is not set up yet.
+Until it is, `./build.sh` and `./run.sh` below are run by hand on the same
+Mac releases are cut from, the same way
+[the top-level README's release process](../README.md#cutting-a-release)
+already works. Wiring this into CI later is only pointing a workflow at
+these same two scripts once a runner exists.
 
 ## Prerequisites
 
-- `buildctl` on the Mac (`brew install buildkit`) and a running cluster
-  (`ferry up`). Docker Desktop does not need to be installed, let alone
-  running.
-- For CI: a **self-hosted** runner on a real Apple silicon Mac, macOS 26+.
-  GitHub-hosted `macos-*` runners are themselves VMs with nested
-  virtualization disabled, and a ferry pod is a
-  `Virtualization.framework` VM — `ferry up` cannot create one inside a
-  runner it doesn't own. See the workflow file's header comment.
+`buildctl` on the Mac (`brew install buildkit`) and a running cluster
+(`ferry up`). Docker Desktop does not need to be installed, let alone
+running.
 
 ## Build and run
 
@@ -90,9 +94,10 @@ hello from node-app, built with ferry image build
 ## What "production grade" covers here, and what it does not
 
 - **Covers:** the build (no Docker), the rollout (`Deployment`, probes,
-  `PodDisruptionBudget`), the security posture of the pod itself
-  (non-root, read-only rootfs, dropped capabilities, `NetworkPolicy`), and
-  CI that gates on all of it actually working, not just applying.
+  `PodDisruptionBudget`), and the security posture of the pod itself
+  (non-root, read-only rootfs, dropped capabilities, `NetworkPolicy`).
+- **Does not cover: automation.** See "No CI yet, on purpose" above —
+  `build.sh` and `run.sh` are run by hand today.
 - **Does not cover: shipping the image to a registry.** `ferry image build`
   loads straight into the image store pods on *this cluster* are served
   from (and, via `ferry-registry`, every other node or Mac already joined
