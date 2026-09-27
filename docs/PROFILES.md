@@ -3,14 +3,19 @@
 ```
 $ ferry profile
 profile default
+  kubernetes  v1.37.0
   state       /Users/you/.ferry
   runtime     /tmp/ferry-run
   node name   ferry-mac
   pod network 10.244.0.0/16
   api server  https://192.168.1.29:6443
+  kubelet     10250
+  streaming   127.0.0.1:10350
+  pod switch  udp/8472
   node ports  30000-30199
 
   This is the main checkout, so nothing is renamed or moved.
+  Set FERRY_PROFILE to override.
 ```
 
 A second checkout gets its own everything, without being asked to:
@@ -18,12 +23,20 @@ A second checkout gets its own everything, without being asked to:
 ```
 $ cd .claude/worktrees/gpu-work && ferry profile
 profile gpu-work
+  kubernetes  v1.37.0
   state       /Users/you/.ferry-gpu-work
   runtime     /tmp/ferry-run-gpu-work
   node name   ferry-mac-gpu-work
   pod network 10.151.0.0/16
   api server  https://192.168.1.29:7443
+  kubelet     11250
+  streaming   127.0.0.1:11350
+  pod switch  udp/9472
   node ports  30200-30399
+
+  This is a worktree, so it has its own state, ports and pod network
+  and will not disturb a cluster running from another checkout.
+  Set FERRY_PROFILE to override.
 ```
 
 Both clusters then run at the same time and do not notice each other.
@@ -31,8 +44,8 @@ Both clusters then run at the same time and do not notice each other.
 ## Why this exists
 
 ferry kept its state at fixed paths and bound fixed ports, which is right until a
-second copy runs on the same Mac -- and with git worktrees that happens without
-anyone deciding to. Two clusters then shared one etcd, one set of certificates,
+second copy runs on the same Mac. With git worktrees that happens without anyone
+deciding to. Two clusters then shared one etcd, one set of certificates,
 one set of sockets, and both tried to reserve the same vmnet subnet.
 
 What that looked like from outside was a cluster that had been working and
@@ -60,10 +73,10 @@ before it was recognised as a design problem rather than an accident.
 The default profile keeps every path and port it had, so a single checkout is
 unaffected.
 
-`ferry node add` takes three consecutive ports out of that thousand per node --
-a kubelet, its healthz and a streamer -- from 10701 upward, which is the largest
-run of the thousand nothing above has claimed. That is what caps a profile at 99
-added nodes: the arithmetic runs out before the Mac does. An added node's
+`ferry node add` takes three consecutive ports out of that thousand per node,
+for a kubelet, its healthz and a streamer, from 10701 upward, the largest run
+of the thousand that nothing above has claimed. That caps a profile at 99 added
+nodes: the arithmetic runs out before the Mac does. An added node's
 sockets are named after the profile too, like every other socket ferry opens.
 
 ## The directory, not the branch
@@ -79,10 +92,9 @@ stable for as long as the worktree is.
 ## The number is allocated, not hashed
 
 Each profile needs a number, for the port offsets and the subnet. The first
-attempt hashed the name, and put two of three worktrees on the same number --
-which is exactly the collision this change exists to prevent, reintroduced by the
-fix for it. With a handful of profiles a birthday collision is likely rather than
-exotic.
+attempt hashed the name, and put two of three worktrees on the same number. That
+is the collision this change exists to prevent, reintroduced by the fix for it.
+With a handful of profiles a birthday collision is likely rather than exotic.
 
 So numbers are claimed and written down in `~/.ferry-profiles`:
 

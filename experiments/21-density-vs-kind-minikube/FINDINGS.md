@@ -10,8 +10,8 @@ ferry v0.1.0.
 
 **Docker Desktop: 15.6 GiB and 16 cpus, committed before the first pod exists.**
 That is the whole of kind's and minikube's memory budget, taken whether it is
-used or not. ferry allocates nothing up front; a pod VM is created when a pod
-is.
+used or not. ferry allocates nothing up front. It creates a pod VM when a pod
+is created.
 
 ## Results
 
@@ -29,39 +29,39 @@ With eight pods rather than one:
 | minikube | 2300 MiB in the VM | 14.2 MiB |
 | **ferry**, mode 1 | 2705 MiB of the Mac | 236.8 MiB |
 
-"Up" means *able to run a pod*, not *the command returned* — see below.
+"Up" means *able to run a pod*, not *the command returned*. See the harness
+bugs at the end.
 
 ## The two memory columns are not the same number, and cannot be
 
 There is no way to measure what a pod costs the Mac under kind or minikube.
 Their pods live inside Docker Desktop's VM, whose memory is committed when the
-VM starts: allocating a gigabyte inside it moves no host process's RSS by a
-single page, measured directly. A `vm_stat` delta around a cluster start
-therefore returns noise — the first version of this reported kind costing
+VM starts. Measured directly, allocating a gigabyte inside it moves no host
+process's RSS by a single page. A `vm_stat` delta around a cluster start
+therefore returns noise. The first version of this reported kind costing
 **minus 210 MiB** for a cluster and a pod, which is how the problem was found.
 
-That is not a measurement to work around. It is the difference:
+That is not a measurement to work around. It is the difference between them:
 
 - a pod on kind or minikube costs the Mac **nothing extra**, because the memory
-  was taken in advance; it costs a slice of a fixed VM, and when that slice is
-  gone, pods stop fitting;
+  was taken in advance. It costs a slice of a fixed VM, and when that slice is
+  gone, pods stop fitting.
 - a pod on ferry costs the Mac **236.8 MiB**, and nothing is reserved before it.
 
-So the honest report is two numbers labelled as what they are: what a pod takes
-from the VM you committed, against what a pod takes from the machine.
+So the report is two numbers labelled as what they are. One is what a pod takes
+from the VM you committed, and the other is what a pod takes from the machine.
 
 236.8 MiB per pod independently reproduces the 226 MiB measured by
 [experiment 13](../13-shared-kernel-cost/FINDINGS.md) by a different method, on
-a different day, which is the main reason to believe this harness measures
-anything at all.
+a different day, which is the main reason to trust this harness.
 
 ## What the numbers say
 
 **Starting is not where the difference is.** ferry is up in 12.6 s against
-kind's 13.8 and minikube's 21.4 — faster, but not by the margin the pod numbers
-suggest, because all three are dominated by a control plane coming up rather
-than by virtualization. Where ferry wins outright is that those 12.6 s include
-*creating* the machine it runs on; kind's and minikube's exclude 15.6 GiB of VM
+kind's 13.8 and minikube's 21.4. That is faster, but not by the margin the pod
+numbers suggest, because a control plane coming up dominates all three, not
+virtualization. Where ferry wins outright is that those 12.6 s include
+*creating* the machine it runs on. kind's and minikube's exclude 15.6 GiB of VM
 that had to exist first.
 
 **A cluster costs 2.2–2.4 GiB before any workload.** kind and minikube both
@@ -71,10 +71,10 @@ Docker Desktop's default allocation is a substantial fraction of the machine,
 and 2.3 GiB of it is gone before the first workload.
 
 **Pods are nearly free inside an existing VM, and are not free on ferry.** Eight
-`sleep` containers added nothing measurable to kind and 14 MiB each to minikube;
-they cost ferry 237 MiB each. That is the price of a kernel per pod, and it is
-the trade the whole project is about — but it is a real trade, and anybody
-choosing ferry mode 1 on a small Mac is choosing to spend memory on isolation.
+`sleep` containers added nothing measurable to kind and 14 MiB each to minikube.
+They cost ferry 237 MiB each. That is the price of a kernel per pod, and it is
+the trade the whole project is about. It is a real cost, and anybody choosing
+ferry mode 1 on a small Mac is choosing to spend memory on isolation.
 
 ## Caveats, and they matter
 
@@ -82,21 +82,22 @@ choosing ferry mode 1 on a small Mac is choosing to spend memory on isolation.
   second or a hundred MiB as noise.
 - **kind's first pod at 10.3 s is suspect.** minikube did the same work in 1.0 s
   and ferry in 1.0 s. The harness pre-pulls the image into the node with
-  `crictl pull`; if that did not take for kind, the 10.3 s includes a registry
+  `crictl pull`. If that did not take for kind, the 10.3 s includes a registry
   fetch and is not a scheduling measurement. It is reported as measured rather
-  than quietly dropped, but it should not be cited as kind being ten times
-  slower to start a pod.
+  than dropped, but it should not be cited as kind being ten times slower to
+  start a pod.
 - **The Mac was not idle.** Docker Desktop, another minikube profile and a
   second ferry cluster were running throughout. ferry's numbers are host deltas,
-  which subtracts a constant background; kind's and minikube's are read from
-  inside their own VM, which is unaffected. Neither is immune to CPU contention
-  affecting the timings.
+  which subtracts a constant background. kind's and minikube's are read from
+  inside their own VM, which is unaffected. CPU contention can affect the
+  timings of either.
 - **ferry mode 2 was not measured.** The harness kept being interrupted before
   it completed, and the numbers it would have produced are the interesting ones
   for the question of which mode should be the default. Until it is measured,
-  [MACHINES.md](../../docs/MACHINES.md)'s figures from experiment 16 — ~17 MiB
-  marginal per container, ~45 ms to start one — are what is known, and neither
+  [MACHINES.md](../../docs/MACHINES.md)'s figures from experiment 16, ~17 MiB
+  marginal per container and ~45 ms to start one, are what is known. Neither
   answers whether a node VM's memory is lazily backed the way a pod VM's is.
+
 - **Docker Desktop's allocation is this Mac's setting**, not a default. A
   smaller Mac would have a smaller VM, and less of it left after the 2.3 GiB
   baseline.

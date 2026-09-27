@@ -17,7 +17,7 @@ on applies it again, which is how one is upgraded after the repo moves on.
 
 Every row was enabled on a running cluster, used for what it is for, and
 disabled again with nothing left behind. Memory is each pod VM's
-`phys_footprint` on the Mac, idle after enabling -- a pod here is a virtual
+`phys_footprint` on the Mac, idle after enabling. A pod here is a virtual
 machine, so the pod count is the cost.
 
 | addon | version | pods | Mac memory | verified by |
@@ -25,7 +25,7 @@ machine, so the pod count is the cost.
 | metrics-server | v0.7.2 | 1 | 318 MiB | `kubectl top nodes` answering |
 | ingress-nginx | v1.15.1 | 1 | 237 MiB | an Ingress naming no class answering 200 at `localhost` and the LAN address on 80 and 443, and at the node port; 404 for another host |
 | traefik | v3.7.13 | 1 | 293 MiB | the same, plus an Ingress's own TLS Secret served on 443 and the Mac's address written back to the Ingress |
-| registry | 3.1.1 | 1 | 306 MiB | `crane copy` to localhost:5001, a pod pulling `localhost:5001/…` and running it; images still there after the pod and the cluster were restarted |
+| registry | 3.1.1 | 1 | 306 MiB | `crane copy` to localhost:5001, a pod pulling `localhost:5001/...` and running it; images still there after the pod and the cluster were restarted |
 | dashboard | v2.7.0 | 2 | 549 MiB | port-forward, the dashboard's own API listing kube-system's pods with the token, 401 without |
 | headlamp | v0.45.0 | 1 | 373 MiB | port-forward, namespaces listed through Headlamp with the token, 403 without |
 | cert-manager | v1.21.2 | 3 | 903 MiB | the webhook denying an invalid Issuer; a self-signed ClusterIssuer issuing a Certificate in 1 s |
@@ -42,30 +42,32 @@ two-pod dashboard. A pod doing little is about 300 MiB (CoreDNS: 310), above
 the 226 MiB of an idle VM by what the workload holds.
 
 Leaner is chosen over complete wherever the two differ, because of that last
-column. The dashboard is 2.7.0, the last release with a plain manifest -- 7.x is
-five pods behind Kong -- and the one minikube still ships; the project itself
+column. The dashboard is 2.7.0, the last release with a plain manifest, and the
+one minikube still ships. 7.x is five pods behind Kong. The project itself
 was retired in 2026 in favour of Headlamp, which is one pod. The prometheus addon
 is one Prometheus, not kube-prometheus's dozen pods. Traefik is only its
-Ingress provider -- one pod and no CRDs -- where upstream's chart installs a
-stack of its own resource types beside it; Gateway API is envoy-gateway's.
+Ingress provider, one pod and no CRDs, where upstream's chart installs a
+stack of its own resource types beside it. Gateway API is envoy-gateway's.
 
-ingress-nginx is kept at its last release, v1.15.1: the project was retired in
-March 2026. Traefik reads the same Ingresses and is maintained. Both mark
-their IngressClass as the default, and with both enabled Kubernetes gives an
-Ingress that names no class to whichever was enabled last -- measured on
-v1.37, where it no longer refuses such an Ingress. Only one of them can have
-the Mac's port 80; the other reports `PortInUse` and is reached at its node
-port, and takes 80 and 443 by itself once the first is disabled.
+ingress-nginx is kept at its last release, v1.15.1, because the project was
+retired in March 2026. Traefik reads the same Ingresses and is maintained. Both
+mark their IngressClass as the default, and with both enabled Kubernetes gives
+an Ingress that names no class to whichever was enabled last. That was measured
+on v1.37, which no longer refuses such an Ingress. Only one of them can have
+the Mac's port 80. The other reports `PortInUse`, is reached at its node port,
+and takes 80 and 443 by itself once the first is disabled. Enabling v1.15.1
+over an earlier v1.11.3 upgrades it in place: its `pre-enable` deletes the old
+release's finished admission Jobs, whose pod templates cannot be changed.
 
 Some things are absent because they cannot work here rather than because nobody
-wrote them. Anything that is a DaemonSet reading the node's kernel --
-node-exporter, CSI node plugins, eBPF agents, a CNI -- expects `hostPID`,
+wrote them. Anything that is a DaemonSet reading the node's kernel, such as
+node-exporter, CSI node plugins, eBPF agents or a CNI, expects `hostPID`,
 `hostNetwork` and a Linux host under `hostPath`. A ferry node is a Mac, and each
 pod gets its own VM whatever it asks for.
 
 ## What an addon is
 
-A directory holding ordinary Kubernetes manifests and an `addon.conf`:
+A directory holding ordinary Kubernetes manifests and an `addon.conf`.
 
 ```
 description=image registry at localhost:5001, backed by a PersistentVolume
@@ -82,39 +84,40 @@ Beside it, all optional:
 
 - **`*.yaml`**, applied after any sources. `__CLUSTER_DNS__`, `__NODE_NAME__` and
   `__LOAD_BALANCER_IP__` are substituted in these, not in fetched files.
-- **`kustomization.yaml`**, which makes the whole directory -- fetched files
-  included, under their names -- a kustomize build. It is how an upstream
-  manifest gets pinned or patched without being copied: headlamp's `:latest`
-  becomes a tag, and envoy-gateway's bundled copy of the Gateway API CRDs is
-  dropped so the gateway-api addon alone owns them.
+- **`kustomization.yaml`**, which makes the whole directory, fetched files
+  included under their names, a kustomize build. It is how an upstream
+  manifest gets pinned or patched without being copied. headlamp's `:latest`
+  becomes a tag, ingress-nginx's IngressClass becomes the default, and
+  envoy-gateway's bundled copy of the Gateway API CRDs is dropped so the
+  gateway-api addon alone owns them.
 - **`NOTES`**, printed after enabling.
 - **`pre-enable`, `post-enable`, `pre-disable`, `post-disable`**, executables
   run with `KUBECONFIG` set, and `ADDON_DIR` and `ADDON_STATE` naming the addon
   and its state directory. The dashboard's writes its login token to a file
-  there rather than to the terminal; cert-manager's deletes the leader-election
-  leases it made in kube-system, which no manifest lists.
+  there rather than to the terminal. cert-manager's deletes the leader-election
+  leases it made in kube-system, which no manifest lists. ingress-nginx's
+  clears the previous release's admission Jobs before an upgrade.
 
 Enabling applies, then waits: every Deployment, StatefulSet and DaemonSet has to
 finish rolling out, then every `check` has to pass. A check says what "works"
-means for that addon, which a Ready pod usually does not: metrics-server's is
-the aggregated API answering, cert-manager's is a server-side dry run through
-its webhook. When it gives up it prints the pods, what each is waiting on --
-this is where an image with no arm64 build shows up -- and the recent warnings.
-When kubectl refuses the manifest, its error is printed.
+means for that addon, which a Ready pod usually does not. metrics-server's is
+the aggregated API answering, and cert-manager's is a server-side dry run through
+its webhook. When it gives up it prints the pods, what each is waiting on, and the
+recent warnings. An image with no arm64 build shows up there.
+When kubectl refuses the manifest, `enable` prints kubectl's error.
 
 What was applied is recorded in `$FERRY_HOME/addons/<name>/`. `list` reads that
-record -- it used to guess from a namespace or a kube-system Deployment named
+record. It used to guess from a namespace or a kube-system Deployment named
 after the addon, which would call dashboard, prometheus and gateway-api off
-while they were on -- and `disable`
-deletes what the record holds, so it removes what was applied even after the
-repo's copy has changed. An addon enabled before there were records is disabled
-by deleting what enabling it now would create.
+while they were on. `disable` deletes what the record holds, so it removes what
+was applied even after the repo's copy has changed. An addon enabled before
+there were records is disabled by deleting what enabling it now would create.
 
 ## Remote sources, and offline
 
 Large upstream manifests are fetched rather than vendored: cert-manager is 14
-thousand lines, Envoy Gateway 63 thousand. Each is pinned by sha256; a file that
-has changed upstream under the same URL is refused, not applied. Fetched files
+thousand lines, Envoy Gateway 63 thousand. Each is pinned by sha256, and a file
+that has changed upstream under the same URL is refused, not applied. Fetched files
 are kept in `$FERRY_HOME/cache/addons/` under their hash (6 MiB for everything
 here), and the cache is consulted first, so an addon enabled once enables again
 with no network. `FERRY_ADDON_CACHE` moves it.
@@ -123,10 +126,10 @@ with no network. `FERRY_ADDON_CACHE` moves it.
 
 ## The registry
 
-`localhost:5001` is the same registry from both sides: a push from the Mac, and
-a pod's image reference, because a pod's image is pulled by ferry-cri on the
-Mac. ferry-cri speaks plain HTTP to loopback and to the Mac's own addresses;
-other plain-HTTP registries go in `FERRY_INSECURE_REGISTRIES`, comma separated,
+`localhost:5001` is the same registry from both sides, for a push from the Mac
+and for a pod's image reference, because ferry-cri pulls a pod's image on the
+Mac. ferry-cri speaks plain HTTP to loopback and to the Mac's own addresses.
+Other plain-HTTP registries go in `FERRY_INSECURE_REGISTRIES`, comma separated,
 when ferry starts. Anything else is HTTPS, as before.
 
 It is not on 5000 because macOS's AirPlay Receiver holds `*:5000`, and answers a
@@ -134,8 +137,8 @@ registry client there with `403` from a server calling itself AirTunes.
 
 Before this, a plain-HTTP registry could not be pulled from at all: pulling
 from one on a pod's address fails after about a minute with `-9836: bad
-protocol version`, TLS meeting HTTP, and so did `localtest.me:5001` -- a public
-name for 127.0.0.1 -- until it was named in `FERRY_INSECURE_REGISTRIES`, when it
+protocol version`, TLS meeting HTTP. So did `localtest.me:5001`, a public
+name for 127.0.0.1, until it was named in `FERRY_INSECURE_REGISTRIES`, when it
 pulled. From localhost a pull takes 13 to 60 ms, and a fresh image pushed with
 `crane`, pulled and run took 3 s end to end.
 
@@ -143,14 +146,18 @@ pulled. From localhost a pull takes 13 to 60 ms, and a fresh image pushed with
 
 - **ingress-nginx's NOTES told everyone they needed root.** They said 80
   and 443 stayed `<pending>` unless ferry-proxy ran as root, which experiment
-  27 had made untrue; the address was answering on 80 all along. The addon was also v1.11.3, from before the fix for
-  CVE-2025-1974, and its IngressClass was not the default, so an Ingress
-  without `ingressClassName` was ignored in silence.
+  27 had made untrue. The address was answering on 80 all along. The addon
+  was also v1.11.3, from before the fix for CVE-2025-1974, and its IngressClass
+  was not the default, so an Ingress without `ingressClassName` was ignored in
+  silence.
 - **A hostPort in front of a different containerPort reached the pod's own
   port.** With `hostPort: 5001, containerPort: 5000`, a request to
-  `localhost:5001` arrived in the pod on 5001 -- where registry:3's debug server
-  answered 404 -- instead of being rewritten to 5000. The registry listens on
-  5001 inside the pod as well, which sidesteps it; the cause is not found.
+  `localhost:5001` arrived in the pod on 5001, where registry:3's debug server
+  answered 404, instead of being rewritten to 5000. The registry listens on
+  5001 inside the pod as well, which sidesteps it. The cause was later found
+  and fixed: `ferry-proxy` forwarded at the host port and relied on the pod's
+  own `portmap` rule, which was never written. It now forwards at the
+  container port ([SERVICES.md](../docs/SERVICES.md#the-outside-edge-nodeport-loadbalancer-hostport)).
 - **cAdvisor on a Mac has no container series.** `/metrics/cadvisor` serves
   machine facts only, so the prometheus addon scrapes `/metrics/resource`,
   which has `container_memory_working_set_bytes` per container.
@@ -158,6 +165,6 @@ pulled. From localhost a pull takes 13 to 60 ms, and a fresh image pushed with
   reading `.items`, waited for nothing on a one-Deployment manifest and said
   "ready in 0s". A deliberately broken addon caught it.
 - **`ferry down` stopped every profile's ferry-proxy**, with a `pkill` that
-  matched every checkout's; this cluster's LoadBalancers and hostPorts vanished
+  matched every checkout's. This cluster's LoadBalancers and hostPorts vanished
   twice while other sessions shut down. It now matches this profile's
   kubeconfig.

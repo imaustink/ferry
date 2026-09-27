@@ -1,19 +1,19 @@
-# Experiment 01 — How much of the kubelet works on macOS?
+# Experiment 01: How much of the kubelet works on macOS?
 
 **Question.** The darwin kubelet compiles and starts, but dies the moment it
 looks for a CRI socket. Once a runtime answers, how much further does it get,
 and how large is the patch needed to make it useful?
 
-**Method.** `fakecri` is a CRI runtime that creates nothing — every sandbox and
-container is a map entry. It logs every call. Point a darwin/arm64 kubelet at
-it in standalone mode with a static pod manifest and see what breaks, patching
-forward until it stops breaking.
+**Method.** `fakecri` is a CRI runtime that creates nothing. Every sandbox and
+container is a map entry, and it logs every call. Point a darwin/arm64 kubelet
+at it in standalone mode with a static pod manifest and see what breaks,
+patching forward until it stops breaking.
 
 Nothing here involves a hypervisor, a VM, or a Linux guest.
 
 ## Result
 
-The kubelet drove a **complete pod lifecycle**:
+The kubelet drove a complete pod lifecycle:
 
 ```
 RunPodSandbox → PodSandboxStatus → ImageStatus → PullImage → ImageStatus
@@ -21,7 +21,7 @@ RunPodSandbox → PodSandboxStatus → ImageStatus → PullImage → ImageStatus
   → ContainerStatus / ReopenContainerLog / Status  (steady state)
 ```
 
-210 CRI calls over 50s, **zero fatal errors**, PLEG healthy, node conditions
+210 CRI calls over 50s, zero fatal errors, PLEG healthy, and node conditions
 (`NodeHasSufficientMemory`, `NodeHasNoDiskPressure`, `NodeHasSufficientPID`)
 reported from real machine facts.
 
@@ -31,12 +31,12 @@ reported from real machine facts.
 |---|---|---|---|
 | 1 | no CRI endpoint | yes | the experiment itself |
 | 2 | `RuntimeConfig` unimplemented | **no** | kubelet logs it and falls back to its own cgroup driver config |
-| 3 | `cAdvisor is unsupported in this build` | yes | `cadvisor_darwin.go` — sysctl + statfs |
-| 4 | `volume/util/hostutil on this platform is not supported` | yes | `hostutil_darwin.go` — plain stat work |
+| 3 | `cAdvisor is unsupported in this build` | yes | `cadvisor_darwin.go`, using sysctl and statfs |
+| 4 | `volume/util/hostutil on this platform is not supported` | yes | `hostutil_darwin.go`, plain stat work |
 | 5 | `mkdir /var/log/containers: permission denied` | yes | not architectural; kubelet runs as root in production. Overridable var used instead. |
-| 6 | `Container Manager is unsupported in this build` | yes | `container_manager_darwin.go` — 15 lines over the existing stub |
+| 6 | `Container Manager is unsupported in this build` | yes | `container_manager_darwin.go`, 15 lines over the existing stub |
 
-## Patch surface
+## Patch size
 
 | File | Lines | What it does |
 |---|---|---|
@@ -45,14 +45,13 @@ reported from real machine facts.
 | `pkg/kubelet/cm/container_manager_darwin.go` | ~15 | returns the upstream stub, whose `Start()` already succeeds |
 | `pkg/kubelet/container_logs_dir_darwin.go` | ~10 | honours an override for the container log root |
 
-Roughly **300 lines**, no upstream logic reimplemented, plus three build-tag
+Roughly 300 lines, no upstream logic reimplemented, plus three build-tag
 widenings so the darwin files win over `!linux && !windows` fallbacks.
 
-`containerManagerStub` deserves specific mention: it is a complete 35-method
-`ContainerManager` whose `Start()` already returns nil. Upstream keeps it for
-tests. On darwin it is the correct implementation, not a placeholder — when a
-pod is a VM, the hypervisor bounds its resources and there is no host cgroup
-tree to program.
+`containerManagerStub` is a complete 35-method `ContainerManager` whose
+`Start()` already returns nil. Upstream keeps it for tests. On darwin it is the
+correct implementation, not a placeholder. When a pod is a VM, the hypervisor
+bounds its resources and there is no host cgroup tree to program.
 
 ## Residual non-fatal issues
 
@@ -70,11 +69,11 @@ tree to program.
 ## Conclusion
 
 The kubelet is not the hard part. A working darwin kubelet is ~300 lines of
-platform glue over unmodified upstream code, and every wall hit was a missing
-platform implementation with an existing interface to fill — never a design
+platform glue over unmodified upstream code. Every wall was a missing platform
+implementation with an existing interface to fill. None was a design
 assumption that a pod must be a Linux process on the local kernel.
 
-The remaining risk moves entirely to the runtime: implementing CRI against the
+The remaining risk is in the runtime: implementing CRI against the
 Containerization framework, and the concurrent-VM ceiling.
 
 ## Reproduce

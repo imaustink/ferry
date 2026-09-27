@@ -36,7 +36,7 @@ Before the change, with `deny-all` in place, the LoadBalancer still served the L
 - Inside the guest, only loopback, established traffic and the pod's own node are exempt. The all-nodes accept and the non-cluster accept are gone.
 - `ipBlock.except`, `endPort` and named ports are now compiled. Named ports used to go to nft, which looked them up in `/etc/services`.
 
-The alternative was to exempt the node only on each pod's probe ports. That was rejected: it would break the API server reaching admission webhooks (ingress-nginx's 8443 has no probe), `ferry image build` reaching buildkitd, and `curl` from the Mac to a pod.
+The alternative was to exempt the node only on each pod's probe ports. That was rejected because it would break the API server reaching admission webhooks (ingress-nginx's 8443 has no probe), `ferry image build` reaching buildkitd, and `curl` from the Mac to a pod.
 
 After the change (`policy.sh`):
 

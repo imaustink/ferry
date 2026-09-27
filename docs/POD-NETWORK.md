@@ -15,7 +15,7 @@ default          via 10.244.0.1 dev eth0
 ## Two interfaces, one address
 
 A pod has two NICs and the same address on both. Longest match decides which is
-used: this node's own `/24` leaves by `eth0`, on vmnet's kernel datapath; the
+used. This node's own `/24` leaves by `eth0`, on vmnet's kernel datapath; the
 rest of the cluster leaves by `eth1`, through ferry's switch. The source address
 is identical either way, so a pod is one pod wherever it is talking to.
 
@@ -24,14 +24,14 @@ is identical either way, so a pod is one pod wherever it is talking to.
 This is the part that matters, and it took a wrong turn to find.
 
 The first version put pod addresses only on ferry's switch. That is a segment
-between pods, and **the Mac is not on it** -- so the host could not reach a pod at
+between pods, and **the Mac is not on it**, so the host could not reach a pod at
 the address the cluster knew it by. Everything the Mac does to a pod needed a
-translation table: the kubelet's probes, `kubectl port-forward`, the host side of
+translation table, for the kubelet's probes, `kubectl port-forward`, the host side of
 NodePort and LoadBalancer. Each of those was a separate patch reading a file
 mapping one address to another.
 
 Aggregated APIs could not be made to work at all. `kubectl top` reads
-`metrics.k8s.io`, which the API server does not answer -- it forwards the request
+`metrics.k8s.io`, which the API server does not answer. It forwards the request
 to a pod. The API server is a macOS process with no route to any pod, so the
 request timed out no matter what was translated, and the only remedy was binding
 ClusterIPs on the Mac, which needs root.
@@ -49,34 +49,34 @@ address translation, and the map `ferry-cri` published for them to read.
 The design depends on getting one particular subnet, and vmnet does not always
 grant it. A network stays reserved for a while after the process using it stops,
 and only 32 exist across the whole Mac, so a few restarts in a row can leave the
-slice unavailable for longer than it takes to get annoyed about.
+slice unavailable for minutes.
 
-Falling back to another subnet is harmless while this Mac is the whole cluster:
-the gateway changes, CoreDNS rolls out again, nothing else notices. With another
+Falling back to another subnet is harmless while this Mac is the whole cluster.
+The gateway changes, CoreDNS rolls out again, and nothing else notices. With another
 node in the cluster it is not a fallback, it is a partition. The other Macs route
 `10.244.<node>.0/24` over the switch, this node keeps advertising that slice as
-its `podCIDR`, and its pods are on some other network entirely -- so nothing
+its `podCIDR`, and its pods are on some other network entirely. Nothing
 reaches them, TCP included, while every node still reports `Ready`.
 
 So the two cases are treated differently:
 
-- **No other nodes:** fall back at once, and say the pods are off the pod network
-  and another Mac cannot join until this one starts on its slice. Pods started
-  off the slice get no `eth1` and the switch is off: everything they reach,
-  the API server included, goes through vmnet. They used to get an `eth1`
-  carrying their fallback address with the cluster's prefix -- `192.168.66.5/16`,
+- **With no other nodes, fall back at once**, and say the pods are off the pod
+  network and another Mac cannot join until this one starts on its slice. Pods
+  started off the slice get no `eth1` and the switch is off, so everything they
+  reach, the API server included, goes through vmnet. They used to get an `eth1`
+  carrying their fallback address with the cluster's prefix, `192.168.66.5/16`,
   a route for all of `192.168.0.0/16` into a switch nothing answers on. That
   took in the Mac's LAN address, which is what the kubernetes Service points
   at, so CoreDNS could not reach the API server and every lookup in the
   cluster failed, while the gateway, on the longer `/24` match, still answered.
-- **Other nodes:** wait for the slice, then refuse to start. A node that cannot
+- **With other nodes, wait for the slice, then refuse to start.** A node that cannot
   hold its slice has nothing to offer a cluster it cannot talk to.
   `FERRY_ALLOW_OFF_SLICE=1` overrides this and starts anyway, with a warning.
 
 ### Waiting means not asking
 
-The wait asks twice, ninety-five seconds apart, and that spacing is the whole
-reason it works.
+The wait asks once every ninety-five seconds, four times in all, and that spacing
+is the reason it works.
 
 A refused `vmnet_network_create` **renews the reservation it was refused by**
 ([experiment 22](../experiments/22-vmnet-lifecycle/FINDINGS.md)). The earlier
@@ -87,24 +87,24 @@ ferry fully down, six hundred and one asks over ten minutes never got it, and a
 single ask after ninety seconds of silence did.
 
 This is also why a reboot looked like the only cure. A reboot is not a longer
-wait; it is a wait during which nothing asks.
+wait. It is a wait during which nothing asks.
 
 Most of the time there is now nothing to wait for. `ferry down` releases the
-subnet, so the next start takes it back at once -- measured at zero seconds,
+subnet, so the next start takes it back at once, measured at zero seconds
 against ten minutes of refusals before. That needed ferry to create the network
 itself (`PodNetwork`), because Containerization is a pinned dependency that
-keeps the reference in a struct with no `deinit` and no accessor; pod VMs are
+keeps the reference in a struct with no `deinit` and no accessor. Pod VMs are
 still configured with its own `VmnetNetwork.Interface`, whose
 `init(reference:)` is public.
 
-It also needed the shutdown handler to run at all, which it never had: a closure
+It also needed the shutdown handler to run at all, which it never had. A closure
 written in top-level code is `@MainActor`-isolated, a dispatch signal source
 calls it off the main queue, and Swift traps on the isolation check about a
 second after SIGTERM. So pods were not being stopped either. The wait above is
 what remains for the case where another process genuinely holds the subnet.
 
 Whether this node has peers is read from `$FERRY_HOME/peers`, which is why that
-file lives with the cluster's state rather than in the run directory -- the
+file lives with the cluster's state rather than in the run directory. The
 question is asked before there is an API server to ask instead.
 
 ## What each interface is for
@@ -119,7 +119,7 @@ question is asked before there is an API server to ask instead.
 ## What it does not do
 
 - **The Mac reaches pods on *this* node only.** A pod on another Mac is still
-  behind that Mac's switch. Nothing on the host needs it: a kubelet probes its
+  behind that Mac's switch. Nothing on the host needs it. A kubelet probes its
   own node's pods, and the host side of a Service hands a connection for a remote
   pod to the Mac that has it.
 - **An aggregated API must be served from the control-plane node** for the API

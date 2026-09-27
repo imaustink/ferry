@@ -11,8 +11,8 @@ failed to prepare runtime: unsupported:
 ```
 
 The belief is wrong, and `probe.swift` shows it. It calls vmnet directly, signed
-with the same entitlement ferry-cri uses -- unsigned, every call fails with
-`VMNET_MEM_FAILURE`, which is worth knowing before reading any other result.
+with the same entitlement ferry-cri uses. Unsigned, every call fails with
+`VMNET_MEM_FAILURE`, so check the signature before reading any other result.
 
 ## Three facts
 
@@ -48,7 +48,7 @@ created 192.168.45.1, exiting without CFRelease
 ```
 
 **A network ferry actually used does outlive it, for about a minute.** This is
-the one that matters, and the probe above does not show it -- the probe never
+the one that matters, and the probe above does not show it. The probe never
 starts an interface, and ferry's pods do. Asking for each subnet ferry had used
 during one afternoon:
 
@@ -65,13 +65,13 @@ Measured directly: a subnet in use was refused, and came back 60 seconds after
 
 The reservations were real, and time-based. ferry burns one subnet per run and
 holds it for about a minute, against fifteen candidates and a system-wide cap of
-32 -- so a run of restarts inside that window exhausts the list and ferry will
-not start at all. The error said only `VMNET_FAILURE`, which explains none of it.
+32. A run of restarts inside that window exhausts the list, and ferry will not
+start at all. The error said only `VMNET_FAILURE`, which explains none of it.
 
-Waiting for the preferred subnet is not the answer: it costs a minute of startup
-for something that was never going to be free. Moving on is right. What moving
-costs is a changed gateway, which is part of the CoreDNS manifest and so rolls
-CoreDNS out again -- and that rollout is what the DNS readiness check had been
+Waiting for the preferred subnet is not the answer. It costs a minute of startup
+for something that was never going to be free. Moving on is right. The cost of
+moving is a changed gateway, which is part of the CoreDNS manifest and so rolls
+CoreDNS out again. That rollout is what the DNS readiness check had been
 misreading.
 
 ## Not explained here
@@ -80,13 +80,13 @@ misreading.
 but `==> stopping pods and releasing the pod network` is never printed and
 `shutdown()` never runs, so pods are not stopped cleanly either. Whether
 releasing the network there would return the subnet any sooner is therefore
-untested -- the header says `CFRelease` ends the reservation, but `VmnetNetwork`
-holds that pointer privately in a struct and offers no way to do it.
+untested. The header says `CFRelease` ends the reservation, but `VmnetNetwork`
+holds that pointer privately in a struct and offers no way to call it.
 
 ## Reproducing
 
 ```
 swiftc -O probe.swift -o probe
 codesign --force --sign - --entitlements entitlements.plist ./probe
-./probe cycle | ./probe hold | ./probe leak
+./probe cycle        # or: ./probe hold, ./probe leak
 ```

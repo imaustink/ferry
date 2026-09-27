@@ -13,7 +13,7 @@ ls: /run/ferry/: No such file or directory
 ```
 
 An ordinary pod, asking for `ferry.dev/gpu: 1` in its manifest, doing 9.4
-TFLOP/s of Metal arithmetic and a round of on-device text generation -- through
+TFLOP/s of Metal arithmetic and a round of on-device text generation, through
 a unix socket relayed into its VM over vsock. The sidecar in the same VM, which
 did not ask, does not even have the directory.
 
@@ -32,7 +32,7 @@ but `VZUSBDeviceConfiguration`'s only conformer is mass storage.
 
 The Mac's GPU is reachable through exactly one door: Metal, in a macOS process.
 ferry already has a macOS process next to every pod. So the GPU does not move
-into the pod -- the work moves out to the host, over a socket, and the pod
+into the pod. The work moves out to the host, over a socket, and the pod
 never learns there was a hypervisor in the way.
 
 ## The shape
@@ -50,7 +50,7 @@ never learns there was a hypervisor in the way.
 
 A pod that asks for `ferry.dev/gpu` gets one extra file in its filesystem: a
 unix socket. Behind it, on the Mac, is `ferry-gpud` holding the GPU. Nothing
-else about the pod changes -- no device node, no privileged mode, no host
+else about the pod changes: no device node, no privileged mode, no host
 network.
 
 ## The transport is already built
@@ -66,7 +66,7 @@ public var sockets: [UnixSocketConfiguration] = []
 
 `UnixSocketConfiguration(source:destination:permissions:direction:)` with
 `direction: .into` takes a socket path on the host and makes it a socket path
-inside the guest. The relay runs over the pod's existing vsock device --
+inside the guest. The relay runs over the pod's existing vsock device.
 `Vminitd: SocketRelayAgent` (`Vminitd+SocketRelay.swift:17`) is the guest end,
 `UnixSocketRelayManager` the host end, and `LinuxPod.relayUnixSocket` allocates
 the port and starts both.
@@ -74,11 +74,12 @@ the port and starts both.
 Two details worth knowing, both from `LinuxPod.swift`:
 
 - The socket is staged **outside** the rootfs, at `/run/sockets/<id>.sock`, and
-  bind-mounted to the destination when the container starts -- deliberately, to
-  avoid symlink traversal and mount shadowing. The pod cannot reach around it.
+  bind-mounted to the destination when the container starts. This is
+  deliberate, to avoid symlink traversal and mount shadowing. The pod cannot
+  reach around it.
 - `relayUnixSocket(_ containerID:socket:)` is public and works on a created pod,
   so a relay can be added after boot. This is the one device-shaped thing on
-  ferry that is **not** frozen at boot -- unlike containers, which are.
+  ferry that is **not** frozen at boot. Containers are.
 
 There is no guest kernel change, no new binary in the guest, and no new
 transport code on either side.
@@ -86,7 +87,7 @@ transport code on either side.
 Experiment 08 confirms all of it end to end: a socket on the Mac appears in the
 container, bytes round-trip, the destination path is created however deep it is,
 and a second container in the same pod that asked for nothing finds *nothing* at
-that path. The last one matters most -- containers in a pod share a kernel and a
+that path. The last one matters most. Containers in a pod share a kernel and a
 network stack, so per-container scoping was not obvious, and the design assumes
 a sidecar does not inherit the GPU its neighbour was granted.
 
@@ -114,9 +115,9 @@ have to be enforced by the service itself, on a source address, forever.
 
 The honest cost: **vsock is not covered by NetworkPolicy.** A pod with
 deny-all egress still reaches `ferry-gpud`, because the relay is not on the pod
-network at all. That is the correct behaviour for a device -- a NetworkPolicy
-does not stop a pod using its GPU on any other cluster either -- but it means
-the resource request is the only gate, so it has to actually hold.
+network at all. That is the correct behaviour for a device, since a
+NetworkPolicy does not stop a pod using its GPU on any other cluster either. But
+it means the resource request is the only gate, so it has to hold.
 
 ## Getting the request to the runtime
 
@@ -126,8 +127,8 @@ CRI contract, so the runtime has to be told some other way.
 
 ferry already has the mechanism. `ferry-cri` asks `ferry-streamer` what a pod
 contains, on every pod, because CRI never says how many containers to expect
-(`podlookup.go:44`, `PodRuntime.swift:384`). That endpoint has the real pod spec
-in hand and currently throws all of it away but the names:
+(`podlookup.go:47`, `PodRuntime.swift:870`). That endpoint has the real pod spec
+in hand, so it reports which containers asked for the GPU alongside their names:
 
 ```go
 type podContainers struct {
@@ -178,16 +179,17 @@ It merges into `node.Status.Capacity` rather than replacing it, and only zeroes
 resources a device plugin previously registered and then withdrew
 (`pkg/kubelet/nodestatus/setters.go:204-283`). So a `PATCH` of
 `status.capacity["ferry.dev/gpu"]` at `ferry up` sticks, the scheduler gates on
-it, and `darwinContainerManager` -- which wraps `NewStubContainerManager()` and
-has no device manager -- stays as it is.
+it, and `darwinContainerManager`, which wraps `NewStubContainerManager()` and
+has no device manager, stays as it is.
 
-That one patch is the start of it, not the whole story: ferry-streamer then
-keeps the resource matching the daemon, so the node stops advertising a GPU it
-cannot actually serve. See **When things die**.
+That one patch is the start of it. ferry-streamer then keeps the resource
+matching the daemon, so the node stops advertising a GPU it cannot serve. See
+[When things die](#when-things-die).
 
-This is worth stating plainly because it is the opposite of what the device
-plugin documentation implies: ferry does not need to implement the device
-plugin API to have a schedulable GPU resource. It needs one PATCH.
+This is the opposite of what the device plugin documentation implies. ferry
+does not need to implement the device plugin API to have a schedulable GPU
+resource. It needs one PATCH.
+
 
 What capacity to advertise is a policy question, not a discovery one. There is
 one GPU. The number is how many pods may hold a relay at once, and `1` is the
@@ -202,7 +204,7 @@ no package graph to fetch and no weights to ship before a pod can use it.
 
 | | |
 |---|---|
-| `GET /v1/device` | what the GPU is -- name, architecture, unified memory, limits |
+| `GET /v1/device` | what the GPU is: name, architecture, unified memory, limits |
 | `GET /v1/model` | whether the on-device model is usable, and why not if it is not |
 | `POST /v1/matmul` | a square matrix multiply on the GPU, `{size, iterations}` |
 | `POST /v1/generate` | text generation on the on-device model, `{prompt, instructions, temperature, maxTokens}`; reports how often it yielded |
@@ -210,8 +212,8 @@ no package graph to fetch and no weights to ship before a pod can use it.
 
 The control socket adds `/capacity`, `/pods`, `/stats` and `/metrics`.
 
-`matmul` is not a demo of the protocol -- it is the thing that proves, from
-inside a pod, that the Mac's GPU did arithmetic the pod asked for. It returns
+`matmul` is not a demo of the protocol. It proves, from inside a pod, that the
+Mac's GPU did arithmetic the pod asked for. It returns
 GFLOP/s and a checksum over fixed inputs, so a caller can tell that work
 happened rather than that time passed.
 
@@ -220,7 +222,7 @@ inference backend rather than MLX or llama.cpp: nothing to download. Those can
 sit behind the same endpoint later without the pod noticing, which is the point
 of putting a protocol here rather than a device.
 
-Work is serialized on one device -- Metal will accept work from ten pods at
+Work is serialized on one device. Metal will accept work from ten pods at
 once and serve all of them badly, and the timings would stop meaning anything.
 Each generation gets a fresh session: pods do not share a conversation, and a
 transcript accumulating across tenants would be a leak rather than a feature.
@@ -254,10 +256,10 @@ own loader so the base image is irrelevant, listening on `127.0.0.1:<port>` and
 forwarding to `/run/ferry/gpu.sock`. Containers in a pod share a network stack,
 so one shim serves the whole pod.
 
-Not built -- `curl --unix-socket` and most HTTP libraries handle a unix socket
-directly, including Python's `http.client` with a four-line subclass -- but it
-is what would turn "a socket ferry gave you" into "an endpoint your SDK already
-reaches".
+This is not built, because `curl --unix-socket` and most HTTP libraries handle a
+unix socket directly, including Python's `http.client` with a four-line
+subclass. But it is what would turn "a socket ferry gave you" into "an endpoint
+your SDK already reaches".
 
 ## What this is not
 
@@ -308,8 +310,8 @@ doing its job.
 `ferry join` brings up another Mac, which has a GPU of its own: it starts its
 own daemon and advertises its own capacity.
 
-`ferry node add` is different -- another node on *this* Mac, sharing the one
-GPU. Those nodes reach the same daemon, but do not advertise capacity of their
+`ferry node add` is different. It adds another node on *this* Mac, sharing the
+one GPU. Those nodes reach the same daemon, but do not advertise capacity of their
 own: two nodes each claiming `ferry.dev/gpu: 1` would tell the cluster there are
 two GPUs when there is one. In practice GPU pods land on node 0.
 
@@ -317,7 +319,7 @@ two GPUs when there is one. In practice GPU pods land on node 0.
 
 The socket directory is `0700` and each pod socket `0600`. The only thing that
 opens them on the host is ferry-cri's relay, running as the same user, so
-nothing is lost by closing them -- and on a shared Mac it means another local
+nothing is lost by closing them. On a shared Mac it means another local
 account cannot dial a pod's GPU socket directly.
 
 Inside the pod it is the opposite, and deliberately: any process in that
@@ -340,8 +342,8 @@ matmul + generation   matmul -0.9%, generation -12.0% per character
 
 Two Metal matmuls split one GPU and the total does not move, so running them at
 once buys one percent and makes both of them half as fast. A matmul and a
-generation ignore each other entirely -- Apple's model does not run on the
-shaders, and the Neural Engine is separate silicon.
+generation ignore each other. Apple's model does not run on the shaders, and
+the Neural Engine is separate silicon.
 
 So there is a lane per unit rather than one token for the machine: **compute**
 for Metal work, serialised, and **model** for the on-device model, independent.
@@ -358,7 +360,7 @@ another matmul running (same lane)           0.098s 0.580s 0.579s   <- the slice
 ```
 
 That middle row used to cost 0.26-0.77s. It is now indistinguishable from an
-idle machine, and the generation is not interrupted at all -- it reports zero
+idle machine, and the generation is not interrupted at all. It reports zero
 yields, because nothing needs it to step aside.
 
 `GET /capacity` and `/metrics` report what is queued per lane, which is the
@@ -366,7 +368,7 @@ number that says *which* resource is short rather than that something is.
 
 ### Sharing a lane
 
-One lane, many pods, so something has to decide the order -- and a plain lock
+One lane, many pods, so something has to decide the order, and a plain lock
 decides it badly. `ferry-gpud` hands out a device token behind a queue that is
 bounded, fair, deadlined, preemptible and cancellable.
 
@@ -404,9 +406,9 @@ handoff. Nothing is re-run and no progress is serialised anywhere.
 
 **Generation yields too**, which is not obvious, because a generation looks
 opaque: hand over a prompt, wait, get a paragraph. It is not, if it is streamed.
-The model emits snapshots as it goes -- measured on this one, a 5s generation
-arrives as 27 snapshots a median of 0.153s apart -- and the gap between them is
-a checkpoint as good as the gap between matmul passes.
+The model emits snapshots as it goes. Measured on this one, a 5s generation
+arrives as 27 snapshots a median of 0.153s apart, and the gap between them is a
+checkpoint as good as the gap between matmul passes.
 
 So `/v1/generate` streams internally even though nothing shows partial output to
 anyone. It is streamed for the checkpoint. A matmul asking while a 4.6s
@@ -423,14 +425,14 @@ generation, and the rest are fast only because there is nothing left to wait
 for. Streaming costs the generation nothing beyond the time it hands over.
 
 It buys two other things that were previously impossible. A generation can now
-be **cancelled** when its pod goes away -- 499 within a snapshot of the pod being
-deleted, rather than after the whole paragraph -- and its **deadline** is checked
+be **cancelled** when its pod goes away, with a 499 within a snapshot of the pod
+being deleted rather than after the whole paragraph. Its **deadline** is checked
 per snapshot rather than only at the end.
 
 What **cannot** be preempted is a single Metal command buffer, which runs to
 completion whatever anyone wants. That is the real floor on how long a co-tenant
-waits -- one pass of whatever is running, which at the largest allowed matmul is
-about 0.9s -- and it is why size is capped as well as time.
+waits: one pass of whatever is running, which at the largest allowed matmul is
+about 0.9s. It is why size is capped as well as time.
 
 The slice is 0.5s by default (`FERRY_GPU_SLICE`), which is roughly the worst
 wait a co-tenant sees. It was picked by measuring rather than taste: at 2s a
@@ -441,7 +443,7 @@ device did not measurably change.
 
 Kubernetes already has the word for this. `PriorityClass` is a first-class API,
 and the admission plugin resolves `priorityClassName` into `spec.priority` on
-every pod -- 0 when nobody said otherwise. ferry already reads the pod spec to
+every pod, 0 when nobody said otherwise. ferry already reads the pod spec to
 find the GPU request, so priority comes along beside it and needs nothing new
 invented.
 
@@ -456,26 +458,26 @@ hog and the same waiter, changing only the priorities:
 | outranked by it (0 vs 100000) | 5.20s 5.16s 5.18s 5.16s |
 
 Strict priority starves, so it is bounded. Anything that has waited longer than
-the starvation guard -- 5s by default -- goes next whatever anyone's priority,
-which is the third row: served last, but served. **Priority decides who goes
+the starvation guard, 5s by default, goes next whatever anyone's priority. That
+is the third row: served last, but served. **Priority decides who goes
 first, not who goes at all.**
 
 The rescue has to be protected to mean anything. A pod let in by the guard would
 otherwise hit its first checkpoint, see the pod that outranks it still waiting,
-and hand the device straight back without doing any work -- admitted by the
+and hand the device straight back without doing any work, admitted by the
 guard and evicted by priority, forever. So a pod rescued *from a pod that
 outranks it* keeps the device for its slice. A pod that merely waited a long
 time on a busy device is not rescued from anyone and gets no protection, or a
 high-priority arrival would be delayed a slice for nothing.
 
-**Every request has a deadline**, queue time included -- a client that asked for
+**Every request has a deadline**, queue time included. A client that asked for
 120s means 120s, not 120s once it is its turn. Verified both while running (504
 at 5.00s against a 5s budget) and while queued.
 
 **A deleted pod takes its work with it.** Revoking a grant cancels that pod's
 queued *and* running requests, and the caller gets a 499 rather than waiting.
 
-**The queue is bounded** -- 64 waiting by default, 8 from any one pod -- and a
+**The queue is bounded**, 64 waiting by default and 8 from any one pod, and a
 full queue is a 503 rather than an unbounded backlog.
 
 Each lane also bounds how big one request may be, and they need different
@@ -484,8 +486,8 @@ most a quarter of the GPU's recommended working set: unified memory is shared
 with the whole Mac and the allocation is the host's, so an unbounded one is a
 denial of service against the Mac rather than against the pod. A model request
 is capped at 4096 response tokens, which is the same idea for the thing the
-model actually spends -- `maximumResponseTokens` previously went to the
-framework exactly as the pod sent it, so "as long as it likes" was the policy.
+model spends. `maximumResponseTokens` previously went to the framework exactly
+as the pod sent it, so "as long as it likes" was the policy.
 
 | flag | default | |
 |---|---|---|
@@ -502,7 +504,7 @@ framework exactly as the pod sent it, so "as long as it likes" was the policy.
 
 `FERRY_GPU_CAPACITY` above 1 is a supported configuration rather than a
 theoretical one: preemption, fair queueing and deadlines are what it was waiting
-on. It does not make the Mac faster -- it lets more pods share one device, each
+on. It does not make the Mac faster. It lets more pods share one device, each
 of them slower, with a bounded wait. The numbers above were measured at
 capacity 2.
 
@@ -521,25 +523,25 @@ gpu-quick   0.3       1.5
 ```
 
 `ferry-streamer` writes those onto the pod, because `kubectl top` will never
-show them -- it reads the kubelet's summary API, which knows about CPU and
+show them. It reads the kubelet's summary API, which knows about CPU and
 memory and nothing else. The pod object is the nearest place the cluster can
-see. Writes only happen when a value actually moves, so an idle pod costs
+see. Writes only happen when a value moves, so an idle pod costs
 nothing; a node credential that is not allowed to annotate pods logs once and
 stops trying.
 
 The same numbers are on the control socket at `GET /stats`, as Prometheus text
-at `GET /metrics`, and a pod can read its own -- and only its own -- at
+at `GET /metrics`, and a pod can read its own, and only its own, at
 `GET /v1/usage`.
 
 The queue-wait number is the one worth watching: it says whether `--capacity` is
-set higher than what these pods actually do.
+set higher than what these pods can use.
 
 ## When things die
 
 **The daemon.** Grants are written to `grants.json` beside the sockets and
 restored on startup, so a daemon that crashes or is restarted re-binds the same
 socket paths. The relay dials on demand, so a pod that was running throughout
-simply works again -- verified by SIGKILLing the daemon under a live pod, which
+works again. This was verified by SIGKILLing the daemon under a live pod, which
 kept its GPU without restarting. `ferry up` deletes that file, because there the
 pods really are gone.
 
@@ -550,7 +552,7 @@ crash does not block the next start.
 
 **A pod that went away while the daemon was down.** Restoring grants would
 otherwise re-bind a socket for a pod that no longer exists, and nothing would
-ever release it -- the node's only slot, held by a ghost. ferry-cri cannot fix
+ever release it. The node's only slot would be held by a ghost. ferry-cri cannot fix
 this, since its own view of sandboxes does not survive a restart either. The API
 server knows, so `ferry-streamer` revokes any grant older than a minute whose
 pod is gone or finished:
@@ -563,8 +565,8 @@ gpu: revoked default/ghost -- its pod is gone
 seconds and keeps `ferry.dev/gpu` matching the answer. That covers the two ways
 the node ends up lying: a Node object recreated without the resource, and a
 daemon that died while the node kept advertising a GPU. Three consecutive failed
-probes withdraw it -- enough tolerance that restarting the daemon by hand does
-not flap the node, little enough that a dead one is noticed:
+probes withdraw it. That is enough tolerance that restarting the daemon by hand
+does not flap the node, and little enough that a dead one is noticed:
 
 ```
 t+20s: ferry.dev/gpu appears 3 time(s)
@@ -580,16 +582,16 @@ daemon and it is back within a tick.
   is the time slice plus whatever command buffer is already running, and the
   second half of that is not ours to interrupt. At the largest allowed matmul it
   is about 0.9s.
-- **Two lanes because two were measured.** A third kind of work -- a Core ML
-  model, a video encode, a matmul too small to fill the GPU -- would need its own
-  measurement before anyone could say which lane it belongs in. The lane is a
+- **Two lanes because two were measured.** A third kind of work, such as a Core
+  ML model, a video encode, or a matmul too small to fill the GPU, would need its
+  own measurement before anyone could say which lane it belongs in. The lane is a
   claim about hardware, not a label.
 - **The `.outOf` direction** remains unexplored, and is the interesting inverse:
   a pod exposing a socket onto the Mac.
 
 ## Next step
 
-Another backend behind `/v1/generate` -- MLX or llama.cpp with real weights, for
+Another backend behind `/v1/generate`: MLX or llama.cpp with real weights, for
 a model larger than the one the OS ships. The endpoint was shaped so that lands
 without the pod noticing, and the yielding is already solved for it: a token
 loop has the same checkpoint between tokens that the stream gives us here.

@@ -2,8 +2,8 @@
 
 **Read this before you measure anything.** Most of what follows is not about
 ferry. It is about the ways this particular comparison produces confident,
-publishable, wrong numbers — and how each of those was caught. Every mistake
-below was actually made, most of them more than once, and several survived long
+publishable, wrong numbers, and how each of those was caught. Every mistake
+below was made, most of them more than once, and several survived long
 enough to be written up as findings before something contradicted them.
 
 The harness is [`experiments/24-benchmark-harness/`](../experiments/24-benchmark-harness/).
@@ -27,12 +27,12 @@ in three runs.
 
 ### `vmmap` saturates, and it does so silently
 
-`phys_footprint` from `vmmap --summary` is the right number for a macOS process
-— it is what the OS charges, resident minus the shared pages every VM process
+`phys_footprint` from `vmmap --summary` is the right number for a macOS process.
+It is what the OS charges: resident minus the shared pages every VM process
 maps its own copy of. It is also useless above a certain size.
 
 Docker Desktop's VM reported **exactly 14,848.0 MiB in every phase of every
-stack** — baseline, idle, and at twenty pods, for both kind and minikube. That is
+stack**: baseline, idle, and at twenty pods, for both kind and minikube. That is
 `vmmap` pinned to the allocation of a VM sized at 16 GB. It never moved because
 it *cannot* move. If you difference it you get zero, and zero looks like a
 result.
@@ -46,7 +46,7 @@ processes, which is larger than several of the effects being measured.
 ### The two bases are not interchangeable
 
 Because `vmmap` fails on Docker, kind and minikube have to be read from *inside*
-the guest — `docker run --rm alpine free -m`, reporting the VM's own
+the guest, with `docker run --rm alpine free -m` reporting the VM's own
 `/proc/meminfo`. That is the honest number for them.
 
 The trap is then charging ferry host-side while charging kind guest-side. That
@@ -59,15 +59,15 @@ is not conservative, it is **biased against ferry**, and by a factor of three:
 
 The ~1,000 MiB difference is guest page cache the host is still backing. Both
 numbers are real and they answer different questions. Mixing them produced the
-claim *"mode 2 has the highest idle memory of the four"* — which reversed
-completely once mode 2 was read on kind's basis, where it has the **lowest**.
+claim *"mode 2 has the highest idle memory of the four"*, which reversed once
+mode 2 was read on kind's basis, where it has the **lowest**.
 
 The same mixing produced *"mode 2 repays its floor against kind at ~100 pods."*
 On a common basis it never crosses at all: 406 + 8.1n against 712 + 13.1n is a
 lower floor *and* a lower slope.
 
-**So:** where a shared guest exists, read inside it, for every stack. Mode 1 is
-the one exception and has to be — its pods are separate VMs with no shared guest
+Where a shared guest exists, read inside it, for every stack. Mode 1 is the one
+exception and has to be, because its pods are separate VMs with no shared guest
 to read. Say so wherever its line appears next to the others.
 `m2mem.sh` does this for mode 2; `lib.sh:docker_guest_used_mib` does it for
 Docker.
@@ -79,8 +79,8 @@ Mode 2's per-pod memory, charged as VM footprint, read **7.3 MiB** on one run an
 
 Nothing about mode 2 changed by 19×. What changed was how much page cache the
 guest happened to be holding, because VM footprint tracks that rather than pods.
-Read inside the guest it is 7.9 MiB at ten pods and 8.1 at twenty — stable, and
-consistent with the earlier figure.
+Read inside the guest it is 7.9 MiB at ten pods and 8.1 at twenty. That is
+stable, and consistent with the earlier figure.
 
 **A number that moves by an order of magnitude between runs is not a noisy
 measurement of the right thing. It is a measurement of the wrong thing.** That
@@ -88,9 +88,10 @@ swing is what exposed the basis error; without two runs to compare it would have
 shipped.
 
 > **Later correction.** Page cache may not be the cause. The battery was also
-> scheduling half of ferry2's pods onto the Mac node as mode-1 VMs -- see
-> "With mode 2 on, an unpinned pod is not a mode-2 pod" below -- and a varying
-> mode-1 share explains a varying per-pod figure at least as well. The
+> scheduling half of ferry2's pods onto the Mac node as mode-1 VMs (see
+> [With mode 2 on, an unpinned pod is not a mode-2 pod](#with-mode-2-on-an-unpinned-pod-is-not-a-mode-2-pod)
+> below), and a varying mode-1 share explains a varying per-pod figure at least
+> as well. The
 > conclusion to draw from the swing is unchanged: the number was measuring
 > something other than what it claimed.
 
@@ -100,19 +101,19 @@ It is a decaying average over the process's *lifetime*. For a process that has
 been up for hours it barely responds to what is happening now, and for a process
 seconds old it is dominated by startup. Both appear in this comparison at once.
 
-Use cumulative CPU-time deltas instead — `ps -o time`, sampled at the two ends of
+Use cumulative CPU-time deltas instead: `ps -o time`, sampled at the two ends of
 a fixed window. `lib.sh:cpu_of` does this over 60s.
 
 ### A shared Docker Desktop poisons every Docker-side number
 
-If anything else is running in Docker — and on a working machine, something
-always is — its VM's CPU and memory are not attributable to the cluster under
-test.
+If anything else is running in Docker, its VM's CPU and memory are not
+attributable to the cluster under test. On a working machine, something always
+is.
 
 On the machine used for the 1.37 run, Docker Desktop was hosting three unrelated
 containers. Its VM sat at **73–80% CPU with every cluster down**, and kind's
-"cluster up" reading came in at 71.7% — *below* its own baseline. That is not a
-noisy measurement of a real effect; it is unusable, and the whole column was
+"cluster up" reading came in at 71.7%, *below* its own baseline. That is not a
+noisy measurement of a real effect. It is unusable, and the whole column was
 withdrawn rather than reported.
 
 Memory survives this better than CPU, because a before/after delta around the
@@ -155,7 +156,7 @@ faster than about 1 Hz is measuring itself.
 The single most expensive mistake in this whole effort: a ten-burst background
 task was still running during a later kind run, the "clean" run after it, and the
 A/B after that. Three sets of numbers were reported before the overlap was
-noticed, and a conclusion — *"a 0.41s gap, and the ranges do not overlap"* — had
+noticed, and a conclusion, *"a 0.41s gap, and the ranges do not overlap"*, had
 to be retracted.
 
 Before every measurement:
@@ -164,7 +165,8 @@ Before every measurement:
 ps -Ao command= | grep -cE '[a]ltbench|[b]ench/run.sh|[m]2mem'
 ```
 
-Zero, or do not start. (Note the `[a]` bracket — see below, it matters.)
+Zero, or do not start. Note the `[a]` bracket. The next section explains why it
+matters.
 
 ### `pgrep -f` matches the waiter's own command line
 
@@ -183,20 +185,20 @@ until ! pgrep -f "[f]erry build" >/dev/null 2>&1; do sleep 20; done  # correct
 
 The bracket makes the pattern not match its own literal text.
 
-This bites specifically when the loop is passed **inline** — `bash -c '...'`, or
-a background one-liner — because then the pattern is part of the shell's own
+This bites when the loop is passed **inline**, as `bash -c '...'` or a
+background one-liner, because then the pattern is part of the shell's own
 command line. A script file is safe: `bash waiter.sh` puts only the filename
 there, which is why the `pgrep -f` calls in this harness do not need the bracket.
 Use it in every inline guard of this shape.
 
 ### Warm-up is real, and a single ordering hides it
 
-Mode 2's twenty-pod burst improved monotonically across four alternating rounds —
-1.83, 1.63, 1.59, 1.54s — while kind's did not. A battery that runs each stack
+Mode 2's twenty-pod burst improved monotonically across four alternating rounds,
+1.83, 1.63, 1.59, 1.54s, while kind's did not. A battery that runs each stack
 once, in a fixed order, cannot see that: it charges the first stack a warm-up it
 never charges the last.
 
-This also produced the one number in the 1.37 run that does not behave — mode 2's
+This also produced the one number in the 1.37 run that does not behave: mode 2's
 ten-pod time (3.63s) coming out *slower* than its twenty-pod time (2.72s),
 because ten pods runs first.
 
@@ -214,8 +216,8 @@ roughly one pod start in six picks up a full extra second.
 That single API is the whole of the difference between mode 2's v1.34 spread
 (0.83–1.95s) and its v1.37 spread (0.82s, five times out of five).
 
-Pin all stacks to the same minor if the question is architectural. If you cannot
-— minikube is hard to move off its default — say which column is not
+Pin all stacks to the same minor if the question is architectural. If you
+cannot, and minikube is hard to move off its default, say which column is not
 version-matched, in the table, not in a footnote.
 
 ### "Apply to Running" includes a lot that is not the runtime
@@ -226,12 +228,12 @@ Running per pod.
 
 Doing that killed two of my own findings:
 
-- *"A 0.08s volume tax versus kind"* — there is none. The full volume phase is
+- *"A 0.08s volume tax versus kind."* There is none. The full volume phase is
   0.307s for mode 2 against 0.306s for kind. The mount itself is 3 ms; the rest
   is the kubelet's own 100 ms populator and reconciler periods, which both
   stacks pay identically.
-- *"~2 seconds inside `RunPodSandbox`"* — no. Sandbox creation is 0.16s. The
-  `-v=2` log simply does not carry the "Created PodSandbox" line, and its absence
+- *"~2 seconds inside `RunPodSandbox`."* No. Sandbox creation is 0.16s. The
+  `-v=2` log does not carry the "Created PodSandbox" line, and its absence
   was read as duration.
 
 Ferry already wins or ties every phase it controls: volume setup 0.307 vs 0.306s,
@@ -241,16 +243,16 @@ gap is not in any of them.
 ### Time the readiness bar, not the prompt coming back
 
 `kind create cluster` returns in 7.7s. The cluster is not usable for another
-18.9s -- kind hands the prompt back and finishes behind you. `ferry up`
+18.9s. kind hands the prompt back and finishes behind you. `ferry up`
 returns in 12.7s and is done 0.3s later, because it waits for CoreDNS before
 it says it is up.
 
 Timing "when the command returned" makes kind 1.6x faster at cluster
 creation. Timing "every node Ready and every kube-system pod Running" makes
 it 2x slower. Both numbers are real and only the second one is a comparison,
-because it is the only one that means the same thing for both tools -- and
-which one a stack reports is a UX choice its authors made, not a property of
-how fast it is.
+because it is the only one that means the same thing for both tools. Which one
+a stack reports is a UX choice its authors made, not a property of how fast it
+is.
 
 So define the bar first and apply it to everything, including the stack whose
 own command already blocks. run.sh does this by timing `stack_up` *plus*
@@ -266,8 +268,8 @@ Decide what working means, measure that.
 ### A very regular number is a rate limiter, and small ones are not logged
 
 The last thing standing between ferry and kind on a 20-pod burst was the pod
-statuses landing 39.6ms apart -- min 2.7ms, max 41.7ms. That regularity is
-the finding. Real work is variable; a token bucket is not.
+statuses landing 39.6ms apart, min 2.7ms, max 41.7ms. That regularity is
+the finding. Real work is variable. A token bucket is not.
 
 It was `kubeAPIQPS`, which defaults to 50: one token per 20ms, two spent per
 pod, so 40ms a pod with every container already running. Three things made it
@@ -292,10 +294,10 @@ and time the spacing.
 `curl 127.0.0.1:2379/metrics` returned etcd metrics, and they were not this
 cluster's. ferry shifts every port by the profile's index, so the profile
 under test had its etcd on 11379; 2379 was a different ferry entirely, left
-running by another worktree. The numbers looked entirely reasonable -- 5.13ms
-per WAL fsync, against the 4.85ms the right process turned out to be -- and
-the conclusion drawn from them happened to survive being re-measured, which
-is luck and not method.
+running by another worktree. The numbers looked reasonable, 5.13ms per WAL
+fsync against the 4.85ms the right process turned out to be, and the
+conclusion drawn from them happened to survive being re-measured, which is
+luck and not method.
 
 A localhost port is not an identifier. Find the process, confirm its
 `--data-dir` is the state directory under test, and read the port off that:
@@ -306,8 +308,8 @@ lsof -nP -iTCP -sTCP:LISTEN -a -p <pid>
 ```
 
 The same applies to anything else this harness reaches by a fixed port on
-127.0.0.1. On a machine that runs more than one ferry -- which is every
-machine with more than one worktree -- the default port is the one *least*
+127.0.0.1. On a machine that runs more than one ferry, which is every
+machine with more than one worktree, the default port is the one *least*
 likely to be the cluster you mean.
 
 ### Docker Desktop's VM has a cheaper fsync than macOS does
@@ -318,7 +320,7 @@ kind's runs inside Docker Desktop's VM and averages 0.88ms and 1.78ms, on
 the same Mac and the same physical disk.
 
 kind's etcd is not better tuned, and the reason is more specific than
-"Docker relaxed it" -- which is what this section said first, on a
+"Docker relaxed it", which is what this section said first, on a
 measurement that did not support it. Plain `fsync(2)` is 0.031 ms natively on
 macOS and 0.042 ms inside Docker's VM: no difference worth having.
 
@@ -333,14 +335,14 @@ them by GOOS:
 
 `os.File.Sync()` is `F_FULLFSYNC` on darwin and `fsync(2)` on linux. etcd is
 Go. So the same source line flushes the drive's write cache when etcd runs
-natively and does not when it runs on Linux in a VM -- 128x, decided at
+natively and does not when it runs on Linux in a VM. That is 128x, decided at
 compile time and invisible in the code.
 
 The lesson generalises past fsync: when the same program is fast on one
-platform and slow on another, check whether its runtime is quietly calling
-something different, before concluding anything about the platform. The
-measurement that finds this is the *syscall*, not the program -- timing etcd
-would only ever have told you etcd was slower.
+platform and slow on another, check whether its runtime is calling something
+different, before concluding anything about the platform. The measurement that
+finds this is the *syscall*, not the program. Timing etcd would only ever have
+told you etcd was slower.
 
 The corollary, which cost an afternoon to notice: an `F_FULLFSYNC` flushes
 the device cache, so it stalls whatever else is queued on that volume.
@@ -370,14 +372,14 @@ So when a phase comes out a tie, it is worth asking a second question before
 moving on: *is this a floor, and can we alone move it?* A cost both stacks
 pay identically is invisible to any A/B between them, which makes a
 comparative harness exactly the wrong instrument for finding it. The thing
-that found it was the absolute breakdown -- 301ms of wait against 10ms of
+that found it was the absolute breakdown: 301ms of wait against 10ms of
 work, with the ratio printed rather than left to be noticed.
 
 The corollary is the trap: this only pays where ferry controls the binary. It
 reached mode 1 immediately and mode 2 only after `build-kubelet-linux.sh`,
 because mode 2's guest kubelet was upstream's download. Before claiming a
-patch like this, check which of ferry's own configurations actually run the
-thing that was patched -- and keep an unpatched one in the run as a control.
+patch like this, check which of ferry's own configurations run the thing that
+was patched, and keep an unpatched one in the run as a control.
 Mode 2 sitting at 497ms while mode 1 moved 710 to 431 is the only reason the
 279ms is attributable to the patch rather than to the afternoon.
 
@@ -395,7 +397,7 @@ The worst measurement error found so far, and it was in this harness for three
 runs.
 
 `ferry machines enable` gives the cluster **two nodes of different
-architectures** -- the Mac node, where a pod is a VM with its own kernel, and
+architectures**: the Mac node, where a pod is a VM with its own kernel, and
 the machine node, where a pod is a container sharing one. A Deployment with no
 `nodeSelector` is scheduled across both. Measured, with ten replicas and the
 battery's own manifest:
@@ -410,9 +412,11 @@ half mode 2**, and the ratio moved from run to run with whatever the scheduler
 scored. That single bug produced:
 
 - *"mode 2 starts a pod in 0.82s against kind's 0.62s."* Watched rather than
-  polled, and pinned, it is **541ms against kind's 544ms** -- a tie. (A tie
-  only until the volume manager's poll intervals came down; it is now 229ms
-  against 500ms. See "A tie is not the same as nothing to win" above.)
+  polled, and pinned, it is **541ms against kind's 544ms**, a tie. It was a tie
+  only until the volume manager's poll intervals came down, and it is now 229ms
+  against 500ms. See
+  [A tie is not the same as nothing to win](#a-tie-is-not-the-same-as-nothing-to-win)
+  above.
 - *"mode 2's ten-pod time (3.63s) is slower than its twenty-pod time (2.72s),
   which should not happen."* It does not happen. That was the mixture changing
   between the two cells.
@@ -420,13 +424,13 @@ scored. That single bug produced:
   cache. Ten mode-1 pod VMs at ~220 MiB is 2,200 MiB, against an observed
   2,814 MiB at twenty pods, where a pure mode-2 burst costs ~8 MiB a pod. The
   page-cache explanation is not needed to account for it and the arithmetic
-  fits the mixture better. Not yet confirmed by a dedicated run -- treat the
-  cause as open, but do not trust the old number either way.
+  fits the mixture better. This is not yet confirmed by a dedicated run. Treat
+  the cause as open, but do not trust the old number either way.
 
 `stacks.sh:node_selector_of` now pins ferry2. `whereland.sh` is the check:
 apply the battery's own manifest unpinned and print where the pods went.
 
-> **The general form:** if a stack can put the work in more than one place,
+> **The general form.** If a stack can put the work in more than one place,
 > pin it, and have the harness *report* where it landed. `burst.py` prints the
 > node histogram with every result for exactly this reason. A latency number
 > with no statement of where it ran is not a measurement of an architecture.
@@ -434,12 +438,12 @@ apply the battery's own manifest unpinned and print where the pods went.
 ### Watch, do not poll, when the thing you are timing is sub-second
 
 The battery polls `kubectl get pods` until the count is right, so its
-resolution is one iteration of that command -- **40.7ms against ferry and
+resolution is one iteration of that command: **40.7ms against ferry and
 48.5ms against kind** (`pollcost.sh`). On a 0.5s event that is 10% of the
 answer, and it is not the same 10% for both stacks.
 
-Polling was not what produced the wrong headline here -- ferry is the *faster*
-of the two to poll, so the bias ran the other way -- but it is why the
+Polling was not what produced the wrong headline here. ferry is the *faster*
+of the two to poll, so the bias ran the other way. But it is why the
 battery's absolute numbers sit ~200ms above the watched ones. `timeline.py`
 and `burst.py` watch the API instead, through `kubectl proxy`.
 
@@ -481,7 +485,7 @@ Recorded so nobody re-runs them hopefully.
 | The gap is volume setup | No. 0.307s vs kind's 0.306s |
 | The gap is API round-trip latency across the host/guest boundary | No. 1.15ms from inside ferry's node against kind's 0.84ms, and a pod start makes nothing like the 645 round trips that would need. `rtt.sh` |
 | The gap is the control plane or the scheduler | No. All 20 pods of a burst are created by 142ms and scheduled by 152ms. `burst.py` |
-| The gap is the durability barrier, still | No. fsync costs 0.085ms inside ferry's node against kind's 0.098ms -- the `.fsync` change fixed it thoroughly. `fsynccost.sh` |
+| The gap is the durability barrier, still | No. fsync costs 0.085ms inside ferry's node against kind's 0.098ms. The `.fsync` change fixed it. `fsynccost.sh` |
 | The gap is containerd serializing | No. 20 containers in 165ms with a 6x speedup from concurrency, kubelet not involved. `ctrconc.sh` |
 | The gap is kubelet configuration | No. Neither sets kubeAPIQPS/Burst, and ferry uses cgroupfs where kind uses the slower systemd driver. `knobs.sh` |
 | The battery's poll loop is biased against ferry | No. It costs 40.7ms an iteration against ferry and 48.5ms against kind. `pollcost.sh` |
@@ -518,7 +522,7 @@ python3 summarize.py results/raw.tsv
 ```
 
 One stack at a time, sequentially, with teardown between. `run.sh` writes
-`results/raw.tsv` as `stack<TAB>key<TAB>value`, appended — archive or clear the
+`results/raw.tsv` as `stack<TAB>key<TAB>value`, appended. Archive or clear the
 directory between runs or two runs will be interleaved in one file.
 
 Then, for the numbers the battery cannot get honestly:
@@ -529,7 +533,7 @@ Then, for the numbers the battery cannot get honestly:
 ```
 
 `summarize.py` handles the baseline subtraction per stack and picks the right
-instrument for each. It does **not** correct the ferry2 memory basis — that is
+instrument for each. It does **not** correct the ferry2 memory basis. That is
 what `m2mem.sh` is for, and the two should be reported together.
 
 ## A checklist
@@ -537,7 +541,7 @@ what `m2mem.sh` is for, and the two should be reported together.
 Before:
 
 - [ ] Nothing else measuring (`ps -Ao command= | grep -c ...`, expect 0)
-- [ ] Host memory pressure noted — free, compressed, swap
+- [ ] Host memory pressure noted: free, compressed, swap
 - [ ] What is running in Docker Desktop, written down
 - [ ] Kubernetes version of every stack, written down
 - [ ] No profiler or sampler armed
@@ -551,5 +555,6 @@ After, for every number:
 
 And the habit that caught the most: **when a result is surprising, assume the
 measurement before the architecture.** Every genuinely surprising number in this
-effort was an instrument problem until proven otherwise, and most of them stayed
+effort was an instrument problem until shown otherwise, and most of them stayed
+
 that way.

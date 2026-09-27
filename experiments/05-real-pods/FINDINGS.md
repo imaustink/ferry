@@ -1,12 +1,12 @@
-# Experiment 05 — Real pods, one VM each
+# Experiment 05: Real pods, one VM each
 
 **Question.** Everything up to here used a fake runtime. Does the whole stack
 work with `ferry-cri` in place: native control plane, patched darwin kubelet,
 and a real virtual machine per pod?
 
 **Method.** `run.sh` starts `ferry-cri`, then the control plane, then the
-kubelet pointed at `ferry-cri`. Pods are created through `kubectl` and probed
-from the host.
+kubelet pointed at `ferry-cri`. Pods are created through `kubectl`, and the
+host probes them.
 
 ## Result
 
@@ -30,9 +30,9 @@ $ pgrep -fl com.apple.Virtualization.VirtualMachine
   ... one process per pod
 ```
 
-Kubernetes scheduling pods onto a Mac, where each pod is a hypervisor-isolated
-virtual machine with its own kernel and its own routable address, and no Linux
-host exists anywhere in the system.
+Kubernetes schedules pods onto a Mac. Each pod is a hypervisor-isolated virtual
+machine with its own kernel and its own routable address, and no Linux host
+exists anywhere in the system.
 
 ### The API server is reachable from inside a pod
 
@@ -71,18 +71,18 @@ talks to the API.
 Error: unsupported: "hotplug not supported"
 ```
 
-`LinuxPod.addContainer` hotplugs into a running VM — but only where the VMM
+`LinuxPod.addContainer` hotplugs into a running VM, but only where the VMM
 supports it, which cloud-hypervisor does and `Virtualization.framework` does
 not. CRI's ordering is sandbox first, containers afterwards, so a VM created at
 `RunPodSandbox` can never accept them.
 
 The fix is to boot the VM lazily on the first `StartContainer`, with every
-container added beforehand. **This is a real constraint, not just a workaround:
-on this hypervisor a pod's container set must be complete before it starts.**
-Single-container pods work. Multi-container pods, and init containers — which
-the kubelet creates and starts one at a time — cannot work this way. Options are
-to buffer the whole pod's containers before booting (needs the kubelet to be
-told the sandbox is not ready yet), or to accept the limitation on macOS.
+container added beforehand. This is a real constraint, not only a workaround:
+on this hypervisor a pod's container set must be complete before it starts.
+Single-container pods work. Multi-container pods and init containers, which
+the kubelet creates and starts one at a time, cannot work this way. The options
+are to buffer the whole pod's containers before booting (the kubelet would have
+to be told the sandbox is not ready yet), or to accept the limitation on macOS.
 
 ### vmnet networks leak permanently
 
@@ -120,13 +120,13 @@ reference `PullImage` was called with. The rootfs cache is keyed by both.
 - **Mounts are ignored.** `ContainerConfig.mounts` is not implemented, so
   projected ServiceAccount tokens, ConfigMaps and Secrets do not reach the pod.
   `LinuxPod.Configuration.volumes` with `PodVolume.Source.tmpfs` is the intended
-  home for these, and would put SA tokens on tmpfs inside the guest — closer to
-  Linux behaviour than the host-disk projection in experiment 02.
+  home for these, and would put SA tokens on tmpfs inside the guest. That is
+  closer to Linux behaviour than the host-disk projection in experiment 02.
 - **No `Exec` / `Attach` / `PortForward` / logs.** `LinuxPod.execInContainer`
-  exists; wiring it to CRI's streaming endpoints is not done.
-- **No container stats.** Reported empty rather than invented, so the eviction
-  manager is not fed fabricated numbers.
-- **No Services.** See below.
+  exists, but nothing wires it to CRI's streaming endpoints yet.
+- **No container stats.** The runtime reports them empty rather than invented,
+  so the eviction manager gets no fabricated numbers.
+- **No Services.** Experiment 06 takes this up.
 
 ## Reproduce
 
