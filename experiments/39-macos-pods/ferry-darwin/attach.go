@@ -2,13 +2,13 @@ package main
 
 // kubectl attach, and a container's stdin and terminal.
 //
-// A container's output used to go one way, into its log. For attach it has
-// to go to whoever is attached as well, as it arrives, so each stream is read
-// in chunks: the chunk goes to every attached client, and the lines in it go
-// to the log in the kubelet's format. A pod that asks for `stdin: true` gets a
-// pipe for its standard input that attach writes into -- closed after the
-// first attach when it asked for `stdinOnce` -- and one that asks for `tty:
-// true` runs on a pseudo-terminal, which attach reads, writes and resizes.
+// A container's output goes to files the reaper writes and the runtime follows
+// (tail.go); attach subscribes to that follow through the fanout here, so a
+// client sees output as it arrives without the runtime owning the container's
+// streams. Input goes the other way: attach writes the client's bytes into the
+// container's stdin fifo, which the reaper holds and copies to the child. A
+// `tty: true` container's terminal is the reaper's too; attach resizes it by
+// opening its device, and ends stdinOnce input by signalling the reaper.
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -63,42 +64,6 @@ func (f *fanout) write(stream int, p []byte) {
 	}
 }
 
-// pump reads one stream of a container: every chunk to the attached clients,
-// every line to the log.
-func (l *criLog) pump(stream string, r io.Reader, fan *fanout) {
-	idx := 0
-	if stream == "stderr" {
-		idx = 1
-	}
-	buf := make([]byte, 32*1024)
-	var line []byte
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			fan.write(idx, buf[:n])
-			line = append(line, buf[:n]...)
-			for {
-				i := indexByte(line, '\n')
-				if i < 0 {
-					break
-				}
-				l.write(stream, "F", string(trimCR(line[:i])))
-				line = line[i+1:]
-			}
-			if len(line) > 64*1024 {
-				l.write(stream, "P", string(line))
-				line = nil
-			}
-		}
-		if err != nil {
-			if len(line) > 0 {
-				l.write(stream, "F", string(trimCR(line)))
-			}
-			return
-		}
-	}
-}
-
 func (l *criLog) write(stream, tag, text string) {
 	if l == nil {
 		return
@@ -137,7 +102,7 @@ func (s *streamRuntime) Attach(ctx context.Context, containerID string, in io.Re
 		return fmt.Errorf("container %q not found", containerID)
 	}
 	c.mu.Lock()
-	done, stdin, term := c.done, c.stdin, c.pty
+	done, stdin, ttyPath, reaperPid := c.done, c.stdin, c.ttyPath, c.reaperPid
 	c.mu.Unlock()
 	if done == nil {
 		return fmt.Errorf("container %s is not running", containerID)
@@ -150,21 +115,28 @@ func (s *streamRuntime) Attach(ctx context.Context, containerID string, in io.Re
 	id := c.fan.subscribe(out, e)
 	defer c.fan.unsubscribe(id)
 
-	if term != nil && resize != nil {
-		go func() {
-			for size := range resize {
-				_ = pty.Setsize(term, &pty.Winsize{Rows: size.Height, Cols: size.Width})
-			}
-		}()
+	// Resize the terminal the reaper holds by opening its device, since the
+	// runtime no longer keeps the terminal itself.
+	if c.tty && ttyPath != "" && resize != nil {
+		if term, err := os.OpenFile(ttyPath, os.O_RDWR, 0); err == nil {
+			defer term.Close()
+			go func() {
+				for size := range resize {
+					_ = pty.Setsize(term, &pty.Winsize{Rows: size.Height, Cols: size.Width})
+				}
+			}()
+		}
 	}
 	inDone := make(chan struct{})
 	if in != nil && stdin != nil {
 		go func() {
 			_, _ = io.Copy(stdin, in)
 			// stdinOnce: the stream the first attach gave is the container's
-			// whole input, so its end is the input's end.
-			if c.stdinOnce {
-				_ = stdin.Close()
+			// whole input, so its end is the input's end. The stdin fifo is held
+			// open by the reaper, so the runtime cannot end it by closing its own
+			// handle; it signals the reaper to close the child's stdin instead.
+			if c.stdinOnce && reaperPid > 0 {
+				_ = syscall.Kill(reaperPid, syscall.SIGUSR1)
 			}
 			close(inDone)
 		}()
@@ -178,35 +150,4 @@ func (s *streamRuntime) Attach(ctx context.Context, containerID string, in io.Re
 		}
 	}
 	return nil
-}
-
-// startStdio wires a container's standard streams before it starts: a
-// terminal if it asked for one, otherwise pipes, and stdin only if it asked.
-func (c *container) startStdio(start func() error, setTTY func()) (outputs []io.Reader, err error) {
-	if c.tty {
-		setTTY()
-		term, err := startPTY(c)
-		if err != nil {
-			return nil, err
-		}
-		c.pty, c.stdin = term, term
-		return []io.Reader{term}, nil
-	}
-	stdout, _ := c.cmd.StdoutPipe()
-	stderr, _ := c.cmd.StderrPipe()
-	if c.openStdin {
-		w, err := c.cmd.StdinPipe()
-		if err != nil {
-			return nil, err
-		}
-		c.stdin = w
-	}
-	if err := start(); err != nil {
-		return nil, err
-	}
-	return []io.Reader{stdout, stderr}, nil
-}
-
-func startPTY(c *container) (*os.File, error) {
-	return pty.StartWithAttrs(c.cmd, nil, c.cmd.SysProcAttr)
 }

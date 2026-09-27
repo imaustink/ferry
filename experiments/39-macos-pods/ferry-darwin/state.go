@@ -249,9 +249,15 @@ func (r *runtimeSvc) restore() {
 			finished++
 			continue
 		}
-		if !c.tty && isOurs(c.reaperPid, "reap") {
+		if isOurs(c.reaperPid, "reap") {
+			// Its reaper is still running (tty or not), holding its terminal,
+			// stdin and output; the runtime picks the follow and the wait back
+			// up, and reopens the stdin end attach writes to.
 			c.done = make(chan struct{})
 			r.openLog(c)
+			if c.openStdin {
+				r.openStdin(c)
+			}
 			go r.follow(c)
 			go r.waitReaper(c, nil)
 			if c.memLimit > 0 {
@@ -263,9 +269,8 @@ func (r *runtimeSvc) restore() {
 			adopted++
 			continue
 		}
-		// Gone without a record -- a terminal container, whose terminal was the
-		// old runtime's, or a reaper that was killed. Make sure nothing of it is
-		// left running, and say it ended without knowing how.
+		// Gone without a record -- a reaper that was killed. Make sure nothing of
+		// it is left running, and say it ended without knowing how.
 		if alive(c.pid) {
 			_ = syscall.Kill(-c.pid, syscall.SIGKILL)
 		}
@@ -300,6 +305,16 @@ func (r *runtimeSvc) containerFromRecord(cr containerRecord, dir string) *contai
 		exit: cr.Exit, reason: cr.Reason, oomKilled: cr.OOMKilled,
 		pid: cr.Pid, reaperPid: cr.ReaperPid, logOffsets: cr.LogOffsets, dir: dir,
 		stdoutPath: filepath.Join(dir, "stdout"), stderrPath: filepath.Join(dir, "stderr")}
+	if cr.OpenStdin {
+		c.stdinPath = filepath.Join(dir, "stdin")
+	}
+	if cr.TTY {
+		// The terminal device path the reaper wrote; still valid while the
+		// reaper holds it, this boot.
+		if b, err := os.ReadFile(filepath.Join(dir, "tty")); err == nil {
+			c.ttyPath = strings.TrimSpace(string(b))
+		}
+	}
 	for _, v := range cr.Mounts {
 		c.mounts = append(c.mounts, volumeMount{host: v.Host, path: v.Path, readOnly: v.ReadOnly, file: v.File})
 	}

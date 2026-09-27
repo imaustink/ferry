@@ -68,15 +68,16 @@ type container struct {
 	cpuQuota, cpuPeriod int64
 	// stdio, for kubectl attach: what the pod asked for, and what it got.
 	tty, openStdin, stdinOnce bool
-	stdin                     io.WriteCloser
-	pty                       *os.File
+	stdin                     io.WriteCloser // the reaper's stdin fifo, opened to write into
 	fan                       fanout
 
 	// Where the container lives outside its root (state.go), its output files
-	// (tail.go), how far they have been read into the kubelet's log, and the
-	// log itself.
+	// (tail.go), how far they have been read into the kubelet's log, the log
+	// itself, and -- held by the reaper, named here so a restart finds them --
+	// its stdin fifo and, for a tty, the terminal device to resize.
 	dir                    string
 	stdoutPath, stderrPath string
+	stdinPath, ttyPath     string
 	logOffsets             [2]int64
 	clog                   *criLog
 	// The container's pid, which is also its process group, and its reaper's
@@ -92,7 +93,6 @@ type container struct {
 	reason    string
 	message   string
 	oomKilled bool
-	cmd       *exec.Cmd
 	done      chan struct{}
 }
 
@@ -480,81 +480,70 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 			cmd.Path = filepath.Join(c.root, "bin", c.argv[0])
 		}
 	}
-	if c.tty {
-		return r.startTerminal(c, s, cmd)
-	}
-
-	// Through the reaper, with output to files: see reap.go and tail.go.
+	// Every container runs through the reaper (reap.go), including a tty one:
+	// output goes to files the runtime follows, the exit status to a file, and
+	// the terminal and stdin are the reaper's, so all of it outlives a runtime
+	// restart. See "The runtime restarts" in FINDINGS.
 	spec := reapSpec{Path: cmd.Path, Argv: cmd.Args, Env: cmd.Env, Dir: cmd.Dir, Chroot: cmd.SysProcAttr.Chroot,
-		UID: -1, Stdout: c.stdoutPath, Stderr: c.stderrPath,
+		UID: -1, TTY: c.tty, Stdout: c.stdoutPath, Stderr: c.stderrPath,
 		PidFile: filepath.Join(c.dir, "pid"), Exit: filepath.Join(c.dir, "exit")}
 	if cr := cmd.SysProcAttr.Credential; cr != nil {
 		spec.UID = int(cr.Uid)
 	}
-	_ = os.Remove(spec.Exit)
-	var stdinR *os.File
+	if c.tty {
+		c.ttyPath = filepath.Join(c.dir, "tty")
+		spec.TTYFile = c.ttyPath
+	}
 	if c.openStdin {
-		pr, pw, err := os.Pipe()
-		if err != nil {
+		c.stdinPath = filepath.Join(c.dir, "stdin")
+		_ = os.Remove(c.stdinPath)
+		if err := syscall.Mkfifo(c.stdinPath, 0o600); err != nil {
 			c.clog.close()
-			return nil, err
+			return nil, fmt.Errorf("stdin pipe: %w", err)
 		}
-		stdinR, c.stdin = pr, pw
+		spec.Stdin = c.stdinPath
 	}
-	proc, pid, err := startReaper(c.dir, spec, stdinR)
-	if stdinR != nil {
-		stdinR.Close()
-	}
+	_ = os.Remove(spec.Exit)
+	proc, pid, err := startReaper(c.dir, spec)
 	if err != nil {
 		c.clog.close()
 		return nil, fmt.Errorf("start %v: %w", c.argv, err)
+	}
+	if c.openStdin {
+		r.openStdin(c)
+	}
+	if c.tty {
+		// The reaper wrote the terminal's device path before it reported ready.
+		if b, err := os.ReadFile(c.ttyPath); err == nil {
+			c.ttyPath = strings.TrimSpace(string(b))
+		}
 	}
 	c.mu.Lock()
 	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
 	c.pid, c.reaperPid = pid, proc.Pid
 	c.mu.Unlock()
 	r.saveContainer(c)
-	log.Printf("container %s: started pid %d (reaper %d) as uid %d at %s (stdin %v)", c.id, pid, proc.Pid, s.addr.uid, s.addr.ip, c.openStdin)
+	log.Printf("container %s: started pid %d (reaper %d) as uid %d at %s (tty %v, stdin %v)", c.id, pid, proc.Pid, s.addr.uid, s.addr.ip, c.tty, c.openStdin)
 	r.startWatchers(c)
 	go r.follow(c)
 	go r.waitReaper(c, proc)
 	return &runtimeapi.StartContainerResponse{}, nil
 }
 
-// startTerminal runs a `tty: true` container the old way: the runtime's own
-// child, on a pseudo-terminal the runtime holds. The terminal cannot outlive
-// the runtime, so neither can the container; a restarted runtime reports it
-// ended (state.go). Terminal containers are interactive, and short-lived.
-func (r *runtimeSvc) startTerminal(c *container, s *sandbox, cmd *exec.Cmd) (*runtimeapi.StartContainerResponse, error) {
-	c.cmd = cmd
-	outputs, err := c.startStdio(cmd.Start, func() {
-		// A terminal makes the process a session leader, which a process
-		// group of its own already is; the two cannot both be asked for.
-		cmd.SysProcAttr.Setpgid = false
-		cmd.SysProcAttr.Setsid, cmd.SysProcAttr.Setctty = true, true
-	})
-	if err != nil {
-		c.clog.close()
-		return nil, fmt.Errorf("start %v: %w", c.argv, err)
+// openStdin opens the container's stdin fifo for writing, the end attach feeds
+// the client's input into. Read-write so it never blocks on open and an attach
+// disconnecting is not the end of the container's input.
+func (r *runtimeSvc) openStdin(c *container) {
+	if c.stdinPath == "" {
+		return
 	}
-	c.mu.Lock()
-	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
-	c.pid = cmd.Process.Pid
-	c.mu.Unlock()
-	r.saveContainer(c)
-	log.Printf("container %s: started pid %d as uid %d at %s (tty)", c.id, c.pid, s.addr.uid, s.addr.ip)
-	r.startWatchers(c)
-	go func() {
-		c.clog.pump("stdout", outputs[0], &c.fan)
-		_ = cmd.Wait()
-		rec := exitRecord{Code: int32(cmd.ProcessState.ExitCode()), Finished: time.Now().UnixNano()}
-		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			rec.Code = 128 + int32(ws.Signal())
-		}
-		r.finish(c, rec)
-		c.clog.close()
-	}()
-	return &runtimeapi.StartContainerResponse{}, nil
+	if f, err := os.OpenFile(c.stdinPath, os.O_RDWR, 0); err == nil {
+		c.mu.Lock()
+		c.stdin = f
+		c.mu.Unlock()
+	} else {
+		log.Printf("container %s: reopening stdin: %v", c.id, err)
+	}
 }
 
 func (r *runtimeSvc) startWatchers(c *container) {

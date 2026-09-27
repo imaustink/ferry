@@ -23,7 +23,7 @@ k apply -f "$here/macos-machine.yaml" >/dev/null
 for _ in $(seq 180); do k get node mac-0 >/dev/null 2>&1 && break; sleep 1; done
 k wait --for=condition=Ready node/mac-0 --timeout=180s >/dev/null || { echo "mac-0 not Ready"; exit 1; }
 
-k delete pod web counter pvpod finisher --ignore-not-found --wait=true >/dev/null 2>&1
+k delete pod web counter pvpod finisher shell --ignore-not-found --wait=true >/dev/null 2>&1
 k delete pvc rr-data --ignore-not-found --wait=true >/dev/null 2>&1
 k apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -62,10 +62,25 @@ spec:
       image: $img
       command: [/bin/sh, -c, 'echo before > /data/f; sleep 3600']
       volumeMounts: [{name: d, mountPath: /data}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: shell, labels: {experiment: "39"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  nodeSelector: {kubernetes.io/hostname: mac-0}
+  containers:
+    - name: c
+      image: $img
+      # A terminal container: its pty is the reaper's, not the runtime's, so it
+      # has to survive a restart like the rest.
+      command: [/bin/sh, -c, 'sleep 3600']
+      tty: true
+      stdin: true
 EOF
 # 300 s: ferry-storage has been seen to take ~2.5 min to provision a claim for a
 # node that has just registered.
-k wait --for=condition=Ready pod/web pod/counter pod/pvpod --timeout=300s >/dev/null || { echo "pods not Ready"; exit 1; }
+k wait --for=condition=Ready pod/web pod/counter pod/pvpod pod/shell --timeout=300s >/dev/null || { echo "pods not Ready"; exit 1; }
 sleep 3
 
 snap() { # pod -> "containerID restarts ip"
@@ -87,7 +102,7 @@ same() { # name before after
 }
 
 echo "=== 1. crash: SIGKILL ferry-darwin"
-b_web=$(snap web); b_cnt=$(snap counter); b_pv=$(snap pvpod)
+b_web=$(snap web); b_cnt=$(snap counter); b_pv=$(snap pvpod); b_sh=$(snap shell)
 echo "    web answers: $(serves)"
 n0=$(restored_count)
 request crash
@@ -101,12 +116,14 @@ ok=0
 same web "$b_web" "$(snap web)" && ok=$((ok+1))
 same counter "$b_cnt" "$(snap counter)" && ok=$((ok+1))
 same pvpod "$b_pv" "$(snap pvpod)" && ok=$((ok+1))
+same shell "$b_sh" "$(snap shell)" && ok=$((ok+1))  # the terminal container
 echo "    web answers: $(serves)"
 serves | grep -q . && ok=$((ok+1))
 pvw=$(k exec pvpod -- /bin/sh -c 'echo after >> /data/f; cat /data/f' 2>&1 | tr '\n' ' ')
 echo "    exec + PVC after the restart: $pvw"
 [ "$pvw" = "before after " ] && ok=$((ok+1))
-echo "    crash verdict: $ok of 5"
+echo "    exec into the terminal pod: $(k exec shell -- /bin/echo alive 2>&1 | tr -d '\r')"
+echo "    crash verdict: $ok of 6"
 
 echo "=== 2. pause: runtime down 20 s while a Job's pod exits 3"
 k apply -f - >/dev/null <<EOF
@@ -152,5 +169,5 @@ k delete pod web --wait=true --timeout=60s >/dev/null 2>&1
 echo "    web deleted in $(( $(date +%s) - t0 )) s"
 [ $(( $(date +%s) - t0 )) -lt 40 ] && echo "    stop verdict: ok" || echo "    stop verdict: FAILED"
 
-k delete pod counter pvpod finisher --wait=false >/dev/null 2>&1
+k delete pod counter pvpod finisher shell --wait=false >/dev/null 2>&1
 k delete pvc rr-data --wait=false >/dev/null 2>&1

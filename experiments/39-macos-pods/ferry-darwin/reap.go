@@ -8,22 +8,38 @@ package main
 // finished while the runtime was down could not say whether it had succeeded.
 //
 // So a container is started through `ferry-darwin reap SPEC`: a process that
-// does nothing but start the container as its child, wait for it, and write
-// what it returned to a file. It has no pipes of the container's -- output goes
-// straight to files (see tail.go) -- so there is nothing in it that needs the
-// runtime alive. It runs in a session of its own, outside the container's
-// process group, so signals meant for the container do not reach it.
+// starts the container as its child, waits for it, and writes what it returned
+// to a file. Output goes to files (tail.go), not through the reaper, so there is
+// nothing in it that needs the runtime alive; it runs in a session of its own,
+// so signals meant for the container do not reach it.
+//
+// It also holds the ends of a container's stdio that cannot be plain files, so
+// those too outlive a runtime restart:
+//
+//	stdin     a named pipe the reaper keeps open read-write, so it never sees
+//	          end-of-input when a runtime writing into it goes away; the reaper
+//	          copies it to the child. SIGUSR1 (stdinOnce) closes the child's
+//	          input so it reads EOF.
+//	terminal  for tty containers, the pseudo-terminal's controlling end, which
+//	          used to be the runtime's -- so the container was hung up (SIGHUP)
+//	          when the runtime died. The reaper copies it to the output file and
+//	          the stdin pipe into it; the runtime resizes it by device path,
+//	          without holding it.
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 // reapSpec is what the reaper is told to run.
@@ -36,6 +52,9 @@ type reapSpec struct {
 	UID     int      `json:"uid"` // -1: as root, without changing credentials
 	Stdout  string   `json:"stdout"`
 	Stderr  string   `json:"stderr"`
+	Stdin   string   `json:"stdin"`   // a named pipe, or "" for no input
+	TTY     bool     `json:"tty"`     // run on a pseudo-terminal
+	TTYFile string   `json:"ttyFile"` // where the terminal's device path is written
 	PidFile string   `json:"pidFile"`
 	Exit    string   `json:"exit"`
 }
@@ -46,8 +65,8 @@ type exitRecord struct {
 	Finished int64 `json:"finished"`
 }
 
-// runReaper is `ferry-darwin reap SPEC`. Its stdin is the container's; fd 3 is
-// where it reports "ok <pid>" once the container runs, or why it could not.
+// runReaper is `ferry-darwin reap SPEC`. fd 3 is where it reports "ok <pid>"
+// once the container runs, or why it could not.
 func runReaper(specPath string) {
 	report := os.NewFile(3, "report")
 	fail := func(err error) {
@@ -64,6 +83,8 @@ func runReaper(specPath string) {
 	if err := json.Unmarshal(b, &spec); err != nil {
 		fail(err)
 	}
+	// Both output files exist for the runtime to follow, even a terminal's,
+	// whose stderr stays empty because a terminal is one stream.
 	stdout, err := os.OpenFile(spec.Stdout, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		fail(err)
@@ -72,21 +93,96 @@ func runReaper(specPath string) {
 	if err != nil {
 		fail(err)
 	}
-	cmd := &exec.Cmd{Path: spec.Path, Args: spec.Argv, Env: spec.Env, Dir: spec.Dir,
-		Stdin: os.Stdin, Stdout: stdout, Stderr: stderr}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: spec.Chroot, Setpgid: true}
+	// The input pipe, held open read-write so the reader never sees end-of-input
+	// when a runtime that was writing into it goes away.
+	var fifo *os.File
+	if spec.Stdin != "" {
+		if fifo, err = os.OpenFile(spec.Stdin, os.O_RDWR, 0); err != nil {
+			fail(err)
+		}
+	}
+
+	cmd := &exec.Cmd{Path: spec.Path, Args: spec.Argv, Env: spec.Env, Dir: spec.Dir}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: spec.Chroot}
 	if spec.UID >= 0 {
 		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(spec.UID), Gid: uint32(spec.UID)}
 	}
-	if err := cmd.Start(); err != nil {
-		fail(err)
+
+	var master *os.File     // the terminal end the reaper keeps
+	var closeInput func()   // ends the container's input (stdinOnce)
+	var childStdin *os.File // the reaper's copy of the child's stdin, to close after start
+
+	if spec.TTY {
+		m, slave, err := pty.Open()
+		if err != nil {
+			fail(err)
+		}
+		master = m
+		// The slave is the child's three streams and its controlling terminal.
+		// A session leader leads its own process group, so the child's pid is
+		// still its group id -- Setsid instead of Setpgid, not both.
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+		cmd.SysProcAttr.Setsid, cmd.SysProcAttr.Setctty = true, true
+		// The terminal's device path, so the runtime can resize it (attach's
+		// window-size messages) without holding it open.
+		if spec.TTYFile != "" {
+			_ = writeFileAtomic(spec.TTYFile, []byte(slave.Name()))
+		}
+		if err := cmd.Start(); err != nil {
+			fail(err)
+		}
+		_ = slave.Close() // the child holds it now
+		go func() { _, _ = io.Copy(stdout, master) }()
+		if fifo != nil {
+			go func() { _, _ = io.Copy(master, fifo) }()
+		}
+	} else {
+		cmd.SysProcAttr.Setpgid = true
+		cmd.Stdout, cmd.Stderr = stdout, stderr
+		if fifo != nil {
+			// A plain pipe between the fifo and the child: the child gets the
+			// read end, which ends cleanly on close, while the fifo stays held
+			// open. SIGUSR1 (stdinOnce) closes the write end, so the child reads
+			// end-of-input.
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				fail(err)
+			}
+			cmd.Stdin, childStdin = pr, pr
+			go func() { _, _ = io.Copy(pw, fifo) }()
+			closeInput = func() { _ = pw.Close() }
+		} else if devnull, err := os.Open(os.DevNull); err == nil {
+			cmd.Stdin, childStdin = devnull, devnull
+		}
+		if err := cmd.Start(); err != nil {
+			fail(err)
+		}
 	}
+	if childStdin != nil {
+		_ = childStdin.Close() // the child holds its own copy
+	}
+
+	// stdinOnce: the runtime signals when the one input stream has ended.
+	// Installed before "ok", so a signal is never missed and never kills the
+	// reaper (SIGUSR1's default disposition).
+	sigUSR1 := make(chan os.Signal, 1)
+	signal.Notify(sigUSR1, syscall.SIGUSR1)
+	go func() {
+		for range sigUSR1 {
+			if closeInput != nil {
+				closeInput()
+			}
+		}
+	}()
+
 	_ = writeFileAtomic(spec.PidFile, []byte(strconv.Itoa(cmd.Process.Pid)))
 	fmt.Fprintf(report, "ok %d\n", cmd.Process.Pid)
 	report.Close()
-	os.Stdin.Close() // the container has its own copy; the reaper keeps no end of it
 
 	_ = cmd.Wait()
+	if master != nil {
+		_ = master.Close() // ends the output copy
+	}
 	rec := exitRecord{Code: int32(cmd.ProcessState.ExitCode()), Finished: time.Now().UnixNano()}
 	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		rec.Code = 128 + int32(ws.Signal())
@@ -96,8 +192,10 @@ func runReaper(specPath string) {
 }
 
 // startReaper runs a container through the reaper and returns the reaper's
-// process and the container's pid once it is running.
-func startReaper(dir string, spec reapSpec, stdin *os.File) (*os.Process, int, error) {
+// process and the container's pid once it is running. The reaper opens the
+// container's stdin, output and terminal itself, by the paths in the spec, so
+// nothing of the container is held by this runtime.
+func startReaper(dir string, spec reapSpec) (*os.Process, int, error) {
 	specPath := filepath.Join(dir, "reap.json")
 	b, _ := json.Marshal(spec)
 	if err := writeFileAtomic(specPath, b); err != nil {
@@ -113,9 +211,7 @@ func startReaper(dir string, spec reapSpec, stdin *os.File) (*os.Process, int, e
 	}
 	defer rd.Close()
 	cmd := exec.Command(self, "reap", specPath)
-	cmd.Stdin = stdin
-	if stdin == nil {
-		devnull, _ := os.Open(os.DevNull)
+	if devnull, err := os.Open(os.DevNull); err == nil {
 		defer devnull.Close()
 		cmd.Stdin = devnull
 	}

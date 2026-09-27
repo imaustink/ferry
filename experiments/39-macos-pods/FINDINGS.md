@@ -887,24 +887,26 @@ split is right, not that new code was written.
 ### The runtime restarts; the pods do not notice
 
 `run-macos-runtime-restart.sh` -- a crash, then a 20 s stop, with a web server,
-a counter, a pod on a PVC, and a Job's pod that exits during the stop:
+a counter, a pod on a PVC, a `tty: true` shell, and a Job's pod that exits
+during the stop:
 
 ```
 === 1. crash: SIGKILL ferry-darwin
-    runtime: state: restored 6 sandboxes, 3 containers (3 running adopted, 0 ended while the runtime was down)
-    web: same container, no restart, same address (ferry-darwin://ctr-000008 0 10.190.74.5)
-    counter: same container, no restart, same address (ferry-darwin://ctr-000010 0 10.190.74.6)
-    pvpod: same container, no restart, same address (ferry-darwin://ctr-000012 0 10.190.74.7)
-    web answers: web (uid 1004) sees peer 10.190.74.5
+    runtime: state: restored 4 sandboxes, 4 containers (4 running adopted, 0 ended while the runtime was down)
+    web: same container, no restart, same address (ferry-darwin://ctr-000006 0 10.190.80.4)
+    counter: same container, no restart, same address (ferry-darwin://ctr-000003 0 10.190.80.2)
+    pvpod: same container, no restart, same address (ferry-darwin://ctr-000008 0 10.190.80.5)
+    shell: same container, no restart, same address (ferry-darwin://ctr-000004 0 10.190.80.3)
     exec + PVC after the restart: before after
-    crash verdict: 5 of 5
+    exec into the terminal pod: alive
+    crash verdict: 6 of 6
 === 2. pause: runtime down 20 s while a Job's pod exits 3
     init: restart-runtime pause: stopping ferry-darwin for 20 s
     init: restart-runtime pause: ferry-darwin started again
-    runtime: state: restored 4 sandboxes, 4 containers (3 running adopted, 1 ended while the runtime was down)
+    runtime: state: restored 5 sandboxes, 5 containers (4 running adopted, 1 ended while the runtime was down)
     finisher: Failed, exit 3, log: finishing
     exit verdict: ok (exit 3 kept while the runtime was down)
-    counter log across both restarts: 0 gaps, 33 lines
+    counter log across both restarts: 0 gaps, 32 lines
 === 3. stop: delete an adopted pod
     web deleted in 1 s
 ```
@@ -931,9 +933,15 @@ reasons, and each needed its own change:
   files do not grow for the container's life. Its exit status used to go to
   the runtime's `wait`, and to launchd, which discards it, once the runtime was
   gone; now each container is started by `ferry-darwin reap`, a parent that
-  does nothing but wait and write the status to a file. An adopted reaper is not
-  the new runtime's child, so it is checked to be ours (`ps`) and waited on with
-  kqueue `NOTE_EXIT`, which works for any process.
+  waits and writes the status to a file. An adopted reaper is not the new
+  runtime's child, so it is checked to be ours (`ps`) and waited on with kqueue
+  `NOTE_EXIT`, which works for any process. A `tty: true` container was the
+  sharper case: its terminal *was* the runtime's, so the runtime dying hung it up
+  (`SIGHUP`). The reaper holds the terminal now, copying it to the output file
+  and the stdin pipe into it; the runtime resizes it by opening its device path,
+  which it need not keep open. Stdin is the same story -- a named pipe the reaper
+  holds, not a pipe the runtime held -- so a container being fed input does not
+  lose it at a restart either.
 - **Nothing restarted it.** It was a background child of the init script with
   a `wait` on it, so one that died stayed dead. It is a launchd service now,
   `KeepAlive` and `AbandonProcessGroup`, from a plist written under the
@@ -953,9 +961,11 @@ exited with the runtime up. Requests are now a new file each
 (`restart-runtime-N`), and the verdict requires the runtime to say the
 container ended while it was down.
 
-What does not survive: a `tty: true` container, whose terminal the runtime
-holds -- it is reported ended after a restart, with nothing of it left running
--- and an exec or attach session open at the time.
+What does not survive is an `exec` or `attach` session open at the moment of the
+restart: those are connections to the runtime's own streaming server, so they
+drop and the client reconnects -- which is what containerd does too, its
+streaming server being part of containerd. The container they were talking to is
+unaffected.
 
 ### Memory limits, without cgroups
 
@@ -1312,12 +1322,12 @@ the user.
 - Mode-1's kubelet runs inside the pod's own VM, so a root pod can read that
   node's kubelet credentials. It is acceptable only because the VM is discarded
   after the one pod.
-- A runtime restart is survived by every container but a `tty: true` one,
-  whose terminal is the runtime's (see "The runtime restarts"). An `exec`
-  session or `attach` open across the restart is dropped, and stdin a
-  container was being fed ends. A restart of the kubelet, or of the whole
-  machine, is a different thing: a machine reboot discards the runtime's state
-  (records carry the boot session), since nothing it describes is left.
+- A runtime restart is survived by every container, terminal ones included (see
+  "The runtime restarts"). What drops is an `exec` or `attach` session open at
+  the time, since it is a connection to the runtime's streaming server; the
+  client reconnects. A machine reboot is a different thing and discards the
+  runtime's state (records carry the boot session), since nothing it describes
+  is left running.
 - Container stats are the process group's (`proc_pid_rusage`), so a container
   that daemonizes out of its group, or re-parents to launchd, is undercounted;
   no workload here did. Network and filesystem-layer stats are not reported.
