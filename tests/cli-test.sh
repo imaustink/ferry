@@ -698,5 +698,22 @@ contains "it is pinned to the first node" "$(cat "$repo/manifests/coredns.yaml")
 contains "and ferry says which node that is" "$(sed -n '/^install_dns()/,/^}/p' "$repo/ferry")" 's|__DNS_NODE__|$NODE_NAME|g'
 echo
 
+printf '\033[1m%s\033[0m\n' "ferry image build can package a macOS image"
+# A darwin image is FROM scratch + COPY, so it does not go through buildkit at
+# all; the flag surface and the platform switch are checked here without a
+# cluster. The layout itself is ferry-mkimage's own Go tests.
+build_help="$("$repo/ferry" image build --help 2>&1)"
+contains "the help offers --os darwin" "$build_help" "--os darwin"
+darwin_ctx="$sandbox/darwin-ctx"; mkdir -p "$darwin_ctx"
+printf 'FROM scratch\nCOPY f /f\n' > "$darwin_ctx/Dockerfile"; echo x > "$darwin_ctx/f"
+build_out="$("$repo/ferry" image build --os bogus "$darwin_ctx" 2>&1)"; build_rc=$?
+is "an unknown --os is refused" "$build_rc" 2
+contains "and it names the two it knows" "$build_out" "linux or darwin"
+contains "ferry build compiles the darwin packager" \
+  "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-mkimage"'
+contains "a darwin build refuses to run on ferry-cri, which is Linux" \
+  "$(sed -n '/^ferry_image_build_darwin()/,/^}/p' "$repo/ferry")" "ferry-registry"
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]

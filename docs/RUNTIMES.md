@@ -13,6 +13,11 @@ A pod VM costs the Mac about 133 MiB before its workload does anything; a
 container on a machine costs about 14 MiB. Why the two exist, and what each
 costs, is in [MACHINES.md](MACHINES.md). This page is how to use them.
 
+Both rows above run **Linux** pods. A cluster with a macOS golden image can also
+run **native macOS** pods — Darwin processes for `xcodebuild`, the iOS
+simulator, `codesign` or any macOS-only tool — with two more classes in the
+same two modes. See [macOS pods](#macos-pods).
+
 `ferry-shared` needs machines turned on: `ferry machines enable`, or
 `machines: true` in [ferry's config](INSTALL.md#configuration). `ferry-vm`
 always works.
@@ -195,6 +200,137 @@ spec:
 `durability` on a Machine is what its disk survives —
 [INSTALL.md](INSTALL.md#configuration) has the levels.
 
+## macOS pods
+
+Everything above runs Linux pods. A cluster whose Mac has a macOS golden image
+can also run **native macOS** pods — Darwin processes for `xcodebuild`, the iOS
+simulator, `codesign` or any macOS-only tool. They pick a runtime the same way,
+with two more classes for the same two modes:
+
+| `runtimeClassName` | the pod is | worth it for |
+|---|---|---|
+| `ferry-macos-vm` | a macOS VM of its own, with its own XNU kernel | a job that must be root, load a kext, or change system settings |
+| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling |
+
+Both use the handler `ferry-darwin` and a darwin image. As with the Linux
+classes, the class carries the `nodeSelector` and toleration, so
+`runtimeClassName` is all you write on the pod:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata: {name: build}
+spec:
+  runtimeClassName: ferry-macos-vm        # or ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - {name: build, image: myorg/build-darwin:1}
+```
+
+On a Deployment, Job or any object that makes pods it goes in the pod template,
+exactly as `ferry-shared` does above.
+
+Three things set macOS pods apart from the Linux classes:
+
+- **They need a macOS image.** Both run on macOS machines — `Machine`s with
+  `spec.os: darwin` — which ferry only provisions when this Mac has a golden
+  macOS image (the `FERRY_MAC_IMAGE` bundle, passed to ferry-machined as
+  `--mac-image`). Without one the classes still exist but nothing schedules onto
+  them, and a pod that names one stays Pending. Building it is
+  [below](#building-the-image).
+- **A macOS machine is always tainted.** Under every `defaultRuntime` a macOS
+  machine carries its `ferry.dev/mode` taint, so `runtimeClassName` — which
+  brings the matching toleration — is the *only* way onto one. A bare
+  `nodeSelector: {ferry.dev/mode: shared-macos}` stays Pending, and a pod that
+  names no class never lands on XNU.
+- **The Mac runs two macOS guests at most, of either kind.** A `ferry-macos-vm`
+  pod takes a whole guest to itself — its machine is registered with
+  `maxPods: 1` and is torn down when the pod finishes, so the next pod gets a
+  fresh one, never a used kernel. `ferry-macos-shared` pods pack many onto a
+  guest. Either way the two-guest ceiling is shared: a third `ferry-macos-vm`
+  pod, or the first shared pod while two VM pods hold both slots, waits Pending
+  until a slot frees. Getting past two is exactly what `ferry-macos-shared`
+  buys.
+
+So the choice mirrors `ferry-vm` vs `ferry-shared`: `ferry-macos-vm` is a
+hypervisor boundary between pods (root, its own kernel, single-use);
+`ferry-macos-shared` is a uid and a chroot on a shared kernel (cheaper, denser,
+and not a boundary against the host kernel).
+
+### Building the image
+
+macOS pods need two things built. The **pod image** is `ferry image build --os
+darwin` (below). The **golden macOS bundle** the machine boots is not a `ferry`
+subcommand yet — it comes from [experiment 39](../experiments/39-macos-pods/),
+and `ferry` uses the result through `FERRY_MAC_IMAGE`.
+
+**1. The golden macOS bundle** — the OS a macOS machine boots, and what
+`FERRY_MAC_IMAGE` points at:
+
+```sh
+cd experiments/39-macos-pods
+./build.sh                                          # macvm (host) + ferry-macagent (guest)
+curl -fLo .cache/mac.ipsw <VirtualMac2,1 IPSW from ipsw.me>
+build/macvm install .cache/mac.ipsw .cache/golden   # ~3 min: installs macOS into a bundle
+sudo ./inject.sh .cache/golden                      # put the guest agent on it (root, once)
+```
+
+That much already boots a macOS VM. For **`ferry-macos-shared`** (mode 2), the
+per-pod `chroot` needs **SIP off** in the guest — a one-time manual step in
+recoveryOS. Do it on a copy so the golden stays pristine:
+
+```sh
+cp -Rc .cache/golden .cache/golden-sipoff           # APFS clone, instant
+build/macvm boot .cache/golden-sipoff --recovery    # opens the recovery window
+# in the guest: make an admin, run `diskutil apfs updatePreboot /`,
+#               then `csrutil disable` and `halt`
+```
+
+Then bake the machine image from it — kubelet, `ferry-darwin` and the OS base
+copied in, so a machine is Ready in ~10 s instead of spending ~30 s on first
+boot:
+
+```sh
+./bake-macos-node.sh .cache/golden-sipoff .cache/golden-node
+```
+
+Point ferry at the baked bundle and bring machines up:
+
+```sh
+export FERRY_MAC_IMAGE="$PWD/.cache/golden-node"
+ferry up                # installs the macOS NodePools, passes --mac-image to ferry-machined
+ferry machines enable
+```
+
+**2. A darwin pod image** — what a macOS pod runs. It holds only *your own*
+arm64/arm64e binaries: dyld and the system libraries come from the node, because
+Apple's signed binaries are killed anywhere but where the OS put them. So it is
+`FROM scratch` plus `COPY` — the node is the base, not a layer, and there is no
+`RUN` (a Linux builder cannot execute Darwin binaries; compile on the Mac and
+copy the result in). `ferry image build --os darwin` packages it:
+
+```sh
+cat > Dockerfile <<'EOF'
+FROM scratch
+COPY app /bin/app                # your own arm64/arm64e binary
+ENTRYPOINT ["/bin/app"]
+EOF
+ferry image build --os darwin -t example.com/app-darwin:1 .
+```
+
+Unlike a Linux build this needs no buildkit; it writes the OCI layout directly
+and serves it from this Mac's registry, so **machines must be on**
+(`ferry machines enable`) — a macOS pod always runs on a machine, and that is
+where it pulls from. A pod that names `image: example.com/app-darwin:1` with
+`runtimeClassName: ferry-macos-shared` (or `ferry-macos-vm`) and
+`imagePullPolicy: IfNotPresent` then runs it.
+
+`ferry image build --os darwin` accepts the common Dockerfile instructions that
+don't run anything — `COPY`/`ADD`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`,
+`LABEL` — and rejects `RUN` (and `--build-arg`) with a message saying why. The
+full walk-through of the macOS runtime is
+[experiment 39's FINDINGS](../experiments/39-macos-pods/FINDINGS.md).
+
 ## Checking where things landed
 
 ```sh
@@ -215,6 +351,7 @@ ferry status                                               # the default runtime
 | `didn't match Pod's node affinity/selector`, for a `ferry-shared` pod | no machines: mode 2 is off | `ferry machines enable` |
 | a DaemonSet's `DESIRED` is fewer than your nodes, with no error | the cluster's default has tainted one kind of node, and the DaemonSet does not tolerate it | add the toleration under [DaemonSets meant for every node](#daemonsets-meant-for-every-node) |
 | `RuntimeClass "…" not found` | the class does not exist in this cluster — usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
+| a `ferry-macos-*` pod stays Pending and no machine appears | this Mac has no macOS golden image, so no `spec.os: darwin` machine can be made for it | build one ([experiment 39](../experiments/39-macos-pods/FINDINGS.md)) and give ferry-machined its `--mac-image` |
 | `Failed to create pod sandbox: … has no runtime handler "runc"` | a pod whose class is not `ferry-vm` was put on the Mac anyway, usually with `nodeName` | let the scheduler place it, or name `ferry-vm` |
 
 The last one is deliberate. ferry-cri runs every pod as a VM, and a pod that
