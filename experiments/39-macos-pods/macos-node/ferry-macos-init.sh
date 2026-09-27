@@ -111,13 +111,40 @@ sed -e "s|__DNS__|$DNS|" -e "s|__CA__|$C/ca.crt|" -e "s|__MAXPODS__|$MAXPODS|" "
 
 mirror=""
 [ -n "$REGISTRY" ] && mirror="http://$GW:$REGISTRY"
-"$F/ferry-darwin" -endpoint "$R/cri.sock" -state /private/var/ferry/darwin -mirror "$mirror" \
+set -- "$F/ferry-darwin" -endpoint "$R/cri.sock" -state /private/var/ferry/darwin -mirror "$mirror" \
     -shim "$F/podnet.dylib" -iface "$POD_IF" -cluster-cidr "$CLUSTER_CIDR" \
-    -api "$API" -ca "$C/ca.crt" -cluster-dns "$DNS" -volumes-root "$R/kubelet/pods" -node-name "$NODE" \
-    ${VOLUMES:+-host-volumes "$VOLUMES"} \
-    $([ "$MODE" = macos-vm ] && echo -pod-vm) \
-    $([ "$(v debug)" = 1 ] && echo -debug-annotations) \
-    > "$L/runtime.log" 2>&1 &
+    -api "$API" -ca "$C/ca.crt" -cluster-dns "$DNS" -volumes-root "$R/kubelet/pods" -node-name "$NODE"
+[ -n "$VOLUMES" ] && set -- "$@" -host-volumes "$VOLUMES"
+[ "$MODE" = macos-vm ] && set -- "$@" -pod-vm
+[ "$(v debug)" = 1 ] && set -- "$@" -debug-annotations
+
+# The runtime is a launchd service of its own, kept alive: a ferry-darwin that
+# crashes is started again, and finds its pods where it left them (state.go),
+# their containers still running under their reapers. It was a background
+# child of this script, and one that died stayed dead. The plist is written
+# under $R, which is new every boot, not in /Library/LaunchDaemons: there
+# launchd would start the runtime at boot itself, before any of the above.
+# AbandonProcessGroup: when launchd restarts the runtime, the reapers and
+# PersistentVolume servers it started are left alone.
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+{
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo '<key>Label</key><string>dev.ferry.darwin</string>'
+    echo '<key>ProgramArguments</key><array>'
+    for a in "$@"; do echo "<string>$(xml "$a")</string>"; done
+    echo '</array>'
+    echo '<key>KeepAlive</key><true/>'
+    echo '<key>ThrottleInterval</key><integer>1</integer>'
+    echo '<key>AbandonProcessGroup</key><true/>'
+    echo "<key>StandardOutPath</key><string>$(xml "$L/runtime.log")</string>"
+    echo "<key>StandardErrorPath</key><string>$(xml "$L/runtime.log")</string>"
+    echo '</dict></plist>'
+} > "$R/dev.ferry.darwin.plist"
+chmod 644 "$R/dev.ferry.darwin.plist"
+launchctl bootout system/dev.ferry.darwin 2>/dev/null
+launchctl bootstrap system "$R/dev.ferry.darwin.plist" || log "launchctl bootstrap failed"
 # The kubelet exits at startup if its runtime is not serving yet.
 n=0; until [ -S "$R/cri.sock" ] || [ $n -ge 600 ]; do sleep 0.1; n=$((n + 1)); done
 log "ferry-darwin serving ($(( $(date +%s) - t0 )) s)"
@@ -130,4 +157,31 @@ FERRY_CONTAINER_LOGS_DIR="$R/containerlogs" "$F/kubelet" \
     --hostname-override="$NODE" --node-ip="$ip" \
     --root-dir="$R/kubelet" --cert-dir="$R/pki" --v=2 > "$L/kubelet.log" 2>&1 &
 log "kubelet started ($(( $(date +%s) - t0 )) s)"
+
+# restart-runtime-N: the Mac asks for the runtime to be restarted by writing
+# the next of these files into the config share -- restart-runtime-1, then -2
+# -- the Mac's own way in, the counterpart of `systemctl restart containerd`,
+# and how the restart test makes one. A new name each time, not one file
+# rewritten: virtiofs here served a rewritten file's old contents from cache,
+# and the second request was never seen. "pause" stops the runtime for 20 s and
+# starts it again; anything else is SIGKILL, so the runtime gets no chance to
+# tidy -- a crash, which launchd answers by starting it again at once.
+next=1
+while sleep 1; do
+    now=$(v "restart-runtime-$next")
+    if [ -n "$now" ]; then
+        next=$((next + 1))
+        case "$now" in
+            pause*)
+                log "restart-runtime $now: stopping ferry-darwin for 20 s"
+                launchctl bootout system/dev.ferry.darwin
+                sleep 20
+                launchctl bootstrap system "$R/dev.ferry.darwin.plist" || log "launchctl bootstrap failed"
+                log "restart-runtime $now: ferry-darwin started again" ;;
+            *)
+                log "restart-runtime $now: killing ferry-darwin; launchd starts it again"
+                launchctl kill SIGKILL system/dev.ferry.darwin ;;
+        esac
+    fi
+done &
 wait

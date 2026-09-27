@@ -37,6 +37,8 @@ echo "cpu limits: ${cpu_v:-?} (capped $(echo "$cpu_n" | sed -n 1p), uncapped $(e
 echo "restart: $(count restart.log 'verdict: ok') of 2 (a crash loop and a liveness failure both restart in place)"
 "$here/run-macos-subpath.sh" > "$b/subpath.log" 2>&1
 echo "subPath: $(count subpath.log 'Succeeded') of 1 (single ConfigMap key at an exact path, emptyDir subdir)"
+"$here/run-macos-runtime-restart.sh" > "$b/runtime-restart.log" 2>&1
+echo "runtime restart: crash $(grep -oE 'crash verdict: [0-9]+ of [0-9]+' "$b/runtime-restart.log" | awk '{print $3"/"$5}'), $(checks runtime-restart.log 'exit verdict: ok' 'log verdict: ok' 'stop verdict: ok') of 3 (exit kept while down, log without gaps, adopted pod stops)"
 "$here/run-nfs-attack.sh" > "$b/nfs-attack.log" 2>&1
 echo "NFS isolation: $(count nfs-attack.log 'refused:') refused, $(count nfs-attack.log '^    open:') read -- want all refused, 0 read"
 # Last: it takes every macOS guest slot, so mac-0 goes first.

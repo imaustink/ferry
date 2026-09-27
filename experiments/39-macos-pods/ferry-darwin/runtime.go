@@ -72,6 +72,17 @@ type container struct {
 	pty                       *os.File
 	fan                       fanout
 
+	// Where the container lives outside its root (state.go), its output files
+	// (tail.go), how far they have been read into the kubelet's log, and the
+	// log itself.
+	dir                    string
+	stdoutPath, stderrPath string
+	logOffsets             [2]int64
+	clog                   *criLog
+	// The container's pid, which is also its process group, and its reaper's
+	// (reap.go). A terminal container has no reaper: it is the runtime's child.
+	pid, reaperPid int
+
 	mu        sync.Mutex
 	state     runtimeapi.ContainerState
 	made      int64
@@ -97,8 +108,10 @@ type runtimeSvc struct {
 	podVMOwner string
 	// debugAnnotations honours the ferry.dev/debug-* pod annotations.
 	debugAnnotations bool
-	services         *serviceTable // nil when not given an API server
-	streaming        streaming.Server
+	// boot is this boot's session id, which state on disk is checked against.
+	boot      string
+	services  *serviceTable // nil when not given an API server
+	streaming streaming.Server
 	// The kubelet's pods directory, exported over NFS; empty leaves volumes off.
 	volumesRoots []string
 	nfsReady     chan struct{} // closed once nfsd serves volumesRoots
@@ -168,6 +181,7 @@ func (r *runtimeSvc) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSand
 	}
 	id := r.nextID("sandbox")
 	r.mu.Unlock()
+	defer r.saveRuntime()
 	addr, err := r.node.allocate(id)
 	if err != nil {
 		return nil, err
@@ -182,6 +196,7 @@ func (r *runtimeSvc) RunPodSandbox(_ context.Context, req *runtimeapi.RunPodSand
 	r.mu.Lock()
 	r.sboxes[id] = s
 	r.mu.Unlock()
+	r.saveSandbox(s)
 	if s.meta != nil {
 		log.Printf("sandbox %s: pod %s/%s at %s, uid %d", id, s.meta.Namespace, s.meta.Name, addr.ip, addr.uid)
 	}
@@ -252,6 +267,7 @@ func (r *runtimeSvc) StopPodSandbox(_ context.Context, req *runtimeapi.StopPodSa
 	if ok && s.ready {
 		r.node.release(s.id)
 		s.ready = false
+		r.saveSandbox(s)
 	}
 	return &runtimeapi.StopPodSandboxResponse{}, nil
 }
@@ -365,10 +381,17 @@ func (r *runtimeSvc) CreateContainer(_ context.Context, req *runtimeapi.CreateCo
 		cpuPeriod: cfg.GetLinux().GetResources().GetCpuPeriod(),
 		tty:       cfg.Tty, openStdin: cfg.Stdin, stdinOnce: cfg.StdinOnce,
 		state: runtimeapi.ContainerState_CONTAINER_CREATED, made: time.Now().UnixNano(),
+		dir: r.containerDir(s.id, id),
+	}
+	c.stdoutPath, c.stderrPath = filepath.Join(c.dir, "stdout"), filepath.Join(c.dir, "stderr")
+	if err := os.MkdirAll(c.dir, 0o755); err != nil {
+		return nil, err
 	}
 	r.mu.Lock()
 	r.ctrs[id] = c
 	r.mu.Unlock()
+	r.saveContainer(c)
+	r.saveRuntime()
 	log.Printf("container %s: %s in %s, %v", id, cfg.GetMetadata().GetName(), s.id, argv)
 	return &runtimeapi.CreateContainerResponse{ContainerId: id}, nil
 }
@@ -416,11 +439,7 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 	if err := linkDevFiles(c.root, c.mounts); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(c.logPath), 0o755); err != nil {
-		return nil, err
-	}
-	logf, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
-	if err != nil {
+	if err := r.openLog(c); err != nil {
 		return nil, err
 	}
 
@@ -461,7 +480,52 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 			cmd.Path = filepath.Join(c.root, "bin", c.argv[0])
 		}
 	}
-	w := &criLog{f: logf}
+	if c.tty {
+		return r.startTerminal(c, s, cmd)
+	}
+
+	// Through the reaper, with output to files: see reap.go and tail.go.
+	spec := reapSpec{Path: cmd.Path, Argv: cmd.Args, Env: cmd.Env, Dir: cmd.Dir, Chroot: cmd.SysProcAttr.Chroot,
+		UID: -1, Stdout: c.stdoutPath, Stderr: c.stderrPath,
+		PidFile: filepath.Join(c.dir, "pid"), Exit: filepath.Join(c.dir, "exit")}
+	if cr := cmd.SysProcAttr.Credential; cr != nil {
+		spec.UID = int(cr.Uid)
+	}
+	_ = os.Remove(spec.Exit)
+	var stdinR *os.File
+	if c.openStdin {
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			c.clog.close()
+			return nil, err
+		}
+		stdinR, c.stdin = pr, pw
+	}
+	proc, pid, err := startReaper(c.dir, spec, stdinR)
+	if stdinR != nil {
+		stdinR.Close()
+	}
+	if err != nil {
+		c.clog.close()
+		return nil, fmt.Errorf("start %v: %w", c.argv, err)
+	}
+	c.mu.Lock()
+	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
+	c.pid, c.reaperPid = pid, proc.Pid
+	c.mu.Unlock()
+	r.saveContainer(c)
+	log.Printf("container %s: started pid %d (reaper %d) as uid %d at %s (stdin %v)", c.id, pid, proc.Pid, s.addr.uid, s.addr.ip, c.openStdin)
+	r.startWatchers(c)
+	go r.follow(c)
+	go r.waitReaper(c, proc)
+	return &runtimeapi.StartContainerResponse{}, nil
+}
+
+// startTerminal runs a `tty: true` container the old way: the runtime's own
+// child, on a pseudo-terminal the runtime holds. The terminal cannot outlive
+// the runtime, so neither can the container; a restarted runtime reports it
+// ended (state.go). Terminal containers are interactive, and short-lived.
+func (r *runtimeSvc) startTerminal(c *container, s *sandbox, cmd *exec.Cmd) (*runtimeapi.StartContainerResponse, error) {
 	c.cmd = cmd
 	outputs, err := c.startStdio(cmd.Start, func() {
 		// A terminal makes the process a session leader, which a process
@@ -470,84 +534,150 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 		cmd.SysProcAttr.Setsid, cmd.SysProcAttr.Setctty = true, true
 	})
 	if err != nil {
-		logf.Close()
+		c.clog.close()
 		return nil, fmt.Errorf("start %v: %w", c.argv, err)
 	}
 	c.mu.Lock()
 	c.state, c.started, c.done = runtimeapi.ContainerState_CONTAINER_RUNNING, time.Now().UnixNano(), make(chan struct{})
+	c.pid = cmd.Process.Pid
 	c.mu.Unlock()
-	log.Printf("container %s: started pid %d as uid %d at %s (tty %v, stdin %v)", c.id, cmd.Process.Pid, s.addr.uid, s.addr.ip, c.tty, c.openStdin)
-	if c.memLimit > 0 {
-		go r.watchMemory(c, cmd.Process.Pid)
-	}
-	if c.cpuQuota > 0 && c.cpuPeriod > 0 {
-		go r.throttleCPU(c, cmd.Process.Pid)
-	}
-
-	var streams sync.WaitGroup
-	for i, r := range outputs {
-		stream := "stdout"
-		if i == 1 {
-			stream = "stderr"
-		}
-		streams.Add(1)
-		go func(stream string, r io.Reader) { w.pump(stream, r, &c.fan); streams.Done() }(stream, r)
-	}
+	r.saveContainer(c)
+	log.Printf("container %s: started pid %d as uid %d at %s (tty)", c.id, c.pid, s.addr.uid, s.addr.ip)
+	r.startWatchers(c)
 	go func() {
-		streams.Wait()
-		err := cmd.Wait()
-		logf.Close()
-		c.mu.Lock()
-		c.state, c.finished = runtimeapi.ContainerState_CONTAINER_EXITED, time.Now().UnixNano()
-		c.exit = int32(cmd.ProcessState.ExitCode())
+		c.clog.pump("stdout", outputs[0], &c.fan)
+		_ = cmd.Wait()
+		rec := exitRecord{Code: int32(cmd.ProcessState.ExitCode()), Finished: time.Now().UnixNano()}
 		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			c.exit = 128 + int32(ws.Signal())
+			rec.Code = 128 + int32(ws.Signal())
 		}
-		// No message of the runtime's own: the kubelet fills an empty one
-		// from the container's termination-log file, and "exit status 3"
-		// here would be what the user reads instead of what the container
-		// wrote.
-		c.reason = "Completed"
-		if c.exit != 0 {
-			c.reason = "Error"
-		}
-		// The kubelet reads OOMKilled and backs the pod off as it would a
-		// cgroup kill; without it a memory-killed container looks like any
-		// other non-zero exit.
-		if c.oomKilled {
-			c.reason = "OOMKilled"
-		}
-		_ = err
-		close(c.done)
-		c.mu.Unlock()
-		unmountDev(c.root)
-		log.Printf("container %s: exited %d", c.id, c.exit)
+		r.finish(c, rec)
+		c.clog.close()
 	}()
 	return &runtimeapi.StartContainerResponse{}, nil
+}
+
+func (r *runtimeSvc) startWatchers(c *container) {
+	if c.memLimit > 0 {
+		go r.watchMemory(c, c.pid)
+	}
+	if c.cpuQuota > 0 && c.cpuPeriod > 0 {
+		go r.throttleCPU(c, c.pid)
+	}
+}
+
+// waitReaper waits for a container's reaper -- as its parent when this runtime
+// started it, by polling when it was adopted from an earlier one -- and records
+// how the container ended.
+func (r *runtimeSvc) waitReaper(c *container, proc *os.Process) {
+	if proc != nil {
+		_, _ = proc.Wait()
+	} else {
+		waitExit(c.reaperPid)
+	}
+	rec, ok := readExit(filepath.Join(c.dir, "exit"))
+	if !ok {
+		// The reaper went without saying: it was killed. Make sure the
+		// container went with it.
+		if alive(c.pid) {
+			_ = syscall.Kill(-c.pid, syscall.SIGKILL)
+		}
+		rec = exitRecord{Code: 255, Finished: time.Now().UnixNano()}
+	}
+	r.finish(c, rec)
+}
+
+// finish records a container's end, once.
+func (r *runtimeSvc) finish(c *container, rec exitRecord) {
+	c.mu.Lock()
+	if c.state == runtimeapi.ContainerState_CONTAINER_EXITED {
+		c.mu.Unlock()
+		return
+	}
+	c.state, c.finished, c.exit = runtimeapi.ContainerState_CONTAINER_EXITED, rec.Finished, rec.Code
+	// No message of the runtime's own: the kubelet fills an empty one from the
+	// container's termination-log file, and "exit status 3" here would be what
+	// the user reads instead of what the container wrote.
+	c.reason = "Completed"
+	if c.exit != 0 {
+		c.reason = "Error"
+	}
+	// The kubelet reads OOMKilled and backs the pod off as it would a cgroup
+	// kill; without it a memory-killed container looks like any other exit.
+	if c.oomKilled {
+		c.reason = "OOMKilled"
+	}
+	close(c.done)
+	c.mu.Unlock()
+	unmountDev(c.root)
+	r.saveContainer(c)
+	log.Printf("container %s: exited %d", c.id, rec.Code)
+}
+
+// openLog opens the kubelet's log file for a container, appending.
+func (r *runtimeSvc) openLog(c *container) error {
+	if err := os.MkdirAll(filepath.Dir(c.logPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	c.clog = &criLog{f: f, path: c.logPath}
+	return nil
 }
 
 // criLog writes a container's output in the format the kubelet reads back for
 // `kubectl logs`: "<RFC3339Nano> <stream> F <line>".
 type criLog struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	f    *os.File
+	path string
+}
+
+// reopen starts a new file at the same path, after the kubelet has rotated the
+// old one away (ReopenContainerLog).
+func (l *criLog) reopen() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	if l.f != nil {
+		l.f.Close()
+	}
+	l.f = f
+	return nil
+}
+
+func (l *criLog) close() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f != nil {
+		l.f.Close()
+		l.f = nil
+	}
 }
 
 func (c *container) stop(timeout time.Duration) {
 	c.mu.Lock()
-	cmd, done, running := c.cmd, c.done, c.state == runtimeapi.ContainerState_CONTAINER_RUNNING
+	pid, done, running := c.pid, c.done, c.state == runtimeapi.ContainerState_CONTAINER_RUNNING
 	c.mu.Unlock()
-	if !running || cmd == nil {
+	if !running || pid <= 0 {
 		return
 	}
 	// SIGCONT first: the CPU throttle may have the group SIGSTOP'd, and a
 	// stopped process does not act on SIGTERM until it is continued.
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT)
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	_ = syscall.Kill(-pid, syscall.SIGCONT)
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		<-done
 	}
 }
@@ -581,6 +711,7 @@ func (r *runtimeSvc) RemoveContainer(_ context.Context, req *runtimeapi.RemoveCo
 			return nil, fmt.Errorf("container %s: %s is still mounted", c.id, c.root)
 		}
 		_ = os.RemoveAll(c.root)
+		_ = os.RemoveAll(c.dir)
 	}
 	return &runtimeapi.RemoveContainerResponse{}, nil
 }
@@ -647,6 +778,9 @@ func (r *runtimeSvc) UpdateRuntimeConfig(_ context.Context, req *runtimeapi.Upda
 	if err := r.node.setPodCIDR(req.GetRuntimeConfig().GetNetworkConfig().GetPodCidr()); err != nil {
 		return nil, err
 	}
+	// Saved: the kubelet sends this once, when the CIDR changes, and would not
+	// send it again to a restarted runtime.
+	r.saveRuntime()
 	return &runtimeapi.UpdateRuntimeConfigResponse{}, nil
 }
 
@@ -654,7 +788,21 @@ func (r *runtimeSvc) RuntimeConfig(_ context.Context, _ *runtimeapi.RuntimeConfi
 	return &runtimeapi.RuntimeConfigResponse{}, nil
 }
 
-func (r *runtimeSvc) ReopenContainerLog(_ context.Context, _ *runtimeapi.ReopenContainerLogRequest) (*runtimeapi.ReopenContainerLogResponse, error) {
+// ReopenContainerLog is the kubelet's log rotation: it has renamed the file,
+// and wants writing to carry on in a new one at the old path.
+func (r *runtimeSvc) ReopenContainerLog(_ context.Context, req *runtimeapi.ReopenContainerLogRequest) (*runtimeapi.ReopenContainerLogResponse, error) {
+	r.mu.Lock()
+	c, ok := r.ctrs[req.ContainerId]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("container %q not found", req.ContainerId)
+	}
+	if c.clog == nil {
+		return nil, fmt.Errorf("container %s is not running", req.ContainerId)
+	}
+	if err := c.clog.reopen(); err != nil {
+		return nil, err
+	}
 	return &runtimeapi.ReopenContainerLogResponse{}, nil
 }
 
@@ -664,7 +812,7 @@ func (r *runtimeSvc) ReopenContainerLog(_ context.Context, _ *runtimeapi.ReopenC
 // what a Linux runtime does for one whose cgroup is gone.
 func (r *runtimeSvc) containerStats(c *container) *runtimeapi.ContainerStats {
 	c.mu.Lock()
-	state, cmd := c.state, c.cmd
+	state, pid := c.state, c.pid
 	c.mu.Unlock()
 	now := time.Now().UnixNano()
 	stats := &runtimeapi.ContainerStats{
@@ -674,10 +822,10 @@ func (r *runtimeSvc) containerStats(c *container) *runtimeapi.ContainerStats {
 		Cpu:    &runtimeapi.CpuUsage{Timestamp: now},
 		Memory: &runtimeapi.MemoryUsage{Timestamp: now},
 	}
-	if state == runtimeapi.ContainerState_CONTAINER_RUNNING && cmd != nil && cmd.Process != nil {
-		// The pid is the process group's id: StartContainer sets Setpgid, so
-		// the container leads its own group and everything it spawns is in it.
-		if cpu, mem, ok := procStats(cmd.Process.Pid); ok {
+	if state == runtimeapi.ContainerState_CONTAINER_RUNNING && pid > 0 {
+		// The pid is the process group's id: the container leads its own group
+		// (Setpgid, in the reaper), and everything it spawns is in it.
+		if cpu, mem, ok := procStats(pid); ok {
 			stats.Cpu.UsageCoreNanoSeconds = &runtimeapi.UInt64Value{Value: cpu}
 			stats.Memory.WorkingSetBytes = &runtimeapi.UInt64Value{Value: mem}
 			stats.Memory.UsageBytes = &runtimeapi.UInt64Value{Value: mem}

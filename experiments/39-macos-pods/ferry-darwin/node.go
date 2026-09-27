@@ -152,9 +152,8 @@ func newNode(state, iface, shim, clusterCIDR string) (*node, error) {
 	if err := n.prepareOS(); err != nil {
 		return nil, err
 	}
-	if err := n.startPF(); err != nil {
-		return nil, err
-	}
+	// pf is started by main once the runtime's state is restored (state.go):
+	// the anchor is written from n.pods, which is empty until then.
 	return n, nil
 }
 

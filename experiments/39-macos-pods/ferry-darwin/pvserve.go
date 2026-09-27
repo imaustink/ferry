@@ -20,12 +20,28 @@ package main
 // root can bind -- the kernel's NFS client, mounting with resvport -- and a
 // pod's processes are not root. Without it, a pod on a shared machine could
 // speak NFS from userspace to 127.0.0.1 and read any claim mounted there.
+//
+// Each server is a process of its own, `ferry-darwin pvserve DIR`, not a
+// goroutine of the runtime's. In the runtime, the servers died with it and
+// every pod with a claim was left with a mount whose server was gone -- a hard
+// NFS mount, so anything touching the claim hung. Out of it, they outlive a
+// restart; the runtime keeps a record of each (dir, port, pid) and a restarted
+// one finds them there, still serving the mounts the pods already have.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5/osfs"
 	nfs "github.com/willscott/go-nfs"
@@ -33,36 +49,108 @@ import (
 )
 
 type pvServers struct {
+	dir    string // where the records are kept
 	mu     sync.Mutex
-	byPath map[string]int // directory -> loopback port
+	byPath map[string]pvRecord // served directory -> its server
+}
+
+type pvRecord struct {
+	Dir  string `json:"dir"`
+	Port int    `json:"port"`
+	Pid  int    `json:"pid"`
+	Boot string `json:"boot"` // a record from an earlier boot names a pid that is not ours
+}
+
+func (p *pvServers) recordPath(dir string) string {
+	sum := sha256.Sum256([]byte(dir))
+	return filepath.Join(p.dir, hex.EncodeToString(sum[:8])+".json")
+}
+
+// load finds the servers an earlier runtime started that are still running.
+func (p *pvServers) load() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.byPath = map[string]pvRecord{}
+	_ = os.MkdirAll(p.dir, 0o755)
+	boot := bootSession()
+	recs, _ := filepath.Glob(filepath.Join(p.dir, "*.json"))
+	for _, path := range recs {
+		var rec pvRecord
+		if b, err := os.ReadFile(path); err != nil || json.Unmarshal(b, &rec) != nil ||
+			rec.Boot != boot || !isOurs(rec.Pid, "pvserve") {
+			_ = os.Remove(path)
+			continue
+		}
+		p.byPath[rec.Dir] = rec
+	}
+	if len(p.byPath) > 0 {
+		log.Printf("volumes: %d PersistentVolume servers still running", len(p.byPath))
+	}
 }
 
 // portFor serves dir over NFS on 127.0.0.1, once, and says where.
 func (p *pvServers) portFor(dir string) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if port, ok := p.byPath[dir]; ok {
-		return port, nil
+	if rec, ok := p.byPath[dir]; ok && alive(rec.Pid) {
+		return rec.Port, nil
 	}
-	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	self, err := os.Executable()
 	if err != nil {
 		return 0, err
 	}
-	ln := reservedOnly{tcp}
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		return 0, err
+	}
+	defer rd.Close()
+	logf, _ := os.OpenFile(strings.TrimSuffix(p.recordPath(dir), ".json")+".log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	cmd := exec.Command(self, "pvserve", dir)
+	cmd.Stdout, cmd.Stderr = logf, logf
+	cmd.ExtraFiles = []*os.File{wr}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // outlives the runtime
+	if err := cmd.Start(); err != nil {
+		wr.Close()
+		return 0, err
+	}
+	wr.Close()
+	if logf != nil {
+		logf.Close()
+	}
+	buf := make([]byte, 256)
+	n, _ := rd.Read(buf)
+	msg := strings.TrimSpace(string(buf[:n]))
+	portStr, ok := strings.CutPrefix(msg, "ok ")
+	port, err := strconv.Atoi(portStr)
+	if !ok || err != nil {
+		_ = cmd.Wait()
+		return 0, fmt.Errorf("serving %s: %s", dir, msg)
+	}
+	go func() { _ = cmd.Wait() }() // reaped if it ever ends while we are here
+	rec := pvRecord{Dir: dir, Port: port, Pid: cmd.Process.Pid, Boot: bootSession()}
+	p.byPath[dir] = rec
+	saveJSON(p.recordPath(dir), rec)
+	log.Printf("volumes: serving %s over NFS on 127.0.0.1:%d (pid %d)", dir, port, rec.Pid)
+	return port, nil
+}
+
+// runPVServer is `ferry-darwin pvserve DIR`: one PersistentVolume's server. It
+// reports "ok <port>" on fd 3 once it is listening.
+func runPVServer(dir string) {
+	report := os.NewFile(3, "report")
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(report, "err %v\n", err)
+		os.Exit(1)
+	}
 	fs := osfs.New(dir, osfs.WithBoundOS())
 	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(fs), 4096)
-	go func() {
-		if err := nfs.Serve(ln, handler); err != nil {
-			log.Printf("volumes: the NFS server for %s stopped: %v", dir, err)
-		}
-	}()
-	port := tcp.Addr().(*net.TCPAddr).Port
-	if p.byPath == nil {
-		p.byPath = map[string]int{}
+	fmt.Fprintf(report, "ok %d\n", tcp.Addr().(*net.TCPAddr).Port)
+	report.Close()
+	if err := nfs.Serve(reservedOnly{tcp}, handler); err != nil {
+		log.Printf("volumes: the NFS server for %s stopped: %v", dir, err)
+		os.Exit(1)
 	}
-	p.byPath[dir] = port
-	log.Printf("volumes: serving %s over NFS on 127.0.0.1:%d", dir, port)
-	return port, nil
 }
 
 // mountPV mounts a PersistentVolume directory at target through its server.

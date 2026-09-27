@@ -18,6 +18,14 @@ package main
 #include <sys/resource.h>
 #include <mach/mach_time.h>
 #include <stdlib.h>
+#include <fcntl.h>
+
+// punchHole frees the blocks of [off, off+len) in an open file, which reads as
+// zeros afterwards, without moving its size or anyone's offset in it.
+static int punchHole(int fd, long long off, long long len) {
+    struct fpunchhole p = {0, 0, off, len};
+    return fcntl(fd, F_PUNCHHOLE, &p);
+}
 
 // sumPgrp sums CPU (nanoseconds) and memory (bytes) over process group pgid,
 // and returns how many processes it found, or a negative number on error.
@@ -52,6 +60,16 @@ static int sumPgrp(int pgid, unsigned long long *cpu, unsigned long long *mem) {
 }
 */
 import "C"
+
+import "fmt"
+
+// punchHole frees [off, off+n) of f's blocks (tail.go).
+func punchHole(fd uintptr, off, n int64) error {
+	if C.punchHole(C.int(fd), C.longlong(off), C.longlong(n)) != 0 {
+		return fmt.Errorf("F_PUNCHHOLE failed")
+	}
+	return nil
+}
 
 // procStats is cumulative CPU nanoseconds and current memory bytes for the
 // process group pgid, or ok=false when the group is gone.

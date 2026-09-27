@@ -63,6 +63,56 @@ func normalize(ref string) (domain, repo, tag string) {
 	return
 }
 
+// imageRecord is an image's metadata beside its rootfs, so a restarted
+// runtime still knows the images on disk -- and the image every running
+// container was made from -- without pulling them again.
+type imageRecord struct {
+	ID         string   `json:"id"`
+	Refs       []string `json:"refs"`
+	Size       uint64   `json:"size"`
+	Rootfs     string   `json:"rootfs"`
+	Entrypoint []string `json:"entrypoint"`
+	Cmd        []string `json:"cmd"`
+	Env        []string `json:"env"`
+	Workdir    string   `json:"workdir"`
+}
+
+func (s *imageSvc) add(img *image) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.images[img.id] = img
+	for _, r := range img.refs {
+		s.images[r] = img
+	}
+}
+
+// load reads back every image on disk.
+func (s *imageSvc) load() {
+	recs, _ := filepath.Glob(filepath.Join(s.dir, "*", "image.json"))
+	for _, p := range recs {
+		var ir imageRecord
+		if b, err := os.ReadFile(p); err != nil || json.Unmarshal(b, &ir) != nil {
+			continue
+		}
+		s.add(&image{id: ir.ID, refs: ir.Refs, size: ir.Size, rootfs: ir.Rootfs,
+			entrypoint: ir.Entrypoint, cmd: ir.Cmd, env: ir.Env, workdir: ir.Workdir})
+	}
+	if len(recs) > 0 {
+		log.Printf("image: %d on disk", len(recs))
+	}
+}
+
+// byID is the image with this id, or a stand-in carrying only the id when it
+// has since been removed: a container's status names its image either way.
+func (s *imageSvc) byID(id string) *image {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if img, ok := s.images[id]; ok {
+		return img
+	}
+	return &image{id: id}
+}
+
 func (s *imageSvc) lookup(ref string) *image {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,12 +225,10 @@ func (s *imageSvc) PullImage(_ context.Context, req *runtimeapi.PullImageRequest
 			return nil, fmt.Errorf("layer %s: %w", l.Digest, err)
 		}
 	}
-	s.mu.Lock()
-	s.images[img.id] = img
-	for _, r := range img.refs {
-		s.images[r] = img
-	}
-	s.mu.Unlock()
+	s.add(img)
+	saveJSON(filepath.Join(filepath.Dir(img.rootfs), "image.json"), imageRecord{
+		ID: img.id, Refs: img.refs, Size: img.size, Rootfs: img.rootfs,
+		Entrypoint: img.entrypoint, Cmd: img.cmd, Env: img.env, Workdir: img.workdir})
 	log.Printf("image: pulled %s (%s, %d bytes) in %s", ref, img.id[:19], img.size, time.Since(start).Round(time.Millisecond))
 	return &runtimeapi.PullImageResponse{ImageRef: img.id}, nil
 }

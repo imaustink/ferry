@@ -100,8 +100,14 @@ func (l *criLog) pump(stream string, r io.Reader, fan *fanout) {
 }
 
 func (l *criLog) write(stream, tag, text string) {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.f == nil {
+		return
+	}
 	fmt.Fprintf(l.f, "%s %s %s %s\n", time.Now().Format(time.RFC3339Nano), stream, tag, text)
 }
 

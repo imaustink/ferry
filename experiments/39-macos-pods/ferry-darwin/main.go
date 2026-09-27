@@ -25,6 +25,18 @@ import (
 )
 
 func main() {
+	// The same binary is each container's reaper (reap.go) and each
+	// PersistentVolume's server (pvserve.go): processes that outlive the runtime.
+	if len(os.Args) > 2 {
+		switch os.Args[1] {
+		case "reap":
+			runReaper(os.Args[2])
+			return
+		case "pvserve":
+			runPVServer(os.Args[2])
+			return
+		}
+	}
 	endpoint := flag.String("endpoint", "/private/var/ferry/node/cri.sock", "unix socket to serve CRI on")
 	state := flag.String("state", "/private/var/ferry/darwin", "runtime state: the OS base, images, pod roots")
 	mirror := flag.String("mirror", "", "ferry-registry to pull through, e.g. http://192.168.1.29:45060")
@@ -79,6 +91,17 @@ func main() {
 		debugAnnotations: *debugAnns}
 	if *debugAnns {
 		log.Printf("debug annotations are ON: any pod here can remove its own isolation")
+	}
+	// What an earlier ferry-darwin left: images, sandboxes, containers still
+	// running under their reapers. Before pf is loaded, so a pod's address is
+	// never without its rules, and before the CRI is served, so the kubelet
+	// never sees an empty runtime and makes its pods a second time.
+	images.load()
+	rt.pv.dir = filepath.Join(*state, "pv")
+	rt.pv.load()
+	rt.restore()
+	if err := n.startPF(); err != nil {
+		log.Fatalf("pf: %v", err)
 	}
 	if *api != "" {
 		rt.services = &serviceTable{api: *api, ca: *ca, cert: *clientCert, rt: rt,
