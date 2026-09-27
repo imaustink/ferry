@@ -210,7 +210,7 @@ with two more classes for the same two modes:
 | `runtimeClassName` | the pod is | worth it for |
 |---|---|---|
 | `ferry-macos-vm` | a macOS VM of its own, with its own XNU kernel | a job that must be root, load a kext, or change system settings |
-| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling |
+| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling — **trusted code only** (see the warning below) |
 
 Both use the handler `ferry-darwin` and a darwin image. As with the Linux
 classes, the class carries the `nodeSelector` and toleration, so
@@ -229,6 +229,26 @@ spec:
 
 On a Deployment, Job or any object that makes pods it goes in the pod template,
 exactly as `ferry-shared` does above.
+
+> ⚠️ **`ferry-macos-shared` is not a security boundary — run only code you
+> trust on it.** Darwin has no namespaces and no cgroups, so a shared-kernel
+> macOS pod is not a container in the Linux sense. It is a per-pod uid, a
+> `chroot` for a private `/`, a Seatbelt profile and pf rules — assembled on a
+> guest that must run with **SIP disabled**, i.e. with the kernel's own
+> protections turned off. The `chroot` hides the filesystem and nothing else,
+> and it holds only because the pod is not root; there is no VM between one pod
+> and the next, and no hardened kernel beneath them. A pod that reaches root, or
+> a kernel bug, is not contained the way a VM contains it. Its limits are soft,
+> too: memory and CPU are enforced by polling (a poll-and-kill OOM watcher, a
+> `SIGSTOP`/`SIGCONT` duty cycle), not a hard barrier, so a brief burst can
+> overshoot before it is caught.
+>
+> For anything untrusted, privileged, or hostile — CI running third-party pull
+> requests, a sandbox for user code, anything you would not run as yourself on
+> your own Mac — use **`ferry-macos-vm`** instead, where each pod is its own
+> single-use XNU kernel behind a hypervisor. That is the same isolation
+> `ferry-vm` gives a Linux pod; `ferry-macos-shared` is closer to running the
+> workload as another user on one machine.
 
 Three things set macOS pods apart from the Linux classes:
 
@@ -252,10 +272,12 @@ Three things set macOS pods apart from the Linux classes:
   until a slot frees. Getting past two is exactly what `ferry-macos-shared`
   buys.
 
-So the choice mirrors `ferry-vm` vs `ferry-shared`: `ferry-macos-vm` is a
-hypervisor boundary between pods (root, its own kernel, single-use);
-`ferry-macos-shared` is a uid and a chroot on a shared kernel (cheaper, denser,
-and not a boundary against the host kernel).
+So the choice mirrors `ferry-vm` vs `ferry-shared`, but the gap is wider: with
+no namespaces or cgroups to build on, `ferry-macos-shared` is a uid and a chroot
+on a shared kernel — cheaper and denser, and **not a boundary against the host
+kernel or the other pods on it**. `ferry-macos-vm` is a hypervisor boundary
+between pods (root, its own kernel, single-use), and the only one of the two you
+should hand code you do not trust.
 
 ### Building the image
 
@@ -277,7 +299,9 @@ sudo ./inject.sh .cache/golden                      # put the guest agent on it 
 
 That much already boots a macOS VM. For **`ferry-macos-shared`** (mode 2), the
 per-pod `chroot` needs **SIP off** in the guest — a one-time manual step in
-recoveryOS. Do it on a copy so the golden stays pristine:
+recoveryOS. This is also why a shared-macos node is not a security boundary
+([above](#macos-pods)): its kernel runs with SIP disabled. Do it on a copy so
+the golden stays pristine:
 
 ```sh
 cp -Rc .cache/golden .cache/golden-sipoff           # APFS clone, instant
