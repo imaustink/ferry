@@ -4,10 +4,11 @@
 #   ./release/publish.sh --version v0.1.0
 #
 # Releases are built here rather than in CI, because building them needs a Mac
-# on macOS 26 with Swift 6.4 and a Docker daemon for the guest kernel, and
-# nothing hosted offers that combination today. The consequence worth naming:
-# the tarball is whatever this Mac had built, so this script refuses to publish
-# one whose VERSION does not match the tag, and refuses a dirty tree.
+# on macOS 26 with Swift 6.4 and a running ferry cluster for the guest kernel
+# and node image builds, and nothing hosted offers that combination today. The
+# consequence worth naming: the tarball is whatever this Mac had built, so
+# this script refuses to publish one whose VERSION does not match the tag, and
+# refuses a dirty tree.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
