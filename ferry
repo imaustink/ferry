@@ -631,8 +631,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
 
   ferry doctor      check that this machine can run ferry
   ferry version     what this is, and what Kubernetes it runs
-  ferry kernel      build a guest kernel with NAT support (slow, needs docker)
-  ferry node-image  build the mode 2 node image (slow, needs docker)
+  ferry kernel      build a guest kernel with NAT support (slow, needs 'ferry up' first)
+  ferry node-image  build the mode 2 node image (slow, needs 'ferry up' first)
   ferry build       build the kubelet, the runtime, and fetch the guest kernel
                     --kubernetes-version <vX.Y.Z> to pick a version, --rebuild to force
   ferry init        choose what this cluster is for, and write its config file
@@ -1042,8 +1042,9 @@ cmd_build() {
   echo
   # Mode 2: the controller that turns a Machine into a node, and the tool that
   # makes the VM for it. Both are quick. The node *image* they boot is not, and
-  # is built separately by 'ferry node-image' -- it needs Docker, which is the
-  # same bargain 'ferry kernel' makes.
+  # is built separately by 'ferry node-image' -- it builds itself with
+  # 'ferry image build', which needs a running cluster, the same bargain
+  # 'ferry kernel' makes.
   echo "==> ferry-machined"
   ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
   echo "==> $here/bin/ferry-machined"
@@ -1085,31 +1086,31 @@ cmd_build() {
   echo
   bold "built -- run: ferry up"
   if [ ! -d "$NODE_IMAGE_LAYOUT" ]; then
-    echo "  For mode 2 machines as well: ferry node-image  (slow, needs docker)"
+    echo "  For mode 2 machines as well: ferry node-image  (slow, needs 'ferry up' first)"
   fi
 }
 
 # The mode 2 node image: a Linux userspace with containerd, a kubelet and the
-# CNI plugins, built by Docker and exported as an OCI layout.
+# CNI plugins, built with 'ferry image build' and exported as an OCI layout.
 #
 # Separate from 'ferry build' for the same reason 'ferry kernel' is: it needs
-# Docker and it takes minutes, and neither is worth imposing on someone who only
-# wants mode 1. A release carries the result, so the Mac installing one needs
-# none of this.
+# a running cluster to build against and it takes minutes, and neither is
+# worth imposing on someone who only wants mode 1. A release carries the
+# result, so the Mac installing one needs none of this.
 cmd_node_image() {
   if is_release; then
     if release_has_node_image; then
       bad "this is an installed ferry $(ferry_release_version); it already carries the node image"
     else
       bad "this ferry $(ferry_release_version) was packaged without a node image, and a release cannot build one"
-      echo "    It needs Docker and a Kubernetes staging step that a release does not carry."
+      echo "    It needs a running cluster and a Kubernetes staging step that a release does not carry."
       echo "    Install a release built with one, or build ferry from source:"
     fi
     echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry node-image"
     return 1
   fi
-  command -v docker >/dev/null || { bad "docker is required to build the node image"; return 1; }
-  docker info >/dev/null 2>&1 || { bad "docker is installed but not running"; return 1; }
+  command -v buildctl >/dev/null || { bad "buildctl is required to build the node image (brew install buildkit)"; return 1; }
+  [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up -- 'ferry image build' needs a running cluster to build against"; return 1; }
 
   bold "building the mode 2 node image"
   # The node's kubelet has to match the control plane it joins, so the staging
@@ -2267,7 +2268,7 @@ machines_ready() {
       echo "    This release was packaged without one. Mode 2 needs a release built"
       echo "    with 'ferry node-image'; mode 1 is unaffected."
     else
-      echo "    Build it: ferry node-image   (slow, needs docker)"
+      echo "    Build it: ferry node-image   (slow, needs 'ferry up' first)"
     fi
     return 1; }
   # Unpacked from the layout the release carries, and re-unpacked when that
@@ -4756,6 +4757,7 @@ ferry_image_build_darwin() {
 
 cmd_image_build() {
   local tag="" dockerfile="" context="" no_cache="" progress=auto os=linux
+  local export_path="" no_load=""
   local -a build_args=()
 
   while [ $# -gt 0 ]; do
@@ -4785,14 +4787,25 @@ cmd_image_build() {
       --os=*) os="${1#*=}"; shift ;;
       --no-cache) no_cache=1; shift ;;
       --quiet|-q) progress=quiet; shift ;;
+      --export)
+        [ $# -ge 2 ] || { bad "--export needs a path to write the OCI tarball to"; return 2; }
+        export_path="$2"; shift 2 ;;
+      --no-load) no_load=1; shift ;;
       -h|--help)
         echo "usage: ferry image build [-t <name:tag>] [-f <Dockerfile>] [--build-arg K=V]"
-        echo "                         [--os linux|darwin] [--no-cache] [--quiet] [<context>]"
+        echo "                         [--os linux|darwin] [--no-cache] [--quiet]"
+        echo "                         [--export <path>] [--no-load] [<context>]"
         echo "       ferry image build --stop"
         echo
-        echo "  --os darwin  package a macOS image (FROM scratch + COPY; RUN runs in a macOS VM"
-        echo "               cloned from \$FERRY_MAC_IMAGE, if the Dockerfile has one)."
-        echo "               See docs/RUNTIMES.md#building-the-image"
+        echo "  --os darwin    package a macOS image (FROM scratch + COPY; RUN runs in a macOS"
+        echo "                 VM cloned from \$FERRY_MAC_IMAGE, if the Dockerfile has one)."
+        echo "                 See docs/RUNTIMES.md#building-the-image"
+        echo "  --export PATH  also write the built OCI image as a tarball at PATH -- the same"
+        echo "                 format 'docker buildx build -o type=oci,dest=PATH' produces, for"
+        echo "                 anything that wants the tar itself rather than a running pod's"
+        echo "                 image store (kernel/build-kernel.sh, ferry node-image)."
+        echo "  --no-load      skip loading the image into this cluster's store; only useful"
+        echo "                 with --export, for a build whose result is not meant to run here"
         return 0 ;;
       -*) bad "unknown flag $1"; return 2 ;;
       *)  context="$1"; shift ;;
@@ -4810,6 +4823,7 @@ cmd_image_build() {
     darwin)
       [ ${#build_args[@]} -eq 0 ] || warn "--build-arg is ignored for --os darwin (ARG is not supported)"
       [ -z "$no_cache" ] || warn "--no-cache is ignored for --os darwin (the layout is rebuilt each time)"
+      [ -z "$export_path" ] || warn "--export is ignored for --os darwin (it already writes an OCI layout directly)"
       ferry_image_build_darwin "$tag" "$dockerfile" "$context"; return $? ;;
     *) bad "--os $os is not supported: use linux or darwin"; return 2 ;;
   esac
@@ -4853,11 +4867,27 @@ cmd_image_build() {
 
   buildctl "${args[@]}" || { bad "build failed"; return 1; }
 
-  # Straight into the image store ferry-cri serves pods from, by the same path
-  # `ferry image load` uses -- so the image is present before the next `kubectl
-  # apply`, with no registry in between.
+  # --export copies the tarball buildctl just wrote before the trap above
+  # removes it on return -- the same bytes 'ferry image load' would read,
+  # handed to whatever asked for the tar itself instead of a running pod's
+  # image store.
+  if [ -n "$export_path" ]; then
+    mkdir -p "$(dirname "$export_path")"
+    cp "$layout" "$export_path" || { bad "built, but could not write $export_path"; return 1; }
+  fi
+
+  if [ -n "$no_load" ]; then
+    ok "built $tag"
+    [ -n "$export_path" ] && echo "    tar: $export_path"
+    return 0
+  fi
+
+  # Straight into the image store ferry-cri serves pods from, by the same
+  # path `ferry image load` uses -- so the image is present before the next
+  # `kubectl apply`, with no registry in between.
   cmd_image_load "$layout" >/dev/null || { bad "built, but could not load it"; return 1; }
   ok "built and loaded $tag"
+  [ -n "$export_path" ] && echo "    tar: $export_path"
   echo
   echo "    image: $tag"
   echo "    Pods must not try to fetch it: set"
@@ -5439,7 +5469,7 @@ cmd_machines_status() {
     bad "no node image -- this release was packaged without one"
     echo "      mode 2 needs a release built with it; mode 1 is unaffected"
   else
-    bad "no node image -- ferry node-image   (slow, needs docker)"
+    bad "no node image -- ferry node-image   (slow, needs 'ferry up' first)"
   fi
   [ -f "$NODE_DISK" ] && ok "node disk $NODE_DISK ($(du -h "$NODE_DISK" | awk '{print $1}') used)" \
     || echo "  node disk not unpacked yet; the first 'machines enable' does it"
@@ -6392,7 +6422,7 @@ case "${1:-}" in
               # or directory" -- while usage() still advertises it.
               if is_release; then
                 bad "this is an installed ferry $(ferry_release_version); it already carries the guest kernel"
-                echo "    Building one needs a checkout and Docker:"
+                echo "    Building one needs a checkout and a running cluster:"
                 echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry kernel"
                 exit 1
               fi

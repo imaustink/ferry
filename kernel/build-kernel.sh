@@ -15,12 +15,22 @@
 #
 # Apple's own kernel configuration does enable it -- CONFIG_NF_NAT,
 # CONFIG_NF_CONNTRACK, CONFIG_NF_NAT_MASQUERADE, CONFIG_NF_TABLES -- so this
-# builds that configuration rather than inventing one. The build runs in a Linux
-# container because it needs a cross toolchain; Apple drives it with their
-# `container` CLI, and Docker serves equally well.
+# builds that configuration rather than inventing one. The build runs in a
+# Linux container because it needs a cross toolchain, and ferry now hosts
+# that itself: the toolchain image is built with `ferry image build`, the
+# same buildkit-in-a-pod path `docs/RUNTIMES.md#building-an-image-without-docker`
+# documents, and the actual compile runs in a one-shot pod against this
+# directory's own .build/stage over a hostPath volume -- the pod equivalent
+# of `docker run -v`. Needs a running cluster (`ferry up`); nothing here
+# talks to Docker.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# The exact ferry this checkout builds with, not whatever version happens to
+# be on PATH -- an older installed release would not have --export/--no-load
+# on 'ferry image build', and cmd_kernel always execs this script from a
+# checkout's own $here/kernel, so the sibling ferry is always the right one.
+FERRY="${FERRY:-$here/../ferry}"
 CONTAINERIZATION_REF="${CONTAINERIZATION_REF:-0.45.0}"
 KERNEL_SOURCE="${KERNEL_SOURCE:-https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz}"
 # OUT and CONFIG_FRAGMENT build a variant without touching the kernel ferry
@@ -46,8 +56,20 @@ if [ -f "$out" ] && [ "${FORCE:-}" != "1" ]; then
   echo "==> $out was built from other patches or configuration; rebuilding"
 fi
 
-command -v docker >/dev/null || { echo "docker is required to build the kernel" >&2; exit 1; }
-docker info >/dev/null 2>&1 || { echo "docker is not running" >&2; exit 1; }
+[ -x "$FERRY" ] || { echo "$FERRY not found or not executable -- run this from a checkout" >&2; exit 1; }
+command -v buildctl >/dev/null || { echo "buildctl is required to build the kernel toolchain image (brew install buildkit)" >&2; exit 1; }
+command -v kubectl >/dev/null || { echo "kubectl is required to run the kernel build (brew install kubectl, or 'ferry doctor')" >&2; exit 1; }
+: "${KUBECONFIG:=$HOME/.ferry/admin.conf}"
+export KUBECONFIG
+kubectl get nodes >/dev/null 2>&1 || { echo "no cluster reachable -- run 'ferry up' first" >&2; exit 1; }
+
+# The pod that does the actual compiling needs real CPU, or it inherits a
+# pod's default 2 vCPUs and takes hours over minutes -- the same sizing
+# lesson experiment 25 paid for with the buildkit builder. Half the Mac by
+# default, matching FERRY_BUILDER_CPUS' own default (docs/INSTALL.md).
+KERNEL_BUILD_CPUS="${KERNEL_BUILD_CPUS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
+[ "$KERNEL_BUILD_CPUS" -ge 2 ] || KERNEL_BUILD_CPUS=2
+KERNEL_BUILD_MEMORY="${KERNEL_BUILD_MEMORY:-8Gi}"
 
 mkdir -p "$work"
 
@@ -77,7 +99,7 @@ if [ ! -f "$work/source.tar.xz" ]; then
 fi
 
 echo "==> building the toolchain image"
-docker build -q -t ferry-kernel-build:1 "$src/image" >/dev/null
+"$FERRY" image build -t ferry-kernel-build:1 --quiet "$src/image"
 
 echo "==> compiling (this takes a while)"
 stage="$work/stage"
@@ -110,9 +132,68 @@ while IFS= read -r line; do
   printf '%s\n' "$line"
   [ "$line" = "$anchor" ] && printf '%s\n' "$hook"
 done < "$stage/build.sh" > "$stage/build-ferry.sh"
-docker run --rm -v "$stage:/kernel" -w /kernel \
-  -e TARGET_ARCH=arm64 -e LOCALVERSION=-ferry \
-  ferry-kernel-build:1 bash /kernel/build-ferry.sh
+
+# A pod in place of 'docker run -v'. hostPath is ferry's own bind mount --
+# what the pod writes into /kernel lands directly in $stage on the Mac, the
+# same round-trip-free arrangement -v gave. restartPolicy: Never and a
+# resources.limits are what make it a one-shot job sized for real work
+# instead of a pod's default 2 vCPUs / 512 MiB (docs/GAPS.md's Volumes and
+# images section covers hostPath support).
+pod="ferry-kernel-build-$$"
+trap 'kubectl delete pod "$pod" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+cat > "$work/pod.yaml" <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  labels: {app: ferry-kernel-build}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: build
+      image: ferry-kernel-build:1
+      imagePullPolicy: IfNotPresent
+      workingDir: /kernel
+      command: ["bash", "/kernel/build-ferry.sh"]
+      env:
+        - {name: TARGET_ARCH, value: "arm64"}
+        - {name: LOCALVERSION, value: "-ferry"}
+      resources:
+        limits: {cpu: "$KERNEL_BUILD_CPUS", memory: "$KERNEL_BUILD_MEMORY"}
+      volumeMounts:
+        - {name: kernel, mountPath: /kernel}
+  volumes:
+    - name: kernel
+      hostPath: {path: "$stage", type: Directory}
+YAML
+
+echo "==> compiling in a pod ($KERNEL_BUILD_CPUS vCPUs, $KERNEL_BUILD_MEMORY) -- this takes a while"
+kubectl apply -f "$work/pod.yaml" >/dev/null
+
+# kubectl logs -f blocks until the container exits and streams its output
+# meanwhile, the same visibility 'docker run' without -d already gave; it
+# just needs a container to attach to first.
+for _ in $(seq 120); do
+  phase="$(kubectl get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [ "$phase" = "Pending" ] || break
+  sleep 1
+done
+kubectl logs -f "$pod" --container=build 2>&1 || true
+
+# A pod's phase can lag a few seconds behind its container actually exiting
+# (logs -f returning is not the same event), so this polls briefly instead
+# of trusting a single read right after the stream ends.
+phase=""
+for _ in $(seq 30); do
+  phase="$(kubectl get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  case "$phase" in Succeeded|Failed) break ;; esac
+  sleep 1
+done
+if [ "$phase" != "Succeeded" ]; then
+  echo "kernel build pod ended $phase" >&2
+  kubectl describe pod "$pod" 2>&1 | tail -20 >&2
+  exit 1
+fi
 
 [ -f "$stage/vmlinux-arm64" ] || { echo "build produced no kernel" >&2; exit 1; }
 install -m 0644 "$stage/vmlinux-arm64" "$out"
