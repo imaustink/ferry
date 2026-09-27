@@ -705,9 +705,11 @@ git clone https://github.com/imaustink/ferry && cd ferry
 ```
 
 - Go 1.26+. `ferry-karpenter`'s module asks for 1.26.6.
-- Docker, for `ferry kernel` and `ferry node-image`. The guest kernel and mode
-  2's node image are the slow builds, and the reason a release is packaged on a
-  Mac rather than in CI.
+- `buildctl` (`brew install buildkit`) for `ferry kernel` and `ferry node-image`
+  -- both build themselves with `ferry image build`, against a running
+  cluster, so run `./ferry up` before either. The guest kernel and mode 2's
+  node image are still the slow builds, and the reason a release is packaged
+  on a Mac rather than in CI.
 - **Swift 6.2+, and 6.4 is what ferry is built with.** Use the same toolchain on
   every Mac in a cluster. Binaries are copied between machines, and two
   toolchains produce two builds that are only probably the same. A release
@@ -741,7 +743,11 @@ Containerization framework requires to build.
 ### Cutting a release
 
 ```sh
-./ferry build && ./ferry kernel && ./ferry node-image   # everything the tarball carries
+./ferry build && ./ferry up   # kubelet, runtime, guest kernel, then a cluster
+                               # to build the rest against
+./ferry kernel && ./ferry restart   # new kernel, then a restart so it's what
+                                     # ferry-cri actually boots pods on
+./ferry node-image             # everything else the tarball carries
 git tag -a v0.1.0 -m "..." && git push origin v0.1.0
 ./release/build.sh --version v0.1.0
 ./release/publish.sh --version v0.1.0      # a draft; --publish to go live

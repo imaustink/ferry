@@ -86,16 +86,19 @@ over SSH.
 
 ### Build from source
 
-For changing ferry. Needs Swift 6.4, Go 1.26+, and Docker for the guest kernel
-and the mode 2 node image.
+For changing ferry. Needs Swift 6.4, Go 1.26+, and `buildctl`
+(`brew install buildkit`) for the guest kernel and the mode 2 node image --
+both build themselves with `ferry image build`, against a running cluster.
 
 ```sh
 git clone https://github.com/imaustink/ferry && cd ferry
 ./ferry doctor        # checks the toolchain, not just the machine
 ./ferry build         # kubelet, runtime, daemons, control plane, CNI
-./ferry kernel        # guest kernel with NAT support (slow, needs docker)
-./ferry node-image    # mode 2 node image (slow, needs docker)
-./ferry up
+./ferry up            # a cluster to build the rest against
+./ferry kernel        # guest kernel with NAT support (slow, needs 'ferry up' first)
+./ferry restart       # so this and every pod after it boots on the new kernel --
+                       # ferry-cri only reads the kernel path at its own startup
+./ferry node-image    # mode 2 node image (slow, needs 'ferry up' first)
 ```
 
 `ferry build` alone is enough for mode 1 with Services routed through a host
@@ -603,17 +606,19 @@ every existing cluster's pods land. Enabling is remembered per cluster, so
 
 The release ships the node image as an **OCI layout**, not as a disk. The first
 `ferry machines enable` unpacks it to `~/.ferry/node.ext4` (~400 MB) with
-`ferry-node`'s own unpacker, so the installing Mac does not need Docker. It
-unpacks again whenever the layout changes: on every upgrade to a release with a
-different node image, and after any `ferry node-image`. The ~400 MB is paid
-once per node image rather than once per Mac. Machines that already exist keep
-the disk they were given; delete and re-apply a `Machine` to move it onto a new
-image. Docker is only needed to *create* the layout, which happens on the
-machine cutting the release:
+`ferry-node`'s own unpacker, so the installing Mac does not need anything
+beyond what a release already carries. It unpacks again whenever the layout
+changes: on every upgrade to a release with a different node image, and after
+any `ferry node-image`. The ~400 MB is paid once per node image rather than
+once per Mac. Machines that already exist keep the disk they were given;
+delete and re-apply a `Machine` to move it onto a new image. A running
+cluster is only needed to *create* the layout, which happens on the machine
+cutting the release:
 
 ```sh
 ./ferry build         # adds ferry-machined, ferry-karpenter and ferry-node
-./ferry node-image    # the node image itself (slow, needs docker)
+./ferry up             # 'ferry node-image' builds itself with 'ferry image build'
+./ferry node-image    # the node image itself (slow, needs 'ferry up' first)
 ```
 
 A release can be built without it (`release/build.sh --without-node-image`); its

@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # Builds the node image and the tool that turns it into a bootable disk.
 #
-# Docker builds the image because that is the tooling everyone has; the image is
-# exported as an OCI layout and unpacked into an ext4 a VM boots from. It is
-# never run as a container.
+# The image is built with `ferry image build --export`, the same
+# buildkit-in-a-pod path docs/RUNTIMES.md#building-an-image-without-docker
+# documents, exported as an OCI layout tarball and unpacked into an ext4 a
+# VM boots from. It is never run as a container -- Docker's only past job
+# here was producing that same tarball, and ferry's own builder produces
+# byte-for-byte the same `type=oci` shape (buildkit under both).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
+
+# The exact ferry this checkout builds with, not whatever is on PATH --
+# cmd_node_image always execs this script from a checkout's own $here, so
+# the repo root two levels up is always the matching one.
+FERRY="${FERRY:-$here/../../ferry}"
+[ -x "$FERRY" ] || { echo "$FERRY not found or not executable -- run this from a checkout" >&2; exit 1; }
+command -v buildctl >/dev/null || { echo "buildctl is required (brew install buildkit)" >&2; exit 1; }
+command -v kubectl >/dev/null || { echo "kubectl is required (brew install kubectl, or 'ferry doctor')" >&2; exit 1; }
+: "${KUBECONFIG:=$HOME/.ferry/admin.conf}"
+export KUBECONFIG
+kubectl get nodes >/dev/null 2>&1 || { echo "no cluster reachable -- run 'ferry up' first" >&2; exit 1; }
 
 SWIFT="${SWIFT:-swift}"
 TAG="${TAG:-ferry-node:dev}"
@@ -52,21 +66,20 @@ SANDBOX_IMAGE="$(grep -E "^[[:space:]]*sandbox = '[^']+'" files/containerd-confi
   | head -1 | sed "s/.*sandbox = '//;s/'.*//")"
 [ -n "$SANDBOX_IMAGE" ] || { echo "no sandbox image pinned in files/containerd-config.toml"; exit 1; }
 echo "==> sandbox image $SANDBOX_IMAGE"
-docker pull --platform linux/arm64 -q "$SANDBOX_IMAGE" >/dev/null
-docker save -o stage/sandbox-image.tar "$SANDBOX_IMAGE"
+# No Dockerfile of its own to build -- just buildkit resolving and pulling
+# a FROM, the same first step every other build already does. --no-load
+# because this tar is for the node's own containerd to import at boot
+# (init.sh, `ctr images import`), not a pod on this dev cluster; --export
+# writes the OCI-layout tar ctr autodetects and imports same as a
+# docker-save tar.
+sandbox_ctx="$(mktemp -d "${TMPDIR:-/tmp}/ferry-sandbox-pull.XXXXXX")"
+printf 'FROM %s\n' "$SANDBOX_IMAGE" > "$sandbox_ctx/Dockerfile"
+"$FERRY" image build -f "$sandbox_ctx/Dockerfile" -t sandbox-pin:local \
+  --export stage/sandbox-image.tar --no-load --quiet "$sandbox_ctx"
+rm -rf "$sandbox_ctx"
 
-# The default buildx driver cannot export an OCI layout, which is the format
-# the image has to arrive in to be unpacked into a filesystem. A
-# docker-container builder can.
-BUILDER="${BUILDER:-ferry-node-builder}"
-if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
-  echo "==> creating buildx builder $BUILDER"
-  docker buildx create --name "$BUILDER" --driver docker-container >/dev/null
-fi
-
-echo "==> docker build ($TAG, linux/arm64)"
-docker buildx build --builder "$BUILDER" --platform linux/arm64 -t "$TAG" \
-  -o "type=oci,dest=$here/build/node-oci.tar" . >/dev/null
+echo "==> ferry image build ($TAG, linux/arm64)"
+"$FERRY" image build -t "$TAG" --export "$here/build/node-oci.tar" --no-load --quiet .
 
 rm -rf "$LAYOUT" && mkdir -p "$LAYOUT"
 tar xf "$here/build/node-oci.tar" -C "$LAYOUT"
