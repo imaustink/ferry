@@ -81,7 +81,8 @@ type container struct {
 	logOffsets             [2]int64
 	clog                   *criLog
 	// The container's pid, which is also its process group, and its reaper's
-	// (reap.go). A terminal container has no reaper: it is the runtime's child.
+	// (reap.go). Every container has a reaper, tty ones included, so all of
+	// them outlive a runtime restart.
 	pid, reaperPid int
 
 	mu        sync.Mutex
