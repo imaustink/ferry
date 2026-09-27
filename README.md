@@ -416,7 +416,7 @@ release/build.sh                     package a built checkout into a release tar
 release/publish.sh                   put one on GitHub Releases
 ferry                                the CLI: doctor, build, init, config, up, down,
                                      status, logs, addons, image, node, join, token,
-                                     upgrade, machines, service, uninstall
+                                     upgrade, machines, mac-image, service, uninstall
 lib/versions.sh                      the version store, and what may follow what
 lib/upgrade.sh                       what an upgrade decides: each node's version, what to prune
 lib/addons.sh                        ferry addons: render, fetch, apply, wait, record

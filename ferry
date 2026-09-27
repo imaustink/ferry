@@ -671,6 +671,12 @@ Machines -- mode 2, where the node is the VM and pods share its kernel:
   ferry machines disable  stop it; Machines and the CRD are left alone
   ferry machines ls       the machines in this cluster
 
+macOS pods -- native Darwin processes, in a VM of their own or a shared kernel:
+  ferry mac-image bake     build this Mac's golden macOS image (slow, needs a
+                          checkout; downloads macOS from Apple, not carried by
+                          ferry). --shared also prepares ferry-macos-shared
+                          (one manual step). See docs/RUNTIMES.md#macos-pods
+
 Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
   ferry upgrade plan <vX.Y.Z>   check an upgrade without doing any of it
@@ -1114,6 +1120,154 @@ cmd_node_image() {
   bold "node image built"
   echo "  $NODE_IMAGE_LAYOUT"
   echo "  turn mode 2 on with: ferry machines enable"
+}
+
+# The macOS golden image a 'ferry-macos-vm' or 'ferry-macos-shared' pod needs
+# (docs/RUNTIMES.md#macos-pods). Every step here already existed as a manual
+# walkthrough in experiments/39-macos-pods; this drives the same scripts in
+# order, downloading macOS from Apple's own restore-image catalog at bake
+# time -- nothing Apple-owned is carried by ferry or this command, only the
+# tooling that assembles it on your own Mac. That is also why it is a
+# checkout-only command, like 'ferry kernel' and 'ferry node-image': the
+# result is tens of gigabytes and specific to the Mac that baked it, so
+# there is nothing a release could ship here that would help the next Mac.
+#
+#   ferry mac-image bake              a VM-per-pod image only (ferry-macos-vm)
+#   ferry mac-image bake --shared     also prepares it for ferry-macos-shared
+#                                     -- one manual recoveryOS step (SIP off),
+#                                     since that cannot be scripted
+#   ferry mac-image bake --rebuild    redo every step even if cached
+#   ferry mac-image bake --ipsw <path> --out <dir>
+cmd_mac_image_bake() {
+  if is_release; then
+    bad "this is an installed ferry $(ferry_release_version) -- baking a macOS image needs a checkout"
+    echo "    The image is specific to the Mac that makes it and is tens of gigabytes,"
+    echo "    so a release could not ship one anyway. Build ferry from source:"
+    echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry mac-image bake"
+    return 1
+  fi
+
+  local out="$FERRY_HOME/mac-image" shared="" rebuild="" ipsw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --shared) shared=1; shift ;;
+      --rebuild) rebuild=1; shift ;;
+      --out) [ $# -ge 2 ] || { bad "--out needs a directory"; return 2; }; out="$2"; shift 2 ;;
+      --out=*) out="${1#*=}"; shift ;;
+      --ipsw) [ $# -ge 2 ] || { bad "--ipsw needs a path"; return 2; }; ipsw="$2"; shift 2 ;;
+      --ipsw=*) ipsw="${1#*=}"; shift ;;
+      -h|--help)
+        echo "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"
+        echo
+        echo "  --shared    also prepare the image for ferry-macos-shared (needs one"
+        echo "              manual recoveryOS step; ferry-macos-vm never does)"
+        echo "  --rebuild   redo every step even if this Mac already has one cached"
+        echo "  --ipsw      a restore image already on disk, instead of fetching Apple's latest"
+        echo "  --out       where to write it (default: \$FERRY_HOME/mac-image)"
+        return 0 ;;
+      -*) bad "unknown flag $1"; return 2 ;;
+      *) bad "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"; return 2 ;;
+    esac
+  done
+
+  command -v swiftc >/dev/null || { bad "Swift is required to build the bake tooling"; swift_install_hint; return 1; }
+  command -v go >/dev/null || { bad "Go 1.24+ is required, to build ferry-darwin into the image"; return 1; }
+
+  local free; free="$(df -g "$HOME" | tail -1 | awk '{print $4}')"
+  local need=60; [ -n "$shared" ] && need=90
+  if [ "$free" -lt "$need" ]; then
+    warn "${free}G free disk; a golden macOS image needs roughly ${need}G"
+  fi
+
+  local exp="$here/experiments/39-macos-pods"
+  mkdir -p "$out"
+
+  bold "macOS golden image -> $out"
+  echo "==> build tooling (macvm, ferry-macagent, latest-ipsw)"
+  "$exp/build.sh" || return 1
+  echo
+
+  local ipsw_file="$out/restore.ipsw"
+  if [ -n "$ipsw" ]; then
+    ipsw_file="$ipsw"
+    [ -f "$ipsw_file" ] || { bad "no such file: $ipsw_file"; return 1; }
+  elif [ -f "$ipsw_file" ] && [ -z "$rebuild" ]; then
+    echo "==> restore image already downloaded, $(du -h "$ipsw_file" | cut -f1) (--rebuild to redo)"
+  else
+    echo "==> asking Apple for the latest restore image for this Mac"
+    local url; url="$("$exp/build/latest-ipsw" | head -1)"
+    [ -n "$url" ] || { bad "could not reach Apple's restore image catalog"; return 1; }
+    echo "    $url"
+    # Downloaded next to the final name, not onto it: a curl an interrupted
+    # download cannot leave a partial file that the next run mistakes for a
+    # finished one, the same failure fixed below for the bundles themselves.
+    local tmp_ipsw="$ipsw_file.part"
+    curl -fL# -o "$tmp_ipsw" "$url" && mv "$tmp_ipsw" "$ipsw_file" \
+      || { rm -f "$tmp_ipsw"; bad "download failed"; return 1; }
+  fi
+  echo
+
+  # A bundle's Disk.img is the last thing macvm install writes and the biggest
+  # thing in it, so its presence is what "already installed" actually means --
+  # not just the directory, which an interrupted run leaves behind too.
+  local golden="$out/golden"
+  if [ -f "$golden/Disk.img" ] && [ -z "$rebuild" ]; then
+    echo "==> golden bundle already installed, $(du -sh "$golden" | cut -f1) (--rebuild to redo)"
+  else
+    echo "==> installing macOS into $golden (a few minutes)"
+    rm -rf "$golden"
+    "$exp/build/macvm" install "$ipsw_file" "$golden" || return 1
+  fi
+  echo
+
+  if [ -z "$rebuild" ] && [ -f "$golden/.ferry-injected" ]; then
+    echo "==> guest agent already on the golden bundle"
+  else
+    echo "==> putting the guest agent on it (root, once)"
+    sudo "$exp/inject.sh" "$golden" || return 1
+    : > "$golden/.ferry-injected"
+  fi
+  echo
+
+  local src="$golden"
+  if [ -n "$shared" ]; then
+    local sipoff="$out/golden-sipoff"
+    if [ -f "$sipoff/Disk.img" ] && [ -z "$rebuild" ]; then
+      echo "==> SIP-off clone already made, $(du -sh "$sipoff" | cut -f1) (--rebuild to redo)"
+    else
+      echo "==> cloning to $sipoff for the one manual step ferry-macos-shared needs"
+      rm -rf "$sipoff"
+      cp -Rc "$golden" "$sipoff" || return 1
+      echo
+      bold "one manual step: turn SIP off in the clone"
+      echo "  This is what makes ferry-macos-shared not a security boundary"
+      echo "  (docs/RUNTIMES.md#macos-pods) -- it cannot be scripted, so a recoveryOS"
+      echo "  window is about to open. In it:"
+      echo "    1. make an admin account if Setup Assistant asks for one"
+      echo "    2. open Terminal from Utilities, then:"
+      echo "         diskutil apfs updatePreboot /"
+      echo "         csrutil disable"
+      echo "         halt"
+      "$exp/build/macvm" boot "$sipoff" --recovery &
+      read -r -p "  press Enter once the guest has halted: " _
+      wait
+    fi
+    src="$sipoff"
+  fi
+  echo
+
+  echo "==> baking the machine image (kubelet, ferry-darwin, the OS base)"
+  "$exp/bake-macos-node.sh" "$src" "$out/golden-node" || return 1
+
+  echo
+  bold "macOS golden image ready"
+  echo "  $out/golden-node"
+  echo
+  echo "  export FERRY_MAC_IMAGE=\"$out/golden-node\""
+  if [ -n "$shared" ]; then
+    echo "  export FERRY_MAC_SHARED=1   # this image is prepared for it; still opt-in"
+  fi
+  echo "  ferry machines enable"
 }
 
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
@@ -6255,6 +6409,11 @@ case "${1:-}" in
               esac ;;
   upgrade)    shift; cmd_upgrade "$@" ;;
   machines)   shift; cmd_machines "$@" ;;
+  mac-image)  shift
+              case "${1:-}" in
+                bake) shift; cmd_mac_image_bake "$@" ;;
+                *) bad "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"; exit 2 ;;
+              esac ;;
   node-image) shift; cmd_node_image "$@" ;;
   service)    shift; cmd_service "$@" ;;
   uninstall)  shift; cmd_uninstall "$@" ;;

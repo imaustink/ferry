@@ -351,11 +351,13 @@ not_shipped="
   ferry-karpenter                               go sources
   ferry-registry                                go sources
   ferry-handover                                go sources; only 'upgrade' runs it, which a release refuses
+  ferry-mkimage                                 go sources; a release ships bin/ferry-mkimage instead
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
   experiments/18-node-image/build.sh            builds the node image with docker; a release ships it built
   experiments/18-node-image/rebuild-tool.sh     builds ferry-node; a release ships it built
+  experiments/39-macos-pods                     bakes the macOS golden image; checkout-only, like ferry kernel
   VERSION                                       written by release/build.sh, not copied
 "
 exempt() { # path
