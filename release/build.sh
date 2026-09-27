@@ -49,10 +49,11 @@ while [ $# -gt 0 ]; do
     --out) out="${2:-}"; shift 2 ;;
     --out=*) out="${1#*=}"; shift ;;
     # Mode 2 is opt-in on the Mac that installs this, but the image it needs
-    # weighs a couple of hundred megabytes and takes a Docker build to make. A
-    # release without it is a legitimate thing to want; a release that quietly
-    # lacks it is not, so this is a flag rather than a silent skip, and VERSION
-    # records the answer for 'ferry machines' to read.
+    # weighs a couple of hundred megabytes and takes 'ferry image build' (a
+    # running cluster, not Docker) to make. A release without it is a
+    # legitimate thing to want; a release that quietly lacks it is not, so
+    # this is a flag rather than a silent skip, and VERSION records the
+    # answer for 'ferry machines' to read.
     --without-node-image) node_image=""; shift ;;
     *) die "usage: release/build.sh [--version vX.Y.Z] [--kubernetes-version vX.Y.Z] [--out <dir>] [--without-node-image]" ;;
   esac
@@ -128,7 +129,7 @@ ok "cli, control plane scripts, manifests, addons and the Machine CRD"
 # exists to avoid. The kata fallback kernel is deliberately not shipped -- it is
 # 15MB spent on making the product worse.
 [ -f "$root/kernel/vmlinux-arm64" ] \
-  || die "no guest kernel at kernel/vmlinux-arm64 -- run: ./ferry kernel (slow, needs docker)"
+  || die "no guest kernel at kernel/vmlinux-arm64 -- run: ./ferry kernel (slow, needs 'ferry up' first)"
 # A kernel from before a patch boots and works, and quietly costs every pod what
 # the patch saved -- 75 MiB each, for the read-ahead one -- so it is not shipped.
 [ "$(FERRY_ROOT="$root" ferry_kernel_inputs)" = "$(cat "$root/kernel/vmlinux-arm64.inputs" 2>/dev/null)" ] \
@@ -201,12 +202,13 @@ ok "ferry-cri, ferry-node and ferry-macvm carry com.apple.security.virtualizatio
 # --- the mode 2 node image ------------------------------------------------
 # The OCI layout rather than the unpacked ext4: the layout is the compressed
 # layers, and 'ferry machines enable' unpacks it to a disk on first use with
-# ferry-node's own unpacker. That keeps Docker off the installing Mac -- Docker
-# is only needed to *create* the layout -- and keeps ~400MB of mostly-zero
-# sparse file out of the tarball.
+# ferry-node's own unpacker. That keeps a build toolchain off the installing
+# Mac -- 'ferry image build' is only needed to *create* the layout, on the
+# Mac cutting the release -- and keeps ~400MB of mostly-zero sparse file out
+# of the tarball.
 if [ -n "$node_image" ]; then
   [ -d "$root/node-image/oci" ] \
-    || die "no node image at node-image/oci -- run: ./ferry node-image (slow, needs docker), or pass --without-node-image"
+    || die "no node image at node-image/oci -- run: ./ferry node-image (slow, needs 'ferry up' first), or pass --without-node-image"
   mkdir -p "$dir/node-image"
   cp -R "$root/node-image/oci" "$dir/node-image/oci"
   ok "mode 2 node image ($(du -sh "$root/node-image/oci" | awk '{print $1}'))"
