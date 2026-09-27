@@ -41,6 +41,7 @@ func main() {
 	volumesRoot := flag.String("volumes-root", "", "the kubelet's pods directory, exported over NFS so volumes can be mounted into container roots; empty leaves volumes off")
 	hostVolumes := flag.String("host-volumes", "", "the Mac's PersistentVolume directory, shared in at the same path; the runtime serves each volume under it over NFS itself")
 	podVM := flag.Bool("pod-vm", false, "this machine is one pod's VM (ferry.dev/mode=macos-vm): its pod runs as root, because the boundary is the hypervisor, not a uid")
+	debugAnns := flag.Bool("debug-annotations", false, "honour the ferry.dev/debug-* pod annotations, each of which removes an isolation (debug-host runs as root on the node); for debugging the runtime only")
 	prepare := flag.Bool("prepare", false, "copy the OS base into -state and exit (for baking a golden image)")
 	flag.Parse()
 	log.SetFlags(log.Lmicroseconds)
@@ -74,7 +75,11 @@ func main() {
 	}
 
 	images := &imageSvc{mirror: *mirror, dir: filepath.Join(*state, "images"), images: map[string]*image{}}
-	rt := &runtimeSvc{node: n, images: images, sboxes: map[string]*sandbox{}, ctrs: map[string]*container{}}
+	rt := &runtimeSvc{node: n, images: images, sboxes: map[string]*sandbox{}, ctrs: map[string]*container{},
+		debugAnnotations: *debugAnns}
+	if *debugAnns {
+		log.Printf("debug annotations are ON: any pod here can remove its own isolation")
+	}
 	if *api != "" {
 		rt.services = &serviceTable{api: *api, ca: *ca, cert: *clientCert, rt: rt,
 			dnsIP: *clusterDNS, domain: *clusterDomain, reservedDNS: reservedDNSFor(n.clusterCIDR),

@@ -95,8 +95,10 @@ type runtimeSvc struct {
 	n      int
 	// podVMOwner is the uid of the one pod a -pod-vm machine is for.
 	podVMOwner string
-	services   *serviceTable // nil when not given an API server
-	streaming  streaming.Server
+	// debugAnnotations honours the ferry.dev/debug-* pod annotations.
+	debugAnnotations bool
+	services         *serviceTable // nil when not given an API server
+	streaming        streaming.Server
 	// The kubelet's pods directory, exported over NFS; empty leaves volumes off.
 	volumesRoots []string
 	nfsReady     chan struct{} // closed once nfsd serves volumesRoots
@@ -429,11 +431,21 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 		Setpgid:    true,
 	}
 	// Debugging knobs, by pod annotation, for telling which of the pieces a
-	// failure comes from. Not a feature: each one takes an isolation away.
-	if s.anns["ferry.dev/debug-root"] == "true" {
+	// failure comes from. Not a feature: each one takes an isolation away --
+	// debug-host runs the command as root on the node itself -- so they are
+	// honoured only on a node started with -debug-annotations. Without it, any
+	// pod on a shared machine could annotate its way out of its chroot.
+	if !r.debugAnnotations {
+		for _, a := range []string{"ferry.dev/debug-root", "ferry.dev/debug-no-chroot", "ferry.dev/debug-host"} {
+			if s.anns[a] == "true" {
+				log.Printf("container %s: ignoring %s; this node was not started with -debug-annotations", c.id, a)
+			}
+		}
+	}
+	if r.debugAnnotations && s.anns["ferry.dev/debug-root"] == "true" {
 		cmd.SysProcAttr.Credential = nil
 	}
-	if s.anns["ferry.dev/debug-no-chroot"] == "true" {
+	if r.debugAnnotations && s.anns["ferry.dev/debug-no-chroot"] == "true" {
 		cmd.SysProcAttr.Chroot = ""
 		cmd.Path = filepath.Join(c.root, path)
 		cmd.Dir = c.root
@@ -442,7 +454,7 @@ func (r *runtimeSvc) StartContainer(_ context.Context, req *runtimeapi.StartCont
 	// The command as the node's own root process would run it: no chroot, no
 	// uid, no shim, the runtime's environment. An absolute argv[0] is a node
 	// path; a relative one is the image's binary.
-	if s.anns["ferry.dev/debug-host"] == "true" {
+	if r.debugAnnotations && s.anns["ferry.dev/debug-host"] == "true" {
 		cmd.SysProcAttr.Chroot, cmd.SysProcAttr.Credential = "", nil
 		cmd.Path, cmd.Dir, cmd.Env = c.argv[0], "/", os.Environ()
 		if !strings.HasPrefix(c.argv[0], "/") {

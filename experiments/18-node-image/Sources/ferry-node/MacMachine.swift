@@ -57,6 +57,9 @@ func bootMac(spec: MachineSpec, network: MachineNetwork, caPath: String, apiServ
     if !volumesDir.isEmpty { values["volumes"] = volumesDir }
     if let mode = spec.mode, !mode.isEmpty { values["mode"] = mode }
     if let maxPods = spec.maxPods, maxPods > 0 { values["maxpods"] = "\(maxPods)" }
+    // The runtime's ferry.dev/debug-* annotations, off unless whoever started
+    // ferry-node asked: each lets a pod remove its own isolation.
+    if ProcessInfo.processInfo.environment["FERRY_NODE_MAC_DEBUG"] == "1" { values["debug"] = "1" }
     for (key, value) in values {
         try Data(value.utf8).write(to: URL(filePath: configDir).appending(path: key))
     }

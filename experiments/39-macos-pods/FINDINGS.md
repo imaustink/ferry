@@ -688,7 +688,13 @@ The debugging that found these is kept as three pod annotations on
 `ferry-darwin` -- `ferry.dev/debug-root`, `ferry.dev/debug-no-chroot` and
 `ferry.dev/debug-host`, the last running a pod's command as the node itself --
 and `dns-probe*.yaml`, `services-probe.yaml`, `run-dns-probe.sh`. Each takes an
-isolation away; they are for finding which piece a failure comes from.
+isolation away; they are for finding which piece a failure comes from. They
+were at first honoured for any pod, which on a shared machine let a pod put
+`ferry.dev/debug-host: "true"` on itself and run as root on the node. They now
+work only when ferry-darwin is started with `-debug-annotations` -- set for
+every macOS machine a ferry-node boots when that ferry-node runs with
+`FERRY_NODE_MAC_DEBUG=1` -- and are otherwise ignored, with a line in the
+runtime log. The probe manifests need a machine booted that way.
 
 What it does not do: NodePorts and LoadBalancers aimed at macOS pods from outside;
 headless Services beyond what DNS already answers; session affinity; and a

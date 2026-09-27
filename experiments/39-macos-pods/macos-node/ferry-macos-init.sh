@@ -116,6 +116,7 @@ mirror=""
     -api "$API" -ca "$C/ca.crt" -cluster-dns "$DNS" -volumes-root "$R/kubelet/pods" -node-name "$NODE" \
     ${VOLUMES:+-host-volumes "$VOLUMES"} \
     $([ "$MODE" = macos-vm ] && echo -pod-vm) \
+    $([ "$(v debug)" = 1 ] && echo -debug-annotations) \
     > "$L/runtime.log" 2>&1 &
 # The kubelet exits at startup if its runtime is not serving yet.
 n=0; until [ -S "$R/cri.sock" ] || [ $n -ge 600 ]; do sleep 0.1; n=$((n + 1)); done
