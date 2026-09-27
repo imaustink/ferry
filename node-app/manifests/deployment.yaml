@@ -1,0 +1,70 @@
+# Namespace-scoped, restart-tolerant deployment: three replicas, a rolling
+# update that never drops below two, and probes that separate "the process
+# is alive" from "route traffic here" (see src/index.js). Resource requests
+# equal limits on CPU would throttle unnecessarily under burst, so only
+# memory is capped tightly; CPU gets room to burst and a floor to schedule
+# on.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-app
+  labels: {app: node-app}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: node-app}
+  template:
+    metadata:
+      labels: {app: node-app}
+    spec:
+      # No known dependency; still worth a couple of seconds of slack for
+      # the kubelet to notice a container is gone before routing to it.
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: node-app
+          image: node-app:1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - {name: PORT, value: "8080"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            limits: {memory: 192Mi}
+          # Covers a slow first start (npm's module graph, JIT warmup)
+          # without borrowing the liveness probe's failure budget for it.
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            failureThreshold: 30
+            periodSeconds: 1
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        # readOnlyRootFilesystem leaves nothing writable; this app writes
+        # nothing today, but express/npm packages that expect a /tmp are
+        # common enough to give one for free rather than debug it later.
+        - name: tmp
+          emptyDir: {}

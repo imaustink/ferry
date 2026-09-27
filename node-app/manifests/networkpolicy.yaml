@@ -1,0 +1,19 @@
+# Defense in depth beyond the Service: only pods in this namespace may
+# reach node-app, and only on its actual port. See docs/NETWORK-POLICY.md --
+# this is enforced in each pod's own kernel, not bolted on at the host.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: node-app
+spec:
+  podSelector:
+    matchLabels: {app: node-app}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # No namespaceSelector: an empty podSelector alone means "any pod in
+        # this policy's own namespace", not "any namespace" -- the two are
+        # easy to swap and mean very different things.
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 8080}

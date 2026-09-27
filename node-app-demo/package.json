@@ -1,9 +1,0 @@
-{
-  "name": "node-app-demo",
-  "version": "1.0.0",
-  "private": true,
-  "description": "A tiny Express app, built into a Linux image with 'ferry image build' instead of Docker.",
-  "dependencies": {
-    "express": "4.21.2"
-  }
-}

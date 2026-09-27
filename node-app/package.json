@@ -1,0 +1,16 @@
+{
+  "name": "node-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A production-shaped Express app, built into a Linux image with 'ferry image build' instead of Docker.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "4.21.2",
+    "helmet": "8.0.0"
+  }
+}

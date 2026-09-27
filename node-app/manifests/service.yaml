@@ -1,0 +1,14 @@
+# A stable ClusterIP in front of the Deployment's pods. Services route
+# inside pods on ferry (no host proxy, no root), so this is reachable from
+# the Mac the same way a pod IP is -- see docs/POD-NETWORK.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-app
+  labels: {app: node-app}
+spec:
+  selector: {app: node-app}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

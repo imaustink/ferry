@@ -1,0 +1,12 @@
+# Keeps at least two of the three replicas up through a voluntary
+# disruption (a node drain, a machine reclaim) -- the same guarantee the
+# Deployment's rolling update gives against a bad rollout, extended to
+# events the Deployment itself does not control.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: node-app
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: node-app}
