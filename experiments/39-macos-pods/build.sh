@@ -15,4 +15,8 @@ echo "==> ferry-macagent (guest)"
 swiftc -O -target arm64-apple-macos26.0 -o build/ferry-macagent agent.swift
 codesign --force --sign - build/ferry-macagent
 
-echo "==> ready: build/macvm build/ferry-macagent"
+echo "==> latest-ipsw (host)"
+swiftc -O -o build/latest-ipsw latest-ipsw.swift -framework Virtualization
+codesign --force --sign - --entitlements entitlements.plist build/latest-ipsw
+
+echo "==> ready: build/macvm build/ferry-macagent build/latest-ipsw"

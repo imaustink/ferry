@@ -287,27 +287,77 @@ should hand code you do not trust.
 
 ### Building the image
 
-macOS pods need two things built. The **pod image** is `ferry image build --os
-darwin` (below). The **golden macOS bundle** the machine boots is not a `ferry`
-subcommand yet — it comes from [experiment 39](../experiments/39-macos-pods/),
-and `ferry` uses the result through `FERRY_MAC_IMAGE`.
+macOS pods need two things built. The **golden macOS bundle** the machine
+boots is `ferry mac-image bake`, below. The **pod image** is `ferry image
+build --os darwin` (below that).
 
 **1. The golden macOS bundle** — the OS a macOS machine boots, and what
-`FERRY_MAC_IMAGE` points at:
+`FERRY_MAC_IMAGE` points at. Built with one command, from a checkout (like
+`ferry kernel` and `ferry node-image`, it needs tools a release does not
+carry, so it is not something an installed ferry can do):
+
+```sh
+./ferry mac-image bake
+```
+
+This downloads macOS straight from Apple's own restore-image catalog onto
+*this* Mac and assembles the bundle here — nothing Apple-owned is ever
+carried by ferry itself, only the tooling that does the assembling. Apple's
+license for macOS does not permit redistributing copies of it (including as a
+baked VM bundle), which is also why the result is a checkout-only artifact:
+there is nothing a release could ship here that would help the next Mac, the
+same reasoning behind `ferry kernel` and `ferry node-image`.
+
+It prints the resulting `export FERRY_MAC_IMAGE=...` line and reminds you to
+run `ferry machines enable`. `--rebuild` redoes every step even if this Mac
+already has one cached; `--ipsw <path>` uses a restore image already on disk
+instead of asking Apple for the latest one; `--out <dir>` picks where it is
+written (default `$FERRY_HOME/mac-image`).
+
+By default this prepares an image for **`ferry-macos-vm`** only, which needs
+no manual steps beyond the one `sudo` prompt (putting the guest agent on the
+bundle). For **`ferry-macos-shared`** as well, add `--shared`:
+
+```sh
+./ferry mac-image bake --shared
+```
+
+`--shared` does one thing the plain form does not: it clones the bundle and
+turns **SIP off** in the clone, because the per-pod `chroot` needs it — a
+recoveryOS step that cannot be scripted, so `ferry mac-image bake` opens the
+recovery window and waits for you to finish it (make an admin, `diskutil apfs
+updatePreboot /`, `csrutil disable`, `halt`) before it bakes the final image.
+This is also why a shared-macos node is not a security boundary
+([above](#macos-pods)): its kernel runs with SIP disabled. The image is still
+just built, though — turning the class on is the separate opt-in below.
+
+Point ferry at the baked bundle and bring machines up (`ferry mac-image bake`
+prints the exact lines for what it built):
+
+```sh
+export FERRY_MAC_IMAGE="$HOME/.ferry/mac-image/golden-node"
+export FERRY_MAC_SHARED=1   # only if baked with --shared and you want ferry-macos-shared; omit for VM-per-pod only
+ferry up                # installs the macOS NodePool(s), passes --mac-image to ferry-machined
+ferry machines enable
+```
+
+`FERRY_MAC_SHARED=1` is what turns on the shared-kernel pool and lets
+`ferry-machined` register a shared macOS machine — leave it out and only
+`ferry-macos-vm` works, which is the safe default (see the warning above).
+
+<details>
+<summary>What <code>ferry mac-image bake</code> runs, if you want to drive it by hand</summary>
 
 ```sh
 cd experiments/39-macos-pods
-./build.sh                                          # macvm (host) + ferry-macagent (guest)
-curl -fLo .cache/mac.ipsw <VirtualMac2,1 IPSW from ipsw.me>
+./build.sh                                          # macvm, ferry-macagent, latest-ipsw
+./build/latest-ipsw                                 # prints the URL Apple serves for this Mac
+curl -fLo .cache/mac.ipsw <that URL>
 build/macvm install .cache/mac.ipsw .cache/golden   # ~3 min: installs macOS into a bundle
 sudo ./inject.sh .cache/golden                      # put the guest agent on it (root, once)
 ```
 
-That much already boots a macOS VM. For **`ferry-macos-shared`** (mode 2), the
-per-pod `chroot` needs **SIP off** in the guest — a one-time manual step in
-recoveryOS. This is also why a shared-macos node is not a security boundary
-([above](#macos-pods)): its kernel runs with SIP disabled. Do it on a copy so
-the golden stays pristine:
+That much already boots a macOS VM. For `ferry-macos-shared`, additionally:
 
 ```sh
 cp -Rc .cache/golden .cache/golden-sipoff           # APFS clone, instant
@@ -316,26 +366,16 @@ build/macvm boot .cache/golden-sipoff --recovery    # opens the recovery window
 #               then `csrutil disable` and `halt`
 ```
 
-Then bake the machine image from it — kubelet, `ferry-darwin` and the OS base
-copied in, so a machine is Ready in ~10 s instead of spending ~30 s on first
-boot:
+Then bake the machine image from either bundle — kubelet, `ferry-darwin` and
+the OS base copied in, so a machine is Ready in ~10 s instead of spending
+~30 s on first boot:
 
 ```sh
-./bake-macos-node.sh .cache/golden-sipoff .cache/golden-node
+./bake-macos-node.sh .cache/golden .cache/golden-node             # ferry-macos-vm only
+./bake-macos-node.sh .cache/golden-sipoff .cache/golden-node      # with --shared
 ```
 
-Point ferry at the baked bundle and bring machines up:
-
-```sh
-export FERRY_MAC_IMAGE="$PWD/.cache/golden-node"
-export FERRY_MAC_SHARED=1   # only for ferry-macos-shared (mode 2); omit for VM-per-pod
-ferry up                # installs the macOS NodePool(s), passes --mac-image to ferry-machined
-ferry machines enable
-```
-
-`FERRY_MAC_SHARED=1` is what turns on the shared-kernel pool and lets
-`ferry-machined` register a shared macOS machine — leave it out and only
-`ferry-macos-vm` works, which is the safe default (see the warning above).
+</details>
 
 **2. A darwin pod image** — what a macOS pod runs. It holds only *your own*
 arm64/arm64e binaries: dyld and the system libraries come from the node, because
@@ -386,7 +426,7 @@ ferry status                                               # the default runtime
 | `didn't match Pod's node affinity/selector`, for a `ferry-shared` pod | no machines: mode 2 is off | `ferry machines enable` |
 | a DaemonSet's `DESIRED` is fewer than your nodes, with no error | the cluster's default has tainted one kind of node, and the DaemonSet does not tolerate it | add the toleration under [DaemonSets meant for every node](#daemonsets-meant-for-every-node) |
 | `RuntimeClass "…" not found` | the class does not exist in this cluster, usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
-| a `ferry-macos-*` pod stays Pending and no machine appears | this Mac has no macOS golden image, so no `spec.os: darwin` machine can be made for it | build one ([experiment 39](../experiments/39-macos-pods/FINDINGS.md)) and give ferry-machined its `--mac-image` |
+| a `ferry-macos-*` pod stays Pending and no machine appears | this Mac has no macOS golden image, so no `spec.os: darwin` machine can be made for it | `ferry mac-image bake`, then `export FERRY_MAC_IMAGE=...` as it prints and `ferry machines enable` |
 | `Failed to create pod sandbox: … has no runtime handler "runc"` | a pod whose class is not `ferry-vm` was put on the Mac anyway, usually with `nodeName` | let the scheduler place it, or name `ferry-vm` |
 
 The last one is deliberate. ferry-cri runs every pod as a VM, and a pod that
