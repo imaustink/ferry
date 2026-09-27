@@ -340,9 +340,8 @@ ferry machines enable
 **2. A darwin pod image** — what a macOS pod runs. It holds only *your own*
 arm64/arm64e binaries: dyld and the system libraries come from the node, because
 Apple's signed binaries are killed anywhere but where the OS put them. So it is
-`FROM scratch` plus `COPY` — the node is the base, not a layer, and there is no
-`RUN` (a Linux builder cannot execute Darwin binaries; compile on the Mac and
-copy the result in). `ferry image build --os darwin` packages it:
+`FROM scratch` plus `COPY` — the node is the base, not a layer. `ferry image
+build --os darwin` packages it:
 
 ```sh
 cat > Dockerfile <<'EOF'
@@ -360,11 +359,45 @@ where it pulls from. A pod that names `image: example.com/app-darwin:1` with
 `runtimeClassName: ferry-macos-shared` (or `ferry-macos-vm`) and
 `imagePullPolicy: IfNotPresent` then runs it.
 
-`ferry image build --os darwin` accepts the common Dockerfile instructions that
-don't run anything — `COPY`/`ADD`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`,
-`LABEL` — and rejects `RUN` (and `--build-arg`) with a message saying why. The
-full walk-through of the macOS runtime is
+`ferry image build --os darwin` accepts the common Dockerfile instructions --
+`COPY`/`ADD`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`, `LABEL` — plus `RUN`. A
+Linux builder still cannot execute a Darwin binary, so a `RUN` runs in a macOS
+VM instead: `bin/ferry-macvm`, cloned from the same golden bundle
+`FERRY_MAC_IMAGE` points machines at, torn down when the build ends. A
+Dockerfile with no `RUN` never starts one — `COPY` still applies straight to a
+plain directory, as fast as before:
+
+```sh
+cat > Dockerfile <<'EOF'
+FROM scratch
+COPY hello.c src/hello.c
+RUN clang -O2 -o bin/hello src/hello.c   # runs in a macOS VM cloned from FERRY_MAC_IMAGE
+ENTRYPOINT ["/bin/hello"]
+EOF
+ferry image build --os darwin -t example.com/hello-darwin:1 .
+```
+
+Three things are worth knowing before reaching for it:
+
+- **It needs `FERRY_MAC_IMAGE`** — the same golden bundle `ferry machines
+  enable` boots machines from (above). `RUN` with no golden bundle set fails
+  with a clear message rather than falling back to anything.
+- **`RUN` is not chrooted into the image root.** It runs against the guest's
+  real OS — the same "the node provides the OS" reasoning that makes the image
+  `FROM scratch` in the first place, so the guest's own compiler, Homebrew,
+  whatever the golden image carries, stays visible. Its paths are relative to
+  `WORKDIR`/`cwd`, not to where things will land in the final image, the way a
+  chrooted build's would be.
+- **It costs a VM boot.** Around 10-20s, paid once per build (clone, boot,
+  every `COPY`/`RUN`, shut down) — there is no warm builder to reuse across
+  builds yet, unlike the Linux path's `ferry-builder`.
+
+`--build-arg`/`ARG` still is not supported. The full account of how this
+works, what does not (yet), and what it costs is
+[experiments/40-mac-build-run/FINDINGS.md](../experiments/40-mac-build-run/FINDINGS.md).
+The full walk-through of the macOS runtime itself is
 [experiment 39's FINDINGS](../experiments/39-macos-pods/FINDINGS.md).
+
 
 ## Checking where things landed
 

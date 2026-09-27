@@ -10,9 +10,17 @@ import (
 )
 
 // buildFromDockerfile parses a small subset of Dockerfile syntax, applies its
-// COPY/ADD into a fresh staging root, and fills img's runtime configuration.
-// It sets img.RootFS to a temp directory the caller removes.
-func buildFromDockerfile(img *image, dockerfile, context string) error {
+// instructions, and fills img's runtime configuration. It sets img.RootFS to
+// a temp directory the caller removes.
+//
+// A Dockerfile with no RUN never touches a builder VM at all: every COPY
+// applies straight to a host temp directory, the same fast, dependency-free
+// path this had before RUN existed. One with RUN needs a builder (see
+// builder.go) because a COPY before a RUN must land where that RUN can see
+// it, and everything after the last RUN must reflect what RUN left behind --
+// so once a builder is needed, every COPY goes through it too, and the image
+// root is read back once, at the end, from the guest's own disk.
+func buildFromDockerfile(img *image, dockerfile, context string, bc builderConfig) error {
 	content, err := os.ReadFile(dockerfile)
 	if err != nil {
 		return err
@@ -22,22 +30,130 @@ func buildFromDockerfile(img *image, dockerfile, context string) error {
 		return err
 	}
 
+	hasRun := false
+	for _, s := range df.steps {
+		if s.kind == "run" {
+			hasRun = true
+			break
+		}
+	}
+
 	root, err := os.MkdirTemp("", "ferry-mkimage-root-*")
 	if err != nil {
 		return err
 	}
 	img.RootFS = root
-	for _, c := range df.copies {
-		if err := applyCopy(context, root, c); err != nil {
-			return fmt.Errorf("COPY %s: %w", strings.Join(append(c.srcs, c.dest), " "), err)
+
+	if hasRun {
+		if err := runSteps(df.steps, context, bc, root); err != nil {
+			return err
+		}
+	} else {
+		for _, s := range df.steps {
+			if s.kind != "copy" {
+				continue
+			}
+			if err := applyCopy(context, root, s.copy); err != nil {
+				return fmt.Errorf("COPY %s: %w", copyOpString(s.copy), err)
+			}
 		}
 	}
+
+	var envList []string
+	workdir := ""
+	for _, s := range df.steps {
+		switch s.kind {
+		case "env":
+			envList = append(envList, s.env...)
+		case "workdir":
+			workdir = joinWorkdir(workdir, s.workdir)
+		}
+	}
+
 	img.Entrypoint = df.entrypoint
 	img.Cmd = df.cmd
-	img.Env = df.env
-	img.WorkingDir = df.workingDir
+	img.Env = envList
+	img.WorkingDir = workdir
 	img.Labels = df.labels
 	return nil
+}
+
+// runSteps drives a builder VM through df's ordered steps, starting it lazily
+// on the first COPY or RUN, and reads the whole build root back once, into
+// root, after the last one.
+func runSteps(steps []step, context string, bc builderConfig, root string) error {
+	var b *macBuilder
+	defer func() {
+		if b != nil {
+			b.close()
+		}
+	}()
+	ensure := func() (*macBuilder, error) {
+		if b != nil {
+			return b, nil
+		}
+		if bc.macvmPath == "" || bc.golden == "" {
+			return nil, fmt.Errorf("RUN needs a macOS builder VM: FERRY_MAC_IMAGE is not set, or bin/ferry-macvm is missing -- see docs/RUNTIMES.md#building-the-image")
+		}
+		nb, err := startMacBuilder(bc.macvmPath, bc.golden)
+		if err != nil {
+			return nil, fmt.Errorf("starting the builder: %w", err)
+		}
+		if _, code, err := nb.run([]string{"/bin/mkdir", "-p", guestRoot}, nil, ""); err != nil {
+			return nil, fmt.Errorf("builder setup: %w", err)
+		} else if code != 0 {
+			return nil, fmt.Errorf("builder setup: mkdir exited %d", code)
+		}
+		b = nb
+		return b, nil
+	}
+
+	var envList []string
+	workdir := ""
+	for _, s := range steps {
+		switch s.kind {
+		case "copy":
+			bd, err := ensure()
+			if err != nil {
+				return err
+			}
+			if err := pushCopy(bd, context, s.copy); err != nil {
+				return fmt.Errorf("COPY %s: %w", copyOpString(s.copy), err)
+			}
+		case "env":
+			envList = append(envList, s.env...)
+		case "workdir":
+			workdir = joinWorkdir(workdir, s.workdir)
+		case "run":
+			bd, err := ensure()
+			if err != nil {
+				return err
+			}
+			envMap := map[string]string{}
+			for _, kv := range envList {
+				k, v := split2eq(kv)
+				envMap[k] = v
+			}
+			cwd := guestRoot
+			if workdir != "" {
+				cwd = guestRoot + "/" + strings.TrimPrefix(workdir, "/")
+			}
+			stdout, code, err := bd.run(s.run, envMap, cwd)
+			os.Stdout.Write(stdout)
+			if err != nil {
+				return fmt.Errorf("RUN %s: %w", strings.Join(s.run, " "), err)
+			}
+			if code != 0 {
+				return fmt.Errorf("RUN %s: exit %d", strings.Join(s.run, " "), code)
+			}
+		}
+	}
+
+	bd, err := ensure() // a Dockerfile with RUN but no COPY still needs the root read back
+	if err != nil {
+		return err
+	}
+	return pullRoot(bd, root)
 }
 
 type copyOp struct {
@@ -45,18 +161,29 @@ type copyOp struct {
 	dest string
 }
 
+// step is one instruction that can affect the filesystem or the environment a
+// later RUN sees: copy, run, env or workdir, kept in the order they appear so
+// a COPY after a RUN sees only that RUN's output, and a RUN after a COPY sees
+// it. ENTRYPOINT/CMD/LABEL do not interleave with anything and stay as
+// dockerfile's own final-state fields.
+type step struct {
+	kind    string // "copy", "run", "env", "workdir"
+	copy    copyOp
+	run     []string
+	env     []string
+	workdir string
+}
+
 type dockerfile struct {
-	copies     []copyOp
+	steps      []step
 	entrypoint []string
 	cmd        []string
-	env        []string
-	workingDir string
 	labels     map[string]string
 }
 
-// parseDockerfile reads the instructions a darwin image can honour and refuses
-// the ones it cannot -- chiefly RUN, which would need to execute a Darwin
-// binary on a builder that has no Darwin to run it.
+// parseDockerfile reads the instructions a darwin image can honour: COPY/ADD,
+// RUN (run in a builder VM -- see runSteps), ENTRYPOINT, CMD, ENV, WORKDIR
+// and LABEL.
 func parseDockerfile(content string) (*dockerfile, error) {
 	df := &dockerfile{}
 	sawFrom := false
@@ -74,7 +201,13 @@ func parseDockerfile(content string) (*dockerfile, error) {
 			if err != nil {
 				return nil, err
 			}
-			df.copies = append(df.copies, c)
+			df.steps = append(df.steps, step{kind: "copy", copy: c})
+		case "RUN":
+			argv := parseExecOrShell(rest)
+			if len(argv) == 0 {
+				return nil, fmt.Errorf("RUN needs a command")
+			}
+			df.steps = append(df.steps, step{kind: "run", run: argv})
 		case "ENTRYPOINT":
 			df.entrypoint = parseExecOrShell(rest)
 		case "CMD":
@@ -84,9 +217,9 @@ func parseDockerfile(content string) (*dockerfile, error) {
 			if err != nil {
 				return nil, err
 			}
-			df.env = append(df.env, kv...)
+			df.steps = append(df.steps, step{kind: "env", env: kv})
 		case "WORKDIR":
-			df.workingDir = joinWorkdir(df.workingDir, strings.TrimSpace(rest))
+			df.steps = append(df.steps, step{kind: "workdir", workdir: strings.TrimSpace(rest)})
 		case "LABEL":
 			kv, err := parseEnv(rest)
 			if err != nil {
@@ -99,8 +232,6 @@ func parseDockerfile(content string) (*dockerfile, error) {
 				k, v := split2eq(e)
 				df.labels[k] = v
 			}
-		case "RUN":
-			return nil, fmt.Errorf("RUN is not supported for a darwin image: a Linux builder cannot execute Darwin binaries. Build on the host and COPY the result in")
 		case "ARG":
 			return nil, fmt.Errorf("ARG is not supported for a darwin image yet")
 		case "USER", "EXPOSE", "VOLUME", "STOPSIGNAL", "HEALTHCHECK", "SHELL", "MAINTAINER":
@@ -171,6 +302,11 @@ func toCopyOp(args []string) (copyOp, error) {
 		return copyOp{}, fmt.Errorf("COPY needs at least one source and a destination")
 	}
 	return copyOp{srcs: args[:len(args)-1], dest: args[len(args)-1]}, nil
+}
+
+// copyOpString renders a copyOp the way it was written, for error messages.
+func copyOpString(c copyOp) string {
+	return strings.Join(append(append([]string{}, c.srcs...), c.dest), " ")
 }
 
 // applyCopy copies each source (relative to context) into root at dest,

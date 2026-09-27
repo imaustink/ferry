@@ -149,7 +149,7 @@ CMD ["--port", "8080"]
 	out := filepath.Join(t.TempDir(), "layout")
 
 	img := &image{Name: "example.com/app-darwin:1"}
-	if err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx); err != nil {
+	if err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{}); err != nil {
 		t.Fatalf("build: %v", err)
 	}
 	defer os.RemoveAll(img.RootFS)
@@ -186,7 +186,7 @@ func TestShellFormEntrypoint(t *testing.T) {
 		"app":        "x",
 	})
 	img := &image{Name: "example.com/app-darwin:1"}
-	if err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx); err != nil {
+	if err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{}); err != nil {
 		t.Fatalf("build: %v", err)
 	}
 	defer os.RemoveAll(img.RootFS)
@@ -196,10 +196,63 @@ func TestShellFormEntrypoint(t *testing.T) {
 	}
 }
 
-func TestRunIsRejected(t *testing.T) {
-	_, err := parseDockerfile("FROM scratch\nRUN make\n")
+func TestRunIsAccepted(t *testing.T) {
+	df, err := parseDockerfile("FROM scratch\nRUN make\n")
+	if err != nil {
+		t.Fatalf("RUN should parse: %v", err)
+	}
+	if len(df.steps) != 1 || df.steps[0].kind != "run" {
+		t.Fatalf("steps = %+v, want one run step", df.steps)
+	}
+	want := []string{"/bin/sh", "-c", "make"}
+	if got := df.steps[0].run; !eq(got, want) {
+		t.Errorf("RUN argv = %v, want %v", got, want)
+	}
+}
+
+func TestRunExecForm(t *testing.T) {
+	df, err := parseDockerfile("FROM scratch\nRUN [\"/bin/echo\", \"hi\"]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/bin/echo", "hi"}; !eq(df.steps[0].run, want) {
+		t.Errorf("argv = %v, want %v", df.steps[0].run, want)
+	}
+}
+
+// TestStepOrderPreserved is the change RUN needed: a COPY after a RUN and a
+// RUN after a COPY must stay in the order they were written, not be sorted
+// into "all copies, then everything else".
+func TestStepOrderPreserved(t *testing.T) {
+	df, err := parseDockerfile(`FROM scratch
+COPY a.txt a.txt
+RUN echo one
+COPY b.txt b.txt
+RUN echo two
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"copy", "run", "copy", "run"}
+	if len(df.steps) != len(want) {
+		t.Fatalf("got %d steps, want %d: %+v", len(df.steps), len(want), df.steps)
+	}
+	for i, kind := range want {
+		if df.steps[i].kind != kind {
+			t.Errorf("step %d kind = %q, want %q", i, df.steps[i].kind, kind)
+		}
+	}
+}
+
+func TestRunWithoutBuilderIsRejected(t *testing.T) {
+	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM scratch\nRUN make\n"})
+	img := &image{Name: "x:1"}
+	err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{})
+	if img.RootFS != "" {
+		defer os.RemoveAll(img.RootFS)
+	}
 	if err == nil {
-		t.Fatal("RUN should be rejected")
+		t.Fatal("RUN with no builder configured should be rejected")
 	}
 }
 
@@ -215,7 +268,7 @@ func TestFromMustBeScratch(t *testing.T) {
 func TestCopyEscapeRejected(t *testing.T) {
 	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM scratch\nCOPY ../secret /x\n"})
 	img := &image{Name: "x:1"}
-	err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx)
+	err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{})
 	if img.RootFS != "" {
 		defer os.RemoveAll(img.RootFS)
 	}
