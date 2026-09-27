@@ -138,6 +138,15 @@ func (s *streamRuntime) Exec(ctx context.Context, containerID string, argv []str
 		return err
 	}
 	defer f.Close()
+	// A disconnected or canceled session leaves the pty child (and this
+	// function, blocked on the copy below) running otherwise: the non-tty
+	// branch kills its group on ctx.Done, and a terminal one has to as well.
+	go func() {
+		<-ctx.Done()
+		if cmd.ProcessState == nil && cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
 	go func() {
 		for size := range resize {
 			_ = pty.Setsize(f, &pty.Winsize{Rows: size.Height, Cols: size.Width})

@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -252,9 +253,13 @@ func untar(body []byte, gz bool, root string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(root, filepath.Clean("/"+h.Name))
-		if !strings.HasPrefix(target, root+"/") {
-			return fmt.Errorf("%q leaves the image root", h.Name)
+		// SecureJoin resolves each existing path component through root, so an
+		// earlier symlink entry (its own name checked, but its target free to
+		// point anywhere) cannot make a later entry land outside the image
+		// root -- a lexical prefix check on the name alone would follow it.
+		target, err := securejoin.SecureJoin(root, h.Name)
+		if err != nil {
+			return err
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:

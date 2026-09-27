@@ -284,7 +284,13 @@ func (r *runtimeSvc) RemovePodSandbox(ctx context.Context, req *runtimeapi.Remov
 	}
 	r.mu.Unlock()
 	for _, id := range ctrs {
-		_, _ = r.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: id})
+		// If a container aborts its own removal because a volume is still
+		// mounted, do not RemoveAll the pod directory: the container roots live
+		// under it, so removing through a live NFS mount would delete the
+		// volume's data on the node. Leave the state for the kubelet to retry.
+		if _, err := r.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: id}); err != nil {
+			return nil, err
+		}
 	}
 	r.mu.Lock()
 	delete(r.sboxes, req.PodSandboxId)
@@ -689,7 +695,6 @@ func (r *runtimeSvc) StopContainer(_ context.Context, req *runtimeapi.StopContai
 func (r *runtimeSvc) RemoveContainer(_ context.Context, req *runtimeapi.RemoveContainerRequest) (*runtimeapi.RemoveContainerResponse, error) {
 	r.mu.Lock()
 	c, ok := r.ctrs[req.ContainerId]
-	delete(r.ctrs, req.ContainerId)
 	r.mu.Unlock()
 	if ok {
 		c.stop(2 * time.Second)
@@ -698,10 +703,16 @@ func (r *runtimeSvc) RemoveContainer(_ context.Context, req *runtimeapi.RemoveCo
 		unmountDev(c.root)
 		unmountVolumes(c.root, c.mounts)
 		if out, err := exec.Command("mount").Output(); err == nil && strings.Contains(string(out), c.root) {
+			// A volume is still mounted; do not remove the tree through it, and
+			// keep the id so a retry runs the unmount again. Dropping it from the
+			// map here would make a retry a silent success that leaks the mount.
 			return nil, fmt.Errorf("container %s: %s is still mounted", c.id, c.root)
 		}
 		_ = os.RemoveAll(c.root)
 		_ = os.RemoveAll(c.dir)
+		r.mu.Lock()
+		delete(r.ctrs, req.ContainerId)
+		r.mu.Unlock()
 	}
 	return &runtimeapi.RemoveContainerResponse{}, nil
 }

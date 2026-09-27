@@ -38,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -164,9 +165,18 @@ func devRel(p string) string {
 // mountVolumes puts each volume at its path in the root.
 func (r *runtimeSvc) mountVolumes(root string, mounts []volumeMount) error {
 	for _, v := range mounts {
-		target := filepath.Join(root, filepath.Clean("/"+v.path))
+		// SecureJoin resolves the path through root, so a symlink a crafted
+		// image planted at the mount point (or any parent of it) cannot make
+		// the runtime -- unchrooted, as root -- operate on a path outside the
+		// container.
+		target, err := securejoin.SecureJoin(root, v.path)
+		if err != nil {
+			return err
+		}
 		if rel := devRel(v.path); v.file && rel != "" {
-			target = filepath.Join(root, devFileDir, rel)
+			if target, err = securejoin.SecureJoin(root, filepath.Join(devFileDir, rel)); err != nil {
+				return err
+			}
 		}
 		if v.file {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -206,7 +216,13 @@ func unmountVolumes(root string, mounts []volumeMount) {
 		if mounts[i].file {
 			continue
 		}
-		target := filepath.Join(root, filepath.Clean("/"+mounts[i].path))
+		// The same symlink-safe resolution mountVolumes used, so unmount acts on
+		// exactly the path that was mounted, never one a planted symlink now
+		// points outside root -- unmounting through which could reach the node.
+		target, err := securejoin.SecureJoin(root, mounts[i].path)
+		if err != nil {
+			continue
+		}
 		if err := exec.Command("umount", target).Run(); err != nil {
 			_ = exec.Command("umount", "-f", target).Run()
 		}

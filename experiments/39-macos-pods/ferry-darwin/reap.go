@@ -324,7 +324,10 @@ func writeFileAtomic(path string, b []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	_ = os.Chmod(tmp, 0o644)
+	// 0o600: these records hold the container's resolved environment, including
+	// Secret-derived values, and are only ever read back by the root runtime
+	// and its reapers -- never by a pod or another local account.
+	_ = os.Chmod(tmp, 0o600)
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err

@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/creack/pty v1.1.24
+	github.com/cyphar/filepath-securejoin v0.6.1
 	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/willscott/go-nfs v0.0.4
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
