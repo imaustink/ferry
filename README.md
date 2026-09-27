@@ -423,7 +423,7 @@ manifests/machines/                  kube-proxy and CoreDNS for mode 2's machine
 tests/                               run.sh: shell, Go and Swift tests, no cluster;
                                      e2e/: against a throwaway cluster. See tests/README.md
 docs/                                HANDOFF.md (the full picture), INSTALL.md,
-                                     RUNTIMES.md (choosing ferry-vm or ferry-shared),
+                                     RUNTIMES.md (choosing ferry-vm, ferry-shared or a macOS pod),
                                      MACHINES.md (mode 2), SERVICES.md,
                                      EXTERNAL-ACCESS.md (routers, several Macs),
                                      BENCHMARKING.md (how to measure this honestly)
@@ -524,7 +524,9 @@ kubectl get nodes -L ferry.dev/mode   # the machine was made for it
 
 [docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
 Jobs, what a pod that names neither gets, and what to do when one will not
-start.
+start. It also covers [native macOS pods](docs/RUNTIMES.md#macos-pods) —
+`ferry-macos-vm` and `ferry-macos-shared`, the same two modes for Darwin
+workloads.
 
 `ferry doctor` explains what is missing if the machine is not ready.
 

@@ -439,6 +439,7 @@ knowing when one of them is the thing you want to change on its own.
 |---|---|---|
 | `FERRY_NODE_IMAGE` | `<root>/node-image/oci` | the OCI layout machines are built from |
 | `FERRY_NODE_DISK` | `$FERRY_HOME/node.ext4` | the disk unpacked from it, cloned per machine |
+| `FERRY_MAC_IMAGE` | — | a golden **macOS** VM bundle to clone for `spec.os: darwin` machines — what makes [macOS pods](RUNTIMES.md#macos-pods) schedulable. Set it and `ferry up` installs the macOS NodePools and passes it to `ferry-machined --mac-image`; unset, `ferry-macos-vm`/`ferry-macos-shared` pods stay Pending. Building the bundle is [experiment 39](../experiments/39-macos-pods/FINDINGS.md), and [RUNTIMES.md](RUNTIMES.md#building-the-image) has the steps |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
 | `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
 | `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
