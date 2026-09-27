@@ -38,6 +38,15 @@ struct MachineSpec: Codable {
     /// spec.durability. Optional for the same reason: absent means the
     /// server's FERRY_NODE_DISK_SYNC, which is the cluster's default.
     let diskSync: String?
+    /// "darwin" for a macOS machine, whose `disk` is then a VM bundle
+    /// directory; absent is Linux. See MacMachine.swift.
+    let os: String?
+    /// For a macOS machine, the ferry.dev/mode it registers: shared-macos, or
+    /// macos-vm for a machine that is one pod's VM. Absent is shared-macos.
+    let mode: String?
+    /// The kubelet's maxPods, when the machine is not the default 110: 1 for a
+    /// macos-vm machine.
+    let maxPods: Int?
 }
 
 /// What this reports back about a machine it is running.
@@ -127,10 +136,14 @@ func serve() throws {
         for (name, spec) in wanted where running[name] == nil {
             known.insert(name)
             do {
-                let machine = try boot(spec: spec, network: network, kernelPath: kernelPath,
-                                       caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
-                                       clusterCIDR: clusterCIDR, podNetwork: podNetwork,
-                                       volumesDir: volumesDir)
+                let machine = spec.os == "darwin"
+                    ? try bootMac(spec: spec, network: network, caPath: caPath, apiServer: apiServer,
+                                  clusterDNS: clusterDNS, clusterCIDR: clusterCIDR,
+                                  podNetwork: podNetwork, volumesDir: volumesDir)
+                    : try boot(spec: spec, network: network, kernelPath: kernelPath,
+                               caPath: caPath, apiServer: apiServer, clusterDNS: clusterDNS,
+                               clusterCIDR: clusterCIDR, podNetwork: podNetwork,
+                               volumesDir: volumesDir)
                 live.add(name, machine)
                 write(status: MachineStatus(
                     name: name, address: machine.address, gateway: machine.gateway,

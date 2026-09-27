@@ -1,0 +1,39 @@
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+port: 10250
+healthzPort: 10248
+podLogsDir: /private/var/ferry/node/podlogs
+containerRuntimeEndpoint: unix:///private/var/ferry/node/cri.sock
+imageServiceEndpoint: unix:///private/var/ferry/node/cri.sock
+volumePluginDir: /private/var/ferry/node/volume-plugins
+kubeAPIQPS: 500
+kubeAPIBurst: 1000
+# The upstream hard-eviction defaults are sized for small cloud nodes; on a
+# laptop disk imagefs.available<15% means holding tens of gigabytes idle or the
+# node taints itself NoSchedule.
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "4Gi"
+  imagefs.available: "4Gi"
+  nodefs.inodesFree: "5%"
+# Image GC is keyed off the same percentage of the same disk, and imagefs here is
+# the Mac's whole data volume, not a disk sized to the cluster: a Mac 90% full of
+# photos looks like 90% images, so kubelet deletes every idle image every five
+# minutes chasing a number images cannot move. A loaded image has no registry
+# to come back from. Disk pressure is left to imagefs.available above.
+imageGCHighThresholdPercent: 100
+imageGCLowThresholdPercent: 99
+maxPods: __MAXPODS__
+cgroupsPerQOS: false
+enforceNodeAllocatable: []
+failSwapOn: false
+readOnlyPort: 0
+clusterDomain: cluster.local
+clusterDNS: [__DNS__]
+# A pod is a VM here, and a VM takes longer to appear than a container does.
+runtimeRequestTimeout: 10m
+authentication:
+  x509: {clientCAFile: __CA__}
+  anonymous: {enabled: false}
+  webhook: {enabled: true}
+authorization: {mode: Webhook}

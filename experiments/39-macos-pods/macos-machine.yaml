@@ -1,0 +1,10 @@
+# A macOS machine: a node whose pods are macOS processes sharing its kernel.
+# ferry-machined clones the golden image (--mac-image) and ferry-node boots it
+# on the machine network, beside any Linux machines.
+apiVersion: ferry.dev/v1alpha1
+kind: Machine
+metadata: {name: mac-0}
+spec:
+  os: darwin
+  cpus: 4
+  memory: 4Gi

@@ -1,0 +1,12 @@
+# How big the OS's command-line tools are, to decide whether every macOS pod
+# root can carry them. Run as the node.
+apiVersion: v1
+kind: Pod
+metadata: {name: size-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command: [/bin/sh, -c, "du -sh /bin /usr/bin /usr/sbin /usr/libexec 2>/dev/null; ls /bin | wc -l; ls /usr/bin | wc -l"]

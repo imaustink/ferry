@@ -1,0 +1,26 @@
+# Whether a devfs mounted in a container root can hold a symlink or a regular
+# file -- which is what /dev/termination-log needs to be, and what decides how
+# a macOS pod's /dev is made. Run as the node (ferry.dev/debug-host).
+apiVersion: v1
+kind: Pod
+metadata: {name: devfs-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command:
+        - /bin/sh
+        - -c
+        - |
+          B=/private/var/tmp/ferry-devfs; rm -rf "$B"; mkdir -p "$B/dev" "$B/logs"
+          echo "hello" > "$B/logs/term"
+          mount_devfs devfs "$B/dev" && echo "devfs mounted"
+          ln -s /private/var/tmp/ferry-devfs/logs/term "$B/dev/termination-log" 2>&1 && echo "symlink in devfs: ok"
+          touch "$B/dev/regular" 2>&1 && echo "regular file in devfs: ok"
+          mount_fdesc -o union fdesc "$B/dev" 2>&1 && echo "fdesc over it: ok"
+          ls -l "$B/dev/termination-log" 2>&1
+          echo "written through the link" > "$B/dev/termination-log" 2>&1 && echo "source now: $(cat "$B/logs/term")"
+          umount "$B/dev" 2>/dev/null; umount "$B/dev" 2>/dev/null
+          rm -rf "$B"

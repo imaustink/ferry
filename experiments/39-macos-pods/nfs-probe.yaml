@@ -1,0 +1,36 @@
+# Whether a loopback NFS mount can stand in for the bind mount macOS does not
+# have: export one directory tree to localhost, mount a subdirectory of it at
+# two paths, and see a write through one appear at the other and at the source.
+# Run as the node (ferry.dev/debug-host).
+apiVersion: v1
+kind: Pod
+metadata: {name: nfs-probe, labels: {experiment: "39"}, annotations: {ferry.dev/debug-host: "true"}}
+spec:
+  runtimeClassName: ferry-macos-shared
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: "example.com/podsrv-darwin:3"
+      command:
+        - /bin/sh
+        - -c
+        - |
+          t() { perl -MTime::HiRes=time -e 'printf "%.1f", time - $ARGV[0]' "$T0"; }
+          T0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+          B=/private/var/tmp/ferry-nfs; rm -rf "$B"; mkdir -p "$B/export/vol" "$B/a" "$B/b"
+          chmod 777 "$B/export/vol"
+          echo "$B/export -alldirs -maproot=root localhost" > /etc/exports
+          nfsd enable 2>&1; nfsd start 2>&1
+          echo "[$(t)] nfsd status: $(nfsd status 2>&1 | tr '\n' ' ')"
+          for i in $(seq 100); do nfsd status 2>&1 | grep -q "is running" && break; sleep 0.1; done
+          echo "[$(t)] rpcinfo: $(rpcinfo -p localhost 2>&1 | awk '{print $5}' | sort -u | tr '\n' ' ')"
+          echo "[$(t)] exports: $(showmount -e localhost 2>&1 | tr '\n' ' ')"
+          mount_nfs -o vers=3,locallocks,nobrowse,soft,timeo=20,retrans=2 localhost:$B/export/vol "$B/a" 2>&1 && echo "[$(t)] mounted at a"
+          mount_nfs -o vers=3,locallocks,nobrowse,soft,timeo=20,retrans=2 localhost:$B/export/vol "$B/b" 2>&1 && echo "[$(t)] mounted at b"
+          echo "written through a" > "$B/a/file"
+          echo "b sees: $(cat "$B/b/file" 2>&1)"
+          echo "source sees: $(cat "$B/export/vol/file" 2>&1)"
+          perl -e '$( = $) = 1234; $< = $> = 1234; open F, ">", "/private/var/tmp/ferry-nfs/a/mine" or die "uid 1234 write: $!\n"; print F "x"; close F; print "uid 1234 wrote through a\n"'
+          ls -ln "$B/export/vol"
+          umount "$B/a" "$B/b" && echo "[$(t)] unmounted"
+          rm -rf "$B"

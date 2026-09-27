@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -63,6 +64,65 @@ type machineSpec struct {
 	// The root disk's barrier, from spec.durability; see diskSync. Empty
 	// leaves it to ferry-node's own default, which is the cluster's.
 	DiskSync string `json:"diskSync,omitempty"`
+	// "darwin" for a macOS machine, whose Disk is then a VM bundle directory
+	// cloned from a golden image rather than an ext4 root; empty is Linux.
+	OS string `json:"os,omitempty"`
+	// The ferry.dev/mode the machine's kubelet registers with, and how many
+	// pods it takes: a macOS machine with spec.isolation vm is a VM of one pod
+	// -- ferry's mode 1 for macOS -- and says so from registration, rather
+	// than being relabelled a reconcile later. Empty and zero leave both to
+	// the guest's defaults.
+	Mode    string `json:"mode,omitempty"`
+	MaxPods int    `json:"maxPods,omitempty"`
+}
+
+// machineIsolation is spec.isolation for a macOS machine: "vm" for one pod per
+// machine, anything else shared.
+func machineIsolation(item *unstructured.Unstructured) string {
+	if v, _, _ := unstructured.NestedString(item.Object, "spec", "isolation"); v == isolationVM {
+		return isolationVM
+	}
+	return "shared"
+}
+
+// machineOS is spec.os: "darwin" for a macOS machine, "linux" otherwise.
+func machineOS(item *unstructured.Unstructured) string {
+	if v, _, _ := unstructured.NestedString(item.Object, "spec", "os"); v == osDarwin {
+		return osDarwin
+	}
+	return "linux"
+}
+
+// modeFor is the ferry.dev/mode a machine's node carries. A macOS machine is
+// a mode of its own: its pods share a kernel, but an XNU one, and a Linux
+// image scheduled there would unpack and fail at exec.
+//
+// A macOS machine of one pod is a mode again: its pod has a VM, and so a
+// kernel, of its own -- what ferry-vm is for Linux, made of a macOS machine,
+// since ferry-cri runs Linux guests only.
+func modeFor(item *unstructured.Unstructured) string {
+	if machineOS(item) == osDarwin {
+		if machineIsolation(item) == isolationVM {
+			return modeMacOSVM
+		}
+		return modeSharedMacOS
+	}
+	return modeShared
+}
+
+// macSharedDisabled reports whether a machine resolves to a shared-kernel macOS
+// node (ferry-macos-shared) while shared mode is not enabled. That node is a
+// chroot on a SIP-disabled guest, not a VM, so it is off by default: a shared
+// XNU kernel is not a security boundary.
+func macSharedDisabled(item *unstructured.Unstructured, allow bool) bool {
+	return machineOS(item) == osDarwin && modeFor(item) == modeSharedMacOS && !allow
+}
+
+// macBundlePath is where a macOS machine's VM bundle lives: a directory of
+// Disk.img, AuxiliaryStorage and the hardware and machine identifiers, cloned
+// from the golden image.
+func macBundlePath(name string) string {
+	return filepath.Join(*stateDir, name+".macvm")
 }
 
 // diskSync is what a durability level means for a machine's root disk, in
@@ -188,15 +248,37 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
 		return err
 	}
+	darwin := machineOS(item) == osDarwin
 	if image == "" {
 		image = *baseImage
+		if darwin {
+			image = *macImage
+		}
+	}
+	if darwin && image == "" {
+		err := fmt.Errorf("spec.os is darwin and there is no macOS golden image: set spec.image or ferry-machined --mac-image")
+		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
+		return err
+	}
+
+	// Shared-kernel macOS pods run in a chroot on a SIP-disabled guest, not a
+	// VM -- not a security boundary (docs/RUNTIMES.md#macos-pods). So a darwin
+	// machine that is not vm-per-pod is refused unless it was explicitly asked
+	// for; the fix a user wants is almost always spec.isolation: vm.
+	if macSharedDisabled(item, *allowMacShared) {
+		err := fmt.Errorf("shared-kernel macOS machines are disabled: a shared XNU kernel is not a security boundary. Set spec.isolation: vm for a VM-per-pod macOS machine, or enable shared mode with ferry-machined --allow-mac-shared (FERRY_MAC_SHARED=1)")
+		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
+		return err
 	}
 
 	// Checked before anything is created: a bootstrap token and a disk clone
 	// are side effects worth not leaving behind on a spec that cannot be met.
-	if err := checkDisk(image, diskGiB); err != nil {
-		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
-		return err
+	// A macOS bundle's disk is whatever size it was installed at.
+	if !darwin {
+		if err := checkDisk(image, diskGiB); err != nil {
+			_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
+			return err
+		}
 	}
 
 	token, err := c.createBootstrapToken(ctx, name)
@@ -206,11 +288,20 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 
 	// A clone rather than a copy: on APFS this is instant and costs nothing
 	// until the node writes, which is what makes a machine cheap to replace.
+	// A macOS machine's is a bundle directory, cloned file by file.
 	disk := diskPath(name)
-	_ = os.Remove(disk)
-	if out, err := exec.Command("cp", "-c", image, disk).CombinedOutput(); err != nil {
-		if out2, err2 := exec.Command("cp", image, disk).CombinedOutput(); err2 != nil {
-			return fmt.Errorf("cloning %s: %v %s / %v %s", image, err, out, err2, out2)
+	if darwin {
+		disk = macBundlePath(name)
+		_ = os.RemoveAll(disk)
+		if out, err := exec.Command("cp", "-cR", image, disk).CombinedOutput(); err != nil {
+			return fmt.Errorf("cloning %s: %v %s", image, err, out)
+		}
+	} else {
+		_ = os.Remove(disk)
+		if out, err := exec.Command("cp", "-c", image, disk).CombinedOutput(); err != nil {
+			if out2, err2 := exec.Command("cp", image, disk).CombinedOutput(); err2 != nil {
+				return fmt.Errorf("cloning %s: %v %s / %v %s", image, err, out, err2, out2)
+			}
 		}
 	}
 
@@ -221,7 +312,14 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	// At registration rather than patched on afterwards, for the reason the
 	// taints field exists at all: a pod that names no RuntimeClass must not
 	// get onto a machine in the moment before its taint arrives.
-	taints = withRegistrationTaint(taints, c.policy)
+	// A macOS machine is always born tainted, whatever the default: no pod
+	// that names nothing can run there, so none may land in the window before
+	// the reconciler would add it.
+	if darwin {
+		taints = withTaint(taints, modeLabel+"="+modeFor(item)+":NoSchedule")
+	} else {
+		taints = withRegistrationTaint(taints, c.policy)
+	}
 	durability, _, _ := unstructured.NestedString(item.Object, "spec", "durability")
 	sync, err := diskSync(durability)
 	if err != nil {
@@ -234,6 +332,12 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 	spec := machineSpec{
 		Name: name, Disk: disk, CPUs: cpus, MemoryMiB: memoryMiB,
 		Token: token, Taints: taints, DiskSync: sync,
+	}
+	if darwin {
+		spec.OS, spec.Mode = osDarwin, modeFor(item)
+		if machineIsolation(item) == isolationVM {
+			spec.MaxPods = 1
+		}
 	}
 	body, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
@@ -276,6 +380,11 @@ func (c *controller) delete(ctx context.Context, item *unstructured.Unstructured
 	_ = os.Remove(statusFile(name))
 	_ = os.Remove(diskPath(name))
 	_ = os.Remove(diskPath(name) + ".config.ext4")
+	// A macOS machine's config share holds its bootstrap token, so it goes with
+	// the machine. Its logs are left for a post-mortem; the next boot of a
+	// machine by that name starts them afresh.
+	_ = os.RemoveAll(macBundlePath(name))
+	_ = os.RemoveAll(macBundlePath(name) + ".config")
 
 	remaining := []string{}
 	for _, f := range item.GetFinalizers() {
@@ -376,8 +485,11 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 	if node, err := c.kube.CoreV1().Nodes().Get(ctx, m.name, metav1.GetOptions{}); err == nil {
 		status["nodeRef"] = map[string]any{"name": node.Name}
 		status["phase"] = "Running"
-		c.ensureModeLabel(ctx, node)
+		c.ensureModeLabel(ctx, node, modeFor(item))
 		c.ensureProviderID(ctx, node)
+		if modeFor(item) == modeMacOSVM {
+			c.ensureSpent(ctx, node)
+		}
 		if node.Spec.PodCIDR != "" {
 			m.podCIDR = node.Spec.PodCIDR
 			status["podCIDR"] = node.Spec.PodCIDR
@@ -396,9 +508,13 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 // with its neighbours, `vm-per-pod` for one of its own. The Mac node sets
 // vm-per-pod on its own kubelet; a machine's is set here.
 const (
-	modeLabel  = "ferry.dev/mode"
-	modeShared = "shared"
-	hostLabel  = "ferry.dev/host"
+	modeLabel       = "ferry.dev/mode"
+	modeShared      = "shared"
+	modeSharedMacOS = "shared-macos"
+	modeMacOSVM     = "macos-vm"
+	isolationVM     = "vm"
+	hostLabel       = "ferry.dev/host"
+	osDarwin        = "darwin"
 )
 
 // Applied here rather than through the kubelet's --node-labels, which would be
@@ -412,14 +528,14 @@ const (
 // `shared` will not schedule here. That is the safe direction: the label is
 // missing rather than wrong, so the scheduler declines to place a pod rather
 // than placing it somewhere it does not belong.
-func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node) {
+func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node, mode string) {
 	host := *hostNode
-	if node.Labels[modeLabel] == modeShared && (host == "" || node.Labels[hostLabel] == host) {
+	if node.Labels[modeLabel] == mode && (host == "" || node.Labels[hostLabel] == host) {
 		return
 	}
-	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, modeLabel, modeShared)
+	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, modeLabel, mode)
 	if host != "" {
-		patch = fmt.Sprintf(`{"metadata":{"labels":{%q:%q,%q:%q}}}`, modeLabel, modeShared, hostLabel, host)
+		patch = fmt.Sprintf(`{"metadata":{"labels":{%q:%q,%q:%q}}}`, modeLabel, mode, hostLabel, host)
 	}
 	if _, err := c.kube.CoreV1().Nodes().Patch(ctx, node.Name,
 		types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
@@ -428,6 +544,58 @@ func (c *controller) ensureModeLabel(ctx context.Context, node *corev1.Node) {
 		// pod that never schedules, and that is hard to diagnose from outside.
 		log.Printf("machine %s: could not label node %s: %v", node.Name, modeLabel, err)
 	}
+}
+
+// spentTaint marks a macos-vm machine that has had its pod. Its own key, not
+// ferry.dev/mode, so the default-runtime reconciler never takes it off.
+const spentTaint = "ferry.dev/spent"
+
+// ensureSpent makes a macOS VM machine single-use: once a pod has been bound
+// to it, nothing else is. maxPods 1 alone is not that -- a finished pod no
+// longer counts against it, so the next pod was scheduled into the VM the last
+// one had root in, its files and its kernel's state still there. Tainted
+// instead, the machine is empty once its pod ends and Karpenter takes it away,
+// and the next pod gets a clone of the golden image, as it would have from the
+// start. ferry-darwin refuses a second pod as well, for the moment between a
+// bind and the next tick here.
+func (c *controller) ensureSpent(ctx context.Context, node *corev1.Node) {
+	for _, t := range node.Spec.Taints {
+		if t.Key == spentTaint {
+			return
+		}
+	}
+	pods, err := c.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + node.Name})
+	if err != nil {
+		log.Printf("machine %s: listing its pods: %v", node.Name, err)
+		return
+	}
+	pod := ""
+	for i := range pods.Items {
+		if !ownedByDaemonSet(&pods.Items[i]) {
+			pod = pods.Items[i].Namespace + "/" + pods.Items[i].Name
+			break
+		}
+	}
+	if pod == "" {
+		return
+	}
+	// An update, like the default runtime's taints, so a conflict is a retry
+	// rather than someone else's taint lost.
+	node.Spec.Taints = append(node.Spec.Taints, corev1.Taint{Key: spentTaint, Value: "true", Effect: corev1.TaintEffectNoSchedule})
+	if _, err := c.kube.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{}); err != nil {
+		log.Printf("machine %s: could not mark it spent: %v", node.Name, err)
+		return
+	}
+	log.Printf("machine %s: spent on %s; no other pod will be scheduled to it", node.Name, pod)
+}
+
+func ownedByDaemonSet(pod *corev1.Pod) bool {
+	for _, o := range pod.OwnerReferences {
+		if o.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
 }
 
 // providerIDPrefix is how a provisioner refers to a machine it asked for.
@@ -530,17 +698,23 @@ func bootstrapSecretName(machine string) string {
 
 // tokenID is six lowercase alphanumerics, which is what Kubernetes requires of
 // a bootstrap token id.
+//
+// Unsigned, because the hash overflows on a name of 13 characters or so --
+// every name Karpenter makes -- and a signed sum that wrapped negative indexed
+// the alphabet with a negative remainder and panicked the controller (found
+// with macos-vm-6tc9j; default-xxxxx names had happened to wrap positive). For
+// a name that never overflowed, the id is what it always was.
 func tokenID(machine string) string {
-	sum := 0
+	var sum uint64
 	for _, r := range machine {
-		sum = sum*31 + int(r)
+		sum = sum*31 + uint64(r)
 	}
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 	id := make([]byte, 6)
 	for i := range id {
-		id[i] = alphabet[sum%len(alphabet)]
-		sum /= len(alphabet)
-		sum += i * 7
+		id[i] = alphabet[sum%uint64(len(alphabet))]
+		sum /= uint64(len(alphabet))
+		sum += uint64(i * 7)
 	}
 	return string(id)
 }

@@ -128,7 +128,11 @@ func (c *controller) reconcileDefaultRuntime(ctx context.Context) {
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
 		mode := node.Labels[modeLabel]
-		taints, changed := withModeTaint(node.Spec.Taints, mode, mode == tainted)
+		// A macOS machine keeps its taint under every policy: the default
+		// chooses between the two Linux-running kinds, and a pod that names
+		// no RuntimeClass is never a macOS pod.
+		want := mode == tainted || mode == modeSharedMacOS || mode == modeMacOSVM
+		taints, changed := withModeTaint(node.Spec.Taints, mode, want)
 		if !changed {
 			continue
 		}
@@ -142,7 +146,7 @@ func (c *controller) reconcileDefaultRuntime(ctx context.Context) {
 			}
 			continue
 		}
-		if mode == tainted {
+		if want {
 			log.Printf("default runtime: %s tainted %s=%s:NoSchedule", node.Name, modeLabel, mode)
 		} else {
 			log.Printf("default runtime: %s untainted", node.Name)
@@ -154,7 +158,12 @@ func (c *controller) reconcileDefaultRuntime(ctx context.Context) {
 // registers with, once. Karpenter's machines usually carry it already, from
 // the NodePool; a Machine written by hand does not.
 func withRegistrationTaint(taints []string, policy string) []string {
-	t := registrationTaint(policy)
+	return withTaint(taints, registrationTaint(policy))
+}
+
+// withTaint adds t, in --register-with-taints spelling, unless it is empty or
+// already there.
+func withTaint(taints []string, t string) []string {
 	if t == "" {
 		return taints
 	}

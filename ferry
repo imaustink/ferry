@@ -654,7 +654,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry node rm <name>    stop one
   ferry node ls           list the nodes
   ferry image build       build an image here, with no docker anywhere
-                          -t <name:tag>, -f <Dockerfile>, --stop to end the builder
+                          -t <name:tag>, -f <Dockerfile>, --os darwin for a macOS
+                          image, --stop to end the builder
   ferry image load <x>    run an image you built elsewhere, without a registry
   ferry profile           which cluster this checkout runs, and on what ports
   ferry addons list       what can be turned on, and what is
@@ -1046,6 +1047,14 @@ cmd_build() {
   echo "==> ferry-registry"
   ( cd "$here/ferry-registry" && go build -o "$here/bin/ferry-registry" . ) || return 1
   echo "==> $here/bin/ferry-registry"
+  echo
+  # The darwin image packager `ferry image build --os darwin` runs. A darwin
+  # image is FROM scratch plus COPY -- no base to run and no RUN to run it --
+  # so buildkit, which executes build steps on a Linux worker, is the wrong
+  # tool; this writes the OCI layout directly. Standard library only.
+  echo "==> ferry-mkimage"
+  ( cd "$here/ferry-mkimage" && go build -o "$here/bin/ferry-mkimage" . ) || return 1
+  echo "==> $here/bin/ferry-mkimage"
   echo
   # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
   # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
@@ -1878,6 +1887,12 @@ start_machines() {
 
   start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
+  # Shared-kernel macOS pods (ferry-macos-shared) are off unless asked for: a
+  # shared XNU kernel is not a security boundary (docs/RUNTIMES.md#macos-pods).
+  # The flag lets ferry-machined register a hand-declared shared macOS machine;
+  # the NodePool below is what lets Karpenter make one.
+  local mac_shared_flag=""
+  [ "${FERRY_MAC_SHARED:-0}" = 1 ] && mac_shared_flag="--allow-mac-shared"
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
@@ -1885,6 +1900,8 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     --memory-ledger "$MACHINE_MEMORY_LEDGER" \
+    ${FERRY_MAC_IMAGE:+--mac-image "$FERRY_MAC_IMAGE"} \
+    $mac_shared_flag \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2001,6 +2018,27 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
+    # macOS machines, only where there is a macOS image to make them from
+    # (experiment 39). Without one a macOS pod stays Pending, as it would with
+    # no pool at all, rather than failing a Machine it cannot boot.
+    #
+    # The VM-per-pod pool (ferry-macos-vm) is always installed with an image.
+    # The shared-kernel pool (ferry-macos-shared) is not: a shared XNU kernel is
+    # not a security boundary, so mode 2 for macOS is opt-in behind
+    # FERRY_MAC_SHARED=1 (docs/RUNTIMES.md#macos-pods). Off, a ferry-macos-shared
+    # pod stays Pending with no node to make for it, which is the intent.
+    if [ -n "${FERRY_MAC_IMAGE:-}" ]; then
+      kube apply -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
+        || warn "could not install the macOS VM NodePool; macOS machines must be declared by hand"
+      if [ "${FERRY_MAC_SHARED:-0}" = 1 ]; then
+        kube apply -f "$dir/macos-nodepool.yaml" >/dev/null 2>&1 \
+          || warn "could not install the shared macOS NodePool; macOS machines must be declared by hand"
+      else
+        kube delete nodepool macos --ignore-not-found >/dev/null 2>&1 || true
+      fi
+    else
+      kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
+    fi
     # The apply above has just put the NodePool back as the file has it,
     # without the default runtime's taint.
     ferry_apply_default_runtime
@@ -4496,8 +4534,63 @@ YAML
   return 1
 }
 
+# A macOS image is FROM scratch plus COPY -- no base to run, no RUN to run it --
+# so buildkit, which executes build steps on a Linux worker, cannot make one.
+# bin/ferry-mkimage writes the OCI layout directly from the same Dockerfile
+# subset.
+#
+# Where it goes differs from a Linux image, too. A darwin image runs only on a
+# macOS machine node, never on this Mac's own pod VMs, which are Linux -- so
+# ferry-cri's store would rightly refuse it ("nothing this node can run"). It
+# belongs in ferry-registry instead, which every macOS machine pulls from. That
+# registry is mode 2, so a darwin build needs machines on.
+ferry_image_build_darwin() {
+  local tag="$1" dockerfile="$2" context="$3"
+  [ -x "$here/bin/ferry-mkimage" ] || {
+    bad "bin/ferry-mkimage is missing -- run 'ferry build'"
+    return 1
+  }
+  [ -x "$here/bin/ferry-registry" ] || {
+    bad "bin/ferry-registry is missing -- run 'ferry build'"
+    return 1
+  }
+  machine_registry_enabled || running ferry-registry || {
+    bad "a macOS image is served to macOS machines through ferry-registry, which is off"
+    echo "    macOS pods run on machines (mode 2); turn them on and build again:"
+    echo "        ferry machines enable"
+    return 1
+  }
+
+  [ -n "$tag" ] || tag="$(basename "$context")-darwin:latest"
+
+  bold "building $tag (darwin)"
+  local staging; staging="$(mktemp -d "${TMPDIR:-/tmp}/ferry-build.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$staging'" RETURN
+  local layout="$staging/layout"
+
+  "$here/bin/ferry-mkimage" -name "$tag" -f "$dockerfile" -context "$context" -out "$layout" \
+    || { bad "build failed"; return 1; }
+
+  # Into the shared registry, the same path 'ferry image load' shares a Linux
+  # image with machines by -- so a macOS machine pulls it on the next
+  # 'kubectl apply', with no external registry in between.
+  local out="$staging/add.out" err="$staging/add.err"
+  if "$here/bin/ferry-registry" add --store "$REGISTRY_DIR" "$layout" >"$out" 2>"$err"; then
+    local name
+    while read -r name; do [ -n "$name" ] && ok "built and loaded $name"; done < "$out"
+  else
+    bad "built, but could not load it: $(tail -1 "$err")"
+    return 1
+  fi
+  echo
+  echo "    image: $tag"
+  echo "    A macOS pod runs it: runtimeClassName ferry-macos-shared or ferry-macos-vm,"
+  echo "    imagePullPolicy IfNotPresent (machines pull it from this Mac's registry)"
+}
+
 cmd_image_build() {
-  local tag="" dockerfile="" context="" no_cache="" progress=auto
+  local tag="" dockerfile="" context="" no_cache="" progress=auto os=linux
   local -a build_args=()
 
   while [ $# -gt 0 ]; do
@@ -4521,12 +4614,19 @@ cmd_image_build() {
       --build-arg)
         [ $# -ge 2 ] || { bad "--build-arg needs KEY=VALUE"; return 2; }
         build_args+=(--opt "build-arg:$2"); shift 2 ;;
+      --os)
+        [ $# -ge 2 ] || { bad "--os needs a value: linux or darwin"; return 2; }
+        os="$2"; shift 2 ;;
+      --os=*) os="${1#*=}"; shift ;;
       --no-cache) no_cache=1; shift ;;
       --quiet|-q) progress=quiet; shift ;;
       -h|--help)
         echo "usage: ferry image build [-t <name:tag>] [-f <Dockerfile>] [--build-arg K=V]"
-        echo "                         [--no-cache] [--quiet] [<context>]"
+        echo "                         [--os linux|darwin] [--no-cache] [--quiet] [<context>]"
         echo "       ferry image build --stop"
+        echo
+        echo "  --os darwin  package a macOS image (FROM scratch + COPY only; no RUN)."
+        echo "               See docs/RUNTIMES.md#building-the-image"
         return 0 ;;
       -*) bad "unknown flag $1"; return 2 ;;
       *)  context="$1"; shift ;;
@@ -4538,6 +4638,15 @@ cmd_image_build() {
   context="$(cd "$context" && pwd)"
   dockerfile="${dockerfile:-$context/Dockerfile}"
   [ -f "$dockerfile" ] || { bad "no Dockerfile at $dockerfile"; return 1; }
+
+  case "$os" in
+    linux) ;;
+    darwin)
+      [ ${#build_args[@]} -eq 0 ] || warn "--build-arg is ignored for --os darwin (ARG is not supported)"
+      [ -z "$no_cache" ] || warn "--no-cache is ignored for --os darwin (the layout is rebuilt each time)"
+      ferry_image_build_darwin "$tag" "$dockerfile" "$context"; return $? ;;
+    *) bad "--os $os is not supported: use linux or darwin"; return 2 ;;
+  esac
 
   [ -S "$FERRY_EXEC_SOCK" ] || { bad "ferry is not up"; return 1; }
 
@@ -4720,9 +4829,11 @@ cmd_image_load() {
       fi
       ;;
     *'"error"'*)
-      bad "$(echo "$reply" | sed -n 's/.*"error":"\(.*\)".*/\1/p')" ;;
+      bad "$(echo "$reply" | sed -n 's/.*"error":"\(.*\)".*/\1/p')"
+      return 1 ;;
     *)
-      bad "ferry-cri did not answer; see 'ferry logs ferry-cri'" ;;
+      bad "ferry-cri did not answer; see 'ferry logs ferry-cri'"
+      return 1 ;;
   esac
 }
 

@@ -1,0 +1,9 @@
+# Whether a RuntimeClass may charge an extended resource as pod overhead --
+# the way a macOS pod VM would take one of the host's two macOS guest slots.
+# Checked with: kubectl apply --dry-run=server -f overhead-probe.yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: ferry-macos-vm-probe}
+handler: ferry-macos-vm
+overhead:
+  podFixed: {memory: 4608Mi, ferry.dev/macos-guest: "1"}

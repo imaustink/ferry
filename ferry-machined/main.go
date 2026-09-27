@@ -30,12 +30,14 @@ import (
 )
 
 var (
-	kubeconfig = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
-	kernel     = flag.String("kernel", "", "guest kernel every machine boots")
-	baseImage  = flag.String("image", "", "node disk image machines are cloned from")
-	stateDir   = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
-	apiServer  = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
-	caFile     = flag.String("ca", "", "cluster CA the machines must trust")
+	kubeconfig     = flag.String("kubeconfig", "", "kubeconfig for the cluster to serve")
+	kernel         = flag.String("kernel", "", "guest kernel every machine boots")
+	baseImage      = flag.String("image", "", "node disk image machines are cloned from")
+	macImage       = flag.String("mac-image", "", "macOS golden VM bundle a spec.os: darwin machine is cloned from")
+	allowMacShared = flag.Bool("allow-mac-shared", false, "permit shared-kernel macOS machines (ferry-macos-shared); off because a shared XNU kernel is not a security boundary")
+	stateDir       = flag.String("state", "/tmp/ferry-machined", "where per-machine disks and logs live")
+	apiServer      = flag.String("api-server", "", "https://host:port machines join, reachable from a VM")
+	caFile         = flag.String("ca", "", "cluster CA the machines must trust")
 	// No --cluster-dns here. It was declared and never read, which made it look
 	// like the place cluster DNS is configured while the value went nowhere: a
 	// machine's kubelet takes its clusterDNS from the boot arguments
