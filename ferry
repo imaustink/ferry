@@ -1887,6 +1887,12 @@ start_machines() {
 
   start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
+  # Shared-kernel macOS pods (ferry-macos-shared) are off unless asked for: a
+  # shared XNU kernel is not a security boundary (docs/RUNTIMES.md#macos-pods).
+  # The flag lets ferry-machined register a hand-declared shared macOS machine;
+  # the NodePool below is what lets Karpenter make one.
+  local mac_shared_flag=""
+  [ "${FERRY_MAC_SHARED:-0}" = 1 ] && mac_shared_flag="--allow-mac-shared"
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
@@ -1895,6 +1901,7 @@ start_machines() {
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     --memory-ledger "$MACHINE_MEMORY_LEDGER" \
     ${FERRY_MAC_IMAGE:+--mac-image "$FERRY_MAC_IMAGE"} \
+    $mac_shared_flag \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2014,9 +2021,21 @@ start_provisioner() {
     # macOS machines, only where there is a macOS image to make them from
     # (experiment 39). Without one a macOS pod stays Pending, as it would with
     # no pool at all, rather than failing a Machine it cannot boot.
+    #
+    # The VM-per-pod pool (ferry-macos-vm) is always installed with an image.
+    # The shared-kernel pool (ferry-macos-shared) is not: a shared XNU kernel is
+    # not a security boundary, so mode 2 for macOS is opt-in behind
+    # FERRY_MAC_SHARED=1 (docs/RUNTIMES.md#macos-pods). Off, a ferry-macos-shared
+    # pod stays Pending with no node to make for it, which is the intent.
     if [ -n "${FERRY_MAC_IMAGE:-}" ]; then
-      kube apply -f "$dir/macos-nodepool.yaml" -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
-        || warn "could not install the macOS NodePools; macOS machines must be declared by hand"
+      kube apply -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
+        || warn "could not install the macOS VM NodePool; macOS machines must be declared by hand"
+      if [ "${FERRY_MAC_SHARED:-0}" = 1 ]; then
+        kube apply -f "$dir/macos-nodepool.yaml" >/dev/null 2>&1 \
+          || warn "could not install the shared macOS NodePool; macOS machines must be declared by hand"
+      else
+        kube delete nodepool macos --ignore-not-found >/dev/null 2>&1 || true
+      fi
     else
       kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
     fi

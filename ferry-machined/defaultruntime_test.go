@@ -106,6 +106,35 @@ func TestMachineOSAndMode(t *testing.T) {
 	}
 }
 
+// A shared-kernel macOS machine is refused unless shared mode is enabled; a
+// VM-per-pod macOS machine and any Linux machine are always allowed.
+func TestMacSharedDisabled(t *testing.T) {
+	for _, tc := range []struct {
+		os, isolation string
+		allow         bool
+		want          bool
+	}{
+		{"darwin", "", false, true},       // shared-macos, not enabled -> refused
+		{"darwin", "shared", false, true}, // the same, spelled out
+		{"darwin", "", true, false},       // enabled -> allowed
+		{"darwin", "vm", false, false},    // VM-per-pod is never shared
+		{"linux", "", false, false},       // Linux is unaffected
+		{"", "", false, false},
+	} {
+		item := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
+		if tc.os != "" {
+			item.Object["spec"].(map[string]any)["os"] = tc.os
+		}
+		if tc.isolation != "" {
+			item.Object["spec"].(map[string]any)["isolation"] = tc.isolation
+		}
+		if got := macSharedDisabled(item, tc.allow); got != tc.want {
+			t.Errorf("os=%q isolation=%q allow=%v: macSharedDisabled=%v, want %v",
+				tc.os, tc.isolation, tc.allow, got, tc.want)
+		}
+	}
+}
+
 // Changing the default moves the taint rather than adding a second one, and
 // leaves every taint that is not ferry's alone.
 func TestDefaultRuntimeSwitchesCleanly(t *testing.T) {

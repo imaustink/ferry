@@ -210,7 +210,7 @@ with two more classes for the same two modes:
 | `runtimeClassName` | the pod is | worth it for |
 |---|---|---|
 | `ferry-macos-vm` | a macOS VM of its own, with its own XNU kernel | a job that must be root, load a kext, or change system settings |
-| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling — **trusted code only** (see the warning below) |
+| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling — **off by default, trusted code only** (see the warning below) |
 
 Both use the handler `ferry-darwin` and a darwin image. As with the Linux
 classes, the class carries the `nodeSelector` and toleration, so
@@ -249,6 +249,12 @@ exactly as `ferry-shared` does above.
 > single-use XNU kernel behind a hypervisor. That is the same isolation
 > `ferry-vm` gives a Linux pod; `ferry-macos-shared` is closer to running the
 > workload as another user on one machine.
+>
+> **It is off by default.** `ferry-macos-vm` needs only a macOS image
+> (`FERRY_MAC_IMAGE`); `ferry-macos-shared` also needs **`FERRY_MAC_SHARED=1`**.
+> Without it ferry installs no shared NodePool and `ferry-machined` refuses a
+> hand-declared `spec.os: darwin` machine that is not `spec.isolation: vm`, so a
+> `ferry-macos-shared` pod stays Pending — you have to opt in, knowing the above.
 
 Three things set macOS pods apart from the Linux classes:
 
@@ -322,9 +328,14 @@ Point ferry at the baked bundle and bring machines up:
 
 ```sh
 export FERRY_MAC_IMAGE="$PWD/.cache/golden-node"
-ferry up                # installs the macOS NodePools, passes --mac-image to ferry-machined
+export FERRY_MAC_SHARED=1   # only for ferry-macos-shared (mode 2); omit for VM-per-pod
+ferry up                # installs the macOS NodePool(s), passes --mac-image to ferry-machined
 ferry machines enable
 ```
+
+`FERRY_MAC_SHARED=1` is what turns on the shared-kernel pool and lets
+`ferry-machined` register a shared macOS machine — leave it out and only
+`ferry-macos-vm` works, which is the safe default (see the warning above).
 
 **2. A darwin pod image** — what a macOS pod runs. It holds only *your own*
 arm64/arm64e binaries: dyld and the system libraries come from the node, because
