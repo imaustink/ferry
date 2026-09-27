@@ -1055,12 +1055,19 @@ cmd_build() {
   echo "==> $here/bin/ferry-registry"
   echo
   # The darwin image packager `ferry image build --os darwin` runs. A darwin
-  # image is FROM scratch plus COPY -- no base to run and no RUN to run it --
-  # so buildkit, which executes build steps on a Linux worker, is the wrong
-  # tool; this writes the OCI layout directly. Standard library only.
+  # image is FROM scratch plus COPY -- no base to run -- so buildkit, which
+  # executes build steps on a Linux worker, is the wrong tool; this writes the
+  # OCI layout directly. Standard library only.
   echo "==> ferry-mkimage"
   ( cd "$here/ferry-mkimage" && go build -o "$here/bin/ferry-mkimage" . ) || return 1
   echo "==> $here/bin/ferry-mkimage"
+  echo
+  # What RUN runs in, when a darwin Dockerfile has one: ferry-mkimage cannot
+  # execute a Darwin binary itself (still no Darwin to run one on), so it
+  # spawns this as a coprocess -- a macOS VM cloned from FERRY_MAC_IMAGE, one
+  # exec request per COPY or RUN. See docs/RUNTIMES.md#building-the-image.
+  echo "==> ferry-macvm"
+  ( cd "$here/ferry-macvm" && ./build.sh ) || return 1
   echo
   # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
   # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
@@ -4688,10 +4695,11 @@ YAML
   return 1
 }
 
-# A macOS image is FROM scratch plus COPY -- no base to run, no RUN to run it --
-# so buildkit, which executes build steps on a Linux worker, cannot make one.
-# bin/ferry-mkimage writes the OCI layout directly from the same Dockerfile
-# subset.
+# A darwin image is FROM scratch plus COPY -- no base to run -- so buildkit,
+# which executes build steps on a Linux worker, cannot make one. bin/ferry-mkimage
+# writes the OCI layout directly from the same Dockerfile subset, and, if the
+# Dockerfile has a RUN, drives bin/ferry-macvm to run it in a macOS VM cloned
+# from FERRY_MAC_IMAGE -- the same golden bundle machines boot from.
 #
 # Where it goes differs from a Linux image, too. A darwin image runs only on a
 # macOS machine node, never on this Mac's own pod VMs, which are Linux -- so
@@ -4723,7 +4731,10 @@ ferry_image_build_darwin() {
   trap "rm -rf '$staging'" RETURN
   local layout="$staging/layout"
 
+  # -golden/-macvm are only used if the Dockerfile has a RUN; ferry-mkimage
+  # says so plainly if it needs them and either is missing.
   "$here/bin/ferry-mkimage" -name "$tag" -f "$dockerfile" -context "$context" -out "$layout" \
+      -golden "${FERRY_MAC_IMAGE:-}" -macvm "$here/bin/ferry-macvm" \
     || { bad "build failed"; return 1; }
 
   # Into the shared registry, the same path 'ferry image load' shares a Linux
@@ -4779,7 +4790,8 @@ cmd_image_build() {
         echo "                         [--os linux|darwin] [--no-cache] [--quiet] [<context>]"
         echo "       ferry image build --stop"
         echo
-        echo "  --os darwin  package a macOS image (FROM scratch + COPY only; no RUN)."
+        echo "  --os darwin  package a macOS image (FROM scratch + COPY; RUN runs in a macOS VM"
+        echo "               cloned from \$FERRY_MAC_IMAGE, if the Dockerfile has one)."
         echo "               See docs/RUNTIMES.md#building-the-image"
         return 0 ;;
       -*) bad "unknown flag $1"; return 2 ;;

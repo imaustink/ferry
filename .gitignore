@@ -29,3 +29,12 @@ experiments/39-macos-pods/.cache/
 experiments/39-macos-pods/build/
 experiments/39-macos-pods/.catalog.xml
 experiments/39-macos-pods/.ipsw.json
+
+# macOS containers demo: build.sh's compiled binary.
+macos-containers-demo/hello
+
+# Experiment 40: the cloned VM working dirs, macvm build output, and the Go
+# driver's compiled binary.
+experiments/40-mac-build-run/.cache/
+experiments/40-mac-build-run/build/
+experiments/40-mac-build-run/mkimage-run/mkimage-run
