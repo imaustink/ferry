@@ -425,8 +425,9 @@ func parseExecOrShell(rest string) []string {
 	return []string{"/bin/sh", "-c", rest}
 }
 
-// parseEnv reads `ENV k=v k2=v2` and the legacy `ENV k v`, returning k=v
-// strings.
+// parseEnv reads `ENV k=v k2=v2` (each value may be shell-quoted, `k="v
+// with spaces"`, the way Docker's own docs show it) and the legacy `ENV k v`,
+// returning k=v strings. LABEL shares this same syntax and this function.
 func parseEnv(rest string) ([]string, error) {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
@@ -439,7 +440,63 @@ func parseEnv(rest string) ([]string, error) {
 		}
 		return []string{k + "=" + strings.TrimSpace(v)}, nil
 	}
-	return strings.Fields(rest), nil
+	pairs, err := splitQuotedFields(rest)
+	if err != nil {
+		return nil, fmt.Errorf("ENV %q: %w", rest, err)
+	}
+	for _, p := range pairs {
+		if !strings.Contains(p, "=") {
+			return nil, fmt.Errorf("ENV %q: %q is not key=value", rest, p)
+		}
+	}
+	return pairs, nil
+}
+
+// splitQuotedFields splits s on whitespace the way a shell would: a
+// single- or double-quoted run holds a space rather than ending the field,
+// and the quote characters themselves are removed from the result. This is
+// what lets `ENV NAME="John Doe" ROLE=admin` keep "John Doe" together --
+// strings.Fields alone would split it into "NAME=\"John", "Doe\"" and
+// "ROLE=admin", the bug this exists to fix.
+func splitQuotedFields(s string) ([]string, error) {
+	var fields []string
+	var cur strings.Builder
+	has := false // cur holds content even if empty, e.g. from KEY=""
+	quote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+				continue
+			}
+			if quote == '"' && c == '\\' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\') {
+				i++
+				c = s[i]
+			}
+			cur.WriteByte(c)
+		case c == '"' || c == '\'':
+			quote = c
+			has = true
+		case c == ' ' || c == '\t':
+			if has {
+				fields = append(fields, cur.String())
+				cur.Reset()
+				has = false
+			}
+		default:
+			cur.WriteByte(c)
+			has = true
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unclosed %c", quote)
+	}
+	if has {
+		fields = append(fields, cur.String())
+	}
+	return fields, nil
 }
 
 func within(base, p string) bool {
