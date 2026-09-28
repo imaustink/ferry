@@ -277,6 +277,78 @@ func TestCopyEscapeRejected(t *testing.T) {
 	}
 }
 
+// A quoted value with spaces used to come back as several near-empty
+// variables (splitQuotedFields, below, is the fix): strings.Fields split
+// `NAME="John Doe" ROLE=admin` on every space, so NAME ended up `"John` and
+// three more entries -- Doe", ROLE=admin -- came back with no way to tell
+// they were never meant to be their own variables.
+func TestEnvQuotedValue(t *testing.T) {
+	df, err := parseDockerfile("FROM scratch\nENV NAME=\"John Doe\" ROLE=admin\n")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := df.steps[0].env
+	want := []string{"NAME=John Doe", "ROLE=admin"}
+	if !eq(got, want) {
+		t.Errorf("env = %#v, want %#v", got, want)
+	}
+}
+
+func TestEnvSingleQuotedValue(t *testing.T) {
+	df, err := parseDockerfile(`FROM scratch
+ENV NAME='John "the man" Doe'
+`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{`NAME=John "the man" Doe`}
+	if !eq(df.steps[0].env, want) {
+		t.Errorf("env = %#v, want %#v", df.steps[0].env, want)
+	}
+}
+
+// LABEL shares parseEnv with ENV, so the same quoting applies to it.
+func TestLabelQuotedValue(t *testing.T) {
+	df, err := parseDockerfile("FROM scratch\nLABEL description=\"a demo, with a comma\"\n")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := df.labels["description"], "a demo, with a comma"; got != want {
+		t.Errorf("labels[description] = %q, want %q", got, want)
+	}
+}
+
+func TestEnvUnclosedQuoteRejected(t *testing.T) {
+	if _, err := parseDockerfile("FROM scratch\nENV NAME=\"unclosed\n"); err == nil {
+		t.Fatal("an unclosed quote should be rejected")
+	}
+}
+
+func TestSplitQuotedFields(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"FOO=bar BAZ=qux", []string{"FOO=bar", "BAZ=qux"}},
+		{`NAME="John Doe" ROLE=admin`, []string{"NAME=John Doe", "ROLE=admin"}},
+		{`NAME='John Doe'`, []string{"NAME=John Doe"}},
+		{`GREETING="hi \"there\""`, []string{`GREETING=hi "there"`}},
+		{`EMPTY=""`, []string{"EMPTY="}},
+		{"A=1   B=2", []string{"A=1", "B=2"}},
+		{`MID=a"b c"d`, []string{"MID=ab cd"}},
+	}
+	for _, c := range cases {
+		got, err := splitQuotedFields(c.in)
+		if err != nil {
+			t.Errorf("splitQuotedFields(%q): %v", c.in, err)
+			continue
+		}
+		if !eq(got, c.want) {
+			t.Errorf("splitQuotedFields(%q) = %#v, want %#v", c.in, got, c.want)
+		}
+	}
+}
+
 func eq(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
