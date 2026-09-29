@@ -135,7 +135,7 @@ func writeCtx(t *testing.T, files map[string]string) string {
 func TestDockerfileImage(t *testing.T) {
 	ctx := writeCtx(t, map[string]string{
 		"Dockerfile": `# a darwin workload
-FROM scratch
+FROM macos
 COPY bin/app /bin/app
 COPY assets/ /assets/
 ENV FOO=bar BAZ=qux
@@ -182,7 +182,7 @@ CMD ["--port", "8080"]
 
 func TestShellFormEntrypoint(t *testing.T) {
 	ctx := writeCtx(t, map[string]string{
-		"Dockerfile": "FROM scratch\nCOPY app /app\nENTRYPOINT /app --serve\n",
+		"Dockerfile": "FROM macos\nCOPY app /app\nENTRYPOINT /app --serve\n",
 		"app":        "x",
 	})
 	img := &image{Name: "example.com/app-darwin:1"}
@@ -197,7 +197,7 @@ func TestShellFormEntrypoint(t *testing.T) {
 }
 
 func TestRunIsAccepted(t *testing.T) {
-	df, err := parseDockerfile("FROM scratch\nRUN make\n")
+	df, err := parseDockerfile("FROM macos\nRUN make\n")
 	if err != nil {
 		t.Fatalf("RUN should parse: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestRunIsAccepted(t *testing.T) {
 }
 
 func TestRunExecForm(t *testing.T) {
-	df, err := parseDockerfile("FROM scratch\nRUN [\"/bin/echo\", \"hi\"]\n")
+	df, err := parseDockerfile("FROM macos\nRUN [\"/bin/echo\", \"hi\"]\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestRunExecForm(t *testing.T) {
 // RUN after a COPY must stay in the order they were written, not be sorted
 // into "all copies, then everything else".
 func TestStepOrderPreserved(t *testing.T) {
-	df, err := parseDockerfile(`FROM scratch
+	df, err := parseDockerfile(`FROM macos
 COPY a.txt a.txt
 RUN echo one
 COPY b.txt b.txt
@@ -245,7 +245,7 @@ RUN echo two
 }
 
 func TestRunWithoutBuilderIsRejected(t *testing.T) {
-	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM scratch\nRUN make\n"})
+	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM macos\nRUN make\n"})
 	img := &image{Name: "x:1"}
 	err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{})
 	if img.RootFS != "" {
@@ -256,17 +256,73 @@ func TestRunWithoutBuilderIsRejected(t *testing.T) {
 	}
 }
 
-func TestFromMustBeScratch(t *testing.T) {
+func TestFromMustBeMacos(t *testing.T) {
 	if _, err := parseDockerfile("FROM alpine:3\n"); err == nil {
-		t.Fatal("non-scratch FROM should be rejected")
+		t.Fatal("non-macos FROM should be rejected")
+	}
+	if _, err := parseDockerfile("FROM scratch\n"); err == nil {
+		t.Fatal("FROM scratch is no longer accepted")
 	}
 	if _, err := parseDockerfile("COPY a b\n"); err == nil {
 		t.Fatal("missing FROM should be rejected")
 	}
+	if df, err := parseDockerfile("FROM macos\nCOPY a b\n"); err != nil {
+		t.Fatalf("FROM macos should parse: %v", err)
+	} else if df.requireMacOS != 0 {
+		t.Errorf("bare FROM macos should not pin a version, got %d", df.requireMacOS)
+	}
+}
+
+func TestFromMacosVersionTag(t *testing.T) {
+	df, err := parseDockerfile("FROM macos:26\nCOPY a b\n")
+	if err != nil {
+		t.Fatalf("FROM macos:26 should parse: %v", err)
+	}
+	if df.requireMacOS != 26 {
+		t.Errorf("requireMacOS = %d, want 26", df.requireMacOS)
+	}
+	if _, err := parseDockerfile("FROM macos:sequoia\n"); err == nil {
+		t.Fatal("a non-integer macos tag should be rejected")
+	}
+}
+
+// A `FROM macos:<major>` pin is checked against the golden image's major when
+// one is known (builderConfig.nodeMacOS); a mismatch fails before any build,
+// a match builds and stamps the major as a label.
+func TestFromMacosVersionCheck(t *testing.T) {
+	ctx := writeCtx(t, map[string]string{
+		"Dockerfile": "FROM macos:26\nCOPY app /app\n",
+		"app":        "x",
+	})
+	df := filepath.Join(ctx, "Dockerfile")
+
+	img := &image{Name: "x:1"}
+	if err := buildFromDockerfile(img, df, ctx, builderConfig{nodeMacOS: 25}); err == nil {
+		if img.RootFS != "" {
+			os.RemoveAll(img.RootFS)
+		}
+		t.Fatal("FROM macos:26 against a macOS 25 image should fail")
+	}
+
+	img = &image{Name: "x:1"}
+	if err := buildFromDockerfile(img, df, ctx, builderConfig{nodeMacOS: 26}); err != nil {
+		t.Fatalf("FROM macos:26 against a macOS 26 image should build: %v", err)
+	}
+	defer os.RemoveAll(img.RootFS)
+	if got := img.Labels["dev.ferry.macos.major"]; got != "26" {
+		t.Errorf("label dev.ferry.macos.major = %q, want 26", got)
+	}
+
+	// Unknown node version does not block.
+	img = &image{Name: "x:1"}
+	if err := buildFromDockerfile(img, df, ctx, builderConfig{nodeMacOS: 0}); err != nil {
+		t.Fatalf("unknown node macOS should not block: %v", err)
+	}
+	defer os.RemoveAll(img.RootFS)
 }
 
 func TestCopyEscapeRejected(t *testing.T) {
-	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM scratch\nCOPY ../secret /x\n"})
+	ctx := writeCtx(t, map[string]string{"Dockerfile": "FROM macos\nCOPY ../secret /x\n"})
 	img := &image{Name: "x:1"}
 	err := buildFromDockerfile(img, filepath.Join(ctx, "Dockerfile"), ctx, builderConfig{})
 	if img.RootFS != "" {
@@ -283,7 +339,7 @@ func TestCopyEscapeRejected(t *testing.T) {
 // three more entries -- Doe", ROLE=admin -- came back with no way to tell
 // they were never meant to be their own variables.
 func TestEnvQuotedValue(t *testing.T) {
-	df, err := parseDockerfile("FROM scratch\nENV NAME=\"John Doe\" ROLE=admin\n")
+	df, err := parseDockerfile("FROM macos\nENV NAME=\"John Doe\" ROLE=admin\n")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -295,7 +351,7 @@ func TestEnvQuotedValue(t *testing.T) {
 }
 
 func TestEnvSingleQuotedValue(t *testing.T) {
-	df, err := parseDockerfile(`FROM scratch
+	df, err := parseDockerfile(`FROM macos
 ENV NAME='John "the man" Doe'
 `)
 	if err != nil {
@@ -309,7 +365,7 @@ ENV NAME='John "the man" Doe'
 
 // LABEL shares parseEnv with ENV, so the same quoting applies to it.
 func TestLabelQuotedValue(t *testing.T) {
-	df, err := parseDockerfile("FROM scratch\nLABEL description=\"a demo, with a comma\"\n")
+	df, err := parseDockerfile("FROM macos\nLABEL description=\"a demo, with a comma\"\n")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -319,7 +375,7 @@ func TestLabelQuotedValue(t *testing.T) {
 }
 
 func TestEnvUnclosedQuoteRejected(t *testing.T) {
-	if _, err := parseDockerfile("FROM scratch\nENV NAME=\"unclosed\n"); err == nil {
+	if _, err := parseDockerfile("FROM macos\nENV NAME=\"unclosed\n"); err == nil {
 		t.Fatal("an unclosed quote should be rejected")
 	}
 }

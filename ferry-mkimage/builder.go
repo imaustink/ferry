@@ -19,6 +19,10 @@ import (
 type builderConfig struct {
 	golden    string
 	macvmPath string
+	// nodeMacOS is the macOS major of the golden image (what a machine cloned
+	// from it runs), used to check a `FROM macos:<major>` pin. 0 means unknown,
+	// which skips the check.
+	nodeMacOS int
 }
 
 // guestRoot is the one directory a build ever touches inside the builder VM.

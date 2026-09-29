@@ -12,7 +12,7 @@
 # change system settings can -- at the price of a whole guest per pod, and of
 # one of the Mac's two macOS guest slots, which both pools share.
 #
-# Applied only when this Mac has a macOS image (FERRY_MAC_IMAGE).
+# Applied only when this Mac has a macOS golden image (found automatically once baked).
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:

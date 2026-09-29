@@ -59,6 +59,9 @@ fi
 # nfsd on at boot, so ferry-darwin's restart of it with the real exports is not
 # also its first start (20 s on a fresh machine).
 nfsd enable 2>/dev/null || true
+# Record which macOS this image is, for the version a `FROM macos:<major>`
+# image pins against. Written into the share, so the host can read it back.
+sw_vers -productVersion > "$S/PRODUCT_VERSION" 2>/dev/null || true
 echo "baked: $(ls "$F" | tr '\n' ' ')"
 csrutil status
 GUEST
@@ -67,4 +70,7 @@ GUEST
 # share and runs the real script from it.
 "$here/build/macvm" boot "$out" --share "$share" -- \
     /bin/sh -c 'set -e; S=/private/var/ferry/share; mkdir -p "$S"; mount_virtiofs ferry "$S"; sh "$S/bake-guest.sh"'
+# Keep the recorded macOS version with the baked bundle, so whatever consumes it
+# (ferry mac-image bake) can read the version without booting the guest again.
+[ -f "$share/PRODUCT_VERSION" ] && cp "$share/PRODUCT_VERSION" "$out/PRODUCT_VERSION"
 du -sh "$out"

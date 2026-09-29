@@ -705,7 +705,7 @@ printf '\033[1m%s\033[0m\n' "ferry image build can package a macOS image"
 build_help="$("$repo/ferry" image build --help 2>&1)"
 contains "the help offers --os darwin" "$build_help" "--os darwin"
 darwin_ctx="$sandbox/darwin-ctx"; mkdir -p "$darwin_ctx"
-printf 'FROM scratch\nCOPY f /f\n' > "$darwin_ctx/Dockerfile"; echo x > "$darwin_ctx/f"
+printf 'FROM macos\nCOPY f /f\n' > "$darwin_ctx/Dockerfile"; echo x > "$darwin_ctx/f"
 build_out="$("$repo/ferry" image build --os bogus "$darwin_ctx" 2>&1)"; build_rc=$?
 is "an unknown --os is refused" "$build_rc" 2
 contains "and it names the two it knows" "$build_out" "linux or darwin"
@@ -717,13 +717,17 @@ echo
 
 printf '\033[1m%s\033[0m\n' "shared-kernel macOS pods are off unless asked for"
 # ferry-macos-shared is a chroot on a SIP-disabled guest, not a VM, so both the
-# NodePool and ferry-machined gate it behind FERRY_MAC_SHARED.
+# NodePool and ferry-machined gate it behind the shared opt-in: resolve_mac_shared,
+# which is 1 only when the image was baked --shared (a marker beside it) or
+# FERRY_MAC_SHARED is set.
 mac_block="$(sed -n '/macos-vm-nodepool.yaml/,/delete nodepool macos macos-vm/p' "$repo/ferry")"
 contains "the VM-per-pod pool installs with the image" "$mac_block" 'macos-vm-nodepool.yaml'
-contains "the shared pool waits for FERRY_MAC_SHARED" "$mac_block" 'FERRY_MAC_SHARED:-0}" = 1'
+contains "the shared pool waits for the shared opt-in" "$mac_block" 'resolve_mac_shared)" = 1'
 contains "and is removed when it is off" "$mac_block" 'delete nodepool macos '
 contains "ferry-machined gets --allow-mac-shared only when asked" \
-  "$(grep -n 'allow-mac-shared' "$repo/ferry")" 'FERRY_MAC_SHARED:-0}" = 1'
+  "$(grep -n 'allow-mac-shared' "$repo/ferry")" 'resolve_mac_shared)" = 1'
+contains "the shared opt-in still honours FERRY_MAC_SHARED" \
+  "$(sed -n '/^resolve_mac_shared()/,/^}/p' "$repo/ferry")" 'FERRY_MAC_SHARED'
 contains "ferry-machined refuses a shared macOS machine by default" \
   "$(cat "$repo/ferry-machined/reconcile.go")" "shared-kernel macOS machines are disabled"
 contains "and FERRY_MAC_SHARED is documented" "$(cat "$repo/docs/INSTALL.md")" "FERRY_MAC_SHARED"

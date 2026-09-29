@@ -5,7 +5,7 @@
 # `nodeSelector: {ferry.dev/mode: shared-macos}` and the toleration for its
 # taint -- and Karpenter makes a macOS machine to hold it (experiment 39):
 # a clone of ferry-machined's golden image, its pods macOS processes sharing
-# its kernel. Applied only when this Mac has such an image (FERRY_MAC_IMAGE).
+# its kernel. Applied only when this Mac has such an image, baked --shared.
 #
 # Separate from the default pool rather than a second requirement in it,
 # because the two do not mix: a macOS machine is tainted, labelled
