@@ -85,4 +85,59 @@ import Testing
         #expect(await d.hasContainer(cid) == false)
         #expect(await d.listSandboxes().isEmpty)
     }
+
+    // The Apple guest ceiling is enforced at admission (runPodSandbox), counting
+    // sandboxes that exist -- not only booted ones -- so a third pod is refused
+    // even before any container has started a guest. maxGuests is 2 here.
+    @Test func theGuestCeilingIsEnforcedAtAdmission() async throws {
+        let d = runtime(golden: "/tmp/fake-golden")
+        _ = try await d.runPodSandbox(config: sandboxConfig(name: "one"))
+        _ = try await d.runPodSandbox(config: sandboxConfig(name: "two"))
+        await #expect(throws: DarwinRuntimeError.self) {
+            _ = try await d.runPodSandbox(config: sandboxConfig(name: "three"))
+        }
+        // Freeing one slot lets a new sandbox in.
+        #expect(await d.listSandboxes().count == 2)
+        let first = await d.listSandboxes().first { $0.name == "one" }!
+        try await d.removePodSandbox(first.id)
+        _ = try await d.runPodSandbox(config: sandboxConfig(name: "three"))
+        #expect(await d.listSandboxes().count == 2)
+    }
+
+    // Stopping one container in a multi-container sandbox must leave its siblings'
+    // records intact (the guest is shared; whole-guest teardown is stopPodSandbox's
+    // job). Boot needs hardware, so this covers the record bookkeeping.
+    @Test func stoppingOneContainerLeavesItsSiblingRecord() async throws {
+        let d = runtime(golden: "/tmp/fake-golden")
+        let sid = try await d.runPodSandbox(config: sandboxConfig())
+        let a = try await d.createContainer(sandboxID: sid, config: containerConfig(name: "a"))
+        let b = try await d.createContainer(sandboxID: sid, config: containerConfig(name: "b"))
+        try await d.stopContainer(a, timeout: 0)
+        // The sibling record is untouched and both are still recorded.
+        #expect(await d.hasContainer(b))
+        let sibling = try await d.containerStatus(b)
+        #expect(sibling.state == .created)
+        #expect(await d.listContainers().count == 2)
+    }
+
+    // The deadline race behind execSync's timeout: work that beats the deadline
+    // returns; work that overruns is cancelled and the timeout error is thrown.
+    // (execSync itself needs a booted guest -- hardware -- so the mechanism is
+    // exercised here directly.)
+    @Test func withDeadlineReturnsFastWork() async throws {
+        let v = try await DarwinRuntime.withDeadline(
+            seconds: 5, onTimeout: DarwinRuntimeError.timedOut("nope")) { 42 }
+        #expect(v == 42)
+    }
+
+    @Test func withDeadlineThrowsWhenWorkOverruns() async throws {
+        await #expect(throws: DarwinRuntimeError.self) {
+            _ = try await DarwinRuntime.withDeadline(
+                seconds: 1, onTimeout: DarwinRuntimeError.timedOut("slow")
+            ) {
+                try await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                return 0
+            }
+        }
+    }
 }

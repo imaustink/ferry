@@ -652,12 +652,18 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         // over the agent, chrooted into the container's root.
         if let darwin, await darwin.hasContainer(request.containerID) {
             do {
-                let result = try await darwin.execSync(request.containerID, cmd: request.cmd)
+                let result = try await darwin.execSync(request.containerID, cmd: request.cmd,
+                                                       timeout: request.timeout)
                 var response = Runtime_V1_ExecSyncResponse()
                 response.stdout = result.stdout
                 response.stderr = result.stderr
                 response.exitCode = result.exit
                 return response
+            } catch let error as DarwinRuntimeError {
+                if case .timedOut(let message) = error {
+                    throw RPCError(code: .deadlineExceeded, message: message)
+                }
+                throw failed(error)
             } catch { throw failed(error) }
         }
         let stdout = CollectingWriter(), stderr = CollectingWriter()

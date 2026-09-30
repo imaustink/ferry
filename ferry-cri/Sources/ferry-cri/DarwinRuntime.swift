@@ -91,12 +91,14 @@ enum DarwinRuntimeError: Error, CustomStringConvertible {
     case unavailable(String)
     case notFound(String)
     case invalid(String)
+    case timedOut(String)
 
     var description: String {
         switch self {
         case .unavailable(let m): return m
         case .notFound(let m): return m
         case .invalid(let m): return m
+        case .timedOut(let m): return m
         }
     }
 }
@@ -272,7 +274,13 @@ actor DarwinRuntime {
                 "this Mac has no macOS golden image, so a ferry-macos-vm pod cannot run -- "
                     + "`ferry mac-image bake` (see docs/RUNTIMES.md#building-the-image)")
         }
-        let live = sandboxes.values.filter { $0.booted }.count
+        // Enforce Apple's guest ceiling at admission, not at boot. A sandbox
+        // boots lazily in startContainer, and the kubelet drives RunPodSandbox
+        // concurrently per pod, so counting only *booted* guests would let
+        // several calls each see zero and be admitted, then all boot past the
+        // limit. The actor serializes runPodSandbox, so counting admitted
+        // sandboxes closes that window and leaves the third pod waiting.
+        let live = sandboxes.count
         if live >= config.maxGuests {
             throw DarwinRuntimeError.unavailable(
                 "the Mac already runs \(config.maxGuests) macOS guests (Apple's licence ceiling); "
@@ -680,13 +688,48 @@ actor DarwinRuntime {
     /// A probe (ExecSync): run a command chrooted into the container's root and
     /// collect its output and exit status. This is what liveness and readiness
     /// exec probes use.
-    func execSync(_ id: String, cmd: [String]) async throws -> (stdout: Data, stderr: Data, exit: Int32) {
+    /// A synchronous exec (kubelet liveness/readiness probes). When `timeout` is
+    /// positive the guest command is raced against that deadline; if it has not
+    /// finished, the exec is abandoned (its vsock work is cancelled) and
+    /// `timedOut` is thrown so the RPC returns DeadlineExceeded rather than
+    /// blocking for ever on a hung probe -- matching the Linux exec path.
+    func execSync(_ id: String, cmd: [String], timeout: Int64 = 0)
+        async throws -> (stdout: Data, stderr: Data, exit: Int32)
+    {
         guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
         guard let root = c.rootPath, let s = sandboxes[c.info.sandboxID], s.booted else {
             throw DarwinRuntimeError.invalid("darwin container \(id) is not running")
         }
-        let (code, out, err) = try await s.sandbox.exec(DarwinRunRequest(argv: cmd, chroot: root))
+        let sandbox = s.sandbox
+        let req = DarwinRunRequest(argv: cmd, chroot: root)
+        guard timeout > 0 else {
+            let (code, out, err) = try await sandbox.exec(req)
+            return (out, err, code)
+        }
+        let (code, out, err) = try await Self.withDeadline(
+            seconds: timeout,
+            onTimeout: DarwinRuntimeError.timedOut("command \(cmd) timed out after \(timeout)s")
+        ) { try await sandbox.exec(req) }
         return (out, err, code)
+    }
+
+    /// Run `work`, but if it has not finished within `seconds` cancel it and throw
+    /// `onTimeout`. The loser task is cancelled either way. Used to bound a guest
+    /// exec (a probe) so a hung command returns DeadlineExceeded instead of
+    /// blocking the RPC for ever.
+    static func withDeadline<T: Sendable>(
+        seconds: Int64, onTimeout: @autoclosure @escaping @Sendable () -> Error,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await work() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                throw onTimeout()
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
     }
 
     /// A streamed exec (`kubectl exec -- cmd`): run a command chrooted into the
@@ -833,17 +876,27 @@ actor DarwinRuntime {
 
     func stopContainer(_ id: String, timeout: Int64) async throws {
         guard let c = containers[id] else { return }
-        // Stopping a VM-per-pod container is stopping its guest; the sandbox stop
-        // does that. Mark it exited so the kubelet sees it end, and cancel the
-        // run task so it does not linger once the guest goes away.
+        // Mark it exited so the kubelet sees it end, and cancel the run task so it
+        // does not linger.
         c.runTask?.cancel()
         c.runTask = nil
         if c.info.state == .running {
             containers[id]?.info = c.info.exited(code: 137, reason: "Stopped", at: Self.now())
         }
+        // A sandbox can hold more than one container. Only tear the guest down
+        // once the last running container in it has stopped -- otherwise stopping
+        // (or a probe-driven restart of) one container in a multi-container pod
+        // would kill its siblings, whose run tasks would then record spurious
+        // exits. Whole-guest teardown for the pod itself happens in
+        // stopPodSandbox.
         if let s = sandboxes[c.info.sandboxID], s.booted {
-            await s.sandbox.shutdown()
-            s.booted = false
+            let othersRunning = s.containers.contains { other in
+                other != id && containers[other]?.info.state == .running
+            }
+            if !othersRunning {
+                await s.sandbox.shutdown()
+                s.booted = false
+            }
         }
     }
 

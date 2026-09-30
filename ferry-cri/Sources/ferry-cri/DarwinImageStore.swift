@@ -156,7 +156,11 @@ enum DarwinImageStore {
         }
         let pick = children.first { $0.platform?.os == "darwin" && $0.platform?.architecture == "arm64" }
             ?? children[0]
-        let childData = try await blob(repository: repository, digest: pick.digest, mirror: mirror, session: session)
+        // The child is itself a manifest: fetch it from the manifests endpoint (a
+        // standard OCI registry 404s a manifest digest on /blobs/), which also
+        // sends the manifest Accept header.
+        let childData = try await manifestBlob(repository: repository, ref: pick.digest,
+                                               mirror: mirror, session: session)
         return try decodeManifest(childData, reference: pick.digest)
     }
 
