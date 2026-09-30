@@ -266,18 +266,24 @@ and a macOS pod already works as a backend via pod-to-pod); and **ingress
 NetworkPolicy**, translated per pod to pf and loaded in the guest (`MacNetpol`),
 verified to allow, default-deny, and reopen on policy removal.
 
-**Remaining (real) work:**
-- **stdin/TTY for interactive `exec -it`** -- needs the guest agent
-  (`ferry-macagent`) to read stdin and allocate a PTY, which means re-injecting
-  it into the golden image (a protocol change on both sides). `kubectl exec`
-  without `-it` works today.
-- **Egress NetworkPolicy** -- a macOS pod's ClusterIP egress is DNATed host-side,
-  so guest pf sees ClusterIPs, not the endpoint addresses the policy names;
-  egress must be enforced in ferry-cri (post-DNAT), not the guest.
-- **Multi-label short-name DNS** (`svc.namespace`) -- macOS `mDNSResponder`
-  appends search domains only to single-label names, so a dotted short name is
-  taken as an FQDN and not searched. The FQDN and the single-label
-  (same-namespace) form both resolve; the 2-label form needs the FQDN.
+All of these are now in too, none of them needing a golden-image change --
+ferry-cri uploads and launches small guest helpers the same way it pushes image
+layers:
+- **Interactive `exec -i/-it`** -- a second guest agent (`ferry-macagent-i`,
+  vsock 7001) is uploaded and launched per boot; it wires stdin and a PTY. The
+  ExecServer uses it when the client asks for stdin/TTY; `exec` without them
+  keeps the output-only path.
+- **Egress NetworkPolicy** -- enforced host-side in `MacServiceNAT`, where a
+  ClusterIP is already resolved to its endpoint (the address the policy names),
+  with inbound connections tracked so established replies are allowed.
+- **Multi-label short-name DNS** (`svc.namespace`) -- a search-list forwarder
+  (`ferry-macdns`) is uploaded and run in the guest and made the pod's resolver;
+  it does the search macOS won't. The resolver is set in the persistent `Setup:`
+  store (a `State:`-only change is reverted by configd).
+
+**Remaining:** session affinity, SCTP and the DNAT run through unit tests but
+are not all exercised live; NetworkPolicy egress is host-side while ingress is
+guest pf (they do not share conntrack, but established is handled on each side).
 
 ## Reusable building blocks (with paths)
 
