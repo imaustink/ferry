@@ -524,7 +524,8 @@ cri_service="$(cat "$repo/ferry-cri/Sources/ferry-cri/RuntimeService.swift")"
 contains "ferry-cri checks the handler a sandbox is asked for" "$cri_service" \
   "RuntimeHandlers.refusal(for: request.runtimeHandler)"
 contains "  and refuses one it does not serve" "$cri_service" "code: .invalidArgument, message: refusal"
-contains "  while a pod naming no RuntimeClass still runs" "$cri_service" 'static let served = ["", vm]'
+contains "  while a pod naming no RuntimeClass still runs" "$cri_service" 'static let served = ["", vm, macosVM]'
+contains "  and a macOS pod is served too" "$cri_service" 'static let macosVM = "ferry-macos-vm"'
 contains "  and says which it serves, for node.status.runtimeHandlers" "$cri_service" "response.runtimeHandlers"
 
 # --- a default for pods that name no RuntimeClass -------------------------

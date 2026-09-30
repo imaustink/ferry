@@ -4,24 +4,38 @@ import Containerization
 import Foundation
 import GRPCCore
 
+/// What a served handler boots: a Linux guest, or a macOS one.
+enum RuntimeKind {
+    case linux
+    case darwin
+}
+
 /// The RuntimeClass handlers ferry-cri answers to.
 ///
-/// Every pod it runs is a virtual machine, so there is one handler, and the
-/// empty one -- a pod that names no RuntimeClass -- means the same thing. What
-/// this exists to catch is a pod that asked for something else: a
-/// `ferry-shared` pod's handler is containerd's `runc`, and one that reached
-/// this node anyway would otherwise have been started as a VM without a word.
-/// The CRI says an unknown handler is to be refused (api.proto, RunPodSandbox).
+/// Every pod it runs is a virtual machine, so the handlers are the empty one --
+/// a pod that names no RuntimeClass -- and `ferry-vm`, both a Linux guest, plus
+/// `ferry-macos-vm`, a macOS guest (see docs/design/macos-cri-sandbox.md). What
+/// this exists to catch is a pod that asked for something else: a `ferry-shared`
+/// pod's handler is containerd's `runc`, and one that reached this node anyway
+/// would otherwise have been started as a VM without a word. The CRI says an
+/// unknown handler is to be refused (api.proto, RunPodSandbox).
 enum RuntimeHandlers {
     static let vm = "ferry-vm"
-    static let served = ["", vm]
+    static let macosVM = "ferry-macos-vm"
+    static let served = ["", vm, macosVM]
+
+    /// Which guest a handler boots. Only `ferry-macos-vm` is darwin; the empty
+    /// handler and `ferry-vm` are Linux.
+    static func kind(for handler: String) -> RuntimeKind {
+        handler == macosVM ? .darwin : .linux
+    }
 
     static func refusal(for handler: String) -> String? {
         if served.contains(handler) { return nil }
-        return "ferry-cri runs every pod as its own virtual machine (RuntimeClass ferry-vm) "
-            + "and has no runtime handler \"\(handler)\"; a pod asking for it belongs on a node "
-            + "that serves it -- ferry-shared pods run on machines, "
-            + "`kubectl get nodes -L ferry.dev/mode`"
+        return "ferry-cri runs every pod as its own virtual machine (RuntimeClass ferry-vm, "
+            + "or ferry-macos-vm for a macOS guest) and has no runtime handler \"\(handler)\"; "
+            + "a pod asking for it belongs on a node that serves it -- ferry-shared pods run on "
+            + "machines, `kubectl get nodes -L ferry.dev/mode`"
     }
 }
 
@@ -100,6 +114,18 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     func runPodSandbox(request: Runtime_V1_RunPodSandboxRequest, context: ServerContext) async throws -> Runtime_V1_RunPodSandboxResponse {
         if let refusal = RuntimeHandlers.refusal(for: request.runtimeHandler) {
             throw RPCError(code: .invalidArgument, message: refusal)
+        }
+        // The darwin VM-sandbox backend is not built yet (Stage 2, increment 2 --
+        // see docs/design/macos-cri-sandbox.md). Until then macOS pods run on
+        // Machine nodes via ferry-darwin, and the ferry-macos-vm RuntimeClass
+        // pins them there, so one should never reach the host CRI. If one does
+        // (e.g. a hand-set nodeName), refuse it clearly rather than boot it as a
+        // Linux guest.
+        if RuntimeHandlers.kind(for: request.runtimeHandler) == .darwin {
+            throw RPCError(code: .unimplemented,
+                message: "ferry-cri does not yet run macOS pods on the host node; a ferry-macos-vm "
+                    + "pod runs on a macOS machine -- let the scheduler place it, "
+                    + "`kubectl get nodes -L ferry.dev/mode`")
         }
         do {
             let id = try await runtime.runPodSandbox(config: request.config)
