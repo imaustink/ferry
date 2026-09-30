@@ -502,6 +502,13 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     // one meant `kubectl top` and every autoscaler stayed broken.
     func containerStats(request: Runtime_V1_ContainerStatsRequest, context: ServerContext) async throws -> Runtime_V1_ContainerStatsResponse {
         var response = Runtime_V1_ContainerStatsResponse()
+        // A macOS pod's numbers come from its guest, not the Linux framework.
+        if let darwin, await darwin.hasContainer(request.containerID) {
+            if let stats = await darwinContainerStats(request.containerID) {
+                response.stats = stats
+            }
+            return response
+        }
         let measured = await runtime.containerStatistics(ids: [request.containerID])
         if let first = measured.first, let stats = await containerStats(for: first.id, from: first.stats) {
             response.stats = stats
@@ -518,7 +525,55 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
                 response.stats.append(stats)
             }
         }
+        // The darwin runtime keeps its own running set; fold its pods in too.
+        if let darwin {
+            var ids = await darwin.runningContainerIDs()
+            if !request.filter.id.isEmpty { ids = ids.filter { $0 == request.filter.id } }
+            for id in ids {
+                if let stats = await darwinContainerStats(id) {
+                    response.stats.append(stats)
+                }
+            }
+        }
         return response
+    }
+
+    /// A macOS pod's stats, measured in its guest and shaped for CRI. Mirrors
+    /// `containerStats(for:from:)` but reads the darwin runtime's numbers.
+    private func darwinContainerStats(_ id: String) async -> Runtime_V1_ContainerStats? {
+        guard let darwin,
+              let record = try? await darwin.containerStatus(id),
+              let measured = await darwin.stats(id) else { return nil }
+
+        var attributes = Runtime_V1_ContainerAttributes()
+        attributes.id = id
+        var metadata = Runtime_V1_ContainerMetadata()
+        metadata.name = record.name
+        metadata.attempt = record.attempt
+        attributes.metadata = metadata
+        attributes.labels = record.labels
+        attributes.annotations = record.annotations
+
+        var stats = Runtime_V1_ContainerStats()
+        stats.attributes = attributes
+
+        let now = Self.now()
+        var cpu = Runtime_V1_CpuUsage()
+        cpu.timestamp = now
+        var nanos = Runtime_V1_UInt64Value(); nanos.value = measured.cpuNanoseconds
+        cpu.usageCoreNanoSeconds = nanos
+        stats.cpu = cpu
+
+        var memory = Runtime_V1_MemoryUsage()
+        memory.timestamp = now
+        var working = Runtime_V1_UInt64Value(); working.value = measured.memoryBytes
+        memory.workingSetBytes = working
+        var used = Runtime_V1_UInt64Value(); used.value = measured.memoryBytes
+        memory.usageBytes = used
+        var rss = Runtime_V1_UInt64Value(); rss.value = measured.memoryBytes
+        memory.rssBytes = rss
+        stats.memory = memory
+        return stats
     }
 
     /// Translates the framework's numbers into CRI's shape.
@@ -642,12 +697,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// process to run the command, so the URL has to come from it -- the token
     /// it contains is issued by the streaming server's own request cache.
     func exec(request: Runtime_V1_ExecRequest, context: ServerContext) async throws -> Runtime_V1_ExecResponse {
-        if let darwin, await darwin.hasContainer(request.containerID) {
-            // Probes (ExecSync) run in the guest already; interactive streamed
-            // exec needs the SPDY/ExecServer bridge onto the agent, which is the
-            // remaining darwin exec work (docs/design/macos-cri-sandbox.md).
-            throw unimplemented("interactive exec into a macOS pod (probes work)")
-        }
+        // Darwin execs are served the same way -- a streamer URL that ferry-streamer
+        // calls back into ExecServer, which runs the command in the guest over the
+        // agent. (Stdin/TTY are not wired for darwin; see ExecServer.)
         do {
             let url = try streamer.url(path: "/exec", body: [
                 "container_id": request.containerID,

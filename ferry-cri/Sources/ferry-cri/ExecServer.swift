@@ -167,10 +167,12 @@ final class FrameSocket: @unchecked Sendable {
 final class ExecServer: @unchecked Sendable {
     private let path: String
     private let runtime: PodRuntime
+    private let darwin: DarwinRuntime?
 
-    init(path: String, runtime: PodRuntime) {
+    init(path: String, runtime: PodRuntime, darwin: DarwinRuntime? = nil) {
         self.path = path
         self.runtime = runtime
+        self.darwin = darwin
     }
 
     func start() throws {
@@ -201,6 +203,7 @@ final class ExecServer: @unchecked Sendable {
         }
 
         let runtime = self.runtime
+        let darwin = self.darwin
         Thread.detachNewThread {
             while true {
                 let accepted = accept(listener, nil, nil)
@@ -224,7 +227,7 @@ final class ExecServer: @unchecked Sendable {
                     }
                 }
                 let socket = FrameSocket(descriptor: accepted)
-                Task { await Self.handle(socket: socket, runtime: runtime) }
+                Task { await Self.handle(socket: socket, runtime: runtime, darwin: darwin) }
             }
         }
     }
@@ -262,7 +265,7 @@ final class ExecServer: @unchecked Sendable {
         }
     }
 
-    private static func handle(socket: FrameSocket, runtime: PodRuntime) async {
+    private static func handle(socket: FrameSocket, runtime: PodRuntime, darwin: DarwinRuntime?) async {
         defer { socket.close() }
         guard let line = socket.readHeaderLine(),
               let header = try? JSONDecoder().decode(ExecHeader.self, from: line)
@@ -298,6 +301,27 @@ final class ExecServer: @unchecked Sendable {
         }
 
         guard let containerID = header.containerID else { return }
+
+        // A macOS pod's exec runs in the guest over the agent, chrooted into the
+        // container root. Output streams back as it arrives; stdin and a TTY are
+        // not wired (the agent runs argv with stdin from /dev/null), so an
+        // interactive `exec -it` runs but sees no input.
+        if let darwin, await darwin.hasContainer(containerID) {
+            do {
+                let exit = try await darwin.execStream(containerID, cmd: header.cmd ?? []) { kind, payload in
+                    switch kind {
+                    case .stdout: socket.writeFrame(.stdout, Data(payload))
+                    case .stderr, .error: socket.writeFrame(.stderr, Data(payload))
+                    case .exit: break
+                    }
+                }
+                socket.writeFrame(.exit, Data([UInt8(clamping: Int(exit))]))
+            } catch {
+                socket.writeFrame(.stderr, Data("ferry-cri: \(error)\n".utf8))
+                socket.writeFrame(.exit, Data([1]))
+            }
+            return
+        }
 
         if header.op == "attach" {
             await attach(containerID: containerID, socket: socket, runtime: runtime)

@@ -198,10 +198,38 @@ runs directly under `chroot` (the agent applies `WORKDIR` as a chdir on the real
 FS before the chroot, so a shell wrapper fails); and the container run is awaited
 (a detached `Task` dropped the exec once `StartContainer` returned).
 
-Remaining refinements (none block a pod running): `kubectl logs` shows only the
-first line (the CRI log format needs a per-line timestamp prefix), `WORKDIR`,
-interactive streamed exec, and stats — plus increment 4's scheduling flip so the
-`ferry-macos-vm` class itself targets the host node.
+The refinements the first runs left are now in, verified live on an M4 Max
+(macOS 26.6.2): **`kubectl logs`** streams every line (output goes through a
+per-line `ContainerLogWriter`, not a single append that prefixed only the first
+line); **`WORKDIR`** is entered by a `cd <dir>; exec` shell inside the chroot
+(macOS `chroot(8)` has no chdir flag) — a pod whose image sets `WORKDIR /src`
+reports `cwd=/src`; **interactive streamed exec** (`kubectl exec`) runs in the
+guest over the agent via the `ExecServer` bridge (stdin/TTY still not wired —
+the agent runs argv with stdin from `/dev/null`); **stats** flow through CRI
+`ContainerStats`/`ListContainerStats` (`ps`-measured guest RSS and cumulative
+CPU, since there are no cgroups), so the kubelet summary reports CPU and memory;
+and the **`ferry.dev/macos-guest`** ceiling is advertised on the node (capacity
+2) with the RuntimeClass overhead charging 1, so a third macOS pod stays
+Pending. Increment 4's scheduling flip (the `ferry-macos-vm` class targets the
+host node) is also in.
+
+Two things surfaced once a *long-running* macOS pod (not just a fast-exiting
+one) was run, both now fixed:
+
+- **`StartContainer` must not block for the life of the process.** The container
+  run is streamed in a detached, tracked `Task` and the container is reported
+  running immediately; awaiting it (the earlier log fix) would hang the kubelet
+  and freeze the actor for every other pod.
+- **A sandbox must report an IP or the kubelet kills it.** The guest is NAT'd
+  behind the host with no routable address of its own (its `en0` gets no DHCP
+  lease under `VZNATNetworkDeviceAttachment`), so `PodSandboxStatus` reports the
+  **node's** address — the guest shares the host's network identity, as a
+  host-network pod does. Without it the kubelet took the running sandbox for
+  broken ("Sandbox for pod has no IP address") and tore it down seconds in.
+
+**Remaining (real) work:** pod-network addressing beyond NAT — a macOS pod on
+the pod CIDR, reachable for Services and pod-to-pod, rather than sharing the
+host's identity — and stdin/TTY for interactive `exec -it`.
 
 ## Reusable building blocks (with paths)
 

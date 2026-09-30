@@ -73,6 +73,11 @@ metadata:
   name: ferry-macos-vm
   labels: {app.kubernetes.io/managed-by: ferry}
 handler: ferry-macos-vm
+# Each macOS pod holds one of the Mac's two macOS-guest slots (Apple's licence,
+# advertised as ferry.dev/macos-guest: 2 on the node). Charging one here caps the
+# scheduler at two, so a third waits Pending rather than being refused at run.
+overhead:
+  podFixed: {ferry.dev/macos-guest: "1"}
 scheduling:
   nodeSelector: {ferry.dev/mode: vm-per-pod}
   tolerations:

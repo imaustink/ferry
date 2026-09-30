@@ -34,7 +34,7 @@ import Testing
         DarwinRuntime(config: .init(
             golden: golden,
             stateDir: URL(filePath: NSTemporaryDirectory()).appendingPathComponent("darwin-test-\(UUID().uuidString)"),
-            defaultCPUs: 4, defaultMemoryBytes: 4 << 30, maxGuests: 2))
+            defaultCPUs: 4, defaultMemoryBytes: 4 << 30, maxGuests: 2, nodeIP: "192.0.2.1"))
     }
 
     @Test func withNoGoldenImageDarwinIsUnavailable() async throws {

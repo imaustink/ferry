@@ -175,7 +175,16 @@ let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
     // sandbox at a darwin-sane floor above the Linux pod default.
     defaultCPUs: max(4, config.defaultCPUs),
     defaultMemoryBytes: max(4 << 30, config.defaultMemoryBytes),
-    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2))
+    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2,
+    // The node's advertised address (host of --relay-endpoint, e.g. 192.168.1.29):
+    // a NAT'd macOS guest shares the host's network identity, and its sandbox must
+    // report an IP or the kubelet kills it. Falls back to --node-ip if given.
+    nodeIP: {
+        let explicit = option("--node-ip", "")
+        if !explicit.isEmpty { return explicit }
+        let endpoint = option("--relay-endpoint", "")
+        return endpoint.split(separator: ":").first.map(String.init) ?? ""
+    }()))
 if !macImage.isEmpty { print("    mac image \(macImage)") }
 
 let runtime = try PodRuntime(config: config)
@@ -190,7 +199,7 @@ print("    network   \(await runtime.subnet), gateway \(await runtime.gateway)")
 
 // kubectl exec arrives over SPDY, which ferry-streamer terminates; it reaches
 // pods through this socket.
-let execServer = ExecServer(path: execSocketPath, runtime: runtime)
+let execServer = ExecServer(path: execSocketPath, runtime: runtime, darwin: darwinRuntime)
 do {
     try execServer.start()
     print("    exec      unix://\(execSocketPath)")

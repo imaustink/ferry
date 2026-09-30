@@ -1696,6 +1696,7 @@ EOF
   # ferry-node actually claimed.
   start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
   advertise_gpu
+  advertise_macos_guest
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   # Mode 2, for a cluster that asked for it. After the node is Ready, because
@@ -1895,6 +1896,24 @@ advertise_gpu() { # node-name [kubeconfig]
     ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
   else
     warn "could not advertise ferry.dev/gpu on $node (HTTP ${code:-no response})"
+  fi
+}
+
+# The macOS guest ceiling as an extended resource, so the scheduler leaves a
+# third ferry-macos-vm pod Pending rather than ferry-cri refusing it after the
+# fact -- the same shape as ferry.dev/gpu above. The RuntimeClass charges one
+# per pod through its overhead; the node's capacity is Apple's two-VM limit.
+# Only when a golden image is present, i.e. macOS pods can run on this node.
+advertise_macos_guest() { # node-name
+  local node="${1:-$NODE_NAME}"
+  [ -n "$(resolve_mac_image)" ] || return 0
+  [ -r "$FERRY_HOME/admin.conf" ] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+  if KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$node" --subresource=status --type=merge \
+       -p "{\"status\":{\"capacity\":{\"ferry.dev/macos-guest\":\"2\"}}}" >/dev/null 2>&1; then
+    ok "node advertises ferry.dev/macos-guest: 2 (Apple's two-VM ceiling)"
+  else
+    warn "could not advertise ferry.dev/macos-guest on $node"
   fi
 }
 

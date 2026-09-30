@@ -91,6 +91,12 @@ actor DarwinRuntime {
         /// Apple's two-VM-per-Mac ceiling, re-homed from Karpenter. A third
         /// concurrent macOS sandbox is refused.
         var maxGuests: Int
+        /// This node's address, reported as a macOS pod's sandbox IP. The guest
+        /// is NAT'd behind the host with no routable address of its own, so its
+        /// network identity is the host's (as a host-network pod's is) -- and a
+        /// sandbox must report *some* IP or the kubelet takes it for broken and
+        /// kills it. Real pod-network addressing is future work (design doc).
+        var nodeIP: String
     }
 
     private let config: Config
@@ -115,6 +121,9 @@ actor DarwinRuntime {
         /// Where the container's root was assembled in the guest (OS base + the
         /// image layer); an exec chroots into it. Set once the container starts.
         var rootPath: String?
+        /// The detached task streaming the entrypoint's output until it exits.
+        /// Held so it is not dropped mid-run and can be cancelled on stop.
+        var runTask: Task<Void, Never>?
         init(info: DarwinContainerInfo, config: Runtime_V1_ContainerConfig) {
             self.info = info
             self.config = config
@@ -167,9 +176,13 @@ actor DarwinRuntime {
             id: id, name: cfg.metadata.name, uid: cfg.metadata.uid,
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
-            // No pod-network address yet (NAT only); reported empty, as a
-            // sandbox with host networking would be.
-            ip: "", createdAt: Self.now(), ready: true)
+            // The node's own address: the guest is NAT'd behind the host with no
+            // routable address of its own, so it shares the host's identity (as a
+            // host-network pod does). A sandbox must report an IP or the kubelet
+            // takes it for broken and kills it -- which is why a long-running
+            // macOS pod was torn down seconds in. Real pod networking is future
+            // work (docs/design/macos-cri-sandbox.md).
+            ip: config.nodeIP, createdAt: Self.now(), ready: true)
         sandboxes[id] = Sandbox(info: info, sandbox: sandbox, logDirectory: cfg.logDirectory)
         return id
     }
@@ -263,40 +276,50 @@ actor DarwinRuntime {
             let (k, v) = Self.splitEnv(e); if !k.isEmpty { env[k] = v }
         }
         for kv in c.config.envs { env[kv.key] = kv.value }
-        // chroot into the image root and run the entrypoint directly -- the same
-        // shape proven to run a Darwin binary in the guest. The env carries the
-        // merged image and container environment. (WORKDIR is not applied yet:
-        // macOS chroot(8) has no chdir flag, and wrapping in a shell to `cd`
-        // first is the follow-up; the demo entrypoint is an absolute path.)
-        let runArgv = ["/usr/sbin/chroot", root] + argv
+        let workdir = c.config.workingDir.isEmpty ? image.workingDir : c.config.workingDir
+        // chroot into the image root and run the entrypoint. macOS chroot(8) has
+        // no chdir flag, and the agent's cwd would apply on the real FS before the
+        // chroot, so WORKDIR is entered inside the new root by a thin shell:
+        // `cd <workdir>; exec <argv>`. The env carries the merged image and
+        // container environment.
+        var runArgv = ["/usr/sbin/chroot", root]
+        if workdir.isEmpty {
+            runArgv += argv
+        } else {
+            runArgv += ["/bin/sh", "-c", "cd \"$0\" 2>/dev/null; exec \"$@\"", workdir] + argv
+        }
         let req = DarwinRunRequest(argv: runArgv, env: env.isEmpty ? nil : env, cwd: nil, chroot: nil)
 
-        // Run the container and collect its output. Awaited here (the collecting
-        // exec proven by the root assembly and --runlocal); a long-running
-        // container would want this detached with the container reported
-        // "running" first, which is the streaming follow-up.
-        let exit: Int32
-        do {
-            let (code, out, err) = try await s.sandbox.exec(req)
-            if let logFile {
-                // Through a per-stream writer, which splits the output into the
-                // one-line-per-record shape the CRI log format requires (each
-                // line its own `<ts> stream F` prefix); a single append would
-                // prefix only the first line and `kubectl logs` would show only
-                // that. close() flushes a trailing line with no newline.
-                let outW = ContainerLogWriter(file: logFile, stream: .stdout)
-                let errW = ContainerLogWriter(file: logFile, stream: .stderr)
-                if !out.isEmpty { try? outW.write(out) }
-                if !err.isEmpty { try? errW.write(err) }
-                try? outW.close()
-                try? errW.close()
+        // Stream the entrypoint's output in a detached task and return now, with
+        // the container reported "running" (set above): StartContainer must not
+        // block for the life of the process, or a long-running container would
+        // hang the kubelet and this actor would be frozen for every other pod.
+        // The task is held on the record so it is not dropped mid-run, streams
+        // each frame to a per-stream writer -- which splits output into the
+        // one-line-per-record shape the CRI log format needs (a single append
+        // would prefix only the first line and `kubectl logs` would show only
+        // that) -- and records the exit status when the process ends.
+        let sandbox = s.sandbox
+        containers[id]?.runTask = Task { [weak self] in
+            let outW = logFile.map { ContainerLogWriter(file: $0, stream: .stdout) }
+            let errW = logFile.map { ContainerLogWriter(file: $0, stream: .stderr) }
+            let exit: Int32
+            do {
+                exit = try await sandbox.run(req) { kind, payload in
+                    switch kind {
+                    case .stdout: try? outW?.write(Data(payload))
+                    case .stderr, .error: try? errW?.write(Data(payload))
+                    case .exit: break
+                    }
+                }
+            } catch {
+                FileHandle.standardError.write("darwin \(id): run threw \(error)\n".data(using: .utf8)!)
+                exit = -1
             }
-            exit = code
-        } catch {
-            FileHandle.standardError.write("darwin \(id): run threw \(error)\n".data(using: .utf8)!)
-            exit = -1
+            try? outW?.close()
+            try? errW?.close()
+            await self?.finishContainer(id, exit: exit)
         }
-        finishContainer(id, exit: exit)
     }
 
     /// Builds the container root in the guest: the baked OS base (dyld + the
@@ -331,8 +354,7 @@ actor DarwinRuntime {
 
     /// A probe (ExecSync): run a command chrooted into the container's root and
     /// collect its output and exit status. This is what liveness and readiness
-    /// exec probes use. Interactive `kubectl exec` (streamed over SPDY) is not
-    /// wired for darwin yet -- see docs/design/macos-cri-sandbox.md.
+    /// exec probes use.
     func execSync(_ id: String, cmd: [String]) async throws -> (stdout: Data, stderr: Data, exit: Int32) {
         guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
         guard let root = c.rootPath, let s = sandboxes[c.info.sandboxID], s.booted else {
@@ -342,10 +364,57 @@ actor DarwinRuntime {
         return (out, err, code)
     }
 
-    /// Records a container's exit; called from the background run task.
+    /// A streamed exec (`kubectl exec -- cmd`): run a command chrooted into the
+    /// container's root, streaming its output to `onOutput` as it arrives, and
+    /// return the exit status. Stdin and a TTY are not wired -- the guest agent
+    /// runs argv with stdin from /dev/null -- so an interactive `exec -it` runs
+    /// the command but sees no input (docs/design/macos-cri-sandbox.md).
+    func execStream(_ id: String, cmd: [String],
+                    onOutput: @escaping @Sendable (DarwinFrameKind, [UInt8]) -> Void) async throws -> Int32 {
+        guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
+        guard let root = c.rootPath, let s = sandboxes[c.info.sandboxID], s.booted else {
+            throw DarwinRuntimeError.invalid("darwin container \(id) is not running")
+        }
+        return try await s.sandbox.run(DarwinRunRequest(argv: cmd, chroot: root), onOutput: onOutput)
+    }
+
+    /// Measured resource use for a running darwin container. A VM-per-pod pod is
+    /// the whole guest, so these are the guest's totals: resident memory (the sum
+    /// of process RSS) and cumulative CPU time, which metrics-server turns into a
+    /// rate. There are no cgroups, so it is measured with `ps` in the guest.
+    struct Stats: Sendable {
+        var memoryBytes: UInt64
+        var cpuNanoseconds: UInt64
+    }
+
+    func stats(_ id: String) async -> Stats? {
+        guard let c = containers[id], c.info.state == .running,
+              let s = sandboxes[c.info.sandboxID], s.booted else { return nil }
+        // rss in KiB summed to bytes; cumulative CPU time ([HH:]MM:SS.ss) summed
+        // to seconds. Runs against the whole guest -- the pod is the VM.
+        let script = "rss=$(ps -A -o rss= | awk '{s+=$1} END{print s*1024}'); "
+            + "cpu=$(ps -A -o time= | awk -F: '{n=NF; sec=$n; if(n>=2) sec+=$(n-1)*60; if(n>=3) sec+=$(n-2)*3600; t+=sec} END{print t}'); "
+            + "printf '%s %s' \"$rss\" \"$cpu\""
+        guard let r = try? await s.sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script])), r.exit == 0,
+              let text = String(data: r.stdout, encoding: .utf8) else { return nil }
+        let parts = text.split(separator: " ")
+        guard parts.count == 2, let mem = UInt64(parts[0]), let cpuSec = Double(parts[1]) else { return nil }
+        return Stats(memoryBytes: mem, cpuNanoseconds: UInt64(cpuSec * 1_000_000_000))
+    }
+
+    /// The ids of running darwin containers, for a stats listing.
+    func runningContainerIDs() -> [String] {
+        containers.values.filter { $0.info.state == .running }.map(\.info.id)
+    }
+
+    /// Records a container's exit; called from the background run task. Only a
+    /// still-running container is updated: a stop already set the exit code, and
+    /// the guest teardown that follows makes the run throw -- that late failure
+    /// must not clobber the stop's status.
     private func finishContainer(_ id: String, exit: Int32) {
-        guard let c = containers[id] else { return }
+        guard let c = containers[id], c.info.state == .running else { return }
         c.info = c.info.exited(code: exit, reason: exit == 0 ? "Completed" : "Error", at: Self.now())
+        c.runTask = nil
     }
 
     private static func splitEnv(_ s: String) -> (String, String) {
@@ -360,7 +429,10 @@ actor DarwinRuntime {
     func stopContainer(_ id: String, timeout: Int64) async throws {
         guard let c = containers[id] else { return }
         // Stopping a VM-per-pod container is stopping its guest; the sandbox stop
-        // does that. Mark it exited so the kubelet sees it end.
+        // does that. Mark it exited so the kubelet sees it end, and cancel the
+        // run task so it does not linger once the guest goes away.
+        c.runTask?.cancel()
+        c.runTask = nil
         if c.info.state == .running {
             containers[id]?.info = c.info.exited(code: 137, reason: "Stopped", at: Self.now())
         }
