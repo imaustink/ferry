@@ -560,6 +560,11 @@ machine_registry_enabled() { [ "$MACHINE_REGISTRY" = 1 ]; }
 # What ferry-cri is told to ask first, so every node on this Mac finds what was
 # loaded on any of them, or on another Mac.
 image_mirror_flag() { machine_registry_enabled && echo "--image-mirror 127.0.0.1:$MACHINE_REGISTRY_PORT"; }
+
+# The golden macOS bundle ferry-cri clones a ferry-macos-vm pod's VM sandbox
+# from, when one is available (docs/design/macos-cri-sandbox.md). Empty
+# otherwise, so ferry-cri runs Linux pods only.
+mac_image_flag() { local i; i="$(resolve_mac_image)"; [ -n "$i" ] && echo "--mac-image $i"; }
 # What the Mac will commit to machines in total.
 #
 # A quarter of memory and half the cores by default. The provisioner will spend
@@ -1533,6 +1538,7 @@ cmd_up() {
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
+    $(mac_image_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -3138,6 +3144,7 @@ start_worker() { # name index server(host:port)
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
+    $(mac_image_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a

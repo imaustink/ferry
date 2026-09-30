@@ -114,6 +114,20 @@ print("    state     \(config.stateDir.path())")
 print("    kernel    \(config.kernelPath)")
 print("    pod size  \(config.defaultCPUs) cpu, \(config.defaultMemoryBytes / 1024 / 1024) MiB")
 
+// The darwin side: macOS VM sandboxes on this host (docs/design/macos-cri-sandbox.md).
+// --mac-image is the golden bundle every sandbox is cloned from; without it,
+// ferry-macos-vm pods are unavailable and only Linux pods run.
+let macImage = option("--mac-image", "")
+let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
+    golden: macImage.isEmpty ? nil : macImage,
+    stateDir: config.stateDir,
+    // A macOS guest needs 4 GiB to install and touches all it is given; size a
+    // sandbox at a darwin-sane floor above the Linux pod default.
+    defaultCPUs: max(4, config.defaultCPUs),
+    defaultMemoryBytes: max(4 << 30, config.defaultMemoryBytes),
+    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2))
+if !macImage.isEmpty { print("    mac image \(macImage)") }
+
 let runtime = try PodRuntime(config: config)
 await runtime.setStreamer(StreamerClient(socketPath: streamerControl))
 do {
@@ -158,7 +172,8 @@ let server = GRPCServer(
     ),
     services: [
         FerryRuntimeService(runtime: runtime, version: runtimeVersion,
-                            streamer: StreamerClient(socketPath: streamerControl)),
+                            streamer: StreamerClient(socketPath: streamerControl),
+                            darwin: darwinRuntime),
         FerryImageService(runtime: runtime),
     ]
 )

@@ -43,6 +43,10 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     let runtime: PodRuntime
     let version: String
     let streamer: StreamerClient
+    /// The darwin side of the CRI (macOS VM sandboxes). Nil when ferry-cri was
+    /// started without a golden image path -- then only Linux pods run. An id is
+    /// routed to whichever side owns it.
+    let darwin: DarwinRuntime?
 
     private func unimplemented(_ name: String) -> RPCError {
         RPCError(code: .unimplemented, message: "ferry-cri does not implement \(name) yet")
@@ -115,17 +119,20 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         if let refusal = RuntimeHandlers.refusal(for: request.runtimeHandler) {
             throw RPCError(code: .invalidArgument, message: refusal)
         }
-        // The darwin VM-sandbox backend is not built yet (Stage 2, increment 2 --
-        // see docs/design/macos-cri-sandbox.md). Until then macOS pods run on
-        // Machine nodes via ferry-darwin, and the ferry-macos-vm RuntimeClass
-        // pins them there, so one should never reach the host CRI. If one does
-        // (e.g. a hand-set nodeName), refuse it clearly rather than boot it as a
-        // Linux guest.
+        // A macOS pod is a VM sandbox on this host, owned by the darwin runtime,
+        // not a Linux microVM (docs/design/macos-cri-sandbox.md).
         if RuntimeHandlers.kind(for: request.runtimeHandler) == .darwin {
-            throw RPCError(code: .unimplemented,
-                message: "ferry-cri does not yet run macOS pods on the host node; a ferry-macos-vm "
-                    + "pod runs on a macOS machine -- let the scheduler place it, "
-                    + "`kubectl get nodes -L ferry.dev/mode`")
+            guard let darwin else {
+                throw RPCError(code: .unimplemented,
+                    message: "ferry-cri was started without a macOS golden image, so it cannot run "
+                        + "ferry-macos-vm pods -- `ferry mac-image bake`")
+            }
+            do {
+                let id = try await darwin.runPodSandbox(config: request.config)
+                var response = Runtime_V1_RunPodSandboxResponse()
+                response.podSandboxID = id
+                return response
+            } catch { throw failed(error) }
         }
         do {
             let id = try await runtime.runPodSandbox(config: request.config)
@@ -137,16 +144,43 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func stopPodSandbox(request: Runtime_V1_StopPodSandboxRequest, context: ServerContext) async throws -> Runtime_V1_StopPodSandboxResponse {
         do {
-            try await runtime.stopPodSandbox(request.podSandboxID)
+            if let darwin, await darwin.hasSandbox(request.podSandboxID) {
+                try await darwin.stopPodSandbox(request.podSandboxID)
+            } else {
+                try await runtime.stopPodSandbox(request.podSandboxID)
+            }
             return Runtime_V1_StopPodSandboxResponse()
         } catch { throw failed(error) }
     }
 
     func removePodSandbox(request: Runtime_V1_RemovePodSandboxRequest, context: ServerContext) async throws -> Runtime_V1_RemovePodSandboxResponse {
         do {
-            try await runtime.removePodSandbox(request.podSandboxID)
+            if let darwin, await darwin.hasSandbox(request.podSandboxID) {
+                try await darwin.removePodSandbox(request.podSandboxID)
+            } else {
+                try await runtime.removePodSandbox(request.podSandboxID)
+            }
             return Runtime_V1_RemovePodSandboxResponse()
         } catch { throw failed(error) }
+    }
+
+    private func metadata(_ i: DarwinSandboxInfo) -> Runtime_V1_PodSandboxMetadata {
+        var m = Runtime_V1_PodSandboxMetadata()
+        m.name = i.name; m.uid = i.uid; m.namespace = i.namespace; m.attempt = i.attempt
+        return m
+    }
+
+    /// A darwin sandbox's CRI PodSandbox, from the OS-agnostic info the darwin
+    /// runtime reports -- the same fields the Linux path reads off a SandboxRecord.
+    private func podSandbox(_ i: DarwinSandboxInfo) -> Runtime_V1_PodSandbox {
+        var item = Runtime_V1_PodSandbox()
+        item.id = i.id
+        item.metadata = metadata(i)
+        item.state = i.ready ? .sandboxReady : .sandboxNotready
+        item.createdAt = i.createdAt
+        item.labels = i.labels
+        item.annotations = i.annotations
+        return item
     }
 
     private func metadata(_ r: SandboxRecord) -> Runtime_V1_PodSandboxMetadata {
@@ -157,6 +191,22 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func podSandboxStatus(request: Runtime_V1_PodSandboxStatusRequest, context: ServerContext) async throws -> Runtime_V1_PodSandboxStatusResponse {
         do {
+            if let darwin, await darwin.hasSandbox(request.podSandboxID) {
+                let i = try await darwin.sandboxStatus(request.podSandboxID)
+                var network = Runtime_V1_PodSandboxNetworkStatus()
+                network.ip = i.ip
+                var status = Runtime_V1_PodSandboxStatus()
+                status.id = i.id
+                status.metadata = metadata(i)
+                status.state = i.ready ? .sandboxReady : .sandboxNotready
+                status.createdAt = i.createdAt
+                status.network = network
+                status.labels = i.labels
+                status.annotations = i.annotations
+                var response = Runtime_V1_PodSandboxStatusResponse()
+                response.status = status
+                return response
+            }
             let record = try await runtime.sandbox(request.podSandboxID)
             var network = Runtime_V1_PodSandboxNetworkStatus()
             network.ip = record.ip
@@ -198,6 +248,17 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             item.annotations = record.annotations
             items.append(item)
         }
+        if let darwin {
+            for i in await darwin.listSandboxes() {
+                let state: Runtime_V1_PodSandboxState = i.ready ? .sandboxReady : .sandboxNotready
+                if let filter {
+                    if !filter.id.isEmpty && filter.id != i.id { continue }
+                    if filter.hasState && filter.state.state != state { continue }
+                    if !filter.labelSelector.allSatisfy({ i.labels[$0.key] == $0.value }) { continue }
+                }
+                items.append(podSandbox(i))
+            }
+        }
         var response = Runtime_V1_ListPodSandboxResponse()
         response.items = items
         return response
@@ -207,9 +268,14 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func createContainer(request: Runtime_V1_CreateContainerRequest, context: ServerContext) async throws -> Runtime_V1_CreateContainerResponse {
         do {
-            let began = ContinuousClock.now
-            let id = try await runtime.createContainer(sandboxID: request.podSandboxID, config: request.config)
-            trace("create", request.config.metadata.name + " " + id, since: began)
+            let id: String
+            if let darwin, await darwin.hasSandbox(request.podSandboxID) {
+                id = try await darwin.createContainer(sandboxID: request.podSandboxID, config: request.config)
+            } else {
+                let began = ContinuousClock.now
+                id = try await runtime.createContainer(sandboxID: request.podSandboxID, config: request.config)
+                trace("create", request.config.metadata.name + " " + id, since: began)
+            }
             var response = Runtime_V1_CreateContainerResponse()
             response.containerID = id
             return response
@@ -218,6 +284,10 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func startContainer(request: Runtime_V1_StartContainerRequest, context: ServerContext) async throws -> Runtime_V1_StartContainerResponse {
         do {
+            if let darwin, await darwin.hasContainer(request.containerID) {
+                try await darwin.startContainer(request.containerID)
+                return Runtime_V1_StartContainerResponse()
+            }
             let began = ContinuousClock.now
             if Self.tracing { print("    trace     start-begin \(request.containerID) at \(Date().timeIntervalSince1970)") }
             try await runtime.startContainer(request.containerID)
@@ -228,14 +298,22 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
 
     func stopContainer(request: Runtime_V1_StopContainerRequest, context: ServerContext) async throws -> Runtime_V1_StopContainerResponse {
         do {
-            try await runtime.stopContainer(request.containerID, timeout: request.timeout)
+            if let darwin, await darwin.hasContainer(request.containerID) {
+                try await darwin.stopContainer(request.containerID, timeout: request.timeout)
+            } else {
+                try await runtime.stopContainer(request.containerID, timeout: request.timeout)
+            }
             return Runtime_V1_StopContainerResponse()
         } catch { throw failed(error) }
     }
 
     func removeContainer(request: Runtime_V1_RemoveContainerRequest, context: ServerContext) async throws -> Runtime_V1_RemoveContainerResponse {
         do {
-            try await runtime.removeContainer(request.containerID)
+            if let darwin, await darwin.hasContainer(request.containerID) {
+                try await darwin.removeContainer(request.containerID)
+            } else {
+                try await runtime.removeContainer(request.containerID)
+            }
             return Runtime_V1_RemoveContainerResponse()
         } catch { throw failed(error) }
     }
@@ -265,8 +343,60 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
         return m
     }
 
+    private func crioState(_ s: DarwinContainerState) -> Runtime_V1_ContainerState {
+        switch s {
+        case .created: .containerCreated
+        case .running: .containerRunning
+        case .exited: .containerExited
+        }
+    }
+
+    private func metadata(_ i: DarwinContainerInfo) -> Runtime_V1_ContainerMetadata {
+        var m = Runtime_V1_ContainerMetadata()
+        m.name = i.name; m.attempt = i.attempt
+        return m
+    }
+
+    private func container(_ i: DarwinContainerInfo) -> Runtime_V1_Container {
+        var spec = Runtime_V1_ImageSpec()
+        spec.image = i.image
+        var item = Runtime_V1_Container()
+        item.id = i.id
+        item.podSandboxID = i.sandboxID
+        item.metadata = metadata(i)
+        item.image = spec
+        item.imageRef = i.imageRef
+        item.state = crioState(i.state)
+        item.createdAt = i.createdAt
+        item.labels = i.labels
+        item.annotations = i.annotations
+        return item
+    }
+
     func containerStatus(request: Runtime_V1_ContainerStatusRequest, context: ServerContext) async throws -> Runtime_V1_ContainerStatusResponse {
         do {
+            if let darwin, await darwin.hasContainer(request.containerID) {
+                let i = try await darwin.containerStatus(request.containerID)
+                var spec = Runtime_V1_ImageSpec()
+                spec.image = i.image
+                var status = Runtime_V1_ContainerStatus()
+                status.id = i.id
+                status.metadata = metadata(i)
+                status.state = crioState(i.state)
+                status.createdAt = i.createdAt
+                status.startedAt = i.startedAt
+                status.finishedAt = i.finishedAt
+                status.exitCode = i.exitCode
+                status.image = spec
+                status.imageRef = i.imageRef
+                status.reason = i.reason
+                status.labels = i.labels
+                status.annotations = i.annotations
+                status.logPath = i.logPath
+                var response = Runtime_V1_ContainerStatusResponse()
+                response.status = status
+                return response
+            }
             let record = try await runtime.container(request.containerID)
             var spec = Runtime_V1_ImageSpec()
             spec.image = record.image
@@ -323,6 +453,18 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
             item.annotations = record.annotations
             items.append(item)
         }
+        if let darwin {
+            for i in await darwin.listContainers() {
+                let state = crioState(i.state)
+                if let filter {
+                    if !filter.id.isEmpty && filter.id != i.id { continue }
+                    if !filter.podSandboxID.isEmpty && filter.podSandboxID != i.sandboxID { continue }
+                    if filter.hasState && filter.state.state != state { continue }
+                    if !filter.labelSelector.allSatisfy({ i.labels[$0.key] == $0.value }) { continue }
+                }
+                items.append(container(i))
+            }
+        }
         var response = Runtime_V1_ListContainersResponse()
         response.containers = items
         return response
@@ -333,6 +475,12 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// quiet.
     func reopenContainerLog(request: Runtime_V1_ReopenContainerLogRequest, context: ServerContext) async throws -> Runtime_V1_ReopenContainerLogResponse {
         do {
+            // A darwin container's log is a single file the run streams into;
+            // rotation handling for it is part of the guest-log work still to
+            // come, so this is a no-op rather than an error.
+            if let darwin, await darwin.hasContainer(request.containerID) {
+                return Runtime_V1_ReopenContainerLogResponse()
+            }
             try await runtime.reopenContainerLog(request.containerID)
             return Runtime_V1_ReopenContainerLogResponse()
         } catch { throw failed(error) }
@@ -445,6 +593,12 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// A command that outlives the timeout is killed and reported as a
     /// DeadlineExceeded, which the kubelet counts as the probe timing out.
     func execSync(request: Runtime_V1_ExecSyncRequest, context: ServerContext) async throws -> Runtime_V1_ExecSyncResponse {
+        // Exec into a darwin sandbox would run over the guest agent's vsock
+        // channel; the agent grows that in a later increment (design doc). Until
+        // then a probe against a macOS pod errors clearly rather than silently.
+        if let darwin, await darwin.hasContainer(request.containerID) {
+            throw unimplemented("exec into a macOS pod")
+        }
         let stdout = CollectingWriter(), stderr = CollectingWriter()
         let process: LinuxProcess
         do {
@@ -482,6 +636,9 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// process to run the command, so the URL has to come from it -- the token
     /// it contains is issued by the streaming server's own request cache.
     func exec(request: Runtime_V1_ExecRequest, context: ServerContext) async throws -> Runtime_V1_ExecResponse {
+        if let darwin, await darwin.hasContainer(request.containerID) {
+            throw unimplemented("exec into a macOS pod")
+        }
         do {
             let url = try streamer.url(path: "/exec", body: [
                 "container_id": request.containerID,
