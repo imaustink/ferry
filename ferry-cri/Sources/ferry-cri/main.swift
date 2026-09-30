@@ -31,6 +31,44 @@ func option(_ name: String, _ fallback: String) -> String {
     return args[i + 1]
 }
 
+// A hardware smoke test for the darwin VM sandbox, off the CRI path: boot a
+// guest from a golden bundle, run a command in it over the agent, and print what
+// came back. This is how the DarwinSandbox boot/agent/exec path is exercised on
+// a real Mac (a golden image and the virtualization entitlement, which the CRI
+// server cannot get in CI).
+//
+//   ferry-cri darwin-smoke <golden-bundle> [command...]   (default: sw_vers)
+//   ferry-cri darwin-smoke <golden-bundle> --chroot <root> [command...]
+if args.first == "darwin-smoke" {
+    guard args.count >= 2 else {
+        FileHandle.standardError.write("usage: ferry-cri darwin-smoke <golden-bundle> [--chroot <root>] [command...]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let golden = args[1]
+    var rest = Array(args.dropFirst(2))
+    var chroot: String?
+    if rest.first == "--chroot", rest.count >= 2 { chroot = rest[1]; rest = Array(rest.dropFirst(2)) }
+    let cmd = rest.isEmpty ? ["/usr/bin/sw_vers"] : rest
+    let work = URL(filePath: NSTemporaryDirectory()).appendingPathComponent("ferry-darwin-smoke-\(UUID().uuidString)")
+    let sb = DarwinSandbox(id: "smoke", golden: URL(filePath: golden), workDir: work,
+                           cpus: 4, memoryBytes: 4 << 30)
+    do {
+        FileHandle.standardError.write("==> cloning + booting \(golden)\n".data(using: .utf8)!)
+        try await sb.boot()
+        FileHandle.standardError.write("==> agent answered; running: \(cmd.joined(separator: " "))\n".data(using: .utf8)!)
+        let (code, out, err) = try await sb.exec(DarwinRunRequest(argv: cmd, chroot: chroot))
+        FileHandle.standardOutput.write(out)
+        if !err.isEmpty { FileHandle.standardError.write(err) }
+        FileHandle.standardError.write("==> exit \(code)\n".data(using: .utf8)!)
+        await sb.shutdown()
+        exit(code == 0 ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write("darwin-smoke failed: \(error)\n".data(using: .utf8)!)
+        await sb.shutdown()
+        exit(1)
+    }
+}
+
 let socketPath = option("--endpoint", "/tmp/ferry-cri.sock")
 let execSocketPath = option("--exec-socket", "/tmp/ferry-exec.sock")
 let streamerControl = option("--streamer-control", "/tmp/ferry-streamer.sock")

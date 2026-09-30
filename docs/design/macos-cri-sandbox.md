@@ -166,6 +166,22 @@ SPDY/`ExecServer` path bridged onto the agent; and **stats** need guest-side
 measurement (there are no cgroups), so `kubectl top` for a macOS pod reports
 nothing for now.
 
+## Hardware validation
+
+`ferry-cri darwin-smoke <golden-bundle> [--chroot <root>] [cmd...]` boots a
+`DarwinSandbox` off the CRI path and runs a command in the guest — the way this
+hardware-only path is exercised (a golden image and the virtualization
+entitlement, which CI has neither). On an M-series Mac (macOS 26.6.2) against a
+baked `golden-node`, confirmed end to end: the bundle clones, the guest boots,
+`ferry-macagent` answers on vsock, `sw_vers` runs and returns; the OS base
+(`/private/var/ferry/darwin/os`, with `dyld`) and the tools the root assembly
+uses (`base64 -D`, `tar`→bsdtar, `chroot`) are present; and a Darwin binary
+**runs chrooted into the OS base**, so dyld resolves inside an assembled root —
+the execution model the container root depends on. What remains for a full
+cluster run is the registry-served image fetch + chunked upload + untar through
+`DarwinRuntime` (its pieces are unit-tested and the upload is the shipped
+`ferry image build` COPY mechanism), and increment 4's scheduling flip.
+
 ## Reusable building blocks (with paths)
 
 - Clone: `clone()` in `ferry-macvm`/`experiments/*/macvm.swift`; `cp -cR`
