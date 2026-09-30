@@ -752,5 +752,35 @@ contains "ferry status cross-checks the macos-vm NodePool too" \
   "$status_block" 'kube get nodepool macos-vm'
 echo
 
+printf '\033[1m%s\033[0m\n' "the golden image finds itself from its markers"
+# resolve_mac_image / _version / _shared are the "finds itself" feature: they
+# read the bundle and its sibling `version`/`shared` markers out of
+# FERRY_HOME/mac-image, so a plain `ferry up` (no env) discovers a baked image.
+# Exercise them behaviorally through `ferry mac-image status` against a fabricated
+# FERRY_HOME -- a source grep would pass even if the marker paths drifted apart
+# from where bake writes them. No Mac or cluster needed (status tolerates a
+# machined that is down).
+mac_home="$sandbox/mac-home"
+mkdir -p "$mac_home/mac-image/golden-node"
+printf '26\n' > "$mac_home/mac-image/version"
+: > "$mac_home/mac-image/shared"
+# $1 is FERRY_MAC_SHARED (empty string = unset-like, so the marker decides).
+mac_status() { env FERRY_HOME="$mac_home" FERRY_MAC_IMAGE= FERRY_MAC_SHARED="$1" "$repo/ferry" mac-image status 2>&1; }
+found="$(mac_status "")"
+contains "status reports the discovered golden-node bundle" \
+  "$found" "$mac_home/mac-image/golden-node"
+contains "and the macOS major read from the sibling version marker" \
+  "$(printf '%s\n' "$found" | grep -E '^[[:space:]]*macOS[[:space:]]')" "26"
+lacks "so the version is not unknown" "$found" "unknown"
+contains "the shared marker beside the bundle turns shared on" \
+  "$found" "on (ferry-macos-shared)"
+rm -f "$mac_home/mac-image/shared"
+contains "and with no marker shared resolves off" \
+  "$(mac_status "")" "off (ferry-macos-vm only)"
+: > "$mac_home/mac-image/shared"
+contains "FERRY_MAC_SHARED=0 forces shared off even with the marker present" \
+  "$(mac_status 0)" "off (ferry-macos-vm only)"
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]
