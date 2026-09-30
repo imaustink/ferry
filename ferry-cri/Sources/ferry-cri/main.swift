@@ -198,7 +198,10 @@ let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
         let endpoint = option("--relay-endpoint", "")
         return endpoint.split(separator: ":").first.map(String.init) ?? ""
     }(),
-    fabric: darwinFabric))
+    fabric: darwinFabric,
+    // The cluster's ClusterIP range, so a macOS pod routes it to the host-side
+    // Service DNAT. Defaults to the ferry control-plane default when unset.
+    serviceCIDR: darwinFabric == nil ? "" : option("--service-cidr", "10.96.0.0/16")))
 if !macImage.isEmpty { print("    mac image \(macImage)") }
 if let f = darwinFabric { print("    mac net   \(f.macSlice) on the pod switch") }
 
@@ -302,6 +305,10 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
         Task {
             if let first = try? await fetchRuleset(proxyd, after: nil) {
                 await runtime.cacheRuleset(first.body, generation: first.generation)
+                // The macOS pods can't load kube-proxy's nft rules (no Linux
+                // kernel); ferry-cri DNATs their ClusterIP traffic host-side from
+                // the same ruleset (MacServiceNAT).
+                await darwinRuntime.applyServiceRules(String(decoding: first.body, as: UTF8.self))
             }
             while true {
                 let seen = await runtime.seenGeneration()
@@ -310,6 +317,7 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
                     continue
                 }
                 await runtime.applyRuleset(next.body, generation: next.generation)
+                await darwinRuntime.applyServiceRules(String(decoding: next.body, as: UTF8.self))
             }
         }
     }

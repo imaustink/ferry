@@ -1532,6 +1532,7 @@ cmd_up() {
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \
@@ -2655,6 +2656,7 @@ cmd_node_add() {
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \
@@ -3129,6 +3131,7 @@ start_worker() { # name index server(host:port)
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \

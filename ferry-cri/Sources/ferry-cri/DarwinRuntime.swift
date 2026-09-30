@@ -122,9 +122,32 @@ actor DarwinRuntime {
         /// IP on the switch (en1) and interoperates with every other pod; when
         /// nil, it falls back to `nodeIP` (host-network-like).
         var fabric: DarwinFabric?
+        /// The cluster's Service (ClusterIP) range, e.g. 10.96.0.0/16. A macOS pod
+        /// routes it to the virtual gateway ferry-cri answers for, which DNATs
+        /// each ClusterIP to a backend (MacServiceNAT). Empty disables Services.
+        var serviceCIDR: String
+    }
+
+    /// The virtual gateway MAC a macOS pod's Service traffic is sent to (and that
+    /// ferry-cri answers ARP for). Locally administered; one is enough since each
+    /// pod has its own switch port and NAT.
+    private static let gatewayMAC: [UInt8] = [0x02, 0x66, 0x72, 0x79, 0x00, 0x01]
+
+    /// The Service gateway address for a macOS pod: the `.1` of this Mac's macOS
+    /// slice (e.g. 10.194.255.1), which every macOS pod reaches on-link via en1.
+    private func gatewayIP() -> UInt32? {
+        guard let slice = config.fabric?.macSlice,
+              let head = slice.split(separator: "/").first,
+              let ip = ipToUInt32(String(head)) else { return nil }
+        return (ip & 0xffff_ff00) | 1     // .1 of the /24
     }
 
     private let config: Config
+
+    /// The current Service table (ClusterIP -> endpoints), parsed from kube-proxy's
+    /// ruleset. Kept so a new pod's NAT is seeded and every live pod's NAT tracks
+    /// changes.
+    private var serviceTable: ServiceTable = [:]
 
     /// Hands out this Mac's macOS-pod addresses from `fabric.macSlice`, starting
     /// at `.2` (`.1` is kept as the Service-CIDR gateway the host proxy-ARPs).
@@ -162,6 +185,9 @@ actor DarwinRuntime {
         let podMAC: String?
         let podPrefix: Int
         let switchInterface: SwitchInterface?
+        /// The host-side Service router for this pod's switch port (ClusterIP
+        /// DNAT). Kept so the current Service table can be pushed to it.
+        let nat: MacServiceNAT?
         /// The pod's DNS config from the kubelet (CRI dns_config): the cluster
         /// DNS server (CoreDNS's reserved pod address) and the search domains.
         /// Used to point the guest's resolver at cluster DNS over the switch.
@@ -172,7 +198,7 @@ actor DarwinRuntime {
         var networkConfigured = false
         init(info: DarwinSandboxInfo, sandbox: DarwinSandbox, logDirectory: String,
              podIP: String? = nil, podMAC: String? = nil, podPrefix: Int = 16,
-             switchInterface: SwitchInterface? = nil,
+             switchInterface: SwitchInterface? = nil, nat: MacServiceNAT? = nil,
              dnsServers: [String] = [], dnsSearches: [String] = []) {
             self.info = info
             self.sandbox = sandbox
@@ -181,6 +207,7 @@ actor DarwinRuntime {
             self.podMAC = podMAC
             self.podPrefix = podPrefix
             self.switchInterface = switchInterface
+            self.nat = nat
             self.dnsServers = dnsServers
             self.dnsSearches = dnsSearches
         }
@@ -251,6 +278,7 @@ actor DarwinRuntime {
         var podMAC: String?
         var podPrefix = config.fabric?.clusterPrefix ?? 16
         var switchIface: SwitchInterface?
+        var nat: MacServiceNAT?
         if let fabric = config.fabric, let (ip, prefix) = allocateMacIP() {
             if let mac = try? MACAddress(VZMACAddress.randomLocallyAdministered().string),
                let cidr = try? CIDRv4("\(ip)/\(prefix)"),
@@ -259,7 +287,14 @@ actor DarwinRuntime {
                 podMAC = mac.description
                 podPrefix = prefix
                 switchIface = nic
-                fabric.podSwitch.attach(podID: id, fd: nic.hostFD)
+                // Host-side ClusterIP DNAT for this pod, seeded with the Services
+                // known now (kept current by applyServiceRules).
+                if !config.serviceCIDR.isEmpty, let ipV = ipToUInt32(ip), let gw = gatewayIP() {
+                    let n = MacServiceNAT(podIP: ipV, gatewayIP: gw, gatewayMAC: Self.gatewayMAC)
+                    n.update(serviceTable)
+                    nat = n
+                }
+                fabric.podSwitch.attach(podID: id, fd: nic.hostFD, nat: nat)
             } else {
                 freeMacIP(ip)   // built no NIC; hand the address back
             }
@@ -279,7 +314,7 @@ actor DarwinRuntime {
             ip: podIP ?? config.nodeIP, createdAt: Self.now(), ready: true)
         sandboxes[id] = Sandbox(info: info, sandbox: sandbox, logDirectory: cfg.logDirectory,
                                 podIP: podIP, podMAC: podMAC, podPrefix: podPrefix,
-                                switchInterface: switchIface,
+                                switchInterface: switchIface, nat: nat,
                                 dnsServers: cfg.dnsConfig.servers, dnsSearches: cfg.dnsConfig.searches)
         return id
     }
@@ -465,6 +500,7 @@ actor DarwinRuntime {
         ifconfig "$dev" inet \(ip) netmask \(maskHex) up || exit 1
         route -q -n add -net \(clusterCIDR) -interface "$dev" 2>/dev/null || true
         echo "cluster NIC $dev = \(ip)/\(bits)"
+        \(serviceRouteScript())
         \(dnsSetupScript(s))
         """
         let r = try? await s.sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script]))
@@ -487,6 +523,21 @@ actor DarwinRuntime {
     /// mDNSResponder drop *all* resolution, external included (measured). A
     /// resolver file configd reads adds the scoped resolver cleanly and leaves the
     /// default resolver intact. Empty when the kubelet gave no DNS config.
+    /// Routes the cluster's Service CIDR to the virtual gateway ferry-cri answers
+    /// ARP for and DNATs (MacServiceNAT). The gateway is the `.1` of this Mac's
+    /// macOS slice, on-link on en1 (within the cluster prefix), so the pod ARPs
+    /// it directly. Empty when there is no Service CIDR or no fabric.
+    private func serviceRouteScript() -> String {
+        guard !config.serviceCIDR.isEmpty,
+              let slice = config.fabric?.macSlice,
+              let gw = slice.split(separator: "/").first else { return "" }
+        return """
+        route -q -n add -net \(config.serviceCIDR) \(gw) 2>/dev/null \
+            || route -q -n change -net \(config.serviceCIDR) \(gw) 2>/dev/null || true
+        echo "Service CIDR \(config.serviceCIDR) via \(gw)"
+        """
+    }
+
     private func dnsSetupScript(_ s: Sandbox) -> String {
         guard !s.dnsServers.isEmpty else { return "" }
         // The cluster search domains are those the kubelet built from the cluster
@@ -605,6 +656,15 @@ actor DarwinRuntime {
         let parts = text.split(separator: " ")
         guard parts.count == 2, let mem = UInt64(parts[0]), let cpuSec = Double(parts[1]) else { return nil }
         return Stats(memoryBytes: mem, cpuNanoseconds: UInt64(cpuSec * 1_000_000_000))
+    }
+
+    /// Update every macOS pod's ClusterIP DNAT from kube-proxy's rendered ruleset
+    /// -- the same text ferry-cri loads into the Linux pods. Parsed once here into
+    /// a ClusterIP -> endpoints table and pushed to each pod's host-side NAT.
+    func applyServiceRules(_ rulesetText: String) {
+        let table = parseKubeProxyRuleset(rulesetText)
+        serviceTable = table
+        for s in sandboxes.values { s.nat?.update(table) }
     }
 
     /// The ids of running darwin containers, for a stats listing.
