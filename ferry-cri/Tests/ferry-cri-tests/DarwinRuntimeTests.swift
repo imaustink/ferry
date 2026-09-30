@@ -35,7 +35,7 @@ import Testing
             golden: golden,
             stateDir: URL(filePath: NSTemporaryDirectory()).appendingPathComponent("darwin-test-\(UUID().uuidString)"),
             defaultCPUs: 4, defaultMemoryBytes: 4 << 30, maxGuests: 2, nodeIP: "192.0.2.1",
-            fabric: nil, serviceCIDR: ""))
+            fabric: nil, serviceCIDR: "", interactiveAgent: nil))
     }
 
     @Test func withNoGoldenImageDarwinIsUnavailable() async throws {

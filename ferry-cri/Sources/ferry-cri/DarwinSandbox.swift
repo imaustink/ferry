@@ -318,6 +318,114 @@ final class DarwinSandbox: @unchecked Sendable {
         }
     }
 
+    /// The vsock port the interactive agent (ferry-macagent-i) listens on, once
+    /// ferry-cri has uploaded and launched it into the guest.
+    static let interactiveAgentPort: UInt32 = 7001
+
+    /// Upload the interactive agent binary and launch it in the guest (vsock 7001),
+    /// so `kubectl exec -i/-it` has a stdin/PTY endpoint. No change to the golden
+    /// image -- the baked agent (7000) does the upload and launch. Idempotent-ish:
+    /// re-launching is harmless (bind fails, the first one keeps serving).
+    func installInteractiveAgent(_ binary: Data) async throws {
+        let b64 = "/private/var/ferry/ferry-macagent-i.b64"
+        let bin = "/private/var/ferry/ferry-macagent-i"
+        try await uploadBase64(binary, toGuestPath: b64)
+        let log = "/private/var/ferry/ferry-macagent-i.log"
+        // Background JUST the agent (with its own fds redirected) -- not a
+        // `pgrep || agent &` subshell, which would inherit and hold this exec's
+        // output pipes open and hang StartContainer.
+        let script = "base64 -D < \"$0\" > \"$1\" && chmod +x \"$1\" && rm -f \"$0\"; "
+            + "if ! pgrep -f \"$1\" >/dev/null 2>&1; then \"$1\" > \"$2\" 2>&1 < /dev/null & fi; "
+            + "sleep 0.5; cat \"$2\" 2>/dev/null"
+        let (_, out, err) = try await exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script, b64, bin, log]))
+        let msg = ((String(data: out, encoding: .utf8) ?? "") + (String(data: err, encoding: .utf8) ?? ""))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !msg.isEmpty, !msg.contains("listening") {   // report only a launch problem
+            FileHandle.standardError.write("darwin \(id): interactive agent: \(msg)\n".data(using: .utf8)!)
+        }
+    }
+
+    /// An open interactive session: write stdin/resize frames to the guest, read
+    /// output through the `onOutput` given to `interactive`, await the exit code.
+    final class Interactive: @unchecked Sendable {
+        fileprivate let fd: Int32
+        private let lock = NSLock()
+        private let done = DispatchSemaphore(value: 0)
+        fileprivate var code: Int32 = 0
+        fileprivate var finished = false
+        init(fd: Int32) { self.fd = fd }
+
+        func writeStdin(_ data: [UInt8]) { frame(0, data) }
+        func closeStdin() { frame(0, []) }
+        func resize(cols: UInt16, rows: UInt16) {
+            frame(4, [UInt8(cols >> 8), UInt8(cols & 0xff), UInt8(rows >> 8), UInt8(rows & 0xff)])
+        }
+        func wait() async -> Int32 {
+            await withCheckedContinuation { (c: CheckedContinuation<Int32, Never>) in
+                DispatchQueue.global().async { self.done.wait(); c.resume(returning: self.code) }
+            }
+        }
+        fileprivate func finish(_ code: Int32) {
+            lock.lock(); if !finished { finished = true; self.code = code; done.signal() }; lock.unlock()
+        }
+        private func frame(_ type: UInt8, _ payload: [UInt8]) {
+            var f = [type]
+            withUnsafeBytes(of: UInt32(payload.count).bigEndian) { f.append(contentsOf: $0) }
+            f.append(contentsOf: payload)
+            lock.lock(); defer { lock.unlock() }
+            var off = 0
+            while off < f.count { let w = f[off...].withUnsafeBytes { write(fd, $0.baseAddress, f.count - off) }; if w <= 0 { return }; off += w }
+        }
+    }
+
+    private struct InteractiveRequest: Encodable {
+        var argv: [String]; var env: [String: String]?; var chroot: String?; var tty: Bool
+    }
+
+    /// Open an interactive exec against the interactive agent (vsock 7001): send
+    /// the request, stream the process's output to `onOutput`, and return a
+    /// session to drive stdin/resize and await exit.
+    func interactive(argv: [String], env: [String: String]?, chroot: String?, tty: Bool,
+                     onOutput: @escaping @Sendable (DarwinFrameKind, [UInt8]) -> Void) async throws -> Interactive {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Interactive, Error>) in
+            queue.async {
+                guard let dev = self.socket else {
+                    cont.resume(throwing: NSError(domain: "ferry.darwin", code: 6,
+                        userInfo: [NSLocalizedDescriptionKey: "sandbox not booted"])); return
+                }
+                dev.connect(toPort: Self.interactiveAgentPort) { r in
+                    guard case .success(let conn) = r else {
+                        cont.resume(throwing: NSError(domain: "ferry.darwin", code: 7,
+                            userInfo: [NSLocalizedDescriptionKey: "interactive agent connect: \(r)"])); return
+                    }
+                    let fd = conn.fileDescriptor
+                    var line = (try? JSONEncoder().encode(InteractiveRequest(argv: argv, env: env, chroot: chroot, tty: tty))) ?? Data()
+                    line.append(0x0A)
+                    _ = line.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+                    let session = Interactive(fd: fd)
+                    Thread {
+                        var parser = DarwinFrameParser()
+                        var buf = [UInt8](repeating: 0, count: 64 * 1024)
+                        var status: Int32 = 0
+                        loop: while true {
+                            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                            if n <= 0 { break }
+                            for f in (try? parser.feed(Array(buf[0 ..< n]))) ?? [] {
+                                switch f.kind {
+                                case .stdout, .stderr, .error: onOutput(f.kind, f.payload)
+                                case .exit: status = DarwinFrameParser.exitStatus(f.payload); break loop
+                                }
+                            }
+                        }
+                        withExtendedLifetime(conn) {}
+                        session.finish(status)
+                    }.start()
+                    self.queue.async { cont.resume(returning: session) }
+                }
+            }
+        }
+    }
+
     /// A thread-safe byte accumulator for collecting a command's output; the run
     /// reader thread appends to it, the awaiting caller reads it once run returns.
     private final class Accum: @unchecked Sendable {

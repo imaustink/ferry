@@ -201,7 +201,17 @@ let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
     fabric: darwinFabric,
     // The cluster's ClusterIP range, so a macOS pod routes it to the host-side
     // Service DNAT. Defaults to the ferry control-plane default when unset.
-    serviceCIDR: darwinFabric == nil ? "" : option("--service-cidr", "10.96.0.0/16")))
+    serviceCIDR: darwinFabric == nil ? "" : option("--service-cidr", "10.96.0.0/16"),
+    // The interactive guest agent binary (kubectl exec -i/-it). Defaults to
+    // ferry-macagent-i next to the ferry-cri executable; nil if not present.
+    interactiveAgent: {
+        let explicit = option("--interactive-agent", "")
+        let path = explicit.isEmpty
+            ? URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+                .appendingPathComponent("ferry-macagent-i").path()
+            : explicit
+        return FileManager.default.contents(atPath: path)
+    }()))
 if !macImage.isEmpty { print("    mac image \(macImage)") }
 if let f = darwinFabric { print("    mac net   \(f.macSlice) on the pod switch") }
 

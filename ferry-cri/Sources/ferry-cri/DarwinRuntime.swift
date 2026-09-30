@@ -126,6 +126,11 @@ actor DarwinRuntime {
         /// routes it to the virtual gateway ferry-cri answers for, which DNATs
         /// each ClusterIP to a backend (MacServiceNAT). Empty disables Services.
         var serviceCIDR: String
+        /// The interactive guest agent binary (ferry-macagent-i), uploaded and
+        /// launched in each guest so `kubectl exec -i/-it` has a stdin/PTY
+        /// endpoint. Nil when not built/available -> interactive exec falls back
+        /// to the non-interactive path.
+        var interactiveAgent: Data?
     }
 
     /// The virtual gateway MAC a macOS pod's Service traffic is sent to (and that
@@ -196,6 +201,8 @@ actor DarwinRuntime {
         /// Set once the guest's cluster NIC has been configured, so a restart of
         /// the container does not reconfigure it.
         var networkConfigured = false
+        /// Set once the interactive agent (kubectl exec -i/-it) is launched.
+        var interactiveReady = false
         init(info: DarwinSandboxInfo, sandbox: DarwinSandbox, logDirectory: String,
              podIP: String? = nil, podMAC: String? = nil, podPrefix: Int = 16,
              switchInterface: SwitchInterface? = nil, nat: MacServiceNAT? = nil,
@@ -409,6 +416,14 @@ actor DarwinRuntime {
             // Seed this pod's NetworkPolicy (ingress) from the current document.
             await applyNetpol(s, podIP: ip)
             s.networkConfigured = true
+        }
+        // Launch the interactive agent (for `kubectl exec -i/-it`) once per boot,
+        // off the critical path: the install must never block the container from
+        // starting. The flag is set now; the agent is up a moment later.
+        if !s.interactiveReady, let agent = config.interactiveAgent {
+            s.interactiveReady = true
+            let sandbox = s.sandbox
+            Task.detached { try? await sandbox.installInteractiveAgent(agent) }
         }
 
         // Fetch the image host-side and assemble the container root in the guest.
@@ -625,9 +640,7 @@ actor DarwinRuntime {
 
     /// A streamed exec (`kubectl exec -- cmd`): run a command chrooted into the
     /// container's root, streaming its output to `onOutput` as it arrives, and
-    /// return the exit status. Stdin and a TTY are not wired -- the guest agent
-    /// runs argv with stdin from /dev/null -- so an interactive `exec -it` runs
-    /// the command but sees no input (docs/design/macos-cri-sandbox.md).
+    /// return the exit status. Output-only -- for stdin/TTY, see interactiveExec.
     func execStream(_ id: String, cmd: [String],
                     onOutput: @escaping @Sendable (DarwinFrameKind, [UInt8]) -> Void) async throws -> Int32 {
         guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
@@ -635,6 +648,25 @@ actor DarwinRuntime {
             throw DarwinRuntimeError.invalid("darwin container \(id) is not running")
         }
         return try await s.sandbox.run(DarwinRunRequest(argv: cmd, chroot: root), onOutput: onOutput)
+    }
+
+    /// Whether the interactive agent is up for a container's sandbox, so the
+    /// ExecServer knows to use the stdin/TTY path.
+    func interactiveAvailable(_ id: String) -> Bool {
+        guard let c = containers[id], let s = sandboxes[c.info.sandboxID] else { return false }
+        return s.interactiveReady
+    }
+
+    /// An interactive exec (`kubectl exec -i/-it`): run a command chrooted into
+    /// the container root against the interactive agent, returning a session that
+    /// carries stdin/resize and the exit code. Output streams to `onOutput`.
+    func interactiveExec(_ id: String, cmd: [String], tty: Bool,
+                         onOutput: @escaping @Sendable (DarwinFrameKind, [UInt8]) -> Void) async throws -> DarwinSandbox.Interactive {
+        guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
+        guard let root = c.rootPath, let s = sandboxes[c.info.sandboxID], s.booted else {
+            throw DarwinRuntimeError.invalid("darwin container \(id) is not running")
+        }
+        return try await s.sandbox.interactive(argv: cmd, env: nil, chroot: root, tty: tty, onOutput: onOutput)
     }
 
     /// Measured resource use for a running darwin container. A VM-per-pod pod is

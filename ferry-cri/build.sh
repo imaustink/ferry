@@ -17,3 +17,10 @@ SWIFT="${SWIFT:-swift}"
 cp "$("$SWIFT" build -c release --show-bin-path)/ferry-cri" ../bin/ferry-cri
 codesign --force --sign - --entitlements entitlements.plist ../bin/ferry-cri
 echo "==> $(cd .. && pwd)/bin/ferry-cri"
+
+# The interactive guest agent (kubectl exec -i/-it). A tiny macOS binary ferry-cri
+# uploads into a booted guest and launches on vsock 7001 -- no change to the
+# golden image. Ad-hoc signed, like the baked agent.
+swiftc -O -target arm64-apple-macos26.0 -o ../bin/ferry-macagent-i guest/ferry-macagent-i.swift
+codesign --force --sign - ../bin/ferry-macagent-i
+echo "==> $(cd .. && pwd)/bin/ferry-macagent-i"
