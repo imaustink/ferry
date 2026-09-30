@@ -30,7 +30,14 @@ struct Endpoint: Hashable, Sendable {
     let port: UInt16
 }
 
-typealias ServiceTable = [ServiceKey: [Endpoint]]
+/// A ClusterIP service: its backends and, when `sessionAffinity: ClientIP` is
+/// set, the window a client sticks to the backend it first hit.
+struct Service: Sendable, Equatable {
+    var endpoints: [Endpoint]
+    var affinityTimeout: TimeInterval?
+}
+
+typealias ServiceTable = [ServiceKey: Service]
 
 /// Parses kube-proxy's rendered nftables ruleset into ClusterIP -> endpoints.
 ///
@@ -46,6 +53,10 @@ func parseKubeProxyRuleset(_ text: String) -> ServiceTable {
     var dnat: [String: [Endpoint]] = [:]
     var jumps: [String: [String]] = [:]
     var serviceOf: [(ServiceKey, String)] = []   // (clusterIP:proto:port, service chain)
+    // A service chain that references an `@affinity-*` set has ClientIP session
+    // affinity; the set's `timeout <N>s` is the window.
+    var affinityChains: Set<String> = []
+    var setTimeout: [String: TimeInterval] = [:]
 
     func endpoint(_ s: Substring) -> Endpoint? {
         // "10.244.0.5:8080"
@@ -71,13 +82,21 @@ func parseKubeProxyRuleset(_ text: String) -> ServiceTable {
             }
             continue
         }
-        // add rule ip kube-proxy <chain> ... (dnat to X:Y | jump/goto <chain>)
+        // add set ip kube-proxy affinity-... { ... timeout <N>s ; }
+        if line.hasPrefix("add set ip kube-proxy affinity-"), f.count >= 5,
+           let ti = f.firstIndex(of: "timeout"), ti + 1 < f.count,
+           let secs = TimeInterval(f[ti + 1].dropLast()) {   // "10800s" -> 10800
+            setTimeout[String(f[4])] = secs
+            continue
+        }
+        // add rule ip kube-proxy <chain> ... (dnat to X:Y | jump/goto <chain> | @affinity-*)
         guard line.hasPrefix("add rule ip kube-proxy "), f.count >= 5 else { continue }
         let chain = String(f[4])
         if let di = f.firstIndex(of: "dnat"), di + 2 < f.count, f[di + 1] == "to",
            let ep = endpoint(f[di + 2]) {
             dnat[chain, default: []].append(ep)
         }
+        if f.contains(where: { $0.hasPrefix("@affinity-") }) { affinityChains.insert(chain) }
         for verb in ["jump", "goto"] {
             if let ji = f.firstIndex(of: Substring(verb)), ji + 1 < f.count {
                 jumps[chain, default: []].append(String(f[ji + 1]))
@@ -98,9 +117,34 @@ func parseKubeProxyRuleset(_ text: String) -> ServiceTable {
     for (key, chain) in serviceOf {
         var seen = Set<String>()
         let eps = resolve(chain, &seen)
-        if !eps.isEmpty { table[key] = eps }
+        guard !eps.isEmpty else { continue }
+        // Affinity timeout: the service is affinity-enabled if its chain (or any
+        // chain it reaches) references an @affinity set. Take the first timeout
+        // known for those sets (they share one per service).
+        var affinity: TimeInterval?
+        if affinityChains.contains(chain) {
+            var s2 = Set<String>()
+            affinity = affinityTimeout(chain, jumps: jumps, setTimeout: setTimeout, seen: &s2) ?? 10800
+        }
+        table[key] = Service(endpoints: eps, affinityTimeout: affinity)
     }
     return table
+}
+
+/// The affinity timeout reachable from a service chain: the affinity sets are
+/// named like the endpoint chains, so match a `setTimeout` entry whose name a
+/// reached chain matches. Falls back to nil (caller defaults it).
+private func affinityTimeout(_ chain: String, jumps: [String: [String]],
+                             setTimeout: [String: TimeInterval], seen: inout Set<String>) -> TimeInterval? {
+    guard seen.insert(chain).inserted else { return nil }
+    // The affinity set for endpoint-<hash>-<svc>/... is affinity-<hash>-<svc>/...
+    if chain.hasPrefix("endpoint-"), let t = setTimeout["affinity-" + chain.dropFirst("endpoint-".count)] {
+        return t
+    }
+    for next in jumps[chain] ?? [] {
+        if let t = affinityTimeout(next, jumps: jumps, setTimeout: setTimeout, seen: &seen) { return t }
+    }
+    return nil
 }
 
 /// The host-side Service router for one macOS pod's switch port. Not an actor: it
@@ -128,6 +172,10 @@ final class MacServiceNAT: @unchecked Sendable {
     private var forward: [ConnKey: Endpoint] = [:]
     private var rr: [ServiceKey: Int] = [:]     // round-robin cursor per service
     private var lastSweep = Date()
+    /// ClientIP session affinity: a client's chosen backend per service, so new
+    /// connections from the same client keep hitting it within the window.
+    private struct AffinityKey: Hashable { let svc: ServiceKey; let client: UInt32 }
+    private var affinity: [AffinityKey: (ep: Endpoint, seen: Date)] = [:]
 
     struct ConnKey: Hashable { let proto: UInt8; let aIP: UInt32; let aPort: UInt16; let bIP: UInt32; let bPort: UInt16 }
 
@@ -170,7 +218,8 @@ final class MacServiceNAT: @unchecked Sendable {
         guard frame.count >= 34 else { return .drop }
         let ihl = Int(frame[14] & 0x0f) * 4
         let proto = frame[23]
-        guard proto == 6 || proto == 17, frame.count >= 14 + ihl + 4 else { return .drop }
+        // TCP, UDP and SCTP all carry src/dst port in the first four L4 bytes.
+        guard proto == 6 || proto == 17 || proto == 132, frame.count >= 14 + ihl + 4 else { return .drop }
         let l4 = 14 + ihl
         let srcIP = u32(frame, 26), dstIP = u32(frame, 30)
         let srcPort = u16(frame, l4), dstPort = u16(frame, l4 + 2)
@@ -180,11 +229,19 @@ final class MacServiceNAT: @unchecked Sendable {
         lock.lock()
         sweepLocked()
         var chosen = forward[connFwd]
-        if chosen == nil, let eps = table[key], !eps.isEmpty {
-            let i = (rr[key] ?? 0) % eps.count
-            rr[key] = i + 1
-            chosen = eps[i]
+        if chosen == nil, let svc = table[key], !svc.endpoints.isEmpty {
+            let now = Date()
+            let affKey = AffinityKey(svc: key, client: srcIP)
+            if let timeout = svc.affinityTimeout, let a = affinity[affKey],
+               now.timeIntervalSince(a.seen) < timeout {
+                chosen = a.ep                                   // stick to the client's backend
+            } else {
+                let i = (rr[key] ?? 0) % svc.endpoints.count    // else round-robin
+                rr[key] = i + 1
+                chosen = svc.endpoints[i]
+            }
             forward[connFwd] = chosen
+            if svc.affinityTimeout != nil, let ep = chosen { affinity[affKey] = (ep, now) }
         }
         if let ep = chosen {
             // Record the reverse so the endpoint's replies restore the ClusterIP.
@@ -209,7 +266,7 @@ final class MacServiceNAT: @unchecked Sendable {
         guard frame.count >= 34, u16(frame, 12) == 0x0800 else { return frame }
         let ihl = Int(frame[14] & 0x0f) * 4
         let proto = frame[23]
-        guard proto == 6 || proto == 17, frame.count >= 14 + ihl + 4 else { return frame }
+        guard proto == 6 || proto == 17 || proto == 132, frame.count >= 14 + ihl + 4 else { return frame }
         let srcIP = u32(frame, 26), dstIP = u32(frame, 30)
         let l4 = 14 + ihl
         let key = ConnKey(proto: proto, aIP: srcIP, aPort: u16(frame, l4),
@@ -231,15 +288,15 @@ final class MacServiceNAT: @unchecked Sendable {
                          setSrcIP sip: UInt32? = nil, setSrcPort sport: UInt16? = nil) {
         let l4 = 14 + ihl
         let proto = f[23]
-        let l4ckOff = proto == 6 ? l4 + 16 : l4 + 6   // TCP checksum / UDP checksum
         var ipDelta: [(UInt16, UInt16)] = []
         var l4Delta: [(UInt16, UInt16)] = []
+        var portChanged = false
 
         if let dip {
             let old = u32(f, 30)
             put32(&f, 30, dip)
             ipDelta += words32(old, dip)
-            l4Delta += words32(old, dip)     // dst IP is in the L4 pseudo-header
+            l4Delta += words32(old, dip)     // dst IP is in the TCP/UDP pseudo-header
         }
         if let sip {
             let old = u32(f, 26)
@@ -250,24 +307,57 @@ final class MacServiceNAT: @unchecked Sendable {
         if let dport {
             let old = u16(f, l4 + 2)
             put16(&f, l4 + 2, dport)
-            l4Delta.append((old, dport))
+            l4Delta.append((old, dport)); portChanged = portChanged || old != dport
         }
         if let sport {
             let old = u16(f, l4)
             put16(&f, l4, sport)
-            l4Delta.append((old, sport))
+            l4Delta.append((old, sport)); portChanged = portChanged || old != sport
         }
         // IP header checksum
         if !ipDelta.isEmpty {
             put16(&f, 24, adjust(u16(f, 24), ipDelta))
         }
-        // L4 checksum (UDP checksum 0 means "not computed" -- leave it alone)
+        if proto == 132 {
+            // SCTP: a CRC32c over the whole SCTP packet, no IP pseudo-header, so
+            // address changes don't touch it -- only a port change does, and then
+            // the whole CRC is recomputed.
+            if portChanged { sctpRecompute(&f, l4: l4) }
+            return
+        }
+        // TCP/UDP checksum (UDP checksum 0 means "not computed" -- leave it alone)
+        let l4ckOff = proto == 6 ? l4 + 16 : l4 + 6
         if !l4Delta.isEmpty, l4ckOff + 2 <= f.count {
             let ck = u16(f, l4ckOff)
             if !(proto == 17 && ck == 0) {
                 put16(&f, l4ckOff, adjust(ck, l4Delta))
             }
         }
+    }
+
+    /// Recompute an SCTP packet's CRC32c (checksum field zeroed during the
+    /// computation), stored little-endian at the SCTP common header + 8.
+    private func sctpRecompute(_ f: inout Data, l4: Int) {
+        guard l4 + 12 <= f.count else { return }
+        for i in 0..<4 { f[f.startIndex + l4 + 8 + i] = 0 }
+        let crc = crc32c(f, from: l4, to: f.count)
+        // SCTP stores the CRC little-endian.
+        f[f.startIndex + l4 + 8] = UInt8(crc & 0xff)
+        f[f.startIndex + l4 + 9] = UInt8((crc >> 8) & 0xff)
+        f[f.startIndex + l4 + 10] = UInt8((crc >> 16) & 0xff)
+        f[f.startIndex + l4 + 11] = UInt8((crc >> 24) & 0xff)
+    }
+
+    /// CRC32c (Castagnoli), reflected, as SCTP (RFC 3309) uses it.
+    private func crc32c(_ d: Data, from: Int, to: Int) -> UInt32 {
+        var crc: UInt32 = 0xffff_ffff
+        for i in from..<to {
+            crc ^= UInt32(d[d.startIndex + i])
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0x82f6_3b78 : crc >> 1
+            }
+        }
+        return crc ^ 0xffff_ffff
     }
 
     /// RFC 1624 incremental checksum update for a set of 16-bit word changes.
@@ -316,6 +406,9 @@ final class MacServiceNAT: @unchecked Sendable {
         guard now.timeIntervalSince(lastSweep) > 60 else { return }
         lastSweep = now
         conntrack = conntrack.filter { now.timeIntervalSince($0.value.seen) < 300 }
+        // Affinity entries expire on their own (checked against each service's
+        // timeout on use); sweep the stalest so the table cannot grow unbounded.
+        affinity = affinity.filter { now.timeIntervalSince($0.value.seen) < 10800 }
         // forward/rr are bounded by live services; drop forward entries older than
         // conntrack's window by clearing those with no reverse still live is hard
         // without back-refs, so cap the table instead.
@@ -351,7 +444,7 @@ func ipToUInt32(_ s: String) -> UInt32? {
 }
 
 func protoNumber(_ s: String) -> UInt8? {
-    switch s.lowercased() { case "tcp": return 6; case "udp": return 17; default: return nil }
+    switch s.lowercased() { case "tcp": return 6; case "udp": return 17; case "sctp": return 132; default: return nil }
 }
 
 func dottedIP(_ v: UInt32) -> String {

@@ -17,7 +17,8 @@ import Testing
         """
         let table = parseKubeProxyRuleset(ruleset)
         let key = ServiceKey(ip: ipToUInt32("10.96.0.1")!, proto: 6, port: 443)
-        #expect(table[key] == [Endpoint(ip: ipToUInt32("192.168.1.29")!, port: 50443)])
+        #expect(table[key]?.endpoints == [Endpoint(ip: ipToUInt32("192.168.1.29")!, port: 50443)])
+        #expect(table[key]?.affinityTimeout == nil)
     }
 
     @Test func parsesMultipleEndpointsThroughEndpointChains() {
@@ -36,9 +37,38 @@ import Testing
         """
         let table = parseKubeProxyRuleset(ruleset)
         let key = ServiceKey(ip: ipToUInt32("10.96.14.2")!, proto: 6, port: 80)
-        let eps = Set(table[key] ?? [])
+        let eps = Set(table[key]?.endpoints ?? [])
         #expect(eps == [Endpoint(ip: ipToUInt32("10.244.0.5")!, port: 8080),
                         Endpoint(ip: ipToUInt32("10.244.0.6")!, port: 8080)])
+    }
+
+    @Test func parsesSessionAffinityAndItsTimeout() {
+        // A ClientIP-affinity service: the service chain matches @affinity-* and
+        // the set carries the timeout.
+        let ruleset = """
+        add chain ip kube-proxy service-VEZ-default/svc-affinity/tcp/
+        add chain ip kube-proxy endpoint-R23-default/svc-affinity/tcp/__10.194.0.4/8080
+        add set ip kube-proxy affinity-R23-default/svc-affinity/tcp/__10.194.0.4/8080 { type ipv4_addr ; flags dynamic,timeout ; timeout 10800s ; }
+        add rule ip kube-proxy endpoint-R23-default/svc-affinity/tcp/__10.194.0.4/8080 update @affinity-R23-default/svc-affinity/tcp/__10.194.0.4/8080 { ip saddr }
+        add rule ip kube-proxy endpoint-R23-default/svc-affinity/tcp/__10.194.0.4/8080 meta l4proto tcp dnat to 10.194.0.4:8080
+        add rule ip kube-proxy service-VEZ-default/svc-affinity/tcp/ ip saddr @affinity-R23-default/svc-affinity/tcp/__10.194.0.4/8080 goto endpoint-R23-default/svc-affinity/tcp/__10.194.0.4/8080
+        add rule ip kube-proxy service-VEZ-default/svc-affinity/tcp/ numgen random mod 1 vmap { 0 : goto endpoint-R23-default/svc-affinity/tcp/__10.194.0.4/8080 }
+        add element ip kube-proxy service-ips { 10.96.15.238 . tcp . 80 : goto service-VEZ-default/svc-affinity/tcp/ }
+        """
+        let key = ServiceKey(ip: ipToUInt32("10.96.15.238")!, proto: 6, port: 80)
+        let svc = parseKubeProxyRuleset(ruleset)[key]
+        #expect(svc?.endpoints == [Endpoint(ip: ipToUInt32("10.194.0.4")!, port: 8080)])
+        #expect(svc?.affinityTimeout == 10800)
+    }
+
+    @Test func parsesSctpService() {
+        let ruleset = """
+        add chain ip kube-proxy service-SC-default/sctp-svc/sctp/
+        add rule ip kube-proxy service-SC-default/sctp-svc/sctp/ meta l4proto sctp dnat to 10.194.0.9:38412
+        add element ip kube-proxy service-ips { 10.96.7.7 . sctp . 38412 : goto service-SC-default/sctp-svc/sctp/ }
+        """
+        let key = ServiceKey(ip: ipToUInt32("10.96.7.7")!, proto: 132, port: 38412)
+        #expect(parseKubeProxyRuleset(ruleset)[key]?.endpoints == [Endpoint(ip: ipToUInt32("10.194.0.9")!, port: 38412)])
     }
 
     @Test func aServiceWithNoEndpointsIsAbsent() {
@@ -56,7 +86,8 @@ import Testing
         let nat = MacServiceNAT(podIP: ipToUInt32("10.194.255.2")!,
                                 gatewayIP: ipToUInt32("10.194.255.1")!, gatewayMAC: gwMAC)
         nat.update([ServiceKey(ip: ipToUInt32("10.96.0.10")!, proto: 6, port: 80):
-                        [Endpoint(ip: ipToUInt32("10.194.0.7")!, port: 8080)]])
+                        Service(endpoints: [Endpoint(ip: ipToUInt32("10.194.0.7")!, port: 8080)],
+                                affinityTimeout: nil)])
         var frame = tcpSyn(dstMAC: gwMAC, srcIP: "10.194.255.2", dstIP: "10.96.0.10",
                            srcPort: 51000, dstPort: 80)
         guard case .forward(let out) = nat.egress(frame) else {
