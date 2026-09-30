@@ -345,6 +345,23 @@ final class DarwinSandbox: @unchecked Sendable {
         }
     }
 
+    /// Upload the DNS forwarder and run it in the guest (127.0.0.1:53), told the
+    /// cluster DNS upstream and search domains. The caller then points the pod's
+    /// resolver at it. As with the interactive agent, no golden change.
+    func installDNSForwarder(_ binary: Data, upstream: String, searches: [String]) async throws {
+        let b64 = "/private/var/ferry/ferry-macdns.b64"
+        let bin = "/private/var/ferry/ferry-macdns"
+        try await uploadBase64(binary, toGuestPath: b64)
+        let args = ([upstream] + searches).map { "'\($0)'" }.joined(separator: " ")
+        // if/then so only the forwarder (fds redirected) is backgrounded -- not a
+        // `pgrep || … &` subshell, which would hold this exec's pipes open.
+        let log = "/private/var/ferry/ferry-macdns.log"
+        let script = "base64 -D < \"$0\" > \"$1\" && chmod +x \"$1\" && rm -f \"$0\"; "
+            + "if ! pgrep -f \"$1\" >/dev/null 2>&1; then \"$1\" \(args) > \"$2\" 2>&1 < /dev/null & fi; "
+            + "sleep 0.5"
+        _ = try await exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script, b64, bin, log]))
+    }
+
     /// An open interactive session: write stdin/resize frames to the guest, read
     /// output through the `onOutput` given to `interactive`, await the exit code.
     final class Interactive: @unchecked Sendable {

@@ -211,6 +211,15 @@ let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
                 .appendingPathComponent("ferry-macagent-i").path()
             : explicit
         return FileManager.default.contents(atPath: path)
+    }(),
+    // The search-list DNS forwarder binary, beside the ferry-cri executable.
+    dnsForwarder: {
+        let explicit = option("--dns-forwarder", "")
+        let path = explicit.isEmpty
+            ? URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+                .appendingPathComponent("ferry-macdns").path()
+            : explicit
+        return FileManager.default.contents(atPath: path)
     }()))
 if !macImage.isEmpty { print("    mac image \(macImage)") }
 if let f = darwinFabric { print("    mac net   \(f.macSlice) on the pod switch") }

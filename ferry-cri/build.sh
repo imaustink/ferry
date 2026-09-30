@@ -24,3 +24,10 @@ echo "==> $(cd .. && pwd)/bin/ferry-cri"
 swiftc -O -target arm64-apple-macos26.0 -o ../bin/ferry-macagent-i guest/ferry-macagent-i.swift
 codesign --force --sign - ../bin/ferry-macagent-i
 echo "==> $(cd .. && pwd)/bin/ferry-macagent-i"
+
+# The search-list DNS forwarder (multi-label short names like svc.namespace).
+# macOS appends search domains only to single-label names; ferry-cri uploads this
+# into the guest and points the pod's resolver at it. Ad-hoc signed.
+swiftc -O -target arm64-apple-macos26.0 -o ../bin/ferry-macdns guest/ferry-macdns.swift
+codesign --force --sign - ../bin/ferry-macdns
+echo "==> $(cd .. && pwd)/bin/ferry-macdns"

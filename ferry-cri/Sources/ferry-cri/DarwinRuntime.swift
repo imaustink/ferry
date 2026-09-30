@@ -131,6 +131,11 @@ actor DarwinRuntime {
         /// endpoint. Nil when not built/available -> interactive exec falls back
         /// to the non-interactive path.
         var interactiveAgent: Data?
+        /// The search-list DNS forwarder binary (ferry-macdns), uploaded and run
+        /// in each guest and made the pod's default resolver, so multi-label short
+        /// names (svc.namespace) resolve -- macOS itself won't search those. Nil
+        /// disables it (single-label and FQDN still work).
+        var dnsForwarder: Data?
     }
 
     /// The virtual gateway MAC a macOS pod's Service traffic is sent to (and that
@@ -415,6 +420,9 @@ actor DarwinRuntime {
             await configureGuestNetwork(s, ip: ip, mac: mac, prefix: s.podPrefix, clusterCIDR: cidr)
             // Seed this pod's NetworkPolicy (ingress) from the current document.
             await applyNetpol(s, podIP: ip)
+            // Multi-label short-name DNS: run the search-list forwarder and point
+            // the resolver at it (does nothing without the forwarder binary).
+            setupDNSForwarder(s)
             s.networkConfigured = true
         }
         // Launch the interactive agent (for `kubectl exec -i/-it`) once per boot,
@@ -556,6 +564,51 @@ actor DarwinRuntime {
         """
     }
 
+    /// The cluster search domains from the kubelet's list: the suffixes of the
+    /// first entry (<ns>.svc.<domain>) -- itself, svc.<domain>, <domain> -- not
+    /// the node's own appended domain (e.g. localdomain).
+    static func clusterSearchDomains(_ searches: [String]) -> [String] {
+        let first = searches.first ?? "svc.cluster.local"
+        let c = searches.filter { first == $0 || first.hasSuffix("." + $0) }
+        return c.isEmpty ? ["cluster.local"] : c
+    }
+
+    /// Install the search-list DNS forwarder in the guest and make it the pod's
+    /// default resolver, so multi-label short names (svc.namespace) resolve --
+    /// macOS appends search domains only to single-label names. The forwarder does
+    /// the search for every name and forwards the rest to cluster DNS (which
+    /// forwards external names upstream), so the default resolver needs no search
+    /// list of its own.
+    private func setupDNSForwarder(_ s: Sandbox) {
+        guard let fwd = config.dnsForwarder, let upstream = s.dnsServers.first else { return }
+        let sandbox = s.sandbox
+        let searches = Self.clusterSearchDomains(s.dnsSearches)
+        // Off the critical path: the install must never block the container.
+        Task.detached {
+            try? await sandbox.installDNSForwarder(fwd, upstream: upstream, searches: searches)
+            // Point the primary service's resolver at the forwarder (127.0.0.1),
+            // with no search list -- the forwarder searches. Setting the *real*
+            // primary service's DNS is safe; a phantom service breaks resolution.
+            // The primary service (en0's DHCP) can take a moment to come up after
+            // boot; wait for it before pointing its resolver at the forwarder.
+            let script = """
+            PID=""
+            n=0
+            while [ -z "$PID" ] && [ $n -lt 100 ]; do
+              PID=$(echo "show State:/Network/Global/IPv4" | scutil | awk '/PrimaryService/ {print $3}')
+              [ -n "$PID" ] && break
+              sleep 0.2; n=$((n + 1))
+            done
+            [ -n "$PID" ] || exit 0
+            # Setup: is persistent -- configd reverts a State:-only DNS back to the
+            # DHCP value; set both (Setup for persistence, State for immediacy).
+            printf 'open\\nd.init\\nd.add ServerAddresses * 127.0.0.1\\nset Setup:/Network/Service/%s/DNS\\nset State:/Network/Service/%s/DNS\\nquit\\n' "$PID" "$PID" | scutil
+            dscacheutil -flushcache 2>/dev/null || true
+            """
+            _ = try? await sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script]))
+        }
+    }
+
     private func dnsSetupScript(_ s: Sandbox) -> String {
         guard !s.dnsServers.isEmpty else { return "" }
         // The cluster search domains are those the kubelet built from the cluster
@@ -565,9 +618,7 @@ actor DarwinRuntime {
         // to CoreDNS. A resolver file per cluster domain sends every *.svc.<domain>
         // and the bare <domain> to CoreDNS; the search line lets a short name
         // (kubernetes.default) be qualified against them.
-        let first = s.dnsSearches.first ?? "svc.cluster.local"
-        var clusterDomains = s.dnsSearches.filter { first == $0 || first.hasSuffix("." + $0) }
-        if clusterDomains.isEmpty { clusterDomains = ["cluster.local"] }
+        let clusterDomains = Self.clusterSearchDomains(s.dnsSearches)
         let searchList = clusterDomains.joined(separator: " ")
         var lines = s.dnsServers.map { "nameserver \($0)" }
         lines.append("search \(searchList)")
