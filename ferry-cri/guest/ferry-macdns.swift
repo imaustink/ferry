@@ -27,7 +27,7 @@ func ipv4(_ s: String) -> in_addr_t? {
 
 /// Decode a DNS name at `off` in `msg` (following compression), returning the
 /// labels and the offset just past the name in the *wire* (not following ptrs).
-func readName(_ msg: [UInt8], _ off: Int) -> (labels: [[UInt8]], next: Int) {
+@Sendable func readName(_ msg: [UInt8], _ off: Int) -> (labels: [[UInt8]], next: Int) {
     var labels: [[UInt8]] = [], i = off, next = -1, guardN = 0
     while i < msg.count, guardN < 128 {
         guardN += 1
@@ -43,17 +43,17 @@ func readName(_ msg: [UInt8], _ off: Int) -> (labels: [[UInt8]], next: Int) {
 }
 
 /// Encode labels as a DNS name (no compression).
-func encodeName(_ labels: [[UInt8]]) -> [UInt8] {
+@Sendable func encodeName(_ labels: [[UInt8]]) -> [UInt8] {
     var out: [UInt8] = []
     for l in labels { out.append(UInt8(l.count)); out += l }
     out.append(0); return out
 }
 
-func u16(_ m: [UInt8], _ o: Int) -> Int { (Int(m[o]) << 8) | Int(m[o + 1]) }
+@Sendable func u16(_ m: [UInt8], _ o: Int) -> Int { (Int(m[o]) << 8) | Int(m[o + 1]) }
 
 /// One answer/record fully expanded (no compression), as raw wire bytes ready to
 /// append, and the offset past it.
-func readRecord(_ msg: [UInt8], _ off: Int) -> (wire: [UInt8], next: Int)? {
+@Sendable func readRecord(_ msg: [UInt8], _ off: Int) -> (wire: [UInt8], next: Int)? {
     let (name, afterName) = readName(msg, off)
     guard afterName + 10 <= msg.count else { return nil }
     let type = u16(msg, afterName), cls = u16(msg, afterName + 2)
@@ -75,7 +75,7 @@ func readRecord(_ msg: [UInt8], _ off: Int) -> (wire: [UInt8], next: Int)? {
 }
 
 /// Send `query` (a full DNS message) to CoreDNS and return the reply.
-func ask(_ query: [UInt8]) -> [UInt8]? {
+@Sendable func ask(_ query: [UInt8]) -> [UInt8]? {
     let s = socket(AF_INET, SOCK_DGRAM, 0); defer { close(s) }
     var tv = timeval(tv_sec: 3, tv_usec: 0)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -88,7 +88,7 @@ func ask(_ query: [UInt8]) -> [UInt8]? {
 }
 
 /// Build a query message for `name` from the original query's header/type.
-func buildQuery(id: [UInt8], name: [[UInt8]], type: Int) -> [UInt8] {
+@Sendable func buildQuery(id: [UInt8], name: [[UInt8]], type: Int) -> [UInt8] {
     var m = id + [0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]   // RD set, QDCOUNT 1
     m += encodeName(name)
     m += [UInt8(type >> 8), UInt8(type & 0xff), 0x00, 0x01]   // QTYPE, QCLASS IN
@@ -96,7 +96,7 @@ func buildQuery(id: [UInt8], name: [[UInt8]], type: Int) -> [UInt8] {
 }
 
 /// The client's resolver query -> our answer.
-func handle(_ query: [UInt8]) -> [UInt8]? {
+@Sendable func handle(_ query: [UInt8]) -> [UInt8]? {
     guard query.count >= 12, u16(query, 4) == 1 else { return nil }   // one question
     let id = Array(query[0 ... 1])
     let (qname, afterQ) = readName(query, 12)
@@ -137,8 +137,7 @@ let sock = socket(AF_INET, SOCK_DGRAM, 0)
 guard sock >= 0 else { perror("socket"); exit(1) }
 var yes: Int32 = 1
 setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-let listenPort = ProcessInfo.processInfo.environment["FERRY_MACDNS_PORT"].flatMap { UInt16($0) } ?? 53
-var addr = sockaddr_in(); addr.sin_family = sa_family_t(AF_INET); addr.sin_port = listenPort.bigEndian
+var addr = sockaddr_in(); addr.sin_family = sa_family_t(AF_INET); addr.sin_port = UInt16(53).bigEndian
 inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
 let bound = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
 guard bound == 0 else { perror("bind"); exit(1) }
