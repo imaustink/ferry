@@ -715,36 +715,33 @@ contains "a darwin build refuses to run on ferry-cri, which is Linux" \
   "$(sed -n '/^ferry_image_build_darwin()/,/^}/p' "$repo/ferry")" "ferry-registry"
 echo
 
-printf '\033[1m%s\033[0m\n' "macOS pods are VM-per-pod only"
-# Shared-kernel macOS (ferry-macos-shared, a chroot on a SIP-disabled guest) was
-# removed: the only macOS RuntimeClass is ferry-macos-vm, no shared NodePool
-# ships, and ferry-machined refuses a darwin machine that is not isolation: vm.
+printf '\033[1m%s\033[0m\n' "macOS pods run on this Mac's own node (no machines)"
+# A ferry-macos-vm pod is a VM sandbox booted by ferry-cri on the host node, not
+# a provisioned Machine: handler ferry-macos-vm, scheduled to vm-per-pod, no macOS
+# NodePool. ferry passes the golden image to ferry-cri with --mac-image.
 rc="$(cat "$repo/manifests/runtimeclasses.yaml")"
-contains "ferry-macos-vm is installed" "$rc" "ferry-macos-vm"
-lacks "ferry-macos-shared is gone" "$rc" "ferry-macos-shared"
-lacks "no shared macOS NodePool ships" "$(ls "$repo/manifests/machines/karpenter")" "macos-nodepool.yaml"
-contains "ferry-machined requires spec.isolation: vm for darwin" \
-  "$(cat "$repo/ferry-machined/reconcile.go")" "shared-kernel macOS machines are no longer supported"
+contains "ferry-macos-vm uses the host CRI handler" "$rc" "handler: ferry-macos-vm"
+contains "and lands on the Mac's own node" "$rc" "nodeSelector: {ferry.dev/mode: vm-per-pod}"
+lacks "no macOS NodePool ships" "$(ls "$repo/manifests/machines/karpenter")" "macos-vm-nodepool.yaml"
+contains "ferry-cri serves the ferry-macos-vm handler" \
+  "$(cat "$repo/ferry-cri/Sources/ferry-cri/RuntimeService.swift")" 'static let macosVM = "ferry-macos-vm"'
+contains "ferry passes the golden image to ferry-cri" \
+  "$(sed -n '/^mac_image_flag()/,/}/p' "$repo/ferry")" "--mac-image"
 lacks "FERRY_MAC_SHARED is gone from ferry" "$(cat "$repo/ferry")" "FERRY_MAC_SHARED"
 echo
 
-printf '\033[1m%s\033[0m\n' "status does not call macOS pods schedulable off a bare running machined"
-# machined reads --mac-image only at launch, so a bake done while it is already
-# up leaves the image cached but unused. The macos-vm NodePool that start_machines
-# installs only when an image resolved is the proof it is in use, so both status
-# views cross-check it rather than reporting green off 'running ferry-machined'
-# alone -- otherwise the bake-while-running flow shows a misleading green while
-# macOS pods stay Pending, the silent failure this change set out to remove.
+printf '\033[1m%s\033[0m\n' "mac-image status reflects ferry-cri, not a nodepool"
+# macOS pods run via ferry-cri, which takes --mac-image at launch; a bake done
+# while ferry was up leaves the image cached but not in use until a restart. So
+# status checks ferry-cri's own arguments, not machines.
 mac_status_block="$(sed -n '/^cmd_mac_image_status()/,/^}/p' "$repo/ferry")"
-contains "mac-image status gates the schedulable claim on the macos-vm NodePool" \
-  "$mac_status_block" 'kube get nodepool macos-vm'
-contains "and tells the user to restart machines to pick up a later bake" \
-  "$mac_status_block" 'ferry machines disable && ferry machines enable'
+contains "mac-image status checks ferry-cri has the image" \
+  "$mac_status_block" "ferry-cri.pid"
+contains "and tells the user to restart to pick up a later bake" \
+  "$mac_status_block" "ferry down && ferry up"
 status_block="$(sed -n '/^cmd_status()/,/^}/p' "$repo/ferry")"
-contains "ferry status flags a baked-but-not-in-use image the same way" \
-  "$status_block" 'image baked but not in use'
-contains "ferry status cross-checks the macos-vm NodePool too" \
-  "$status_block" 'kube get nodepool macos-vm'
+contains "ferry status reports the image runs on this node" \
+  "$status_block" "pods run on this node"
 echo
 
 printf '\033[1m%s\033[0m\n' "the golden image finds itself from its markers"

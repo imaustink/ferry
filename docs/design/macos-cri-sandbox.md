@@ -136,11 +136,19 @@ Mac's taint. The handler stays `ferry-darwin`'s successor served by `ferry-cri`.
    The container root and probes are now closed (see below); what is left in the
    seam is **interactive streamed exec** (`kubectl exec -it`) and **stats**, both
    noted at the end.
-4. **Flip scheduling + remove the Machine path.** Repoint the RuntimeClass to the
-   host node (mirror `ferry-vm`'s `ferry.dev/mode: vm-per-pod`), advertise
-   `ferry.dev/macos-guest`, and delete the darwin code in ferry-karpenter and
-   ferry-machined and the `macos-vm` NodePool. Do this only once increment 3 runs
-   on hardware, so macOS pods never regress.
+4. **Flip scheduling + remove the Machine path (done).** The `ferry-macos-vm`
+   RuntimeClass now targets this Mac's own node (handler `ferry-macos-vm`,
+   `nodeSelector ferry.dev/mode: vm-per-pod`, the toleration `ferry-vm` uses), so
+   a plain `runtimeClassName: ferry-macos-vm` pod runs on the host via
+   `DarwinRuntime` — no host-targeted class, no machines. The darwin **Machine**
+   path is deleted: the `macos-vm` NodePool, the darwin code in ferry-karpenter
+   (shapes, the 2-VM ceiling counter, the darwin Create path) and ferry-machined
+   (`spec.os`/`spec.isolation`, the bundle clone, `--mac-image`, the single-use
+   `ferry.dev/spent` taint) and the CRD's `os`/`isolation` fields. `ferry-cri`
+   takes the golden image with `--mac-image` (`ferry up` passes it), and enforces
+   the two-VM ceiling itself (`maxGuests`). The scheduler-level
+   `ferry.dev/macos-guest` extended resource is a further polish; the ceiling is
+   currently a `ferry-cri` backstop (a third macOS sandbox is refused).
 
 ## Container root and exec (closed)
 

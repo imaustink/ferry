@@ -99,24 +99,13 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 		return nil, err
 	}
 
-	macs, err := p.macosMachines(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	var out []*cloudprovider.InstanceType
-	for _, s := range append(b.shapes(), b.macosShapes()...) {
+	for _, s := range b.shapes() {
 		// Karpenter wants every instance type returned even when it cannot be
 		// had right now, with availability expressed on the offering. That is
 		// what lets it explain "this pod does not fit" rather than behaving as
 		// though the shape never existed.
 		available := b.fits(committed, s) && h.fits(s)
-		// And a macOS shape only while a macOS guest slot is free: the third
-		// macOS machine would fail at boot, and this way the pod waits with a
-		// reason instead.
-		if s.os == osDarwin && macs >= maxMacOSGuests {
-			available = false
-		}
 		out = append(out, &cloudprovider.InstanceType{
 			Name:         s.name(),
 			Capacity:     s.capacity(p.nodeClass.maxPods()),
@@ -140,74 +129,15 @@ func (p *Provider) GetInstanceTypes(ctx context.Context, _ *karpv1.NodePool) ([]
 	return out, nil
 }
 
-// kubeReserved is what the guest keeps for itself.
-//
-// Linux: the guest's own kernel, containerd and kubelet. Measured at roughly
-// 2.3 GiB for an idle single-node cluster in experiment 21; most of that is the
-// control plane's, so this is the node's share rather than the whole figure.
-//
-// macOS: the OS itself, which is most of an idle guest -- launchd, WindowServer
-// with no display, mDNSResponder, the rest of a Mac nobody is using -- and a
-// kubelet on top. Not measured; 1.5 GiB of a 4 GiB guest leaves pods the rest.
-func kubeReserved(s shape) corev1.ResourceList {
-	if s.os == osDarwin {
-		return corev1.ResourceList{
-			corev1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
-			corev1.ResourceMemory: *resource.NewQuantity(1536*mebibyte, resource.BinarySI),
-		}
-	}
+// kubeReserved is what the guest keeps for itself: its own kernel, containerd
+// and kubelet. Measured at roughly 2.3 GiB for an idle single-node cluster in
+// experiment 21; most of that is the control plane's, so this is the node's
+// share rather than the whole figure.
+func kubeReserved(_ shape) corev1.ResourceList {
 	return corev1.ResourceList{
 		corev1.ResourceCPU:    *resource.NewMilliQuantity(250, resource.DecimalSI),
 		corev1.ResourceMemory: *resource.NewQuantity(512*mebibyte, resource.BinarySI),
 	}
-}
-
-// macosMachines counts the Machines that are macOS guests, each of which holds
-// one of the Mac's two slots from the moment it is asked for.
-func (p *Provider) macosMachines(ctx context.Context) (int, error) {
-	list, err := p.dynamic.Resource(machineGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("listing machines: %w", err)
-	}
-	n := 0
-	for i := range list.Items {
-		if machineOS(&list.Items[i]) == osDarwin {
-			n++
-		}
-	}
-	return n, nil
-}
-
-func machineOS(m *unstructured.Unstructured) string {
-	if os, _, _ := unstructured.NestedString(m.Object, "spec", "os"); os == osDarwin {
-		return osDarwin
-	}
-	return ""
-}
-
-const isolationVM = "vm"
-
-// machineIsVM is a macOS Machine that is one pod's VM.
-func machineIsVM(m *unstructured.Unstructured) bool {
-	iso, _, _ := unstructured.NestedString(m.Object, "spec", "isolation")
-	return machineOS(m) == osDarwin && iso == isolationVM
-}
-
-// osLabel is the kubernetes.io/os a shape's node reports.
-func osLabel(s shape) string {
-	if s.os == osDarwin {
-		return osDarwin // what the darwin kubelet registers; corev1 names only linux and windows
-	}
-	return string(corev1.Linux)
-}
-
-// modeOf is the ferry.dev/mode a shape's node carries: a macOS machine is one
-// pod's VM (macos-vm), a mode of its own.
-func modeOf(s shape) string {
-	if s.os == osDarwin {
-		return modeMacOSVM
-	}
-	return modeShared
 }
 
 // One zone, because there is one Mac. Karpenter requires the well-known labels
@@ -219,20 +149,18 @@ func requirementsFor(s shape) scheduling.Requirements {
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, s.name()),
 		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
 		scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, zone),
-		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, osLabel(s)),
+		scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, string(corev1.Linux)),
 		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, karpv1.ArchitectureArm64),
 		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
-		// What mode 2 is for. A node made here shares its kernel between pods,
-		// and a pod says so with nodeSelector -- or with a RuntimeClass whose
-		// scheduling says it.
-		scheduling.NewRequirement(modeLabel, corev1.NodeSelectorOpIn, modeOf(s)),
+		// A node made here shares its kernel between pods, and a pod says so with
+		// nodeSelector -- or with a RuntimeClass whose scheduling says it.
+		scheduling.NewRequirement(modeLabel, corev1.NodeSelectorOpIn, modeShared),
 	)
 }
 
 const (
 	modeLabel    = "ferry.dev/mode"
 	modeShared   = "shared"
-	modeMacOSVM  = "macos-vm"
 	modeVMPerPod = "vm-per-pod"
 	// Which Mac a node runs on: the Mac's own node name, on the Mac node and on
 	// every machine it hosts.
@@ -403,20 +331,6 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 			committed.cpus, committed.memoryGi, candidates[0].name(),
 			b.limitCPUs, b.limitMemoryGi))
 	}
-	// Under the same lock as the memory budget, and for the same reason: two
-	// macOS claims at once would each find the second slot free.
-	if s.os == osDarwin {
-		macs, err := p.macosMachines(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if macs >= maxMacOSGuests {
-			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
-				"the Mac runs %d macOS guests at most and %d macOS machines exist; %s waits for one to go",
-				maxMacOSGuests, macs, s.name()))
-		}
-	}
-
 	machine := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": group + "/" + version,
 		"kind":       "Machine",
@@ -436,14 +350,7 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 			},
 		},
 	}}
-	if s.os == osDarwin {
-		// ferry-machined clones its macOS golden image; the NodeClass's image
-		// is a Linux node disk.
-		_ = unstructured.SetNestedField(machine.Object, osDarwin, "spec", "os")
-		if s.vm {
-			_ = unstructured.SetNestedField(machine.Object, isolationVM, "spec", "isolation")
-		}
-	} else if img := p.nodeClass.Spec.Image; img != "" {
+	if img := p.nodeClass.Spec.Image; img != "" {
 		_ = unstructured.SetNestedField(machine.Object, img, "spec", "image")
 	}
 	if d := p.nodeClass.Spec.Durability; d != "" {
@@ -464,7 +371,7 @@ func (p *Provider) Create(ctx context.Context, claim *karpv1.NodeClaim) (*karpv1
 	out.Labels[corev1.LabelInstanceTypeStable] = s.name()
 	out.Labels[corev1.LabelTopologyZone] = zone
 	out.Labels[corev1.LabelArchStable] = karpv1.ArchitectureArm64
-	out.Labels[corev1.LabelOSStable] = osLabel(s)
+	out.Labels[corev1.LabelOSStable] = string(corev1.Linux)
 	out.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
 	return out, nil
 }
@@ -515,7 +422,7 @@ func (p *Provider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 
 func (p *Provider) claimFor(m *unstructured.Unstructured) *karpv1.NodeClaim {
 	cpus, memoryGi := machineShape(m)
-	s := shape{cpus: cpus, memoryGi: memoryGi, os: machineOS(m), vm: machineIsVM(m)}
+	s := shape{cpus: cpus, memoryGi: memoryGi}
 	claim := &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   m.GetName(),
@@ -528,7 +435,7 @@ func (p *Provider) claimFor(m *unstructured.Unstructured) *karpv1.NodeClaim {
 	claim.Labels[corev1.LabelInstanceTypeStable] = s.name()
 	claim.Labels[corev1.LabelTopologyZone] = zone
 	claim.Labels[corev1.LabelArchStable] = karpv1.ArchitectureArm64
-	claim.Labels[corev1.LabelOSStable] = osLabel(s)
+	claim.Labels[corev1.LabelOSStable] = string(corev1.Linux)
 	claim.Labels[karpv1.CapacityTypeLabelKey] = karpv1.CapacityTypeOnDemand
 	claim.Status.ProviderID = providerIDFor(m.GetName())
 	claim.Status.Capacity = s.capacity(p.nodeClass.maxPods())
@@ -554,9 +461,7 @@ func (p *Provider) IsDrifted(ctx context.Context, claim *karpv1.NodeClaim) (clou
 		}
 		return "", err
 	}
-	// A macOS machine is cloned from ferry-machined's golden image, not the
-	// NodeClass's Linux disk, so the image is not its to drift from.
-	if want := p.nodeClass.Spec.Image; want != "" && machineOS(m) != osDarwin {
+	if want := p.nodeClass.Spec.Image; want != "" {
 		if got, _, _ := unstructured.NestedString(m.Object, "spec", "image"); got != want {
 			return cloudprovider.DriftReason("NodeClassImageChanged"), nil
 		}
@@ -621,10 +526,6 @@ func cheapestThatFits(b bounds, h host, committed shape, candidates []shape) (sh
 // so it has to be reversible.
 func parseShapeName(name string) (shape, bool) {
 	parts := strings.Split(name, "-")
-	os, vm := "", false
-	if len(parts) == 4 && parts[0] == "ferry" && parts[1] == "macvm" {
-		os, vm, parts = osDarwin, true, append([]string{"ferry"}, parts[2:]...)
-	}
 	if len(parts) != 3 || parts[0] != "ferry" {
 		return shape{}, false
 	}
@@ -636,7 +537,7 @@ func parseShapeName(name string) (shape, bool) {
 	if err != nil {
 		return shape{}, false
 	}
-	return shape{cpus: cpus, memoryGi: mem, os: os, vm: vm}, true
+	return shape{cpus: cpus, memoryGi: mem}, true
 }
 
 // isNotFound asks the API machinery rather than the error text.

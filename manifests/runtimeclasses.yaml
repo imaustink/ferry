@@ -59,20 +59,21 @@ scheduling:
 #
 #   runtimeClassName: ferry-macos-vm      a macOS VM of its own, own XNU kernel
 #
-# It runs on a macOS machine -- a Machine with spec.os: darwin, which Karpenter
-# makes when this Mac has a macOS golden image (found automatically once baked)
-# -- and ferry-darwin serves it. The machine is registered with maxPods 1, so
-# its pod is the only thing its kernel runs; the Mac runs two macOS guests at
-# most. macOS machines are always tainted, under every default, so this
-# toleration is the only way onto one. Inert on a Mac with no macOS image.
-# See docs/RUNTIMES.md#macos-pods.
+# It runs on this Mac's own node, the same node a ferry-vm pod runs on: ferry-cri
+# boots the pod a macOS VM sandbox cloned from the golden image (the handler
+# ferry-macos-vm selects that path; docs/design/macos-cri-sandbox.md), rather
+# than provisioning a separate macOS Machine. So it lands on ferry.dev/mode:
+# vm-per-pod with the same toleration ferry-vm uses, and needs only a macOS
+# golden image (ferry-cri --mac-image) -- no machines. The Mac runs two macOS
+# guests at most (Apple's licence), enforced in ferry-cri. Inert on a Mac with
+# no golden image. See docs/RUNTIMES.md#macos-pods.
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:
   name: ferry-macos-vm
   labels: {app.kubernetes.io/managed-by: ferry}
-handler: ferry-darwin
+handler: ferry-macos-vm
 scheduling:
-  nodeSelector: {ferry.dev/mode: macos-vm}
+  nodeSelector: {ferry.dev/mode: vm-per-pod}
   tolerations:
-    - {key: ferry.dev/mode, operator: Equal, value: macos-vm, effect: NoSchedule}
+    - {key: ferry.dev/mode, operator: Equal, value: vm-per-pod, effect: NoSchedule}

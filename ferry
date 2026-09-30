@@ -681,8 +681,8 @@ macOS pods -- native Darwin processes, each in a macOS VM of its own:
                           checkout; downloads macOS from Apple, not carried by
                           ferry). See docs/RUNTIMES.md#macos-pods
   ferry mac-image status   whether a golden image is cached, which macOS, in use
-  ferry machines enable --mac-image
-                          turn machines on and bake the image if none is cached
+  ferry up --mac-image     bake the image if none is cached, then run macOS pods
+                          on this node (they need no machines)
 
 Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
@@ -1297,8 +1297,8 @@ cmd_mac_image_bake() {
     echo "  Built outside the default location, so point ferry at it:"
     echo "      export FERRY_MAC_IMAGE=\"$out/golden-node\""
   fi
-  echo "  Turn machines on to schedule macOS pods:"
-  echo "      ferry machines enable"
+  echo "  macOS pods run on this node -- (re)start ferry to pick up the image:"
+  echo "      ferry up            # or: ferry down && ferry up, if already up"
 }
 
 # cmd_mac_image_status: is there a golden macOS image, where, which macOS, and is
@@ -1308,7 +1308,7 @@ cmd_mac_image_status() {
   if [ -z "$img" ]; then
     echo "macOS image  none"
     echo "  No golden macOS image -- ferry-macos-vm pods stay Pending."
-    echo "  Bake one:  ferry mac-image bake      (or: ferry machines enable --mac-image)"
+    echo "  Bake one:  ferry mac-image bake      (or: ferry up --mac-image)"
     return 0
   fi
   local ver; ver="$(resolve_mac_image_version)"
@@ -1317,19 +1317,16 @@ cmd_mac_image_status() {
   echo "macOS image  $img"
   echo "  source     $src"
   echo "  macOS      ${ver:-unknown}"
-  if ! running ferry-machined; then
-    echo "  machined   off -- run 'ferry machines enable' so macOS pods can schedule"
-  elif kube get nodepool macos-vm >/dev/null 2>&1; then
-    echo "  machined   running (macOS pods can schedule)"
+  # macOS pods run on this node via ferry-cri, which takes the image with
+  # --mac-image at launch. So "in use" is ferry-cri running with it; a bake done
+  # while ferry was already up leaves the image cached but unused until a restart.
+  if ! running ferry-cri; then
+    echo "  in use     no -- ferry is not up; 'ferry up' runs macOS pods on this node"
+  elif ps -p "$(cat "$FERRY_RUN/ferry-cri.pid" 2>/dev/null)" -o command= 2>/dev/null | grep -q -- "--mac-image"; then
+    echo "  in use     yes -- macOS pods run on this node (ferry-macos-vm)"
   else
-    # machined reads --mac-image only at launch, so a bake done while it is
-    # already up leaves this image cached but unused. The macos-vm NodePool is
-    # installed by start_machines only when an image resolved then, so its
-    # absence is the proof machined is not using the image -- and reporting pods
-    # schedulable here would be the silent-Pending green this command exists to
-    # expose. Say so, and how to fix it.
-    echo "  machined   running, but started without this image -- restart to pick"
-    echo "             it up: ferry machines disable && ferry machines enable"
+    echo "  in use     no -- ferry-cri started without this image; restart to use it:"
+    echo "             ferry down && ferry up"
   fi
 }
 
@@ -1500,6 +1497,13 @@ cmd_up() {
   echo server > "$FERRY_HOME/role"
   ferry_config_migrate
   [ -n "$want_durability" ] && ferry_config_set durability "$want_durability"
+
+  # --mac-image: bake this Mac's golden macOS image now if none is cached, before
+  # ferry-cri starts -- it takes the image with --mac-image at launch and runs a
+  # macOS pod as a VM sandbox on this node (docs/design/macos-cri-sandbox.md).
+  if [ -n "$bake_mac" ]; then
+    ensure_mac_image || warn "macOS image bake did not finish; macOS pods will stay Pending"
+  fi
 
   bold "starting ferry"
   # Which file this start is following, every time, for the same reason the
@@ -1693,14 +1697,6 @@ EOF
   start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
   advertise_gpu
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
-
-  # --mac-image: bake this Mac's golden macOS image now if none is cached, so a
-  # macOS pod has something to schedule onto. Before start_machines, which passes
-  # the image to ferry-machined and installs the macOS NodePools.
-  if [ -n "$bake_mac" ]; then
-    ensure_mac_image || warn "macOS image bake did not finish; macOS pods will stay Pending"
-    machines_enabled || warn "--mac-image baked an image, but machines are off -- run 'ferry machines enable'"
-  fi
 
   # Mode 2, for a cluster that asked for it. After the node is Ready, because
   # ferry-machined reads the Node list to work out each machine's pod CIDR.
@@ -2114,7 +2110,6 @@ start_machines() {
 
   start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
-  local mac_image; mac_image="$(resolve_mac_image)"
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
@@ -2122,7 +2117,6 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     --memory-ledger "$MACHINE_MEMORY_LEDGER" \
-    ${mac_image:+--mac-image "$mac_image"} \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2239,28 +2233,10 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
-    # The macOS VM-per-pod pool (ferry-macos-vm), only where there is a macOS
-    # image to make machines from (experiment 39). Without one a macOS pod stays
-    # Pending, as it would with no pool at all, rather than failing a Machine it
-    # cannot boot. The old shared-kernel `macos` pool is deleted if a prior ferry
-    # left one behind.
-    kube delete nodepool macos --ignore-not-found >/dev/null 2>&1 || true
-    if [ -n "$(resolve_mac_image)" ]; then
-      kube apply -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
-        || warn "could not install the macOS VM NodePool; macOS machines must be declared by hand"
-    else
-      # No macOS image resolves. Baked images are found automatically now, so
-      # this is usually just a Linux-only cluster -- silent is right. But if the
-      # macOS pool was already up, macOS pods are about to stop scheduling: say
-      # so loudly rather than tearing it down without a word (the old failure,
-      # a forgotten FERRY_MAC_IMAGE export, left pods Pending with no reason given).
-      if kube get nodepool macos-vm >/dev/null 2>&1; then
-        warn "no macOS golden image found, but the macOS NodePool was installed -- removing it"
-        echo "    ferry-macos-vm pods will stay Pending until an image is baked."
-        echo "    Bake and use one:  ferry machines enable --mac-image   (or: ferry mac-image bake)"
-      fi
-      kube delete nodepool macos-vm --ignore-not-found >/dev/null 2>&1 || true
-    fi
+    # macOS pods no longer use machines: ferry-cri runs a ferry-macos-vm pod as a
+    # VM sandbox on this Mac's own node (docs/design/macos-cri-sandbox.md), so
+    # there is no macOS NodePool. Delete the old macOS pools a prior ferry left.
+    kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
     # The apply above has just put the NodePool back as the file has it,
     # without the default runtime's taint.
     ferry_apply_default_runtime
@@ -4779,9 +4755,9 @@ ferry_image_build_darwin() {
     return 1
   }
   machine_registry_enabled || running ferry-registry || {
-    bad "a macOS image is served to macOS machines through ferry-registry, which is off"
-    echo "    macOS pods run on machines (mode 2); turn them on and build again:"
-    echo "        ferry machines enable"
+    bad "a macOS image is served through ferry-registry, which is off"
+    echo "    bring ferry up (the registry runs with it), then build again:"
+    echo "        ferry up"
     return 1
   }
 
@@ -4816,7 +4792,7 @@ ferry_image_build_darwin() {
   echo
   echo "    image: $tag"
   echo "    A macOS pod runs it: runtimeClassName ferry-macos-vm,"
-  echo "    imagePullPolicy IfNotPresent (machines pull it from this Mac's registry)"
+  echo "    imagePullPolicy IfNotPresent (ferry-cri fetches it from this Mac's registry)"
 }
 
 cmd_image_build() {
@@ -5400,31 +5376,12 @@ install_machine_dns() {
 
 # --- mode 2 -----------------------------------------------------------------
 cmd_machines_enable() {
-  local bake_mac=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --mac-image) bake_mac=1; shift ;;
-      -h|--help)
-        echo "usage: ferry machines enable [--mac-image]"
-        echo
-        echo "  --mac-image  bake this Mac's golden macOS image if none is cached, so"
-        echo "               ferry-macos-vm pods can schedule"
-        return 0 ;;
-      -*) bad "unknown flag $1"; return 2 ;;
-      *) bad "usage: ferry machines enable [--mac-image]"; return 2 ;;
-    esac
-  done
-
   require_cluster || return 1
   bold "turning on machines (mode 2)"
   machines_ready || return 1
 
-  [ -n "$bake_mac" ] && { ensure_mac_image || return 1; }
-
   if running ferry-machined; then
     warn "machines are already running"
-    [ -n "$bake_mac" ] && [ -n "$(resolve_mac_image)" ] \
-      && echo "  restart to pick up the golden image: ferry machines disable && ferry machines enable"
   else
     start_machines || return 1
   fi
@@ -6091,18 +6048,16 @@ cmd_status() {
       if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
       else bad "$component (machines are enabled)"; fi
     done
-    # macOS pods run on machines, so their image only matters once machines are on.
-    local mac_img; mac_img="$(resolve_mac_image)"
-    if [ -z "$mac_img" ]; then
-      echo "  macOS      no image -- macOS pods stay Pending; 'ferry machines enable --mac-image' to bake one"
-    elif running ferry-machined && ! kube get nodepool macos-vm >/dev/null 2>&1; then
-      # An image is cached, but machined came up without it (baked while it was
-      # already running) -- the macos-vm NodePool start_machines would have
-      # installed is absent, so macOS pods still stay Pending. Do not call it
-      # ready: that is the silent-Pending this PR set out to remove.
-      echo "  macOS      image baked but not in use -- restart machines to pick it up; 'ferry mac-image status'"
+  fi
+  # macOS pods run on this node via ferry-cri (no machines); the image matters
+  # whenever one is cached. ferry-cri takes it with --mac-image at launch, so an
+  # image baked after ferry was up is cached but not in use until a restart.
+  local mac_img; mac_img="$(resolve_mac_image)"
+  if [ -n "$mac_img" ]; then
+    if running ferry-cri && ps -p "$(cat "$FERRY_RUN/ferry-cri.pid" 2>/dev/null)" -o command= 2>/dev/null | grep -q -- "--mac-image"; then
+      echo "  macOS      image ready (macOS $(resolve_mac_image_version 2>/dev/null || echo '?')), pods run on this node -- 'ferry mac-image status'"
     else
-      echo "  macOS      image ready (macOS $(resolve_mac_image_version 2>/dev/null || echo '?')) -- 'ferry mac-image status'"
+      echo "  macOS      image cached but not in use -- restart to use it (ferry down && ferry up); 'ferry mac-image status'"
     fi
   fi
   if machine_registry_enabled; then

@@ -279,8 +279,17 @@ actor DarwinRuntime {
         do {
             let (code, out, err) = try await s.sandbox.exec(req)
             if let logFile {
-                if !out.isEmpty { logFile.append(out, stream: .stdout, tag: "F") }
-                if !err.isEmpty { logFile.append(err, stream: .stderr, tag: "F") }
+                // Through a per-stream writer, which splits the output into the
+                // one-line-per-record shape the CRI log format requires (each
+                // line its own `<ts> stream F` prefix); a single append would
+                // prefix only the first line and `kubectl logs` would show only
+                // that. close() flushes a trailing line with no newline.
+                let outW = ContainerLogWriter(file: logFile, stream: .stdout)
+                let errW = ContainerLogWriter(file: logFile, stream: .stderr)
+                if !out.isEmpty { try? outW.write(out) }
+                if !err.isEmpty { try? errW.write(err) }
+                try? outW.close()
+                try? errW.close()
             }
             exit = code
         } catch {

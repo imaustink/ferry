@@ -131,7 +131,7 @@ func (c *controller) reconcileDefaultRuntime(ctx context.Context) {
 		// A macOS machine keeps its taint under every policy: the default
 		// chooses between the two Linux-running kinds, and a pod that names
 		// no RuntimeClass is never a macOS pod.
-		want := mode == tainted || mode == modeMacOSVM
+		want := mode == tainted
 		taints, changed := withModeTaint(node.Spec.Taints, mode, want)
 		if !changed {
 			continue

@@ -233,27 +233,24 @@ the same isolation `ferry-vm` gives a Linux pod. (There is no shared-kernel macO
 class: a `chroot` on a SIP-disabled guest is not a security boundary, so it was
 removed. macOS is VM-per-pod only.)
 
-Two things set macOS pods apart from the Linux classes:
+It runs **on this Mac's own node**, not a separate Machine: `ferry-cri` boots the
+pod a macOS VM sandbox cloned from the golden image, the same way it boots a
+Linux `ferry-vm` pod its own microVM — no Karpenter round-trip, no in-guest
+kubelet, so it starts in ~8s rather than the ~17–35s a provisioned macOS node
+took (docs/design/macos-cri-sandbox.md). Two things to know:
 
-- **They need a macOS image.** They run on macOS machines — `Machine`s with
-  `spec.os: darwin` — which ferry only provisions when this Mac has a golden
-  macOS image (found automatically once baked, and passed to ferry-machined as
-  `--mac-image`). Without one the class still exists but nothing schedules onto
-  it, and a pod that names it stays Pending. Building it is
-  [below](#building-the-image).
-- **A macOS machine is always tainted, and single-use.** Under every
-  `defaultRuntime` a macOS machine carries its `ferry.dev/mode: macos-vm` taint,
-  so `runtimeClassName` — which brings the matching toleration — is the *only*
-  way onto one; a pod that names no class never lands on XNU. The machine is
-  registered with `maxPods: 1` and torn down when its pod finishes, so the next
-  pod gets a fresh one, never a used kernel. The Mac runs **two macOS guests at
-  most** (Apple's licence, enforced by Virtualization.framework), so a third
-  macOS pod waits Pending until a slot frees.
+- **It needs a macOS image.** `ferry-cri` takes the golden image with
+  `--mac-image` at launch (found automatically once baked; `ferry up` passes it).
+  Without one the class still exists but a pod that names it stays Pending.
+  Building it is [below](#building-the-image). No machines are involved.
+- **The Mac runs two macOS guests at most** (Apple's licence, enforced by
+  Virtualization.framework), so a third `ferry-macos-vm` pod waits until one
+  frees; `ferry-cri` enforces this.
 
 ### Building the image
 
-macOS pods need two things built. The **golden macOS bundle** the machine
-boots is `ferry mac-image bake`, below. The **pod image** is `ferry image
+macOS pods need two things built. The **golden macOS bundle** each pod's VM is
+cloned from is `ferry mac-image bake`, below. The **pod image** is `ferry image
 build --os darwin` (below that).
 
 **1. The golden macOS bundle** — the OS a macOS machine boots. Built with one
@@ -347,17 +344,16 @@ is a different macOS; a bare `FROM macos` builds against whatever the node runs.
 (`FROM scratch` from older Dockerfiles is no longer accepted — use `FROM macos`.)
 
 Unlike a Linux build this needs no buildkit; it writes the OCI layout directly
-and serves it from this Mac's registry, so **machines must be on**
-(`ferry machines enable`) — a macOS pod always runs on a machine, and that is
-where it pulls from. A pod that names `image: example.com/app-darwin:1` with
-`runtimeClassName: ferry-macos-vm` and `imagePullPolicy: IfNotPresent` then
-runs it.
+and serves it from this Mac's registry (which runs with `ferry up`). A pod that
+names `image: example.com/app-darwin:1` with `runtimeClassName: ferry-macos-vm`
+and `imagePullPolicy: IfNotPresent` then runs it — `ferry-cri` fetches the image
+from that registry when it assembles the pod's VM sandbox.
 
 `ferry image build --os darwin` accepts the common Dockerfile instructions --
 `COPY`/`ADD`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`, `LABEL` — plus `RUN`. A
 Linux builder still cannot execute a Darwin binary, so a `RUN` runs in a macOS
-VM instead: `bin/ferry-macvm`, cloned from the same golden bundle machines boot
-from, torn down when the build ends. A Dockerfile with no `RUN` never starts
+VM instead: `bin/ferry-macvm`, cloned from the same golden image a pod's sandbox
+is, torn down when the build ends. A Dockerfile with no `RUN` never starts
 one — `COPY` still applies straight to a plain directory, as fast as before:
 
 ```sh
@@ -412,7 +408,7 @@ ferry status                                               # the default runtime
 | `didn't match Pod's node affinity/selector`, for a `ferry-shared` pod | no machines: mode 2 is off | `ferry machines enable` |
 | a DaemonSet's `DESIRED` is fewer than your nodes, with no error | the cluster's default has tainted one kind of node, and the DaemonSet does not tolerate it | add the toleration under [DaemonSets meant for every node](#daemonsets-meant-for-every-node) |
 | `RuntimeClass "…" not found` | the class does not exist in this cluster, usually one started by a ferry older than the classes | `ferry up` installs them; so do `ferry image build` and `ferry addons enable` |
-| a `ferry-macos-*` pod stays Pending and no machine appears | this Mac has no macOS golden image, so no `spec.os: darwin` machine can be made for it (check with `ferry mac-image status`) | `ferry machines enable --mac-image` (bakes it), or `ferry mac-image bake` then `ferry machines enable` |
+| a `ferry-macos-vm` pod stays Pending | this Mac has no golden image, so ferry-cri was started without `--mac-image` and cannot run macOS pods (check with `ferry mac-image status`) | `ferry up --mac-image` (bakes it), or `ferry mac-image bake` then `ferry down && ferry up` |
 | `Failed to create pod sandbox: … has no runtime handler "runc"` | a pod whose class is not `ferry-vm` was put on the Mac anyway, usually with `nodeName` | let the scheduler place it, or name `ferry-vm` |
 
 The last one is deliberate. ferry-cri runs every pod as a VM, and a pod that

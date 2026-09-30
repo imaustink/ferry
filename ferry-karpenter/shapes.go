@@ -23,48 +23,15 @@ import (
 )
 
 // shape is one synthesised instance type: a cpu count and a memory ceiling.
+// Every machine is a Linux node (macOS pods run on this Mac's own node via
+// ferry-cri, not a machine -- docs/design/macos-cri-sandbox.md).
 type shape struct {
 	cpus     int64
 	memoryGi int64
-	// "darwin" for a macOS machine (experiment 39), whose pods are macOS
-	// processes; empty is Linux.
-	os string
-	// vm is a macOS machine that is one pod's VM -- mode 1, for macOS: the
-	// pod gets an XNU kernel of its own, at the price of a whole guest.
-	vm bool
 }
 
 func (s shape) name() string {
-	if s.os == osDarwin {
-		return fmt.Sprintf("ferry-macvm-%dcpu-%dgi", s.cpus, s.memoryGi)
-	}
 	return fmt.Sprintf("ferry-%dcpu-%dgi", s.cpus, s.memoryGi)
-}
-
-// macOS machines are a short catalogue of their own. A macOS guest needs 4 GiB
-// to install and touches all the memory it is given, so there is no cheap
-// rung to offer below that, and the Mac runs two of them at most -- so a few
-// sizes, capped by the same per-machine maximum Linux shapes are.
-const osDarwin = "darwin"
-
-// maxMacOSGuests is Virtualization.framework's limit, and the macOS licence's:
-// the third macOS guest is refused at start, whatever else is free.
-const maxMacOSGuests = 2
-
-// Every macOS machine is one pod's VM (mode 1, for macOS): the pod gets an XNU
-// kernel of its own. Shared-kernel macOS machines were removed, so there is no
-// non-vm darwin shape.
-func (b bounds) macosShapes() []shape {
-	var out []shape
-	for _, s := range []shape{{cpus: 4, memoryGi: 4}, {cpus: 4, memoryGi: 8}, {cpus: 8, memoryGi: 16}} {
-		if b.maxCPUs > 0 && s.cpus > b.maxCPUs || b.maxMemoryGi > 0 && s.memoryGi > b.maxMemoryGi {
-			continue
-		}
-		s.os = osDarwin
-		s.vm = true
-		out = append(out, s)
-	}
-	return out
 }
 
 // cost is what this shape is worth to Karpenter's cheapest-fit logic, and what
@@ -77,9 +44,6 @@ func (b bounds) macosShapes() []shape {
 func (s shape) cost() float64 { return float64(s.cpus)*1.0 + float64(s.memoryGi)*0.1 }
 
 func (s shape) capacity(maxPods int64) corev1.ResourceList {
-	if s.vm {
-		maxPods = 1 // what makes it one pod's VM
-	}
 	return corev1.ResourceList{
 		corev1.ResourceCPU:    *resource.NewQuantity(s.cpus, resource.DecimalSI),
 		corev1.ResourceMemory: *resource.NewQuantity(s.memoryGi*gibibyte, resource.BinarySI),
