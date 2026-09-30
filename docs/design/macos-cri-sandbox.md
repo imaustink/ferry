@@ -258,8 +258,26 @@ pod, resolves cluster DNS, and reaches ClusterIP Services.
   table is parsed from the same kube-proxy render ferry-cri already fetches for
   the Linux pods — no kubelet rebuild.
 
-**Remaining (real) work:** stdin/TTY for interactive `exec -it`; and, for macOS
-pods, NetworkPolicy, session affinity, SCTP and NodePort Services.
+**More Service kinds and NetworkPolicy** are in too: **session affinity**
+(`sessionAffinity: ClientIP` -- the NAT keeps a per-(service, client) backend
+within the ruleset's timeout) and **SCTP** Services (`MacServiceNAT`); **NodePort**
+needs nothing new (a NodePort Service has a ClusterIP, reachable via the DNAT,
+and a macOS pod already works as a backend via pod-to-pod); and **ingress
+NetworkPolicy**, translated per pod to pf and loaded in the guest (`MacNetpol`),
+verified to allow, default-deny, and reopen on policy removal.
+
+**Remaining (real) work:**
+- **stdin/TTY for interactive `exec -it`** -- needs the guest agent
+  (`ferry-macagent`) to read stdin and allocate a PTY, which means re-injecting
+  it into the golden image (a protocol change on both sides). `kubectl exec`
+  without `-it` works today.
+- **Egress NetworkPolicy** -- a macOS pod's ClusterIP egress is DNATed host-side,
+  so guest pf sees ClusterIPs, not the endpoint addresses the policy names;
+  egress must be enforced in ferry-cri (post-DNAT), not the guest.
+- **Multi-label short-name DNS** (`svc.namespace`) -- macOS `mDNSResponder`
+  appends search domains only to single-label names, so a dotted short name is
+  taken as an FQDN and not searched. The FQDN and the single-label
+  (same-namespace) form both resolve; the 2-label form needs the FQDN.
 
 ## Reusable building blocks (with paths)
 
