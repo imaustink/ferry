@@ -227,9 +227,39 @@ one) was run, both now fixed:
   host-network pod does. Without it the kubelet took the running sandbox for
   broken ("Sandbox for pod has no IP address") and tore it down seconds in.
 
-**Remaining (real) work:** pod-network addressing beyond NAT — a macOS pod on
-the pod CIDR, reachable for Services and pod-to-pod, rather than sharing the
-host's identity — and stdin/TTY for interactive `exec -it`.
+## Cluster networking (pod-to-pod, DNS, Services)
+
+A macOS pod now joins the cluster network, so it interoperates with every other
+pod, resolves cluster DNS, and reaches ClusterIP Services.
+
+- **Pod-to-pod.** The pod gets a second NIC (en1) on ferry's shared `PodSwitch`
+  — a `SwitchInterface` (`VZFileHandleNetworkDeviceAttachment` over a socketpair),
+  the same L2 fabric the Linux pods use — carrying a real cluster IP from a
+  **dedicated /24 for this Mac's macOS pods** (counted down from 255 so it never
+  overlaps a node slice, and sits outside the node's own vmnet /24 so every peer
+  routes to it via the switch). en0 keeps NAT for the internet/default route.
+  The root guest agent brings en1 up by the MAC we assigned it (no vminitd), and
+  `PodSandboxStatus` reports the real cluster IP. Linux↔macOS and macOS↔macOS
+  work, both directions, same node or across the relay.
+- **Cluster DNS.** The guest's own resolver works; the fix was the *chroot* a
+  container runs in. The `mDNSResponder` socket is hard-linked into the container
+  root (at `/var/run` and `/private/var/run`) so a chrooted `getaddrinfo` reaches
+  it, and an `/etc/resolver/<cluster-domain>` per cluster search domain points
+  those names at CoreDNS over the switch (`scutil` injection breaks macOS 26's
+  resolver, so a resolver file configd reads is used instead). External DNS,
+  Service FQDNs and single-label (same-namespace) names resolve; multi-label
+  short names (`svc.namespace`) need the FQDN — macOS won't append search domains
+  to dotted names the way Linux ndots does.
+- **ClusterIP Services.** A macOS pod has no in-guest kube-proxy, but its Service
+  traffic transits ferry-cri's pod switch, so ferry-cri DNATs it host-side
+  (`MacServiceNAT`): the pod routes the Service CIDR to a virtual gateway
+  ferry-cri answers ARP for, a ClusterIP frame is rewritten to a chosen endpoint
+  (L3 + checksum), and conntrack un-DNATs the replies. The ClusterIP→endpoint
+  table is parsed from the same kube-proxy render ferry-cri already fetches for
+  the Linux pods — no kubelet rebuild.
+
+**Remaining (real) work:** stdin/TTY for interactive `exec -it`; and, for macOS
+pods, NetworkPolicy, session affinity, SCTP and NodePort Services.
 
 ## Reusable building blocks (with paths)
 
