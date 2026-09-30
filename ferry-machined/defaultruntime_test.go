@@ -69,12 +69,9 @@ func TestDefaultRuntimeTaintsTheOtherKind(t *testing.T) {
 func TestMacOSMachineKeepsItsTaint(t *testing.T) {
 	for _, policy := range []string{runtimeVM, runtimeShared, "", "something-else"} {
 		c := &controller{kube: fake.NewSimpleClientset(
-			policyMap(policy), node("mac", modeVMPerPod), node("darwin-0", modeSharedMacOS),
+			policyMap(policy), node("mac", modeVMPerPod),
 			node("darwin-vm-0", modeMacOSVM))}
 		c.reconcileDefaultRuntime(context.Background())
-		if got := modeTaintOf(t, c, "darwin-0"); got != "shared-macos;" {
-			t.Errorf("policy %q: macOS machine taint %q, want shared-macos;", policy, got)
-		}
 		if got := modeTaintOf(t, c, "darwin-vm-0"); got != "macos-vm;" {
 			t.Errorf("policy %q: macOS VM machine taint %q, want macos-vm;", policy, got)
 		}
@@ -86,8 +83,6 @@ func TestMachineOSAndMode(t *testing.T) {
 		{"", "", "linux", modeShared},
 		{"linux", "", "linux", modeShared},
 		{"linux", "vm", "linux", modeShared}, // isolation is a macOS field
-		{"darwin", "", "darwin", modeSharedMacOS},
-		{"darwin", "shared", "darwin", modeSharedMacOS},
 		{"darwin", "vm", "darwin", modeMacOSVM},
 	} {
 		item := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
@@ -106,20 +101,18 @@ func TestMachineOSAndMode(t *testing.T) {
 	}
 }
 
-// A shared-kernel macOS machine is refused unless shared mode is enabled; a
-// VM-per-pod macOS machine and any Linux machine are always allowed.
-func TestMacSharedDisabled(t *testing.T) {
+// A darwin machine must be VM-per-pod: one declared without spec.isolation: vm
+// is refused (shared-kernel macOS machines were removed). Linux is unaffected.
+func TestMacOSNeedsVM(t *testing.T) {
 	for _, tc := range []struct {
 		os, isolation string
-		allow         bool
 		want          bool
 	}{
-		{"darwin", "", false, true},       // shared-macos, not enabled -> refused
-		{"darwin", "shared", false, true}, // the same, spelled out
-		{"darwin", "", true, false},       // enabled -> allowed
-		{"darwin", "vm", false, false},    // VM-per-pod is never shared
-		{"linux", "", false, false},       // Linux is unaffected
-		{"", "", false, false},
+		{"darwin", "", true},       // no isolation -> refused
+		{"darwin", "shared", true}, // shared no longer supported -> refused
+		{"darwin", "vm", false},    // VM-per-pod is fine
+		{"linux", "", false},       // Linux is unaffected
+		{"", "", false},
 	} {
 		item := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
 		if tc.os != "" {
@@ -128,9 +121,9 @@ func TestMacSharedDisabled(t *testing.T) {
 		if tc.isolation != "" {
 			item.Object["spec"].(map[string]any)["isolation"] = tc.isolation
 		}
-		if got := macSharedDisabled(item, tc.allow); got != tc.want {
-			t.Errorf("os=%q isolation=%q allow=%v: macSharedDisabled=%v, want %v",
-				tc.os, tc.isolation, tc.allow, got, tc.want)
+		if got := macOSNeedsVM(item); got != tc.want {
+			t.Errorf("os=%q isolation=%q: macOSNeedsVM=%v, want %v",
+				tc.os, tc.isolation, got, tc.want)
 		}
 	}
 }

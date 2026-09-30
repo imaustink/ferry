@@ -204,15 +204,13 @@ spec:
 
 Everything above runs Linux pods. A cluster whose Mac has a macOS golden image
 can also run **native macOS** pods — Darwin processes for `xcodebuild`, the iOS
-simulator, `codesign` or any macOS-only tool. They pick a runtime the same way,
-with two more classes for the same two modes:
+simulator, `codesign` or any macOS-only tool — with one more class:
 
 | `runtimeClassName` | the pod is | worth it for |
 |---|---|---|
-| `ferry-macos-vm` | a macOS VM of its own, with its own XNU kernel | a job that must be root, load a kext, or change system settings |
-| `ferry-macos-shared` | a macOS process on a machine's kernel (a uid + a chroot) | density: many macOS pods past the two-guest ceiling — **off by default, trusted code only** (see the warning below) |
+| `ferry-macos-vm` | a macOS VM of its own, with its own XNU kernel | a native Darwin job (xcodebuild, the simulator, codesign) that must be root, load a kext, or change system settings |
 
-Both use the handler `ferry-darwin` and a darwin image. As with the Linux
+It uses the handler `ferry-darwin` and a darwin image. As with the Linux
 classes, the class carries the `nodeSelector` and toleration, so
 `runtimeClassName` is all you write on the pod:
 
@@ -221,7 +219,7 @@ apiVersion: v1
 kind: Pod
 metadata: {name: build}
 spec:
-  runtimeClassName: ferry-macos-vm        # or ferry-macos-shared
+  runtimeClassName: ferry-macos-vm
   restartPolicy: Never
   containers:
     - {name: build, image: myorg/build-darwin:1}
@@ -230,60 +228,27 @@ spec:
 On a Deployment, Job or any object that makes pods it goes in the pod template,
 exactly as `ferry-shared` does above.
 
-> ⚠️ **`ferry-macos-shared` is not a security boundary — run only code you
-> trust on it.** Darwin has no namespaces and no cgroups, so a shared-kernel
-> macOS pod is not a container in the Linux sense. It is a per-pod uid, a
-> `chroot` for a private `/`, a Seatbelt profile and pf rules — assembled on a
-> guest that must run with **SIP disabled**, i.e. with the kernel's own
-> protections turned off. The `chroot` hides the filesystem and nothing else,
-> and it holds only because the pod is not root; there is no VM between one pod
-> and the next, and no hardened kernel beneath them. A pod that reaches root, or
-> a kernel bug, is not contained the way a VM contains it. Its limits are soft,
-> too: memory and CPU are enforced by polling (a poll-and-kill OOM watcher, a
-> `SIGSTOP`/`SIGCONT` duty cycle), not a hard barrier, so a brief burst can
-> overshoot before it is caught.
->
-> For anything untrusted, privileged, or hostile — CI running third-party pull
-> requests, a sandbox for user code, anything you would not run as yourself on
-> your own Mac — use **`ferry-macos-vm`** instead, where each pod is its own
-> single-use XNU kernel behind a hypervisor. That is the same isolation
-> `ferry-vm` gives a Linux pod; `ferry-macos-shared` is closer to running the
-> workload as another user on one machine.
->
-> **It is off by default.** `ferry-macos-vm` needs only a macOS golden image;
-> `ferry-macos-shared` also needs to be baked with `--shared` (which turns it on).
-> Without it ferry installs no shared NodePool and `ferry-machined` refuses a
-> hand-declared `spec.os: darwin` machine that is not `spec.isolation: vm`, so a
-> `ferry-macos-shared` pod stays Pending — you have to opt in, knowing the above.
+Each `ferry-macos-vm` pod is its own single-use XNU kernel behind a hypervisor —
+the same isolation `ferry-vm` gives a Linux pod. (There is no shared-kernel macOS
+class: a `chroot` on a SIP-disabled guest is not a security boundary, so it was
+removed. macOS is VM-per-pod only.)
 
-Three things set macOS pods apart from the Linux classes:
+Two things set macOS pods apart from the Linux classes:
 
-- **They need a macOS image.** Both run on macOS machines — `Machine`s with
+- **They need a macOS image.** They run on macOS machines — `Machine`s with
   `spec.os: darwin` — which ferry only provisions when this Mac has a golden
   macOS image (found automatically once baked, and passed to ferry-machined as
-  `--mac-image`). Without one the classes still exist but nothing schedules onto
-  them, and a pod that names one stays Pending. Building it is
+  `--mac-image`). Without one the class still exists but nothing schedules onto
+  it, and a pod that names it stays Pending. Building it is
   [below](#building-the-image).
-- **A macOS machine is always tainted.** Under every `defaultRuntime` a macOS
-  machine carries its `ferry.dev/mode` taint, so `runtimeClassName` — which
-  brings the matching toleration — is the *only* way onto one. A bare
-  `nodeSelector: {ferry.dev/mode: shared-macos}` stays Pending, and a pod that
-  names no class never lands on XNU.
-- **The Mac runs two macOS guests at most, of either kind.** A `ferry-macos-vm`
-  pod takes a whole guest to itself — its machine is registered with
-  `maxPods: 1` and is torn down when the pod finishes, so the next pod gets a
-  fresh one, never a used kernel. `ferry-macos-shared` pods pack many onto a
-  guest. Either way the two-guest ceiling is shared: a third `ferry-macos-vm`
-  pod, or the first shared pod while two VM pods hold both slots, waits Pending
-  until a slot frees. Getting past two is exactly what `ferry-macos-shared`
-  buys.
-
-So the choice mirrors `ferry-vm` vs `ferry-shared`, but the gap is wider: with
-no namespaces or cgroups to build on, `ferry-macos-shared` is a uid and a chroot
-on a shared kernel — cheaper and denser, and **not a boundary against the host
-kernel or the other pods on it**. `ferry-macos-vm` is a hypervisor boundary
-between pods (root, its own kernel, single-use), and the only one of the two you
-should hand code you do not trust.
+- **A macOS machine is always tainted, and single-use.** Under every
+  `defaultRuntime` a macOS machine carries its `ferry.dev/mode: macos-vm` taint,
+  so `runtimeClassName` — which brings the matching toleration — is the *only*
+  way onto one; a pod that names no class never lands on XNU. The machine is
+  registered with `maxPods: 1` and torn down when its pod finishes, so the next
+  pod gets a fresh one, never a used kernel. The Mac runs **two macOS guests at
+  most** (Apple's licence, enforced by Virtualization.framework), so a third
+  macOS pod waits Pending until a slot frees.
 
 ### Building the image
 
@@ -319,39 +284,21 @@ instead of asking Apple for the latest one; `--out <dir>` picks where it is
 written (default `$FERRY_HOME/mac-image`; a custom location is *not*
 auto-discovered, so set `FERRY_MAC_IMAGE` to point at it).
 
-By default this prepares an image for **`ferry-macos-vm`** only, which needs
-no manual steps beyond the one `sudo` prompt (putting the guest agent on the
-bundle). For **`ferry-macos-shared`** as well, add `--shared`:
+Baking needs no manual steps beyond the one `sudo` prompt (putting the guest
+agent on the bundle). Then just bring machines up — the cached image is used
+automatically:
 
 ```sh
-./ferry mac-image bake --shared
-```
-
-`--shared` does one thing the plain form does not: it clones the bundle and
-turns **SIP off** in the clone, because the per-pod `chroot` needs it — a
-recoveryOS step that cannot be scripted, so `ferry mac-image bake` opens the
-recovery window and waits for you to finish it (make an admin, `diskutil apfs
-updatePreboot /`, `csrutil disable`, `halt`) before it bakes the final image.
-This is also why a shared-macos node is not a security boundary
-([above](#macos-pods)): its kernel runs with SIP disabled. The image is still
-just built, though — turning the class on is the separate opt-in below.
-
-Then just bring machines up — the cached image is used automatically:
-
-```sh
-ferry machines enable   # finds the cached image, installs the macOS NodePool(s)
+ferry machines enable   # finds the cached image, installs the macOS NodePool
 ```
 
 If you have not baked yet, do both at once — `--mac-image` bakes first if none
-is cached (VM-per-pod only; `--shared` still needs the manual step above):
+is cached:
 
 ```sh
 ferry machines enable --mac-image
 ```
 
-Baking with `--shared` also turns the shared-kernel pool on (it records the
-choice beside the image); leave it out and only `ferry-macos-vm` works, the safe
-default (see the warning above). `FERRY_MAC_SHARED=0` forces it back off, and
 `FERRY_MAC_IMAGE` still overrides the cached location for a bundle kept
 elsewhere. `ferry mac-image status` shows what is cached and whether it is in
 use.
@@ -368,22 +315,12 @@ build/macvm install .cache/mac.ipsw .cache/golden   # ~3 min: installs macOS int
 sudo ./inject.sh .cache/golden                      # put the guest agent on it (root, once)
 ```
 
-That much already boots a macOS VM. For `ferry-macos-shared`, additionally:
+That much already boots a macOS VM. Then bake the machine image — kubelet,
+`ferry-darwin` and the OS base copied in, so a machine is Ready in ~10 s instead
+of spending ~30 s on first boot:
 
 ```sh
-cp -Rc .cache/golden .cache/golden-sipoff           # APFS clone, instant
-build/macvm boot .cache/golden-sipoff --recovery    # opens the recovery window
-# in the guest: make an admin, run `diskutil apfs updatePreboot /`,
-#               then `csrutil disable` and `halt`
-```
-
-Then bake the machine image from either bundle — kubelet, `ferry-darwin` and
-the OS base copied in, so a machine is Ready in ~10 s instead of spending
-~30 s on first boot:
-
-```sh
-./bake-macos-node.sh .cache/golden .cache/golden-node             # ferry-macos-vm only
-./bake-macos-node.sh .cache/golden-sipoff .cache/golden-node      # with --shared
+./bake-macos-node.sh .cache/golden .cache/golden-node
 ```
 
 </details>
@@ -413,8 +350,8 @@ Unlike a Linux build this needs no buildkit; it writes the OCI layout directly
 and serves it from this Mac's registry, so **machines must be on**
 (`ferry machines enable`) — a macOS pod always runs on a machine, and that is
 where it pulls from. A pod that names `image: example.com/app-darwin:1` with
-`runtimeClassName: ferry-macos-shared` (or `ferry-macos-vm`) and
-`imagePullPolicy: IfNotPresent` then runs it.
+`runtimeClassName: ferry-macos-vm` and `imagePullPolicy: IfNotPresent` then
+runs it.
 
 `ferry image build --os darwin` accepts the common Dockerfile instructions --
 `COPY`/`ADD`, `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`, `LABEL` — plus `RUN`. A

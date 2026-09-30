@@ -201,14 +201,11 @@ func osLabel(s shape) string {
 	return string(corev1.Linux)
 }
 
-// modeOf is the ferry.dev/mode a shape's node carries: a macOS machine's pods
-// share an XNU kernel, which is a mode of its own.
+// modeOf is the ferry.dev/mode a shape's node carries: a macOS machine is one
+// pod's VM (macos-vm), a mode of its own.
 func modeOf(s shape) string {
-	if s.vm {
-		return modeMacOSVM
-	}
 	if s.os == osDarwin {
-		return modeSharedMacOS
+		return modeMacOSVM
 	}
 	return modeShared
 }
@@ -233,11 +230,10 @@ func requirementsFor(s shape) scheduling.Requirements {
 }
 
 const (
-	modeLabel       = "ferry.dev/mode"
-	modeShared      = "shared"
-	modeSharedMacOS = "shared-macos"
-	modeMacOSVM     = "macos-vm"
-	modeVMPerPod    = "vm-per-pod"
+	modeLabel    = "ferry.dev/mode"
+	modeShared   = "shared"
+	modeMacOSVM  = "macos-vm"
+	modeVMPerPod = "vm-per-pod"
 	// Which Mac a node runs on: the Mac's own node name, on the Mac node and on
 	// every machine it hosts.
 	hostLabel = "ferry.dev/host"
@@ -626,8 +622,8 @@ func cheapestThatFits(b bounds, h host, committed shape, candidates []shape) (sh
 func parseShapeName(name string) (shape, bool) {
 	parts := strings.Split(name, "-")
 	os, vm := "", false
-	if len(parts) == 4 && parts[0] == "ferry" && (parts[1] == "macos" || parts[1] == "macvm") {
-		os, vm, parts = osDarwin, parts[1] == "macvm", append([]string{"ferry"}, parts[2:]...)
+	if len(parts) == 4 && parts[0] == "ferry" && parts[1] == "macvm" {
+		os, vm, parts = osDarwin, true, append([]string{"ferry"}, parts[2:]...)
 	}
 	if len(parts) != 3 || parts[0] != "ferry" {
 		return shape{}, false

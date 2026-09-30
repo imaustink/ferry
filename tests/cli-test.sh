@@ -699,7 +699,7 @@ contains "and ferry says which node that is" "$(sed -n '/^install_dns()/,/^}/p' 
 echo
 
 printf '\033[1m%s\033[0m\n' "ferry image build can package a macOS image"
-# A darwin image is FROM scratch + COPY, so it does not go through buildkit at
+# A darwin image is FROM macos + COPY, so it does not go through buildkit at
 # all; the flag surface and the platform switch are checked here without a
 # cluster. The layout itself is ferry-mkimage's own Go tests.
 build_help="$("$repo/ferry" image build --help 2>&1)"
@@ -715,22 +715,17 @@ contains "a darwin build refuses to run on ferry-cri, which is Linux" \
   "$(sed -n '/^ferry_image_build_darwin()/,/^}/p' "$repo/ferry")" "ferry-registry"
 echo
 
-printf '\033[1m%s\033[0m\n' "shared-kernel macOS pods are off unless asked for"
-# ferry-macos-shared is a chroot on a SIP-disabled guest, not a VM, so both the
-# NodePool and ferry-machined gate it behind the shared opt-in: resolve_mac_shared,
-# which is 1 only when the image was baked --shared (a marker beside it) or
-# FERRY_MAC_SHARED is set.
-mac_block="$(sed -n '/macos-vm-nodepool.yaml/,/delete nodepool macos macos-vm/p' "$repo/ferry")"
-contains "the VM-per-pod pool installs with the image" "$mac_block" 'macos-vm-nodepool.yaml'
-contains "the shared pool waits for the shared opt-in" "$mac_block" 'resolve_mac_shared)" = 1'
-contains "and is removed when it is off" "$mac_block" 'delete nodepool macos '
-contains "ferry-machined gets --allow-mac-shared only when asked" \
-  "$(grep -n 'allow-mac-shared' "$repo/ferry")" 'resolve_mac_shared)" = 1'
-contains "the shared opt-in still honours FERRY_MAC_SHARED" \
-  "$(sed -n '/^resolve_mac_shared()/,/^}/p' "$repo/ferry")" 'FERRY_MAC_SHARED'
-contains "ferry-machined refuses a shared macOS machine by default" \
-  "$(cat "$repo/ferry-machined/reconcile.go")" "shared-kernel macOS machines are disabled"
-contains "and FERRY_MAC_SHARED is documented" "$(cat "$repo/docs/INSTALL.md")" "FERRY_MAC_SHARED"
+printf '\033[1m%s\033[0m\n' "macOS pods are VM-per-pod only"
+# Shared-kernel macOS (ferry-macos-shared, a chroot on a SIP-disabled guest) was
+# removed: the only macOS RuntimeClass is ferry-macos-vm, no shared NodePool
+# ships, and ferry-machined refuses a darwin machine that is not isolation: vm.
+rc="$(cat "$repo/manifests/runtimeclasses.yaml")"
+contains "ferry-macos-vm is installed" "$rc" "ferry-macos-vm"
+lacks "ferry-macos-shared is gone" "$rc" "ferry-macos-shared"
+lacks "no shared macOS NodePool ships" "$(ls "$repo/manifests/machines/karpenter")" "macos-nodepool.yaml"
+contains "ferry-machined requires spec.isolation: vm for darwin" \
+  "$(cat "$repo/ferry-machined/reconcile.go")" "shared-kernel macOS machines are no longer supported"
+lacks "FERRY_MAC_SHARED is gone from ferry" "$(cat "$repo/ferry")" "FERRY_MAC_SHARED"
 echo
 
 printf '\033[1m%s\033[0m\n' "status does not call macOS pods schedulable off a bare running machined"
@@ -753,33 +748,22 @@ contains "ferry status cross-checks the macos-vm NodePool too" \
 echo
 
 printf '\033[1m%s\033[0m\n' "the golden image finds itself from its markers"
-# resolve_mac_image / _version / _shared are the "finds itself" feature: they
-# read the bundle and its sibling `version`/`shared` markers out of
-# FERRY_HOME/mac-image, so a plain `ferry up` (no env) discovers a baked image.
-# Exercise them behaviorally through `ferry mac-image status` against a fabricated
-# FERRY_HOME -- a source grep would pass even if the marker paths drifted apart
-# from where bake writes them. No Mac or cluster needed (status tolerates a
-# machined that is down).
+# resolve_mac_image / _version are the "finds itself" feature: they read the
+# bundle and its sibling `version` marker out of FERRY_HOME/mac-image, so a plain
+# `ferry up` (no env) discovers a baked image. Exercise them behaviorally through
+# `ferry mac-image status` against a fabricated FERRY_HOME -- a source grep would
+# pass even if the marker paths drifted apart from where bake writes them. No Mac
+# or cluster needed (status tolerates a machined that is down).
 mac_home="$sandbox/mac-home"
 mkdir -p "$mac_home/mac-image/golden-node"
 printf '26\n' > "$mac_home/mac-image/version"
-: > "$mac_home/mac-image/shared"
-# $1 is FERRY_MAC_SHARED (empty string = unset-like, so the marker decides).
-mac_status() { env FERRY_HOME="$mac_home" FERRY_MAC_IMAGE= FERRY_MAC_SHARED="$1" "$repo/ferry" mac-image status 2>&1; }
-found="$(mac_status "")"
+mac_status() { env FERRY_HOME="$mac_home" FERRY_MAC_IMAGE= "$repo/ferry" mac-image status 2>&1; }
+found="$(mac_status)"
 contains "status reports the discovered golden-node bundle" \
   "$found" "$mac_home/mac-image/golden-node"
 contains "and the macOS major read from the sibling version marker" \
   "$(printf '%s\n' "$found" | grep -E '^[[:space:]]*macOS[[:space:]]')" "26"
 lacks "so the version is not unknown" "$found" "unknown"
-contains "the shared marker beside the bundle turns shared on" \
-  "$found" "on (ferry-macos-shared)"
-rm -f "$mac_home/mac-image/shared"
-contains "and with no marker shared resolves off" \
-  "$(mac_status "")" "off (ferry-macos-vm only)"
-: > "$mac_home/mac-image/shared"
-contains "FERRY_MAC_SHARED=0 forces shared off even with the marker present" \
-  "$(mac_status 0)" "off (ferry-macos-vm only)"
 echo
 
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"

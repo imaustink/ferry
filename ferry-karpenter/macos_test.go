@@ -45,7 +45,7 @@ func TestMacOSShapeNamesRoundTrip(t *testing.T) {
 			t.Errorf("%s is under the 4 GiB a macOS guest needs", s.name())
 		}
 	}
-	if _, ok := parseShapeName("ferry-macos-4cpu"); ok {
+	if _, ok := parseShapeName("ferry-macvm-4cpu"); ok {
 		t.Error("a truncated macOS name parsed")
 	}
 }
@@ -60,15 +60,15 @@ func TestMacOSShapesRespectTheMaximum(t *testing.T) {
 	}
 }
 
-// A macOS instance type says darwin and shared-macos, so only a pod that asks
-// for a macOS node is ever given one -- and a Linux one never says either.
+// A macOS instance type says darwin and macos-vm, so only a pod that asks for a
+// macOS node is ever given one -- and a Linux one never says either.
 func TestInstanceTypesNameTheirOS(t *testing.T) {
 	p := providerWith("")
 	types, err := p.GetInstanceTypes(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mac, macvm, linux int
+	var macvm, linux int
 	for _, it := range types {
 		s, ok := parseShapeName(it.Name)
 		if !ok {
@@ -77,9 +77,7 @@ func TestInstanceTypesNameTheirOS(t *testing.T) {
 		os := it.Requirements.Get(corev1.LabelOSStable).Any()
 		mode := it.Requirements.Get(modeLabel).Any()
 		switch {
-		case s.os == osDarwin && !s.vm && os == "darwin" && mode == modeSharedMacOS:
-			mac++
-		case s.vm && os == "darwin" && mode == modeMacOSVM:
+		case s.os == osDarwin && os == "darwin" && mode == modeMacOSVM:
 			macvm++
 			if pods := it.Capacity[corev1.ResourcePods]; pods.Value() != 1 {
 				t.Errorf("%s holds %d pods; a pod's VM holds one", it.Name, pods.Value())
@@ -90,8 +88,8 @@ func TestInstanceTypesNameTheirOS(t *testing.T) {
 			t.Errorf("%s says os %q, mode %q", it.Name, os, mode)
 		}
 	}
-	if mac == 0 || macvm == 0 || linux == 0 {
-		t.Errorf("%d macOS, %d macOS VM and %d Linux instance types; want all three", mac, macvm, linux)
+	if macvm == 0 || linux == 0 {
+		t.Errorf("%d macOS VM and %d Linux instance types; want both", macvm, linux)
 	}
 }
 

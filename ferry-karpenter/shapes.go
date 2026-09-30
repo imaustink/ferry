@@ -35,11 +35,8 @@ type shape struct {
 }
 
 func (s shape) name() string {
-	if s.vm {
-		return fmt.Sprintf("ferry-macvm-%dcpu-%dgi", s.cpus, s.memoryGi)
-	}
 	if s.os == osDarwin {
-		return fmt.Sprintf("ferry-macos-%dcpu-%dgi", s.cpus, s.memoryGi)
+		return fmt.Sprintf("ferry-macvm-%dcpu-%dgi", s.cpus, s.memoryGi)
 	}
 	return fmt.Sprintf("ferry-%dcpu-%dgi", s.cpus, s.memoryGi)
 }
@@ -54,6 +51,9 @@ const osDarwin = "darwin"
 // the third macOS guest is refused at start, whatever else is free.
 const maxMacOSGuests = 2
 
+// Every macOS machine is one pod's VM (mode 1, for macOS): the pod gets an XNU
+// kernel of its own. Shared-kernel macOS machines were removed, so there is no
+// non-vm darwin shape.
 func (b bounds) macosShapes() []shape {
 	var out []shape
 	for _, s := range []shape{{cpus: 4, memoryGi: 4}, {cpus: 4, memoryGi: 8}, {cpus: 8, memoryGi: 16}} {
@@ -61,7 +61,6 @@ func (b bounds) macosShapes() []shape {
 			continue
 		}
 		s.os = osDarwin
-		out = append(out, s)
 		s.vm = true
 		out = append(out, s)
 	}

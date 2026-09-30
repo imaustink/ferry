@@ -94,28 +94,23 @@ func machineOS(item *unstructured.Unstructured) string {
 }
 
 // modeFor is the ferry.dev/mode a machine's node carries. A macOS machine is
-// a mode of its own: its pods share a kernel, but an XNU one, and a Linux
-// image scheduled there would unpack and fail at exec.
-//
-// A macOS machine of one pod is a mode again: its pod has a VM, and so a
-// kernel, of its own -- what ferry-vm is for Linux, made of a macOS machine,
-// since ferry-cri runs Linux guests only.
+// a mode of its own: its pod has a VM, and so a kernel, of its own -- what
+// ferry-vm is for Linux, made of a macOS machine, since ferry-cri runs Linux
+// guests only. Every macOS machine is VM-per-pod (a non-vm one is refused; see
+// macOSNeedsVM).
 func modeFor(item *unstructured.Unstructured) string {
 	if machineOS(item) == osDarwin {
-		if machineIsolation(item) == isolationVM {
-			return modeMacOSVM
-		}
-		return modeSharedMacOS
+		return modeMacOSVM
 	}
 	return modeShared
 }
 
-// macSharedDisabled reports whether a machine resolves to a shared-kernel macOS
-// node (ferry-macos-shared) while shared mode is not enabled. That node is a
-// chroot on a SIP-disabled guest, not a VM, so it is off by default: a shared
-// XNU kernel is not a security boundary.
-func macSharedDisabled(item *unstructured.Unstructured, allow bool) bool {
-	return machineOS(item) == osDarwin && modeFor(item) == modeSharedMacOS && !allow
+// macOSNeedsVM reports whether a darwin machine was declared without
+// spec.isolation: vm. Shared-kernel macOS machines are no longer supported --
+// they were a chroot on a SIP-disabled guest, not a VM, so not a security
+// boundary -- so a darwin machine must be VM-per-pod.
+func macOSNeedsVM(item *unstructured.Unstructured) bool {
+	return machineOS(item) == osDarwin && machineIsolation(item) != isolationVM
 }
 
 // macBundlePath is where a macOS machine's VM bundle lives: a directory of
@@ -261,12 +256,12 @@ func (c *controller) create(ctx context.Context, item *unstructured.Unstructured
 		return err
 	}
 
-	// Shared-kernel macOS pods run in a chroot on a SIP-disabled guest, not a
-	// VM -- not a security boundary (docs/RUNTIMES.md#macos-pods). So a darwin
-	// machine that is not vm-per-pod is refused unless it was explicitly asked
-	// for; the fix a user wants is almost always spec.isolation: vm.
-	if macSharedDisabled(item, *allowMacShared) {
-		err := fmt.Errorf("shared-kernel macOS machines are disabled: a shared XNU kernel is not a security boundary. Set spec.isolation: vm for a VM-per-pod macOS machine, or enable shared mode with ferry-machined --allow-mac-shared (FERRY_MAC_SHARED=1)")
+	// Every macOS machine is VM-per-pod. Shared-kernel macOS machines are no
+	// longer supported -- they were a chroot on a SIP-disabled guest, not a VM,
+	// so not a security boundary (docs/RUNTIMES.md#macos-pods). A darwin machine
+	// declared without spec.isolation: vm is refused.
+	if macOSNeedsVM(item) {
+		err := fmt.Errorf("shared-kernel macOS machines are no longer supported: set spec.isolation: vm for a VM-per-pod macOS machine")
 		_ = c.setStatus(ctx, item, map[string]any{"phase": "Failed", "message": err.Error()})
 		return err
 	}
@@ -508,13 +503,12 @@ func (c *controller) updateStatus(ctx context.Context, item *unstructured.Unstru
 // with its neighbours, `vm-per-pod` for one of its own. The Mac node sets
 // vm-per-pod on its own kubelet; a machine's is set here.
 const (
-	modeLabel       = "ferry.dev/mode"
-	modeShared      = "shared"
-	modeSharedMacOS = "shared-macos"
-	modeMacOSVM     = "macos-vm"
-	isolationVM     = "vm"
-	hostLabel       = "ferry.dev/host"
-	osDarwin        = "darwin"
+	modeLabel   = "ferry.dev/mode"
+	modeShared  = "shared"
+	modeMacOSVM = "macos-vm"
+	isolationVM = "vm"
+	hostLabel   = "ferry.dev/host"
+	osDarwin    = "darwin"
 )
 
 // Applied here rather than through the kubelet's --node-labels, which would be
