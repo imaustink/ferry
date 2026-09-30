@@ -53,7 +53,16 @@ enum DarwinImageStore {
     struct Descriptor: Codable, Sendable {
         var mediaType: String?
         var digest: String
+        var size: Int64?
         var platform: Platform?
+    }
+
+    /// The identity the kubelet needs for a darwin image to count as present: a
+    /// non-empty id and a non-zero size (it rejects an ImageStatus missing
+    /// either with ImageInspectError).
+    struct Identity: Sendable {
+        var id: String
+        var size: Int64
     }
     struct Platform: Codable, Sendable {
         var os: String?
@@ -72,7 +81,41 @@ enum DarwinImageStore {
             var Env: [String]?
             var WorkingDir: String?
         }
+        var os: String?
+        var architecture: String?
         var config: Config?
+    }
+
+    /// Whether the registry holds this reference as a darwin image, without
+    /// pulling the layer. The kubelet asks ImageService to pull/inspect an image
+    /// before the sandbox runs and does not say which OS it is for, so this is how
+    /// a darwin pod's image is recognised there (an index's darwin/arm64 child, or
+    /// a plain manifest whose config says os darwin).
+    static func isDarwin(_ reference: String,
+                         session: URLSession = .shared,
+                         mirror: String? = ImageMirror.address) async -> Bool {
+        await resolveDarwin(reference, session: session, mirror: mirror) != nil
+    }
+
+    /// If the registry holds this reference as a darwin image, its identity for
+    /// the kubelet: the config digest as id and the config + layer sizes as size.
+    /// Nil for a non-darwin image or a miss. No layer is downloaded.
+    static func resolveDarwin(_ reference: String,
+                              session: URLSession = .shared,
+                              mirror: String? = ImageMirror.address) async -> Identity? {
+        guard let mirror else { return nil }
+        let canonical = ImageReference.normalize(reference)
+        let (repository, ref) = ImageMirror.split(canonical)
+        do {
+            let m = try await manifest(repository: repository, ref: ref, mirror: mirror, session: session)
+            guard let configDesc = m.config, let layerDesc = m.layers?.first else { return nil }
+            let configData = try await blob(repository: repository, digest: configDesc.digest,
+                                            mirror: mirror, session: session)
+            guard let cfg = try? JSONDecoder().decode(ImageConfig.self, from: configData),
+                  cfg.os == "darwin" else { return nil }
+            let size = (configDesc.size ?? 0) + (layerDesc.size ?? 0)
+            return Identity(id: configDesc.digest, size: size > 0 ? size : 1)
+        } catch { return nil }
     }
 
     /// Fetch an image's run config and layer from this Mac's registry mirror.

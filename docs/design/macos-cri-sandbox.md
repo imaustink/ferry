@@ -168,19 +168,32 @@ nothing for now.
 
 ## Hardware validation
 
-`ferry-cri darwin-smoke <golden-bundle> [--chroot <root>] [cmd...]` boots a
-`DarwinSandbox` off the CRI path and runs a command in the guest — the way this
-hardware-only path is exercised (a golden image and the virtualization
-entitlement, which CI has neither). On an M-series Mac (macOS 26.6.2) against a
-baked `golden-node`, confirmed end to end: the bundle clones, the guest boots,
-`ferry-macagent` answers on vsock, `sw_vers` runs and returns; the OS base
-(`/private/var/ferry/darwin/os`, with `dyld`) and the tools the root assembly
-uses (`base64 -D`, `tar`→bsdtar, `chroot`) are present; and a Darwin binary
-**runs chrooted into the OS base**, so dyld resolves inside an assembled root —
-the execution model the container root depends on. What remains for a full
-cluster run is the registry-served image fetch + chunked upload + untar through
-`DarwinRuntime` (its pieces are unit-tested and the upload is the shipped
-`ferry image build` COPY mechanism), and increment 4's scheduling flip.
+`ferry-cri darwin-smoke <golden-bundle> [--chroot <root>] [--scriptfile <f>] [cmd...]`
+boots a `DarwinSandbox` off the CRI path and runs a command in the guest — the
+way this hardware-only path is exercised (a golden image and the virtualization
+entitlement, which CI has neither).
+
+**End-to-end, on an M-series Mac (macOS 26.6.2) against a baked `golden-node`:**
+a `ferry-macos-vm` pod (via a host-targeted RuntimeClass — handler
+`ferry-macos-vm`, `nodeSelector ferry.dev/mode: vm-per-pod`) ran through the real
+kubelet → ferry-cri → `DarwinRuntime`: the image was fetched from the registry,
+the root assembled (OS base + layer), the entrypoint ran chrooted, and the pod
+**Succeeded (exit 0)** with its output in `kubectl logs`. Measured **~8–9s from
+`kubectl apply` to Succeeded**, against ~17–35s for the Machine path — no second
+Node, no in-guest kubelet.
+
+Four things the first live run shook out (all now fixed): `ImageService` must
+report a darwin image present with an id **and** a non-zero size (else the
+kubelet fails at `ImageInspectError`); the image is fetched by
+`user_specified_image`, not the digest the kubelet substitutes; the entrypoint
+runs directly under `chroot` (the agent applies `WORKDIR` as a chdir on the real
+FS before the chroot, so a shell wrapper fails); and the container run is awaited
+(a detached `Task` dropped the exec once `StartContainer` returned).
+
+Remaining refinements (none block a pod running): `kubectl logs` shows only the
+first line (the CRI log format needs a per-line timestamp prefix), `WORKDIR`,
+interactive streamed exec, and stats — plus increment 4's scheduling flip so the
+`ferry-macos-vm` class itself targets the host node.
 
 ## Reusable building blocks (with paths)
 

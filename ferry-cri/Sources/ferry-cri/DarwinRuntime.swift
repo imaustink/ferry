@@ -243,7 +243,12 @@ actor DarwinRuntime {
         }
 
         // Fetch the image host-side and assemble the container root in the guest.
-        let image = try await DarwinImageStore.fetch(c.config.image.image)
+        // The kubelet rewrites config.image.image to the id ImageStatus returned
+        // (a digest), so fetch by the reference as written in the pod spec, which
+        // CRI carries in user_specified_image.
+        let ref = c.config.image.userSpecifiedImage.isEmpty
+            ? c.config.image.image : c.config.image.userSpecifiedImage
+        let image = try await DarwinImageStore.fetch(ref)
         let root = "/private/var/ferry/pods/\(id)/root"
         try await assembleRoot(root, image: image, in: s.sandbox)
 
@@ -258,29 +263,31 @@ actor DarwinRuntime {
             let (k, v) = Self.splitEnv(e); if !k.isEmpty { env[k] = v }
         }
         for kv in c.config.envs { env[kv.key] = kv.value }
-        let cwd = c.config.workingDir.isEmpty
-            ? (image.workingDir.isEmpty ? nil : image.workingDir) : c.config.workingDir
-        let req = DarwinRunRequest(argv: argv, env: env.isEmpty ? nil : env, cwd: cwd, chroot: root)
+        // chroot into the image root and run the entrypoint directly -- the same
+        // shape proven to run a Darwin binary in the guest. The env carries the
+        // merged image and container environment. (WORKDIR is not applied yet:
+        // macOS chroot(8) has no chdir flag, and wrapping in a shell to `cd`
+        // first is the follow-up; the demo entrypoint is an absolute path.)
+        let runArgv = ["/usr/sbin/chroot", root] + argv
+        let req = DarwinRunRequest(argv: runArgv, env: env.isEmpty ? nil : env, cwd: nil, chroot: nil)
 
-        let sandbox = s.sandbox
-        // The run outlives this call: stream frames into the log, and record the
-        // exit back on the actor when the process ends.
-        Task { [weak self] in
-            let exit: Int32
-            do {
-                exit = try await sandbox.run(req) { kind, payload in
-                    guard let logFile else { return }
-                    switch kind {
-                    case .stdout: logFile.append(Data(payload), stream: .stdout, tag: "F")
-                    case .stderr, .error: logFile.append(Data(payload), stream: .stderr, tag: "F")
-                    case .exit: break
-                    }
-                }
-            } catch {
-                exit = -1
+        // Run the container and collect its output. Awaited here (the collecting
+        // exec proven by the root assembly and --runlocal); a long-running
+        // container would want this detached with the container reported
+        // "running" first, which is the streaming follow-up.
+        let exit: Int32
+        do {
+            let (code, out, err) = try await s.sandbox.exec(req)
+            if let logFile {
+                if !out.isEmpty { logFile.append(out, stream: .stdout, tag: "F") }
+                if !err.isEmpty { logFile.append(err, stream: .stderr, tag: "F") }
             }
-            await self?.finishContainer(id, exit: exit)
+            exit = code
+        } catch {
+            FileHandle.standardError.write("darwin \(id): run threw \(error)\n".data(using: .utf8)!)
+            exit = -1
         }
+        finishContainer(id, exit: exit)
     }
 
     /// Builds the container root in the guest: the baked OS base (dyld + the

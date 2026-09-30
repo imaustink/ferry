@@ -48,19 +48,31 @@ if args.first == "darwin-smoke" {
     var rest = Array(args.dropFirst(2))
     var chroot: String?
     if rest.first == "--chroot", rest.count >= 2 { chroot = rest[1]; rest = Array(rest.dropFirst(2)) }
-    let cmd = rest.isEmpty ? ["/usr/bin/sw_vers"] : rest
+    // --scriptfile <host path>: run the file's contents as /bin/sh in the guest,
+    // for debugging multi-step guest work without a complex host command line.
+    var cmd: [String]
+    if rest.first == "--scriptfile", rest.count >= 2 {
+        let script = (try? String(contentsOfFile: rest[1], encoding: .utf8)) ?? ""
+        cmd = ["/bin/sh", "-c", script]
+    } else {
+        cmd = rest.isEmpty ? ["/usr/bin/sw_vers"] : rest
+    }
     let work = URL(filePath: NSTemporaryDirectory()).appendingPathComponent("ferry-darwin-smoke-\(UUID().uuidString)")
     let sb = DarwinSandbox(id: "smoke", golden: URL(filePath: golden), workDir: work,
                            cpus: 4, memoryBytes: 4 << 30)
+    func ms(_ s: Date) -> String { String(format: "%.2fs", Date().timeIntervalSince(s)) }
     do {
+        let t0 = Date()
         FileHandle.standardError.write("==> cloning + booting \(golden)\n".data(using: .utf8)!)
         try await sb.boot()
-        FileHandle.standardError.write("==> agent answered; running: \(cmd.joined(separator: " "))\n".data(using: .utf8)!)
+        FileHandle.standardError.write("==> ready to run a container in \(ms(t0)) (clone + boot + agent)\n".data(using: .utf8)!)
+        let tExec = Date()
         let (code, out, err) = try await sb.exec(DarwinRunRequest(argv: cmd, chroot: chroot))
         FileHandle.standardOutput.write(out)
         if !err.isEmpty { FileHandle.standardError.write(err) }
-        FileHandle.standardError.write("==> exit \(code)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("==> command ran in \(ms(tExec)); exit \(code); total to result \(ms(t0))\n".data(using: .utf8)!)
         await sb.shutdown()
+        FileHandle.standardError.write("==> torn down; whole cycle \(ms(t0))\n".data(using: .utf8)!)
         exit(code == 0 ? 0 : 1)
     } catch {
         FileHandle.standardError.write("darwin-smoke failed: \(error)\n".data(using: .utf8)!)
@@ -212,7 +224,7 @@ let server = GRPCServer(
         FerryRuntimeService(runtime: runtime, version: runtimeVersion,
                             streamer: StreamerClient(socketPath: streamerControl),
                             darwin: darwinRuntime),
-        FerryImageService(runtime: runtime),
+        FerryImageService(runtime: runtime, darwin: darwinRuntime),
     ]
 )
 

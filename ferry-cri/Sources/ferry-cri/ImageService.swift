@@ -7,9 +7,39 @@ import GRPCCore
 
 struct FerryImageService: Runtime_V1_ImageService.SimpleServiceProtocol {
     let runtime: PodRuntime
+    /// The darwin runtime, so a macOS pod's image is recognised here. The
+    /// kubelet pulls/inspects an image through this service before the sandbox
+    /// runs, and does not say which OS it is for; a darwin image is not an ext4
+    /// Linux rootfs and is fetched by DarwinRuntime at StartContainer, so here it
+    /// only needs to be reported present (and "pulled" as a no-op).
+    let darwin: DarwinRuntime?
+
+    /// The darwin image's identity if the registry holds it as one, else nil.
+    private func darwinIdentity(_ reference: String) async -> DarwinImageStore.Identity? {
+        guard let darwin, await darwin.available else { return nil }
+        return await DarwinImageStore.resolveDarwin(reference)
+    }
+
+    /// An Image proto for a darwin image with the id and size the kubelet
+    /// requires (it rejects a status missing either with ImageInspectError).
+    private func darwinImage(_ reference: String, _ identity: DarwinImageStore.Identity) -> Runtime_V1_Image {
+        var image = Runtime_V1_Image()
+        image.id = identity.id
+        image.repoTags = [reference]
+        image.size = UInt64(identity.size)
+        return image
+    }
 
     func pullImage(request: Runtime_V1_PullImageRequest, context: ServerContext) async throws -> Runtime_V1_PullImageResponse {
         let reference = request.image.image
+        // A darwin image is served by the registry and fetched by DarwinRuntime
+        // when the container starts; there is nothing to unpack to an ext4 device
+        // here, so the pull is a no-op that just confirms the reference.
+        if await darwinIdentity(reference) != nil {
+            var response = Runtime_V1_PullImageResponse()
+            response.imageRef = reference
+            return response
+        }
         do {
             _ = try await runtime.pullImage(reference)
             var response = Runtime_V1_PullImageResponse()
@@ -26,6 +56,8 @@ struct FerryImageService: Runtime_V1_ImageService.SimpleServiceProtocol {
         var response = Runtime_V1_ImageStatusResponse()
         if let image = await runtime.imageStatus(request.image.image) {
             response.image = image
+        } else if let identity = await darwinIdentity(request.image.image) {
+            response.image = darwinImage(request.image.image, identity)
         }
         return response
     }
