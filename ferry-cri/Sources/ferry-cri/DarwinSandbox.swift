@@ -126,6 +126,9 @@ final class DarwinSandbox: @unchecked Sendable {
     let workDir: URL
     let cpus: Int
     let memoryBytes: UInt64
+    /// The pod's cluster NIC (en1 on the shared switch), when it has one. Added
+    /// to the VM config alongside the NAT NIC; the guest brings it up by MAC.
+    private let switchInterface: SwitchInterface?
 
     /// This guest's own serial queue -- Virtualization asserts every VM
     /// operation runs on the queue the VM was created with.
@@ -139,12 +142,14 @@ final class DarwinSandbox: @unchecked Sendable {
     private var connections: [VZVirtioSocketConnection] = []
     private var stopped = false
 
-    init(id: String, golden: URL, workDir: URL, cpus: Int, memoryBytes: UInt64) {
+    init(id: String, golden: URL, workDir: URL, cpus: Int, memoryBytes: UInt64,
+         switchInterface: SwitchInterface? = nil) {
         self.id = id
         self.golden = DarwinBundle(dir: golden)
         self.workDir = workDir
         self.cpus = max(1, cpus)
         self.memoryBytes = memoryBytes
+        self.switchInterface = switchInterface
         self.queue = DispatchQueue(label: "ferry.darwin.sandbox.\(id)")
     }
 
@@ -193,13 +198,16 @@ final class DarwinSandbox: @unchecked Sendable {
         let disk = try VZDiskImageStorageDeviceAttachment(url: b.disk, readOnly: false,
             cachingMode: .automatic, synchronizationMode: .full)
         c.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: disk)]
-        // NAT for now: outbound works, which is enough to prove the sandbox and
-        // to pull nothing (the image is already on the guest's disk). Cluster
-        // networking -- the pod switch, an address on ferry's machine network --
-        // is the follow-up in the design doc.
-        let nic = VZVirtioNetworkDeviceConfiguration()
-        nic.attachment = VZNATNetworkDeviceAttachment()
-        c.networkDevices = [nic]
+        // en0: NAT for the internet and the default route -- fast, free NAT and
+        // gateway, the same role vmnet plays for a Linux pod's eth0.
+        let nat = VZVirtioNetworkDeviceConfiguration()
+        nat.attachment = VZNATNetworkDeviceAttachment()
+        c.networkDevices = [nat]
+        // en1: the pod's cluster NIC on ferry's shared L2 switch, carrying its
+        // real cluster IP. The guest addresses it by the MAC we set here.
+        if let switchInterface {
+            c.networkDevices.append(try switchInterface.device())
+        }
         c.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         c.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         try c.validate()

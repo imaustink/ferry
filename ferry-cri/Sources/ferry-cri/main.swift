@@ -164,29 +164,6 @@ print("    state     \(config.stateDir.path())")
 print("    kernel    \(config.kernelPath)")
 print("    pod size  \(config.defaultCPUs) cpu, \(config.defaultMemoryBytes / 1024 / 1024) MiB")
 
-// The darwin side: macOS VM sandboxes on this host (docs/design/macos-cri-sandbox.md).
-// --mac-image is the golden bundle every sandbox is cloned from; without it,
-// ferry-macos-vm pods are unavailable and only Linux pods run.
-let macImage = option("--mac-image", "")
-let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
-    golden: macImage.isEmpty ? nil : macImage,
-    stateDir: config.stateDir,
-    // A macOS guest needs 4 GiB to install and touches all it is given; size a
-    // sandbox at a darwin-sane floor above the Linux pod default.
-    defaultCPUs: max(4, config.defaultCPUs),
-    defaultMemoryBytes: max(4 << 30, config.defaultMemoryBytes),
-    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2,
-    // The node's advertised address (host of --relay-endpoint, e.g. 192.168.1.29):
-    // a NAT'd macOS guest shares the host's network identity, and its sandbox must
-    // report an IP or the kubelet kills it. Falls back to --node-ip if given.
-    nodeIP: {
-        let explicit = option("--node-ip", "")
-        if !explicit.isEmpty { return explicit }
-        let endpoint = option("--relay-endpoint", "")
-        return endpoint.split(separator: ":").first.map(String.init) ?? ""
-    }()))
-if !macImage.isEmpty { print("    mac image \(macImage)") }
-
 let runtime = try PodRuntime(config: config)
 await runtime.setStreamer(StreamerClient(socketPath: streamerControl))
 do {
@@ -196,6 +173,34 @@ do {
     exit(1)
 }
 print("    network   \(await runtime.subnet), gateway \(await runtime.gateway)")
+
+// The darwin side: macOS VM sandboxes on this host (docs/design/macos-cri-sandbox.md).
+// --mac-image is the golden bundle every sandbox is cloned from; without it,
+// ferry-macos-vm pods are unavailable and only Linux pods run. Built after the
+// runtime is prepared so it can share the same pod-network fabric (the L2 switch
+// and cluster addressing), which is how a macOS pod reaches every other pod.
+let macImage = option("--mac-image", "")
+let darwinFabric = await runtime.darwinFabric()
+let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
+    golden: macImage.isEmpty ? nil : macImage,
+    stateDir: config.stateDir,
+    // A macOS guest needs 4 GiB to install and touches all it is given; size a
+    // sandbox at a darwin-sane floor above the Linux pod default.
+    defaultCPUs: max(4, config.defaultCPUs),
+    defaultMemoryBytes: max(4 << 30, config.defaultMemoryBytes),
+    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2,
+    // The node's advertised address (host of --relay-endpoint, e.g. 192.168.1.29):
+    // the fallback macOS pod IP when there is no fabric, so a sandbox still reports
+    // an address the kubelet accepts. Falls back to --node-ip if given.
+    nodeIP: {
+        let explicit = option("--node-ip", "")
+        if !explicit.isEmpty { return explicit }
+        let endpoint = option("--relay-endpoint", "")
+        return endpoint.split(separator: ":").first.map(String.init) ?? ""
+    }(),
+    fabric: darwinFabric))
+if !macImage.isEmpty { print("    mac image \(macImage)") }
+if let f = darwinFabric { print("    mac net   \(f.macSlice) on the pod switch") }
 
 // kubectl exec arrives over SPDY, which ferry-streamer terminates; it reaches
 // pods through this socket.

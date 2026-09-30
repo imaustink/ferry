@@ -22,6 +22,28 @@
 // lifecycle, compiled and driving the DarwinSandbox backend.
 
 import Foundation
+import Containerization
+import ContainerizationExtras
+@preconcurrency import Virtualization
+
+/// The shared pod-network fabric a macOS pod joins so it interoperates with
+/// Linux pods on one flat L2 segment: the same `PodSwitch` the Linux pods attach
+/// to, plus the cluster addressing. A macOS pod gets a second NIC on this switch
+/// carrying its real cluster IP (en1); its NAT NIC stays as en0 for egress.
+///
+/// The macOS pod's address comes from a **dedicated /24** (`macSlice`), distinct
+/// from this node's own vmnet /24, so that every other pod routes to it via the
+/// switch (its own /24 does not match, the cluster /16 does) rather than over
+/// vmnet -- where a macOS pod, which has no vmnet NIC, would be unreachable.
+struct DarwinFabric: Sendable {
+    let podSwitch: PodSwitch
+    /// The whole cluster network, e.g. 10.194.0.0/16.
+    let clusterCIDR: String
+    /// Its prefix length, e.g. 16 -- what a pod's switch NIC carries.
+    let clusterPrefix: Int
+    /// This Mac's macOS-pod slice as `nodeSlice` renders it, e.g. 10.194.255.1/24.
+    let macSlice: String
+}
 
 /// The OS-agnostic sandbox facts FerryRuntimeService needs to build a
 /// PodSandboxStatus / PodSandbox proto -- the same fields it reads off a Linux
@@ -91,15 +113,41 @@ actor DarwinRuntime {
         /// Apple's two-VM-per-Mac ceiling, re-homed from Karpenter. A third
         /// concurrent macOS sandbox is refused.
         var maxGuests: Int
-        /// This node's address, reported as a macOS pod's sandbox IP. The guest
-        /// is NAT'd behind the host with no routable address of its own, so its
-        /// network identity is the host's (as a host-network pod's is) -- and a
-        /// sandbox must report *some* IP or the kubelet takes it for broken and
-        /// kills it. Real pod-network addressing is future work (design doc).
+        /// This node's address, the fallback macOS pod sandbox IP when there is
+        /// no cluster fabric (no `--cluster-cidr`, or this node is off its slice):
+        /// the NAT'd guest then shares the host's network identity, and a sandbox
+        /// must still report *some* IP or the kubelet takes it for broken.
         var nodeIP: String
+        /// The shared pod network. When present, a macOS pod gets a real cluster
+        /// IP on the switch (en1) and interoperates with every other pod; when
+        /// nil, it falls back to `nodeIP` (host-network-like).
+        var fabric: DarwinFabric?
     }
 
     private let config: Config
+
+    /// Hands out this Mac's macOS-pod addresses from `fabric.macSlice`, starting
+    /// at `.2` (`.1` is kept as the Service-CIDR gateway the host proxy-ARPs).
+    /// At most `maxGuests` are ever live, so the pool is tiny.
+    private var macIPsInUse: Set<UInt8> = []
+    private func allocateMacIP() -> (ip: String, prefix: Int)? {
+        guard let fabric = config.fabric else { return nil }
+        // macSlice is "a.b.c.1/24"; hand out a.b.c.N for N in 2...254.
+        let head = fabric.macSlice.split(separator: "/").first.map(String.init) ?? ""
+        let octets = head.split(separator: ".")
+        guard octets.count == 4 else { return nil }
+        let base = "\(octets[0]).\(octets[1]).\(octets[2])"
+        for n: UInt8 in 2...254 where !macIPsInUse.contains(n) {
+            macIPsInUse.insert(n)
+            return ("\(base).\(n)", fabric.clusterPrefix)
+        }
+        return nil
+    }
+    private func freeMacIP(_ ip: String) {
+        if let last = ip.split(separator: ".").last, let n = UInt8(last) {
+            macIPsInUse.remove(n)
+        }
+    }
 
     private final class Sandbox {
         let info: DarwinSandboxInfo
@@ -107,10 +155,26 @@ actor DarwinRuntime {
         let logDirectory: String
         var containers: [String] = []
         var booted = false
-        init(info: DarwinSandboxInfo, sandbox: DarwinSandbox, logDirectory: String) {
+        /// The pod's port on the shared switch, when it has a cluster IP. Held so
+        /// teardown can detach it and free the address, and so the guest can be
+        /// told which NIC (by MAC) to bring up on which address.
+        let podIP: String?
+        let podMAC: String?
+        let podPrefix: Int
+        let switchInterface: SwitchInterface?
+        /// Set once the guest's cluster NIC has been configured, so a restart of
+        /// the container does not reconfigure it.
+        var networkConfigured = false
+        init(info: DarwinSandboxInfo, sandbox: DarwinSandbox, logDirectory: String,
+             podIP: String? = nil, podMAC: String? = nil, podPrefix: Int = 16,
+             switchInterface: SwitchInterface? = nil) {
             self.info = info
             self.sandbox = sandbox
             self.logDirectory = logDirectory
+            self.podIP = podIP
+            self.podMAC = podMAC
+            self.podPrefix = podPrefix
+            self.switchInterface = switchInterface
         }
     }
 
@@ -169,21 +233,45 @@ actor DarwinRuntime {
         }
         let id = nextID("darwin-sandbox")
         let workDir = config.stateDir.appendingPathComponent("darwin").appendingPathComponent(id)
+
+        // Cluster networking: a second NIC on the shared pod switch (en1)
+        // carrying a real cluster IP, so this pod interoperates with every other
+        // pod. Its NAT NIC stays as en0 for the internet/default route. When
+        // there is no fabric (no --cluster-cidr, or off-slice), fall back to the
+        // node's address -- the guest is then host-network-like, as before.
+        var podIP: String?
+        var podMAC: String?
+        var podPrefix = config.fabric?.clusterPrefix ?? 16
+        var switchIface: SwitchInterface?
+        if let fabric = config.fabric, let (ip, prefix) = allocateMacIP() {
+            if let mac = try? MACAddress(VZMACAddress.randomLocallyAdministered().string),
+               let cidr = try? CIDRv4("\(ip)/\(prefix)"),
+               let nic = try? SwitchInterface(address: cidr, mac: mac) {
+                podIP = ip
+                podMAC = mac.description
+                podPrefix = prefix
+                switchIface = nic
+                fabric.podSwitch.attach(podID: id, fd: nic.hostFD)
+            } else {
+                freeMacIP(ip)   // built no NIC; hand the address back
+            }
+        }
+
         let sandbox = DarwinSandbox(
             id: id, golden: URL(filePath: golden), workDir: workDir,
-            cpus: config.defaultCPUs, memoryBytes: config.defaultMemoryBytes)
+            cpus: config.defaultCPUs, memoryBytes: config.defaultMemoryBytes,
+            switchInterface: switchIface)
         let info = DarwinSandboxInfo(
             id: id, name: cfg.metadata.name, uid: cfg.metadata.uid,
             namespace: cfg.metadata.namespace, attempt: cfg.metadata.attempt,
             labels: cfg.labels, annotations: cfg.annotations,
-            // The node's own address: the guest is NAT'd behind the host with no
-            // routable address of its own, so it shares the host's identity (as a
-            // host-network pod does). A sandbox must report an IP or the kubelet
-            // takes it for broken and kills it -- which is why a long-running
-            // macOS pod was torn down seconds in. Real pod networking is future
-            // work (docs/design/macos-cri-sandbox.md).
-            ip: config.nodeIP, createdAt: Self.now(), ready: true)
-        sandboxes[id] = Sandbox(info: info, sandbox: sandbox, logDirectory: cfg.logDirectory)
+            // The pod's real cluster IP when it is on the switch; otherwise the
+            // node's own address (host-network-like). A sandbox must report an IP
+            // or the kubelet takes it for broken and kills it.
+            ip: podIP ?? config.nodeIP, createdAt: Self.now(), ready: true)
+        sandboxes[id] = Sandbox(info: info, sandbox: sandbox, logDirectory: cfg.logDirectory,
+                                podIP: podIP, podMAC: podMAC, podPrefix: podPrefix,
+                                switchInterface: switchIface)
         return id
     }
 
@@ -210,8 +298,18 @@ actor DarwinRuntime {
     func removePodSandbox(_ id: String) async throws {
         guard let s = sandboxes[id] else { return }
         if s.booted { await s.sandbox.shutdown() }
+        releaseNetwork(s)
         for cid in s.containers { containers.removeValue(forKey: cid) }
         sandboxes.removeValue(forKey: id)
+    }
+
+    /// Detaches the pod's switch port, closes the guest end of its socketpair,
+    /// and frees its address. Safe to call for a sandbox that never got a NIC.
+    private func releaseNetwork(_ s: Sandbox) {
+        guard s.switchInterface != nil else { return }
+        config.fabric?.podSwitch.detach(podID: s.info.id)
+        s.switchInterface?.closeGuestSide()
+        if let ip = s.podIP { freeMacIP(ip) }
     }
 
     // MARK: container lifecycle
@@ -253,6 +351,17 @@ actor DarwinRuntime {
         if !s.booted {
             try await s.sandbox.boot()
             s.booted = true
+        }
+
+        // Bring the pod's cluster NIC up in the guest, once per boot. macOS has
+        // no vminitd to apply the interface config from the VM definition, so the
+        // root agent does it: find the card by the MAC we assigned it, give it the
+        // pod's address with the cluster prefix, and route the cluster network out
+        // it (the NAT NIC keeps the default route for the internet).
+        if !s.networkConfigured, let ip = s.podIP, let mac = s.podMAC,
+           let cidr = config.fabric?.clusterCIDR {
+            await configureGuestNetwork(s, ip: ip, mac: mac, prefix: s.podPrefix, clusterCIDR: cidr)
+            s.networkConfigured = true
         }
 
         // Fetch the image host-side and assemble the container root in the guest.
@@ -319,6 +428,40 @@ actor DarwinRuntime {
             try? outW?.close()
             try? errW?.close()
             await self?.finishContainer(id, exit: exit)
+        }
+    }
+
+    /// Brings the pod's cluster NIC up inside the guest over the root agent.
+    /// Finds the card by the MAC we gave it (macOS does not name cards in attach
+    /// order), assigns the pod address with the cluster prefix -- which installs a
+    /// connected route for the whole cluster network out that card -- and leaves
+    /// the NAT NIC's default route in place for the internet.
+    private func configureGuestNetwork(_ s: Sandbox, ip: String, mac: String,
+                                       prefix: Int, clusterCIDR: String) async {
+        let bits = min(max(prefix, 0), 32)
+        let maskValue: UInt32 = bits == 0 ? 0 : (0xFFFF_FFFF << (32 - bits)) & 0xFFFF_FFFF
+        let maskHex = String(format: "0x%08x", maskValue)
+        let want = mac.lowercased()
+        let script = """
+        want=\(want)
+        dev=""
+        for _ in $(seq 100); do
+          for i in $(ifconfig -l); do
+            if ifconfig "$i" 2>/dev/null | awk -v w="$want" '$1=="ether" && tolower($2)==w{f=1} END{exit !f}'; then dev="$i"; break; fi
+          done
+          [ -n "$dev" ] && break
+          sleep 0.1
+        done
+        [ -n "$dev" ] || { echo "no NIC with MAC $want (have: $(ifconfig -l))" >&2; exit 1; }
+        ifconfig "$dev" inet \(ip) netmask \(maskHex) up || exit 1
+        route -q -n add -net \(clusterCIDR) -interface "$dev" 2>/dev/null || true
+        echo "cluster NIC $dev = \(ip)/\(bits)"
+        """
+        let r = try? await s.sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script]))
+        if let r, r.exit != 0 {
+            FileHandle.standardError.write(
+                "darwin \(s.info.id): cluster NIC setup failed (exit \(r.exit)): \(Self.text(r.stderr))\n"
+                    .data(using: .utf8)!)
         }
     }
 
