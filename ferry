@@ -1364,10 +1364,19 @@ cmd_mac_image_status() {
   echo "  source     $src"
   echo "  macOS      ${ver:-unknown}"
   echo "  shared     $([ "$(resolve_mac_shared)" = 1 ] && echo "on (ferry-macos-shared)" || echo "off (ferry-macos-vm only)")"
-  if running ferry-machined; then
+  if ! running ferry-machined; then
+    echo "  machined   off -- run 'ferry machines enable' so macOS pods can schedule"
+  elif kube get nodepool macos-vm >/dev/null 2>&1; then
     echo "  machined   running (macOS pods can schedule)"
   else
-    echo "  machined   off -- run 'ferry machines enable' so macOS pods can schedule"
+    # machined reads --mac-image only at launch, so a bake done while it is
+    # already up leaves this image cached but unused. The macos-vm NodePool is
+    # installed by start_machines only when an image resolved then, so its
+    # absence is the proof machined is not using the image -- and reporting pods
+    # schedulable here would be the silent-Pending green this command exists to
+    # expose. Say so, and how to fix it.
+    echo "  machined   running, but started without this image -- restart to pick"
+    echo "             it up: ferry machines disable && ferry machines enable"
   fi
 }
 
@@ -6146,10 +6155,16 @@ cmd_status() {
     done
     # macOS pods run on machines, so their image only matters once machines are on.
     local mac_img; mac_img="$(resolve_mac_image)"
-    if [ -n "$mac_img" ]; then
-      echo "  macOS      image ready (macOS $(resolve_mac_image_version 2>/dev/null || echo '?'), $([ "$(resolve_mac_shared)" = 1 ] && echo shared+vm || echo vm)) -- 'ferry mac-image status'"
-    else
+    if [ -z "$mac_img" ]; then
       echo "  macOS      no image -- macOS pods stay Pending; 'ferry machines enable --mac-image' to bake one"
+    elif running ferry-machined && ! kube get nodepool macos-vm >/dev/null 2>&1; then
+      # An image is cached, but machined came up without it (baked while it was
+      # already running) -- the macos-vm NodePool start_machines would have
+      # installed is absent, so macOS pods still stay Pending. Do not call it
+      # ready: that is the silent-Pending this PR set out to remove.
+      echo "  macOS      image baked but not in use -- restart machines to pick it up; 'ferry mac-image status'"
+    else
+      echo "  macOS      image ready (macOS $(resolve_mac_image_version 2>/dev/null || echo '?'), $([ "$(resolve_mac_shared)" = 1 ] && echo shared+vm || echo vm)) -- 'ferry mac-image status'"
     fi
   fi
   if machine_registry_enabled; then

@@ -733,5 +733,24 @@ contains "ferry-machined refuses a shared macOS machine by default" \
 contains "and FERRY_MAC_SHARED is documented" "$(cat "$repo/docs/INSTALL.md")" "FERRY_MAC_SHARED"
 echo
 
+printf '\033[1m%s\033[0m\n' "status does not call macOS pods schedulable off a bare running machined"
+# machined reads --mac-image only at launch, so a bake done while it is already
+# up leaves the image cached but unused. The macos-vm NodePool that start_machines
+# installs only when an image resolved is the proof it is in use, so both status
+# views cross-check it rather than reporting green off 'running ferry-machined'
+# alone -- otherwise the bake-while-running flow shows a misleading green while
+# macOS pods stay Pending, the silent failure this change set out to remove.
+mac_status_block="$(sed -n '/^cmd_mac_image_status()/,/^}/p' "$repo/ferry")"
+contains "mac-image status gates the schedulable claim on the macos-vm NodePool" \
+  "$mac_status_block" 'kube get nodepool macos-vm'
+contains "and tells the user to restart machines to pick up a later bake" \
+  "$mac_status_block" 'ferry machines disable && ferry machines enable'
+status_block="$(sed -n '/^cmd_status()/,/^}/p' "$repo/ferry")"
+contains "ferry status flags a baked-but-not-in-use image the same way" \
+  "$status_block" 'image baked but not in use'
+contains "ferry status cross-checks the macos-vm NodePool too" \
+  "$status_block" 'kube get nodepool macos-vm'
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]
