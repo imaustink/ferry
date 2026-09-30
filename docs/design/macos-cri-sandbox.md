@@ -133,16 +133,38 @@ Mac's taint. The handler stays `ferry-darwin`'s successor served by `ferry-cri`.
    two-VM ceiling is enforced here (`maxGuests`). Compiles + unit-tested
    (`DarwinRuntimeTests`, non-booting paths); a real boot needs Mac hardware.
 
-   Still open within this seam, both needing a golden image to develop against:
-   **the container root** (a `FROM macos` image's files plus the guest's baked OS
-   base assembled under a `chroot` — today the command runs against the guest's
-   own filesystem), and **exec/stats parity** (exec into a macOS pod currently
-   errors clearly rather than running).
+   The container root and probes are now closed (see below); what is left in the
+   seam is **interactive streamed exec** (`kubectl exec -it`) and **stats**, both
+   noted at the end.
 4. **Flip scheduling + remove the Machine path.** Repoint the RuntimeClass to the
    host node (mirror `ferry-vm`'s `ferry.dev/mode: vm-per-pod`), advertise
    `ferry.dev/macos-guest`, and delete the darwin code in ferry-karpenter and
    ferry-machined and the `macos-vm` NodePool. Do this only once increment 3 runs
    on hardware, so macOS pods never regress.
+
+## Container root and exec (closed)
+
+- **Image → guest root (`DarwinImageStore.swift`).** ferry-cri runs on the host
+  and already knows this Mac's registry (`--image-mirror`, the ferry-registry a
+  machine node pulls from), so it fetches a `FROM macos` image's config and
+  single layer over that registry's HTTP API host-side — no guest networking. On
+  the first `StartContainer` the guest root is assembled: the baked OS base
+  (`/private/var/ferry/darwin/os`, from `ferry-darwin -prepare`) is cloned in and
+  the image layer is unpacked over it, so the workload's files have an OS to link
+  against. The layer moves in over the agent as appended base64 chunks (the agent
+  runs argv and reads no stdin, the same channel `ferry image build`'s COPY uses;
+  BSD `tar` in the guest auto-detects gzip). The entrypoint then runs `chroot`ed
+  into that root, with the image's and container's env and working directory
+  merged the way CRI specifies.
+- **Probes (`ExecSync`).** A liveness/readiness exec probe runs its command in
+  the guest over the agent, `chroot`ed into the container root, and returns its
+  output and exit status.
+
+Still open (both need a real Mac to develop against, neither blocks a pod
+running): **interactive streamed exec** (`kubectl exec -it`) needs the
+SPDY/`ExecServer` path bridged onto the agent; and **stats** need guest-side
+measurement (there are no cgroups), so `kubectl top` for a macOS pod reports
+nothing for now.
 
 ## Reusable building blocks (with paths)
 

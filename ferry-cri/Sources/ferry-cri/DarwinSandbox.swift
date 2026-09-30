@@ -310,6 +310,57 @@ final class DarwinSandbox: @unchecked Sendable {
         }
     }
 
+    /// A thread-safe byte accumulator for collecting a command's output; the run
+    /// reader thread appends to it, the awaiting caller reads it once run returns.
+    private final class Accum: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes: [UInt8] = []
+        func append(_ b: [UInt8]) { lock.lock(); bytes.append(contentsOf: b); lock.unlock() }
+        var data: Data { lock.lock(); defer { lock.unlock() }; return Data(bytes) }
+    }
+
+    /// Run a command and collect its whole stdout/stderr and exit status -- for
+    /// assembling the container root, moving files in, and exec probes, where the
+    /// output is wanted in one piece rather than streamed.
+    func exec(_ req: DarwinRunRequest) async throws -> (exit: Int32, stdout: Data, stderr: Data) {
+        let out = Accum(), err = Accum()
+        let code = try await run(req) { kind, payload in
+            switch kind {
+            case .stdout: out.append(payload)
+            case .stderr, .error: err.append(payload)
+            case .exit: break
+            }
+        }
+        return (code, out.data, err.data)
+    }
+
+    /// Move `data` into the guest as base64 text at `path`, appended in chunks --
+    /// the agent runs argv only and reads no stdin, so bytes travel this way (the
+    /// same channel `ferry image build`'s COPY uses). The caller decodes it in
+    /// the guest (`base64 -D < path | tar ...`). Chunks are plain base64 text, so
+    /// there is no 4-byte-alignment constraint: the file is decoded whole.
+    func uploadBase64(_ data: Data, toGuestPath path: String, chunkSize: Int = 128 * 1024) async throws {
+        let b64 = data.base64EncodedString()
+        let (c0, _, e0) = try await exec(DarwinRunRequest(
+            argv: ["/bin/sh", "-c", "mkdir -p \"$(dirname \"$0\")\"; : > \"$0\"", path]))
+        guard c0 == 0 else {
+            throw NSError(domain: "ferry.darwin", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "preparing \(path): \(String(data: e0, encoding: .utf8) ?? "")"])
+        }
+        var i = b64.startIndex
+        while i < b64.endIndex {
+            let j = b64.index(i, offsetBy: chunkSize, limitedBy: b64.endIndex) ?? b64.endIndex
+            let piece = String(b64[i ..< j])
+            let (c, _, e) = try await exec(DarwinRunRequest(
+                argv: ["/bin/sh", "-c", "printf %s \"$1\" >> \"$0\"", path, piece]))
+            guard c == 0 else {
+                throw NSError(domain: "ferry.darwin", code: 11,
+                    userInfo: [NSLocalizedDescriptionKey: "uploading to \(path): \(String(data: e, encoding: .utf8) ?? "")"])
+            }
+            i = j
+        }
+    }
+
     /// Ask the guest to halt, force it after a grace period, then delete the
     /// clone. Safe to call more than once.
     func shutdown() async {

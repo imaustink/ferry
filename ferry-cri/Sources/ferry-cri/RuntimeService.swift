@@ -593,11 +593,17 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// A command that outlives the timeout is killed and reported as a
     /// DeadlineExceeded, which the kubelet counts as the probe timing out.
     func execSync(request: Runtime_V1_ExecSyncRequest, context: ServerContext) async throws -> Runtime_V1_ExecSyncResponse {
-        // Exec into a darwin sandbox would run over the guest agent's vsock
-        // channel; the agent grows that in a later increment (design doc). Until
-        // then a probe against a macOS pod errors clearly rather than silently.
+        // A darwin pod runs its exec (liveness/readiness probes) in the guest
+        // over the agent, chrooted into the container's root.
         if let darwin, await darwin.hasContainer(request.containerID) {
-            throw unimplemented("exec into a macOS pod")
+            do {
+                let result = try await darwin.execSync(request.containerID, cmd: request.cmd)
+                var response = Runtime_V1_ExecSyncResponse()
+                response.stdout = result.stdout
+                response.stderr = result.stderr
+                response.exitCode = result.exit
+                return response
+            } catch { throw failed(error) }
         }
         let stdout = CollectingWriter(), stderr = CollectingWriter()
         let process: LinuxProcess
@@ -637,7 +643,10 @@ struct FerryRuntimeService: Runtime_V1_RuntimeService.SimpleServiceProtocol {
     /// it contains is issued by the streaming server's own request cache.
     func exec(request: Runtime_V1_ExecRequest, context: ServerContext) async throws -> Runtime_V1_ExecResponse {
         if let darwin, await darwin.hasContainer(request.containerID) {
-            throw unimplemented("exec into a macOS pod")
+            // Probes (ExecSync) run in the guest already; interactive streamed
+            // exec needs the SPDY/ExecServer bridge onto the agent, which is the
+            // remaining darwin exec work (docs/design/macos-cri-sandbox.md).
+            throw unimplemented("interactive exec into a macOS pod (probes work)")
         }
         do {
             let url = try streamer.url(path: "/exec", body: [

@@ -112,6 +112,9 @@ actor DarwinRuntime {
         var info: DarwinContainerInfo
         let config: Runtime_V1_ContainerConfig
         var log: ContainerLogFile?
+        /// Where the container's root was assembled in the guest (OS base + the
+        /// image layer); an exec chroots into it. Set once the container starts.
+        var rootPath: String?
         init(info: DarwinContainerInfo, config: Runtime_V1_ContainerConfig) {
             self.info = info
             self.config = config
@@ -224,10 +227,11 @@ actor DarwinRuntime {
 
     func listContainers() -> [DarwinContainerInfo] { containers.values.map(\.info) }
 
-    /// Boot the sandbox if needed, then run the container's command in the guest,
-    /// streaming its output to the container log and recording its exit. Returns
-    /// once the container has started (the run continues in the background), the
-    /// way the Linux path starts a container and reaps it asynchronously.
+    /// Boot the sandbox if needed, assemble the container's root in the guest
+    /// (the baked OS base plus the image layer), then run the entrypoint chrooted
+    /// into it, streaming output to the container log and recording its exit.
+    /// Returns once the container has started; the run continues in the
+    /// background, the way the Linux path reaps a container asynchronously.
     func startContainer(_ id: String) async throws {
         guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
         guard let s = sandboxes[c.info.sandboxID] else {
@@ -238,11 +242,26 @@ actor DarwinRuntime {
             s.booted = true
         }
 
+        // Fetch the image host-side and assemble the container root in the guest.
+        let image = try await DarwinImageStore.fetch(c.config.image.image)
+        let root = "/private/var/ferry/pods/\(id)/root"
+        try await assembleRoot(root, image: image, in: s.sandbox)
+
         let logFile = c.info.logPath.isEmpty ? nil : try? ContainerLogFile(path: c.info.logPath)
         c.log = logFile
+        c.rootPath = root
         c.info = c.info.started(at: Self.now())
 
-        let req = Self.runRequest(for: c.config)
+        let argv = DarwinImageStore.resolvedCommand(image: image, command: c.config.command, args: c.config.args)
+        var env: [String: String] = [:]
+        for e in image.env {
+            let (k, v) = Self.splitEnv(e); if !k.isEmpty { env[k] = v }
+        }
+        for kv in c.config.envs { env[kv.key] = kv.value }
+        let cwd = c.config.workingDir.isEmpty
+            ? (image.workingDir.isEmpty ? nil : image.workingDir) : c.config.workingDir
+        let req = DarwinRunRequest(argv: argv, env: env.isEmpty ? nil : env, cwd: cwd, chroot: root)
+
         let sandbox = s.sandbox
         // The run outlives this call: stream frames into the log, and record the
         // exit back on the actor when the process ends.
@@ -264,10 +283,62 @@ actor DarwinRuntime {
         }
     }
 
+    /// Builds the container root in the guest: the baked OS base (dyld + the
+    /// shared cache + /bin etc., from `ferry-darwin -prepare` at bake time)
+    /// cloned in, then the image layer unpacked over it -- so a `FROM macos`
+    /// image, which ships only the workload's own files, has an OS to link
+    /// against. The command later runs `chroot`ed here.
+    private func assembleRoot(_ root: String, image: DarwinImage, in sandbox: DarwinSandbox) async throws {
+        let osBase = "/private/var/ferry/darwin/os"
+        let assemble = """
+        set -e
+        R="$0"
+        rm -rf "$R"; mkdir -p "$R"
+        if [ -d "\(osBase)" ]; then
+            cp -cR "\(osBase)/." "$R/" 2>/dev/null || cp -R "\(osBase)/." "$R/"
+        fi
+        mkdir -p "$R/dev" "$R/tmp" "$R/private/tmp" "$R/var/tmp"
+        """
+        let (ac, _, ae) = try await sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", assemble, root]))
+        guard ac == 0 else {
+            throw DarwinRuntimeError.invalid("assembling the container root: \(Self.text(ae))")
+        }
+        let b64 = "\(root).layer.b64"
+        try await sandbox.uploadBase64(image.layer, toGuestPath: b64)
+        // BSD tar auto-detects gzip, so the layer is unpacked as served.
+        let untar = "set -e; base64 -D < \"$1\" | tar xf - -C \"$0\"; rm -f \"$1\""
+        let (tc, _, te) = try await sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", untar, root, b64]))
+        guard tc == 0 else {
+            throw DarwinRuntimeError.invalid("unpacking the image layer: \(Self.text(te))")
+        }
+    }
+
+    /// A probe (ExecSync): run a command chrooted into the container's root and
+    /// collect its output and exit status. This is what liveness and readiness
+    /// exec probes use. Interactive `kubectl exec` (streamed over SPDY) is not
+    /// wired for darwin yet -- see docs/design/macos-cri-sandbox.md.
+    func execSync(_ id: String, cmd: [String]) async throws -> (stdout: Data, stderr: Data, exit: Int32) {
+        guard let c = containers[id] else { throw DarwinRuntimeError.notFound("no darwin container \(id)") }
+        guard let root = c.rootPath, let s = sandboxes[c.info.sandboxID], s.booted else {
+            throw DarwinRuntimeError.invalid("darwin container \(id) is not running")
+        }
+        let (code, out, err) = try await s.sandbox.exec(DarwinRunRequest(argv: cmd, chroot: root))
+        return (out, err, code)
+    }
+
     /// Records a container's exit; called from the background run task.
     private func finishContainer(_ id: String, exit: Int32) {
         guard let c = containers[id] else { return }
         c.info = c.info.exited(code: exit, reason: exit == 0 ? "Completed" : "Error", at: Self.now())
+    }
+
+    private static func splitEnv(_ s: String) -> (String, String) {
+        guard let i = s.firstIndex(of: "=") else { return (s, "") }
+        return (String(s[..<i]), String(s[s.index(after: i)...]))
+    }
+
+    private static func text(_ d: Data) -> String {
+        String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     func stopContainer(_ id: String, timeout: Int64) async throws {
@@ -289,21 +360,6 @@ actor DarwinRuntime {
         containers.removeValue(forKey: id)
     }
 
-    /// Builds the guest exec request from a CRI container config. The command is
-    /// the image's entrypoint/cmd as the kubelet resolved it (command + args),
-    /// with the container's environment and working directory.
-    ///
-    /// NB: no `chroot` yet -- assembling the image's files plus the guest OS base
-    /// into a root is the remaining guest-side step (design doc). Until then the
-    /// command runs against the guest's own filesystem.
-    private static func runRequest(for cfg: Runtime_V1_ContainerConfig) -> DarwinRunRequest {
-        var argv = cfg.command + cfg.args
-        if argv.isEmpty { argv = ["/usr/bin/true"] }
-        var env: [String: String] = [:]
-        for kv in cfg.envs { env[kv.key] = kv.value }
-        let cwd = cfg.workingDir.isEmpty ? nil : cfg.workingDir
-        return DarwinRunRequest(argv: argv, env: env.isEmpty ? nil : env, cwd: cwd)
-    }
 }
 
 // MARK: - info transitions
