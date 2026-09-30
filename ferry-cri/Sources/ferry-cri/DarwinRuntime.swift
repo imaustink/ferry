@@ -405,6 +405,8 @@ actor DarwinRuntime {
         if !s.networkConfigured, let ip = s.podIP, let mac = s.podMAC,
            let cidr = config.fabric?.clusterCIDR {
             await configureGuestNetwork(s, ip: ip, mac: mac, prefix: s.podPrefix, clusterCIDR: cidr)
+            // Seed this pod's NetworkPolicy (ingress) from the current document.
+            await applyNetpol(s, podIP: ip)
             s.networkConfigured = true
         }
 
@@ -665,6 +667,54 @@ actor DarwinRuntime {
         let table = parseKubeProxyRuleset(rulesetText)
         serviceTable = table
         for s in sandboxes.values { s.nat?.update(table) }
+    }
+
+    /// The current ferry-netpol document (all pods' sections). Kept so a booting
+    /// pod is seeded with its NetworkPolicy and every live pod tracks changes.
+    private var netpolDocument: String = ""
+
+    /// Enforce NetworkPolicy (ingress) on every macOS pod from ferry-netpol's
+    /// rendered document -- the same text ferry-cri loads into the Linux pods.
+    /// Each pod's `## <address>` section's ingress is translated to pf and loaded
+    /// in the guest (MacNetpol); egress stays open (see MacNetpol).
+    func applyPolicies(_ document: String) async {
+        netpolDocument = document
+        for s in sandboxes.values where s.booted {
+            if let ip = s.podIP { await applyNetpol(s, podIP: ip) }
+        }
+    }
+
+    /// The ferry-netpol section (`## <address>` ... until the next `## `) for one
+    /// address, from the current document.
+    private func netpolSection(_ address: String) -> String {
+        var body = "", inSection = false
+        for line in netpolDocument.split(whereSeparator: \.isNewline) {
+            if line.hasPrefix("## ") {
+                if inSection { break }
+                inSection = line.dropFirst(3).trimmingCharacters(in: .whitespaces) == address
+            } else if inSection {
+                body += line + "\n"
+            }
+        }
+        return body
+    }
+
+    /// Translate this pod's ingress section to pf and load it in the guest; when
+    /// there is no ingress policy, disable pf (open).
+    private func applyNetpol(_ s: Sandbox, podIP: String) async {
+        guard let cidr = config.fabric?.clusterCIDR else { return }
+        let script: String
+        if let ruleset = MacNetpol.ingressRuleset(section: netpolSection(podIP),
+                                                  podIP: podIP, clusterCIDR: cidr) {
+            script = """
+            cat > /tmp/ferry-netpol.pf <<'PFEOF'
+            \(ruleset)PFEOF
+            pfctl -f /tmp/ferry-netpol.pf 2>/dev/null && { pfctl -E 2>/dev/null || pfctl -e 2>/dev/null; } || true
+            """
+        } else {
+            script = "pfctl -d 2>/dev/null || true"
+        }
+        _ = try? await s.sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script]))
     }
 
     /// The ids of running darwin containers, for a stats listing.

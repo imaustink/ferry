@@ -295,8 +295,11 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
                     try? await Task.sleep(for: .seconds(3))
                     continue
                 }
-                await runtime.applyPolicies(
-                    String(data: next.body, encoding: .utf8) ?? "", generation: next.generation)
+                let doc = String(data: next.body, encoding: .utf8) ?? ""
+                await runtime.applyPolicies(doc, generation: next.generation)
+                // The macOS pods can't load the nft policy (no Linux kernel);
+                // ferry-cri translates each one's ingress section to pf in-guest.
+                await darwinRuntime.applyPolicies(doc)
             }
         }
     }
