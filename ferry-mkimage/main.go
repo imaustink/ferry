@@ -8,7 +8,9 @@
 // A darwin image holds only the workload's own files. The OS it links against
 // -- dyld and the shared cache -- comes from the node, because Apple's signed
 // binaries are trusted where the OS put them and killed anywhere else. So a
-// darwin image is FROM scratch plus COPY: there is no base to run.
+// darwin image is FROM macos plus COPY: the node is the base, nothing to run.
+// An optional tag, FROM macos:26, pins the macOS major the image expects; with
+// -node-macos set, a mismatch fails the build before any builder VM boots.
 //
 // There can still be a RUN, though: not run here (this is a plain Go binary;
 // still no Darwin to run a Darwin binary on), but in a macOS VM cloned from
@@ -35,6 +37,7 @@ func main() {
 	context := flag.String("context", ".", "build context the Dockerfile's COPY reads from")
 	golden := flag.String("golden", "", "a macOS VM bundle RUN executes in, e.g. $FERRY_MAC_IMAGE (only needed if the Dockerfile has RUN)")
 	macvmPath := flag.String("macvm", "", "path to the ferry-macvm binary (only needed if the Dockerfile has RUN)")
+	nodeMacOS := flag.Int("node-macos", 0, "macOS major of the golden image, to check a `FROM macos:<major>` pin (0 = unknown, skip)")
 	flag.Parse()
 
 	if *name == "" || *out == "" || (*dir == "" && *dockerfile == "") {
@@ -50,7 +53,7 @@ func main() {
 		img.RootFS = *dir
 		img.Entrypoint = fields(*entrypoint)
 	} else {
-		bc := builderConfig{golden: *golden, macvmPath: *macvmPath}
+		bc := builderConfig{golden: *golden, macvmPath: *macvmPath, nodeMacOS: *nodeMacOS}
 		if err := buildFromDockerfile(img, *dockerfile, *context, bc); err != nil {
 			log.Fatalf("%s: %v", *dockerfile, err)
 		}

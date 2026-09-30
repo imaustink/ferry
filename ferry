@@ -560,6 +560,11 @@ machine_registry_enabled() { [ "$MACHINE_REGISTRY" = 1 ]; }
 # What ferry-cri is told to ask first, so every node on this Mac finds what was
 # loaded on any of them, or on another Mac.
 image_mirror_flag() { machine_registry_enabled && echo "--image-mirror 127.0.0.1:$MACHINE_REGISTRY_PORT"; }
+
+# The golden macOS bundle ferry-cri clones a ferry-macos-vm pod's VM sandbox
+# from, when one is available (docs/design/macos-cri-sandbox.md). Empty
+# otherwise, so ferry-cri runs Linux pods only.
+mac_image_flag() { local i; i="$(resolve_mac_image)"; [ -n "$i" ] && echo "--mac-image $i"; }
 # What the Mac will commit to machines in total.
 #
 # A quarter of memory and half the cores by default. The provisioner will spend
@@ -671,11 +676,13 @@ Machines -- mode 2, where the node is the VM and pods share its kernel:
   ferry machines disable  stop it; Machines and the CRD are left alone
   ferry machines ls       the machines in this cluster
 
-macOS pods -- native Darwin processes, in a VM of their own or a shared kernel:
+macOS pods -- native Darwin processes, each in a macOS VM of its own:
   ferry mac-image bake     build this Mac's golden macOS image (slow, needs a
                           checkout; downloads macOS from Apple, not carried by
-                          ferry). --shared also prepares ferry-macos-shared
-                          (one manual step). See docs/RUNTIMES.md#macos-pods
+                          ferry). See docs/RUNTIMES.md#macos-pods
+  ferry mac-image status   whether a golden image is cached, which macOS, in use
+  ferry up --mac-image     bake the image if none is cached, then run macOS pods
+                          on this node (they need no machines)
 
 Upgrades:
   ferry upgrade status          what is running, what is built, what can roll back
@@ -1056,16 +1063,16 @@ cmd_build() {
   echo "==> $here/bin/ferry-registry"
   echo
   # The darwin image packager `ferry image build --os darwin` runs. A darwin
-  # image is FROM scratch plus COPY -- no base to run -- so buildkit, which
-  # executes build steps on a Linux worker, is the wrong tool; this writes the
-  # OCI layout directly. Standard library only.
+  # image is FROM macos plus COPY -- the node is the base, nothing to run -- so
+  # buildkit, which executes build steps on a Linux worker, is the wrong tool;
+  # this writes the OCI layout directly. Standard library only.
   echo "==> ferry-mkimage"
   ( cd "$here/ferry-mkimage" && go build -o "$here/bin/ferry-mkimage" . ) || return 1
   echo "==> $here/bin/ferry-mkimage"
   echo
   # What RUN runs in, when a darwin Dockerfile has one: ferry-mkimage cannot
   # execute a Darwin binary itself (still no Darwin to run one on), so it
-  # spawns this as a coprocess -- a macOS VM cloned from FERRY_MAC_IMAGE, one
+  # spawns this as a coprocess -- a macOS VM cloned from the golden image, one
   # exec request per COPY or RUN. See docs/RUNTIMES.md#building-the-image.
   echo "==> ferry-macvm"
   ( cd "$here/ferry-macvm" && ./build.sh ) || return 1
@@ -1130,7 +1137,48 @@ cmd_node_image() {
   echo "  turn mode 2 on with: ferry machines enable"
 }
 
-# The macOS golden image a 'ferry-macos-vm' or 'ferry-macos-shared' pod needs
+# Where the golden macOS image lives, and how ferry finds it without an env var.
+#
+# FERRY_MAC_IMAGE used to be the only way anything -- ferry-machined, the NodePool
+# gate, a darwin `RUN` build -- learned where the golden bundle was, so it had to
+# be exported in the same shell as `ferry up`/`machines enable`. Forget it (a new
+# shell, a reboot, a LaunchAgent's bare environment) and macOS pods stayed Pending
+# with no error. Now `ferry mac-image bake` writes the bundle to a known place and
+# records its facts beside it, and these resolvers read from there; the env var
+# stays only as an override for a bundle kept elsewhere.
+MAC_IMAGE_DIR="$FERRY_HOME/mac-image"
+MAC_IMAGE_DEFAULT="$MAC_IMAGE_DIR/golden-node"
+
+# resolve_mac_image prints the golden bundle to use, or nothing: FERRY_MAC_IMAGE
+# if set, else the baked default when it is present.
+resolve_mac_image() {
+  if [ -n "${FERRY_MAC_IMAGE:-}" ]; then printf '%s\n' "$FERRY_MAC_IMAGE"; return; fi
+  [ -d "$MAC_IMAGE_DEFAULT" ] && printf '%s\n' "$MAC_IMAGE_DEFAULT"
+}
+
+# resolve_mac_image_version prints the golden image's macOS major (what a machine
+# cloned from it runs), or nothing. Recorded by bake next to the bundle.
+resolve_mac_image_version() {
+  local img; img="$(resolve_mac_image)"
+  [ -n "$img" ] || return 0
+  local vf; vf="$(dirname "$img")/version"
+  [ -f "$vf" ] && cat "$vf"
+}
+
+# ensure_mac_image bakes a VM-per-pod golden image if one is asked for (the
+# --mac-image opt-in) and none is present yet. It is deliberately not automatic:
+# baking downloads macOS from Apple and takes minutes, so Linux-only clusters
+# never pay for it.
+ensure_mac_image() {
+  [ -n "$(resolve_mac_image)" ] && return 0
+  bold "no macOS golden image cached -- baking one (--mac-image)"
+  echo "  Downloads macOS from Apple, takes a few minutes, one sudo prompt."
+  echo "  Cached at $MAC_IMAGE_DEFAULT and reused after this."
+  echo
+  cmd_mac_image_bake || return 1
+}
+
+# The macOS golden image a 'ferry-macos-vm' pod needs
 # (docs/RUNTIMES.md#macos-pods). Every step here already existed as a manual
 # walkthrough in experiments/39-macos-pods; this drives the same scripts in
 # order, downloading macOS from Apple's own restore-image catalog at bake
@@ -1140,10 +1188,7 @@ cmd_node_image() {
 # result is tens of gigabytes and specific to the Mac that baked it, so
 # there is nothing a release could ship here that would help the next Mac.
 #
-#   ferry mac-image bake              a VM-per-pod image only (ferry-macos-vm)
-#   ferry mac-image bake --shared     also prepares it for ferry-macos-shared
-#                                     -- one manual recoveryOS step (SIP off),
-#                                     since that cannot be scripted
+#   ferry mac-image bake              build the golden image (ferry-macos-vm)
 #   ferry mac-image bake --rebuild    redo every step even if cached
 #   ferry mac-image bake --ipsw <path> --out <dir>
 cmd_mac_image_bake() {
@@ -1155,26 +1200,23 @@ cmd_mac_image_bake() {
     return 1
   fi
 
-  local out="$FERRY_HOME/mac-image" shared="" rebuild="" ipsw=""
+  local out="$FERRY_HOME/mac-image" rebuild="" ipsw=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --shared) shared=1; shift ;;
       --rebuild) rebuild=1; shift ;;
       --out) [ $# -ge 2 ] || { bad "--out needs a directory"; return 2; }; out="$2"; shift 2 ;;
       --out=*) out="${1#*=}"; shift ;;
       --ipsw) [ $# -ge 2 ] || { bad "--ipsw needs a path"; return 2; }; ipsw="$2"; shift 2 ;;
       --ipsw=*) ipsw="${1#*=}"; shift ;;
       -h|--help)
-        echo "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"
+        echo "usage: ferry mac-image bake [--rebuild] [--ipsw <path>] [--out <dir>]"
         echo
-        echo "  --shared    also prepare the image for ferry-macos-shared (needs one"
-        echo "              manual recoveryOS step; ferry-macos-vm never does)"
         echo "  --rebuild   redo every step even if this Mac already has one cached"
         echo "  --ipsw      a restore image already on disk, instead of fetching Apple's latest"
         echo "  --out       where to write it (default: \$FERRY_HOME/mac-image)"
         return 0 ;;
       -*) bad "unknown flag $1"; return 2 ;;
-      *) bad "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"; return 2 ;;
+      *) bad "usage: ferry mac-image bake [--rebuild] [--ipsw <path>] [--out <dir>]"; return 2 ;;
     esac
   done
 
@@ -1182,7 +1224,7 @@ cmd_mac_image_bake() {
   command -v go >/dev/null || { bad "Go 1.24+ is required, to build ferry-darwin into the image"; return 1; }
 
   local free; free="$(df -g "$HOME" | tail -1 | awk '{print $4}')"
-  local need=60; [ -n "$shared" ] && need=90
+  local need=60
   if [ "$free" -lt "$need" ]; then
     warn "${free}G free disk; a golden macOS image needs roughly ${need}G"
   fi
@@ -1237,45 +1279,55 @@ cmd_mac_image_bake() {
   fi
   echo
 
-  local src="$golden"
-  if [ -n "$shared" ]; then
-    local sipoff="$out/golden-sipoff"
-    if [ -f "$sipoff/Disk.img" ] && [ -z "$rebuild" ]; then
-      echo "==> SIP-off clone already made, $(du -sh "$sipoff" | cut -f1) (--rebuild to redo)"
-    else
-      echo "==> cloning to $sipoff for the one manual step ferry-macos-shared needs"
-      rm -rf "$sipoff"
-      cp -Rc "$golden" "$sipoff" || return 1
-      echo
-      bold "one manual step: turn SIP off in the clone"
-      echo "  This is what makes ferry-macos-shared not a security boundary"
-      echo "  (docs/RUNTIMES.md#macos-pods) -- it cannot be scripted, so a recoveryOS"
-      echo "  window is about to open. In it:"
-      echo "    1. make an admin account if Setup Assistant asks for one"
-      echo "    2. open Terminal from Utilities, then:"
-      echo "         diskutil apfs updatePreboot /"
-      echo "         csrutil disable"
-      echo "         halt"
-      "$exp/build/macvm" boot "$sipoff" --recovery &
-      read -r -p "  press Enter once the guest has halted: " _
-      wait
-    fi
-    src="$sipoff"
-  fi
-  echo
-
   echo "==> baking the machine image (kubelet, ferry-darwin, the OS base)"
-  "$exp/bake-macos-node.sh" "$src" "$out/golden-node" || return 1
+  "$exp/bake-macos-node.sh" "$golden" "$out/golden-node" || return 1
+
+  # Record the macOS major beside the bundle, for a `FROM macos:<major>` build
+  # check, so resolve_mac_image_version reads it back without booting the guest.
+  local pv; pv="$(cat "$out/golden-node/PRODUCT_VERSION" 2>/dev/null)"
+  if [ -n "$pv" ]; then printf '%s\n' "${pv%%.*}" > "$out/version"; else rm -f "$out/version"; fi
 
   echo
   bold "macOS golden image ready"
-  echo "  $out/golden-node"
+  echo "  $out/golden-node${pv:+   (macOS $pv)}"
   echo
-  echo "  export FERRY_MAC_IMAGE=\"$out/golden-node\""
-  if [ -n "$shared" ]; then
-    echo "  export FERRY_MAC_SHARED=1   # this image is prepared for it; still opt-in"
+  if [ "$out/golden-node" = "$MAC_IMAGE_DEFAULT" ]; then
+    echo "  Cached here and used automatically -- no FERRY_MAC_IMAGE to export."
+  else
+    echo "  Built outside the default location, so point ferry at it:"
+    echo "      export FERRY_MAC_IMAGE=\"$out/golden-node\""
   fi
-  echo "  ferry machines enable"
+  echo "  macOS pods run on this node -- (re)start ferry to pick up the image:"
+  echo "      ferry up            # or: ferry down && ferry up, if already up"
+}
+
+# cmd_mac_image_status: is there a golden macOS image, where, which macOS, and is
+# ferry actually using it. The one place to look when macOS pods will not schedule.
+cmd_mac_image_status() {
+  local img; img="$(resolve_mac_image)"
+  if [ -z "$img" ]; then
+    echo "macOS image  none"
+    echo "  No golden macOS image -- ferry-macos-vm pods stay Pending."
+    echo "  Bake one:  ferry mac-image bake      (or: ferry up --mac-image)"
+    return 0
+  fi
+  local ver; ver="$(resolve_mac_image_version)"
+  local src="default cache"
+  [ -n "${FERRY_MAC_IMAGE:-}" ] && src="FERRY_MAC_IMAGE override"
+  echo "macOS image  $img"
+  echo "  source     $src"
+  echo "  macOS      ${ver:-unknown}"
+  # macOS pods run on this node via ferry-cri, which takes the image with
+  # --mac-image at launch. So "in use" is ferry-cri running with it; a bake done
+  # while ferry was already up leaves the image cached but unused until a restart.
+  if ! running ferry-cri; then
+    echo "  in use     no -- ferry is not up; 'ferry up' runs macOS pods on this node"
+  elif ps -p "$(cat "$FERRY_RUN/ferry-cri.pid" 2>/dev/null)" -o command= 2>/dev/null | grep -q -- "--mac-image"; then
+    echo "  in use     yes -- macOS pods run on this node (ferry-macos-vm)"
+  else
+    echo "  in use     no -- ferry-cri started without this image; restart to use it:"
+    echo "             ferry down && ferry up"
+  fi
 }
 
 running() { [ -f "$FERRY_RUN/$1.pid" ] && kill -0 "$(cat "$FERRY_RUN/$1.pid")" 2>/dev/null; }
@@ -1393,7 +1445,7 @@ cmd_up() {
   # recreate from a script. --fast was the first spelling of it and still
   # works, but it named the gain and hid the cost. 'full' and 'relaxed' are
   # the old names of the two levels and are accepted and translated.
-  local want_durability="" asked_durability=""
+  local want_durability="" asked_durability="" bake_mac=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --durability) asked_durability="${2:-}"; shift 2 ;;
@@ -1402,6 +1454,7 @@ cmd_up() {
       --fast) asked_durability=process-crash
               warn "--fast is now --disposable: the same setting, named for what it gives up"
               shift ;;
+      --mac-image) bake_mac=1; shift ;;
       *) shift ;;
     esac
   done
@@ -1445,6 +1498,13 @@ cmd_up() {
   ferry_config_migrate
   [ -n "$want_durability" ] && ferry_config_set durability "$want_durability"
 
+  # --mac-image: bake this Mac's golden macOS image now if none is cached, before
+  # ferry-cri starts -- it takes the image with --mac-image at launch and runs a
+  # macOS pod as a VM sandbox on this node (docs/design/macos-cri-sandbox.md).
+  if [ -n "$bake_mac" ]; then
+    ensure_mac_image || warn "macOS image bake did not finish; macOS pods will stay Pending"
+  fi
+
   bold "starting ferry"
   # Which file this start is following, every time, for the same reason the
   # durability warning below is repeated: the question "why is my cluster
@@ -1472,6 +1532,7 @@ cmd_up() {
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \
@@ -1482,6 +1543,7 @@ cmd_up() {
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
+    $(mac_image_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1635,6 +1697,7 @@ EOF
   # ferry-node actually claimed.
   start_registry "$(machines_enabled && echo "$MACHINE_SUBNET")"
   advertise_gpu
+  advertise_macos_guest
   if [ -n "$dns" ]; then install_dns "$gateway" "$dns"; fi
 
   # Mode 2, for a cluster that asked for it. After the node is Ready, because
@@ -1834,6 +1897,24 @@ advertise_gpu() { # node-name [kubeconfig]
     ok "node advertises ferry.dev/gpu: $GPU_CAPACITY"
   else
     warn "could not advertise ferry.dev/gpu on $node (HTTP ${code:-no response})"
+  fi
+}
+
+# The macOS guest ceiling as an extended resource, so the scheduler leaves a
+# third ferry-macos-vm pod Pending rather than ferry-cri refusing it after the
+# fact -- the same shape as ferry.dev/gpu above. The RuntimeClass charges one
+# per pod through its overhead; the node's capacity is Apple's two-VM limit.
+# Only when a golden image is present, i.e. macOS pods can run on this node.
+advertise_macos_guest() { # node-name
+  local node="${1:-$NODE_NAME}"
+  [ -n "$(resolve_mac_image)" ] || return 0
+  [ -r "$FERRY_HOME/admin.conf" ] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+  if KUBECONFIG="$FERRY_HOME/admin.conf" kubectl patch node "$node" --subresource=status --type=merge \
+       -p "{\"status\":{\"capacity\":{\"ferry.dev/macos-guest\":\"2\"}}}" >/dev/null 2>&1; then
+    ok "node advertises ferry.dev/macos-guest: 2 (Apple's two-VM ceiling)"
+  else
+    warn "could not advertise ferry.dev/macos-guest on $node"
   fi
 }
 
@@ -2049,12 +2130,6 @@ start_machines() {
 
   start_registry "${actual_subnet:-$MACHINE_SUBNET}"
 
-  # Shared-kernel macOS pods (ferry-macos-shared) are off unless asked for: a
-  # shared XNU kernel is not a security boundary (docs/RUNTIMES.md#macos-pods).
-  # The flag lets ferry-machined register a hand-declared shared macOS machine;
-  # the NodePool below is what lets Karpenter make one.
-  local mac_shared_flag=""
-  [ "${FERRY_MAC_SHARED:-0}" = 1 ] && mac_shared_flag="--allow-mac-shared"
   "$here/bin/ferry-machined" \
     --kubeconfig "$FERRY_HOME/admin.conf" --kernel "$KERNEL" \
     --image "$NODE_DISK" --state "$FERRY_HOME/machined" \
@@ -2062,8 +2137,6 @@ start_machines() {
     --api-server "https://$LAN_IP:$(( 6443 + PORT_SHIFT ))" \
     --ca "$FERRY_HOME/pki/ca.crt" --host-node "$NODE_NAME" \
     --memory-ledger "$MACHINE_MEMORY_LEDGER" \
-    ${FERRY_MAC_IMAGE:+--mac-image "$FERRY_MAC_IMAGE"} \
-    $mac_shared_flag \
     >"$FERRY_RUN/logs/ferry-machined.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-machined.pid"
   sleep 1
@@ -2180,27 +2253,10 @@ start_provisioner() {
       || { warn "Karpenter's CRDs did not establish; machines must be declared by hand"; return 0; }
     kube apply -f "$dir/default-nodepool.yaml" >/dev/null 2>&1 \
       || { warn "could not install the default NodePool; machines must be declared by hand"; return 0; }
-    # macOS machines, only where there is a macOS image to make them from
-    # (experiment 39). Without one a macOS pod stays Pending, as it would with
-    # no pool at all, rather than failing a Machine it cannot boot.
-    #
-    # The VM-per-pod pool (ferry-macos-vm) is always installed with an image.
-    # The shared-kernel pool (ferry-macos-shared) is not: a shared XNU kernel is
-    # not a security boundary, so mode 2 for macOS is opt-in behind
-    # FERRY_MAC_SHARED=1 (docs/RUNTIMES.md#macos-pods). Off, a ferry-macos-shared
-    # pod stays Pending with no node to make for it, which is the intent.
-    if [ -n "${FERRY_MAC_IMAGE:-}" ]; then
-      kube apply -f "$dir/macos-vm-nodepool.yaml" >/dev/null 2>&1 \
-        || warn "could not install the macOS VM NodePool; macOS machines must be declared by hand"
-      if [ "${FERRY_MAC_SHARED:-0}" = 1 ]; then
-        kube apply -f "$dir/macos-nodepool.yaml" >/dev/null 2>&1 \
-          || warn "could not install the shared macOS NodePool; macOS machines must be declared by hand"
-      else
-        kube delete nodepool macos --ignore-not-found >/dev/null 2>&1 || true
-      fi
-    else
-      kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
-    fi
+    # macOS pods no longer use machines: ferry-cri runs a ferry-macos-vm pod as a
+    # VM sandbox on this Mac's own node (docs/design/macos-cri-sandbox.md), so
+    # there is no macOS NodePool. Delete the old macOS pools a prior ferry left.
+    kube delete nodepool macos macos-vm --ignore-not-found >/dev/null 2>&1 || true
     # The apply above has just put the NodePool back as the file has it,
     # without the default runtime's taint.
     ferry_apply_default_runtime
@@ -2600,6 +2656,7 @@ cmd_node_add() {
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$exec_sock" --streamer-control "$streamer_sock" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \
@@ -3074,6 +3131,7 @@ start_worker() { # name index server(host:port)
     ${FERRY_POD_READAHEAD_KB:+--pod-read-ahead-kb "$FERRY_POD_READAHEAD_KB"} \
     --exec-socket "$FERRY_EXEC_SOCK" --streamer-control "$FERRY_STREAMER_SOCK" \
     --nft-bundle "$here/guest/nft" --proxyd-socket "$FERRY_PROXYD_SOCK" \
+    --service-cidr "${SERVICE_CIDR:-10.96.0.0/16}" \
     --netpol-socket "$FERRY_NETPOL_SOCK" --gpud-socket "$FERRY_GPUD_SOCK" \
     --cni "$here/bin/ferry-cni" \
     --cni-host-plugins "$here/ferry-cni/plugins/host" \
@@ -3084,6 +3142,7 @@ start_worker() { # name index server(host:port)
     --machine-switch "127.0.0.1:$MACHINE_RELAY_PORT" \
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
+    $(mac_image_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a
@@ -4696,11 +4755,11 @@ YAML
   return 1
 }
 
-# A darwin image is FROM scratch plus COPY -- no base to run -- so buildkit,
-# which executes build steps on a Linux worker, cannot make one. bin/ferry-mkimage
+# A darwin image is FROM macos plus COPY -- the node is the base, nothing to run --
+# so buildkit, which executes build steps on a Linux worker, cannot make one. bin/ferry-mkimage
 # writes the OCI layout directly from the same Dockerfile subset, and, if the
 # Dockerfile has a RUN, drives bin/ferry-macvm to run it in a macOS VM cloned
-# from FERRY_MAC_IMAGE -- the same golden bundle machines boot from.
+# from the golden image -- the same bundle machines boot from (resolve_mac_image).
 #
 # Where it goes differs from a Linux image, too. A darwin image runs only on a
 # macOS machine node, never on this Mac's own pod VMs, which are Linux -- so
@@ -4718,9 +4777,9 @@ ferry_image_build_darwin() {
     return 1
   }
   machine_registry_enabled || running ferry-registry || {
-    bad "a macOS image is served to macOS machines through ferry-registry, which is off"
-    echo "    macOS pods run on machines (mode 2); turn them on and build again:"
-    echo "        ferry machines enable"
+    bad "a macOS image is served through ferry-registry, which is off"
+    echo "    bring ferry up (the registry runs with it), then build again:"
+    echo "        ferry up"
     return 1
   }
 
@@ -4733,9 +4792,12 @@ ferry_image_build_darwin() {
   local layout="$staging/layout"
 
   # -golden/-macvm are only used if the Dockerfile has a RUN; ferry-mkimage
-  # says so plainly if it needs them and either is missing.
+  # says so plainly if it needs them and either is missing. -node-macos lets it
+  # check a `FROM macos:<major>` pin against this Mac's golden image (0 = unknown).
+  local node_macos; node_macos="$(resolve_mac_image_version)"
   "$here/bin/ferry-mkimage" -name "$tag" -f "$dockerfile" -context "$context" -out "$layout" \
-      -golden "${FERRY_MAC_IMAGE:-}" -macvm "$here/bin/ferry-macvm" \
+      -golden "$(resolve_mac_image)" -macvm "$here/bin/ferry-macvm" \
+      -node-macos "${node_macos:-0}" \
     || { bad "build failed"; return 1; }
 
   # Into the shared registry, the same path 'ferry image load' shares a Linux
@@ -4751,8 +4813,8 @@ ferry_image_build_darwin() {
   fi
   echo
   echo "    image: $tag"
-  echo "    A macOS pod runs it: runtimeClassName ferry-macos-shared or ferry-macos-vm,"
-  echo "    imagePullPolicy IfNotPresent (machines pull it from this Mac's registry)"
+  echo "    A macOS pod runs it: runtimeClassName ferry-macos-vm,"
+  echo "    imagePullPolicy IfNotPresent (ferry-cri fetches it from this Mac's registry)"
 }
 
 cmd_image_build() {
@@ -4797,8 +4859,8 @@ cmd_image_build() {
         echo "                         [--export <path>] [--no-load] [<context>]"
         echo "       ferry image build --stop"
         echo
-        echo "  --os darwin    package a macOS image (FROM scratch + COPY; RUN runs in a macOS"
-        echo "                 VM cloned from \$FERRY_MAC_IMAGE, if the Dockerfile has one)."
+        echo "  --os darwin    package a macOS image (FROM macos + COPY; RUN runs in a macOS"
+        echo "                 VM cloned from the cached golden image, if the Dockerfile has one)."
         echo "                 See docs/RUNTIMES.md#building-the-image"
         echo "  --export PATH  also write the built OCI image as a tarball at PATH -- the same"
         echo "                 format 'docker buildx build -o type=oci,dest=PATH' produces, for"
@@ -5489,7 +5551,7 @@ cmd_machines_status() {
 
 cmd_machines() {
   case "${1:-status}" in
-    enable|on)   shift; cmd_machines_enable ;;
+    enable|on)   shift; cmd_machines_enable "$@" ;;
     disable|off) shift; cmd_machines_disable ;;
     status)      shift; cmd_machines_status ;;
     ls|list)     shift; kube get machines ;;
@@ -6009,6 +6071,17 @@ cmd_status() {
       else bad "$component (machines are enabled)"; fi
     done
   fi
+  # macOS pods run on this node via ferry-cri (no machines); the image matters
+  # whenever one is cached. ferry-cri takes it with --mac-image at launch, so an
+  # image baked after ferry was up is cached but not in use until a restart.
+  local mac_img; mac_img="$(resolve_mac_image)"
+  if [ -n "$mac_img" ]; then
+    if running ferry-cri && ps -p "$(cat "$FERRY_RUN/ferry-cri.pid" 2>/dev/null)" -o command= 2>/dev/null | grep -q -- "--mac-image"; then
+      echo "  macOS      image ready (macOS $(resolve_mac_image_version 2>/dev/null || echo '?')), pods run on this node -- 'ferry mac-image status'"
+    else
+      echo "  macOS      image cached but not in use -- restart to use it (ferry down && ferry up); 'ferry mac-image status'"
+    fi
+  fi
   if machine_registry_enabled; then
     if running ferry-registry; then ok "ferry-registry (pid $(cat "$FERRY_RUN/ferry-registry.pid"))"
     else bad "ferry-registry (loaded images stay on the node they were loaded on)"; fi
@@ -6452,9 +6525,10 @@ case "${1:-}" in
   upgrade)    shift; cmd_upgrade "$@" ;;
   machines)   shift; cmd_machines "$@" ;;
   mac-image)  shift
-              case "${1:-}" in
+              case "${1:-status}" in
                 bake) shift; cmd_mac_image_bake "$@" ;;
-                *) bad "usage: ferry mac-image bake [--shared] [--rebuild] [--ipsw <path>] [--out <dir>]"; exit 2 ;;
+                status) shift; cmd_mac_image_status "$@" ;;
+                *) bad "usage: ferry mac-image [bake|status]"; exit 2 ;;
               esac ;;
   node-image) shift; cmd_node_image "$@" ;;
   service)    shift; cmd_service "$@" ;;

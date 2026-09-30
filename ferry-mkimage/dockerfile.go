@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -28,6 +29,17 @@ func buildFromDockerfile(img *image, dockerfile, context string, bc builderConfi
 	df, err := parseDockerfile(string(content))
 	if err != nil {
 		return err
+	}
+
+	// Checked before a builder ever boots: a `FROM macos:26` against a macOS 25
+	// golden image should fail at once, not after minutes of VM work. The
+	// golden image and every machine cloned from it are the same macOS, so its
+	// version is the node's -- known here from what `ferry mac-image bake`
+	// recorded. An unknown node version (bc.nodeMacOS == 0) cannot say either
+	// way, so it does not block.
+	if df.requireMacOS != 0 && bc.nodeMacOS != 0 && df.requireMacOS != bc.nodeMacOS {
+		return fmt.Errorf("image is `FROM macos:%d` but this Mac's golden image is macOS %d -- rebake the image or change the tag",
+			df.requireMacOS, bc.nodeMacOS)
 	}
 
 	hasRun := false
@@ -75,6 +87,14 @@ func buildFromDockerfile(img *image, dockerfile, context string, bc builderConfi
 	img.Env = envList
 	img.WorkingDir = workdir
 	img.Labels = df.labels
+	// Record the macOS major the author pinned, so the built image carries the
+	// version it was made for (and a later runtime check could read it back).
+	if df.requireMacOS != 0 {
+		if img.Labels == nil {
+			img.Labels = map[string]string{}
+		}
+		img.Labels["dev.ferry.macos.major"] = strconv.Itoa(df.requireMacOS)
+	}
 	return nil
 }
 
@@ -93,7 +113,7 @@ func runSteps(steps []step, context string, bc builderConfig, root string) error
 			return b, nil
 		}
 		if bc.macvmPath == "" || bc.golden == "" {
-			return nil, fmt.Errorf("RUN needs a macOS builder VM: FERRY_MAC_IMAGE is not set, or bin/ferry-macvm is missing -- see docs/RUNTIMES.md#building-the-image")
+			return nil, fmt.Errorf("RUN needs a macOS builder VM, but no golden image is available (bake one with `ferry mac-image bake`) or bin/ferry-macvm is missing -- see docs/RUNTIMES.md#building-the-image")
 		}
 		nb, err := startMacBuilder(bc.macvmPath, bc.golden)
 		if err != nil {
@@ -179,6 +199,9 @@ type dockerfile struct {
 	entrypoint []string
 	cmd        []string
 	labels     map[string]string
+	// requireMacOS is the macOS major from `FROM macos:<major>`, or 0 when the
+	// tag was omitted (`FROM macos`, run against whatever the node happens to be).
+	requireMacOS int
 }
 
 // parseDockerfile reads the instructions a darwin image can honour: COPY/ADD,
@@ -192,8 +215,22 @@ func parseDockerfile(content string) (*dockerfile, error) {
 		switch strings.ToUpper(instr) {
 		case "FROM":
 			base := strings.Fields(rest)
-			if len(base) == 0 || !strings.EqualFold(base[0], "scratch") {
-				return nil, fmt.Errorf("a darwin image must be `FROM scratch` (the OS comes from the node), not %q", rest)
+			if len(base) == 0 {
+				return nil, fmt.Errorf("FROM needs an image: a darwin image is `FROM macos` (the OS comes from the node)")
+			}
+			name, tag := split2colon(base[0])
+			if strings.EqualFold(name, "scratch") {
+				return nil, fmt.Errorf("`FROM scratch` is no longer used -- a darwin image is `FROM macos` (the OS comes from the node)")
+			}
+			if !strings.EqualFold(name, "macos") {
+				return nil, fmt.Errorf("a darwin image must be `FROM macos` (the OS comes from the node), not %q", rest)
+			}
+			if tag != "" {
+				major, err := strconv.Atoi(tag)
+				if err != nil || major <= 0 {
+					return nil, fmt.Errorf("FROM macos:%s -- the tag must be a macOS major version, e.g. `macos:26`", tag)
+				}
+				df.requireMacOS = major
 			}
 			sawFrom = true
 		case "COPY", "ADD":
@@ -241,7 +278,7 @@ func parseDockerfile(content string) (*dockerfile, error) {
 		}
 	}
 	if !sawFrom {
-		return nil, fmt.Errorf("no FROM: a darwin image must start with `FROM scratch`")
+		return nil, fmt.Errorf("no FROM: a darwin image must start with `FROM macos`")
 	}
 	return df, nil
 }
@@ -524,6 +561,15 @@ func split2(s string) (string, string) {
 
 func split2eq(s string) (string, string) {
 	if i := strings.IndexByte(s, '='); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, ""
+}
+
+// split2colon splits an image reference into name and tag, e.g. "macos:26" ->
+// ("macos", "26"). A bare name has an empty tag.
+func split2colon(s string) (string, string) {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
 		return s[:i], s[i+1:]
 	}
 	return s, ""

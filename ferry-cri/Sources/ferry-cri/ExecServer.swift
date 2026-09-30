@@ -167,10 +167,12 @@ final class FrameSocket: @unchecked Sendable {
 final class ExecServer: @unchecked Sendable {
     private let path: String
     private let runtime: PodRuntime
+    private let darwin: DarwinRuntime?
 
-    init(path: String, runtime: PodRuntime) {
+    init(path: String, runtime: PodRuntime, darwin: DarwinRuntime? = nil) {
         self.path = path
         self.runtime = runtime
+        self.darwin = darwin
     }
 
     func start() throws {
@@ -201,6 +203,7 @@ final class ExecServer: @unchecked Sendable {
         }
 
         let runtime = self.runtime
+        let darwin = self.darwin
         Thread.detachNewThread {
             while true {
                 let accepted = accept(listener, nil, nil)
@@ -224,7 +227,7 @@ final class ExecServer: @unchecked Sendable {
                     }
                 }
                 let socket = FrameSocket(descriptor: accepted)
-                Task { await Self.handle(socket: socket, runtime: runtime) }
+                Task { await Self.handle(socket: socket, runtime: runtime, darwin: darwin) }
             }
         }
     }
@@ -262,7 +265,7 @@ final class ExecServer: @unchecked Sendable {
         }
     }
 
-    private static func handle(socket: FrameSocket, runtime: PodRuntime) async {
+    private static func handle(socket: FrameSocket, runtime: PodRuntime, darwin: DarwinRuntime?) async {
         defer { socket.close() }
         guard let line = socket.readHeaderLine(),
               let header = try? JSONDecoder().decode(ExecHeader.self, from: line)
@@ -298,6 +301,33 @@ final class ExecServer: @unchecked Sendable {
         }
 
         guard let containerID = header.containerID else { return }
+
+        // A macOS pod's exec runs in the guest over the agent, chrooted into the
+        // container root, output streaming back as it arrives. When the client
+        // asks for stdin or a TTY and the interactive agent is up, use it so
+        // `kubectl exec -i/-it` gets a real stdin and terminal.
+        if let darwin, await darwin.hasContainer(containerID) {
+            let wantsInput = (header.stdin ?? false) || (header.tty ?? false)
+            if wantsInput, await darwin.interactiveAvailable(containerID) {
+                await Self.darwinInteractive(containerID: containerID, header: header,
+                                             socket: socket, darwin: darwin)
+                return
+            }
+            do {
+                let exit = try await darwin.execStream(containerID, cmd: header.cmd ?? []) { kind, payload in
+                    switch kind {
+                    case .stdout: socket.writeFrame(.stdout, Data(payload))
+                    case .stderr, .error: socket.writeFrame(.stderr, Data(payload))
+                    case .exit: break
+                    }
+                }
+                socket.writeFrame(.exit, Data([UInt8(clamping: Int(exit))]))
+            } catch {
+                socket.writeFrame(.stderr, Data("ferry-cri: \(error)\n".utf8))
+                socket.writeFrame(.exit, Data([1]))
+            }
+            return
+        }
 
         if header.op == "attach" {
             await attach(containerID: containerID, socket: socket, runtime: runtime)
@@ -359,6 +389,44 @@ final class ExecServer: @unchecked Sendable {
         }
         // After the exit frame, so the client is not kept waiting on cleanup.
         try? await launched?.delete()
+    }
+
+    /// Interactive `kubectl exec -i/-it` into a macOS pod: open a session on the
+    /// interactive agent, stream its output to the client, and pump the client's
+    /// stdin and window-size changes into the guest until it disconnects.
+    private static func darwinInteractive(containerID: String, header: ExecHeader,
+                                          socket: FrameSocket, darwin: DarwinRuntime) async {
+        do {
+            let session = try await darwin.interactiveExec(
+                containerID, cmd: header.cmd ?? [], tty: header.tty ?? false) { kind, payload in
+                switch kind {
+                case .stdout: socket.writeFrame(.stdout, Data(payload))
+                case .stderr, .error: socket.writeFrame(.stderr, Data(payload))
+                case .exit: break
+                }
+            }
+            let pump = Task.detached {
+                while let (channel, payload) = socket.readFrame() {
+                    switch channel {
+                    case .stdin:
+                        if payload.isEmpty { session.closeStdin() } else { session.writeStdin([UInt8](payload)) }
+                    case .resize:
+                        if let size = try? JSONDecoder().decode([String: UInt16].self, from: payload),
+                           let w = size["width"], let h = size["height"] {
+                            session.resize(cols: w, rows: h)
+                        }
+                    default: continue
+                    }
+                }
+                session.closeStdin()
+            }
+            let code = await session.wait()
+            pump.cancel()
+            socket.writeFrame(.exit, Data([UInt8(clamping: Int(code))]))
+        } catch {
+            socket.writeFrame(.stderr, Data("ferry-cri: \(error)\n".utf8))
+            socket.writeFrame(.exit, Data([1]))
+        }
     }
 }
 

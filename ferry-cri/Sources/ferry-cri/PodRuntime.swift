@@ -591,6 +591,20 @@ actor PodRuntime {
     var gateway: String { "\(network.ipv4Gateway)" }
     var subnet: String { "\(network.subnet)" }
 
+    /// The shared pod-network fabric a macOS pod joins so it interoperates with
+    /// the Linux pods on this same L2 segment: the switch, the cluster CIDR/prefix,
+    /// and a dedicated /24 for this Mac's macOS pods. Nil when there is no cluster
+    /// switch (no --cluster-cidr, or this node is off its slice) -- macOS pods then
+    /// fall back to the host-network-like behavior. The macOS slice is counted down
+    /// from 255 so it does not collide with the node slices counted up from 0.
+    func darwinFabric() -> DarwinFabric? {
+        guard let sw = podSwitch, let cidr = config.clusterCIDR else { return nil }
+        let macIndex = max(0, min(255, 255 - config.nodeIndex))
+        guard let slice = Self.nodeSlice(of: cidr, node: macIndex) else { return nil }
+        return DarwinFabric(podSwitch: sw, clusterCIDR: cidr,
+                            clusterPrefix: clusterPrefixLength, macSlice: slice)
+    }
+
     /// How long to wait for this node's slice before giving up on it, when there
     /// are peers that would be cut off by starting anywhere else.
     ///

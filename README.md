@@ -553,8 +553,7 @@ kubectl get nodes -L ferry.dev/mode   # the machine was made for it
 [docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
 Jobs, what a pod that names neither gets, and what to do when one will not
 start. It also covers [native macOS pods](docs/RUNTIMES.md#macos-pods) —
-`ferry-macos-vm` and `ferry-macos-shared`, the same two modes for Darwin
-workloads.
+`ferry-macos-vm`, a Darwin workload in a macOS VM of its own.
 
 `ferry doctor` explains what is missing if the machine is not ready.
 

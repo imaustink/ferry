@@ -31,6 +31,56 @@ func option(_ name: String, _ fallback: String) -> String {
     return args[i + 1]
 }
 
+// A hardware smoke test for the darwin VM sandbox, off the CRI path: boot a
+// guest from a golden bundle, run a command in it over the agent, and print what
+// came back. This is how the DarwinSandbox boot/agent/exec path is exercised on
+// a real Mac (a golden image and the virtualization entitlement, which the CRI
+// server cannot get in CI).
+//
+//   ferry-cri darwin-smoke <golden-bundle> [command...]   (default: sw_vers)
+//   ferry-cri darwin-smoke <golden-bundle> --chroot <root> [command...]
+if args.first == "darwin-smoke" {
+    guard args.count >= 2 else {
+        FileHandle.standardError.write("usage: ferry-cri darwin-smoke <golden-bundle> [--chroot <root>] [command...]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let golden = args[1]
+    var rest = Array(args.dropFirst(2))
+    var chroot: String?
+    if rest.first == "--chroot", rest.count >= 2 { chroot = rest[1]; rest = Array(rest.dropFirst(2)) }
+    // --scriptfile <host path>: run the file's contents as /bin/sh in the guest,
+    // for debugging multi-step guest work without a complex host command line.
+    var cmd: [String]
+    if rest.first == "--scriptfile", rest.count >= 2 {
+        let script = (try? String(contentsOfFile: rest[1], encoding: .utf8)) ?? ""
+        cmd = ["/bin/sh", "-c", script]
+    } else {
+        cmd = rest.isEmpty ? ["/usr/bin/sw_vers"] : rest
+    }
+    let work = URL(filePath: NSTemporaryDirectory()).appendingPathComponent("ferry-darwin-smoke-\(UUID().uuidString)")
+    let sb = DarwinSandbox(id: "smoke", golden: URL(filePath: golden), workDir: work,
+                           cpus: 4, memoryBytes: 4 << 30)
+    func ms(_ s: Date) -> String { String(format: "%.2fs", Date().timeIntervalSince(s)) }
+    do {
+        let t0 = Date()
+        FileHandle.standardError.write("==> cloning + booting \(golden)\n".data(using: .utf8)!)
+        try await sb.boot()
+        FileHandle.standardError.write("==> ready to run a container in \(ms(t0)) (clone + boot + agent)\n".data(using: .utf8)!)
+        let tExec = Date()
+        let (code, out, err) = try await sb.exec(DarwinRunRequest(argv: cmd, chroot: chroot))
+        FileHandle.standardOutput.write(out)
+        if !err.isEmpty { FileHandle.standardError.write(err) }
+        FileHandle.standardError.write("==> command ran in \(ms(tExec)); exit \(code); total to result \(ms(t0))\n".data(using: .utf8)!)
+        await sb.shutdown()
+        FileHandle.standardError.write("==> torn down; whole cycle \(ms(t0))\n".data(using: .utf8)!)
+        exit(code == 0 ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write("darwin-smoke failed: \(error)\n".data(using: .utf8)!)
+        await sb.shutdown()
+        exit(1)
+    }
+}
+
 let socketPath = option("--endpoint", "/tmp/ferry-cri.sock")
 let execSocketPath = option("--exec-socket", "/tmp/ferry-exec.sock")
 let streamerControl = option("--streamer-control", "/tmp/ferry-streamer.sock")
@@ -124,9 +174,59 @@ do {
 }
 print("    network   \(await runtime.subnet), gateway \(await runtime.gateway)")
 
+// The darwin side: macOS VM sandboxes on this host (docs/design/macos-cri-sandbox.md).
+// --mac-image is the golden bundle every sandbox is cloned from; without it,
+// ferry-macos-vm pods are unavailable and only Linux pods run. Built after the
+// runtime is prepared so it can share the same pod-network fabric (the L2 switch
+// and cluster addressing), which is how a macOS pod reaches every other pod.
+let macImage = option("--mac-image", "")
+let darwinFabric = await runtime.darwinFabric()
+let darwinRuntime = DarwinRuntime(config: DarwinRuntime.Config(
+    golden: macImage.isEmpty ? nil : macImage,
+    stateDir: config.stateDir,
+    // A macOS guest needs 4 GiB to install and touches all it is given; size a
+    // sandbox at a darwin-sane floor above the Linux pod default.
+    defaultCPUs: max(4, config.defaultCPUs),
+    defaultMemoryBytes: max(4 << 30, config.defaultMemoryBytes),
+    maxGuests: Int(option("--max-mac-guests", "2")) ?? 2,
+    // The node's advertised address (host of --relay-endpoint, e.g. 192.168.1.29):
+    // the fallback macOS pod IP when there is no fabric, so a sandbox still reports
+    // an address the kubelet accepts. Falls back to --node-ip if given.
+    nodeIP: {
+        let explicit = option("--node-ip", "")
+        if !explicit.isEmpty { return explicit }
+        let endpoint = option("--relay-endpoint", "")
+        return endpoint.split(separator: ":").first.map(String.init) ?? ""
+    }(),
+    fabric: darwinFabric,
+    // The cluster's ClusterIP range, so a macOS pod routes it to the host-side
+    // Service DNAT. Defaults to the ferry control-plane default when unset.
+    serviceCIDR: darwinFabric == nil ? "" : option("--service-cidr", "10.96.0.0/16"),
+    // The interactive guest agent binary (kubectl exec -i/-it). Defaults to
+    // ferry-macagent-i next to the ferry-cri executable; nil if not present.
+    interactiveAgent: {
+        let explicit = option("--interactive-agent", "")
+        let path = explicit.isEmpty
+            ? URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+                .appendingPathComponent("ferry-macagent-i").path()
+            : explicit
+        return FileManager.default.contents(atPath: path)
+    }(),
+    // The search-list DNS forwarder binary, beside the ferry-cri executable.
+    dnsForwarder: {
+        let explicit = option("--dns-forwarder", "")
+        let path = explicit.isEmpty
+            ? URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+                .appendingPathComponent("ferry-macdns").path()
+            : explicit
+        return FileManager.default.contents(atPath: path)
+    }()))
+if !macImage.isEmpty { print("    mac image \(macImage)") }
+if let f = darwinFabric { print("    mac net   \(f.macSlice) on the pod switch") }
+
 // kubectl exec arrives over SPDY, which ferry-streamer terminates; it reaches
 // pods through this socket.
-let execServer = ExecServer(path: execSocketPath, runtime: runtime)
+let execServer = ExecServer(path: execSocketPath, runtime: runtime, darwin: darwinRuntime)
 do {
     try execServer.start()
     print("    exec      unix://\(execSocketPath)")
@@ -158,8 +258,9 @@ let server = GRPCServer(
     ),
     services: [
         FerryRuntimeService(runtime: runtime, version: runtimeVersion,
-                            streamer: StreamerClient(socketPath: streamerControl)),
-        FerryImageService(runtime: runtime),
+                            streamer: StreamerClient(socketPath: streamerControl),
+                            darwin: darwinRuntime),
+        FerryImageService(runtime: runtime, darwin: darwinRuntime),
     ]
 )
 
@@ -213,8 +314,11 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
                     try? await Task.sleep(for: .seconds(3))
                     continue
                 }
-                await runtime.applyPolicies(
-                    String(data: next.body, encoding: .utf8) ?? "", generation: next.generation)
+                let doc = String(data: next.body, encoding: .utf8) ?? ""
+                await runtime.applyPolicies(doc, generation: next.generation)
+                // The macOS pods can't load the nft policy (no Linux kernel);
+                // ferry-cri translates each one's ingress section to pf in-guest.
+                await darwinRuntime.applyPolicies(doc)
             }
         }
     }
@@ -223,6 +327,10 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
         Task {
             if let first = try? await fetchRuleset(proxyd, after: nil) {
                 await runtime.cacheRuleset(first.body, generation: first.generation)
+                // The macOS pods can't load kube-proxy's nft rules (no Linux
+                // kernel); ferry-cri DNATs their ClusterIP traffic host-side from
+                // the same ruleset (MacServiceNAT).
+                await darwinRuntime.applyServiceRules(String(decoding: first.body, as: UTF8.self))
             }
             while true {
                 let seen = await runtime.seenGeneration()
@@ -231,6 +339,7 @@ if config.nftBundlePath != nil, let proxyd = config.proxydSocket {
                     continue
                 }
                 await runtime.applyRuleset(next.body, generation: next.generation)
+                await darwinRuntime.applyServiceRules(String(decoding: next.body, as: UTF8.self))
             }
         }
     }

@@ -26,6 +26,10 @@ final class PodSwitch: @unchecked Sendable {
         let podID: String
         let fd: Int32
         let source: any DispatchSourceRead
+        /// The host-side Service router, for a macOS pod that has no in-guest
+        /// kube-proxy: it DNATs the pod's ClusterIP traffic and un-DNATs the
+        /// replies. Nil for a Linux pod, which does its own in-guest DNAT.
+        let nat: MacServiceNAT?
     }
 
     private let lock = NSLock()
@@ -101,9 +105,9 @@ final class PodSwitch: @unchecked Sendable {
 
     // MARK: - Ports
 
-    func attach(podID: String, fd: Int32) {
+    func attach(podID: String, fd: Int32, nat: MacServiceNAT? = nil) {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        let port = Port(podID: podID, fd: fd, source: source)
+        let port = Port(podID: podID, fd: fd, source: source, nat: nat)
         source.setEventHandler { [weak self] in self?.readFrames(from: port) }
         // The port owns the host end from here on, and closes it only once the
         // source has stopped reading it. Nothing closed it before: every pod
@@ -131,6 +135,29 @@ final class PodSwitch: @unchecked Sendable {
             if n <= 0 { return }
             guard n >= 14 else { continue }
             let frame = Data(buffer[0..<n])
+            learnIP(frame)
+            // A macOS pod's Service traffic (to the virtual gateway) is DNATed
+            // here; its ARP for the gateway is answered here; everything else --
+            // pod-to-pod -- falls through to normal L2 switching.
+            if let nat = port.nat {
+                switch nat.egress(frame) {
+                case .reply(let r): write(r, to: port.fd); continue
+                case .drop: continue
+                case .forward(var rewritten):
+                    learn(source: mac(frame, at: 6), from: port.podID)
+                    // Unicast to the backend if its MAC is known (a broadcast TCP
+                    // segment is dropped by a Linux endpoint). If not, ARP for it
+                    // as the gateway so the retransmit can unicast, and let this
+                    // one flood as a best effort.
+                    if let dip = dstIPv4(rewritten) {
+                        if let m = macForIP(dip) { setDstMAC(&rewritten, m) }
+                        else if let nat = port.nat { arpFor(dip, senderIP: nat.gwIP, senderMAC: nat.gwMAC) }
+                    }
+                    deliver(rewritten, destination: mac(rewritten, at: 0), cameFromPeer: nil)
+                    continue
+                case .pass: break
+                }
+            }
             learn(source: mac(frame, at: 6), from: port.podID)
             deliver(frame, destination: mac(frame, at: 0), cameFromPeer: nil)
         }
@@ -150,7 +177,7 @@ final class PodSwitch: @unchecked Sendable {
         lock.unlock()
 
         if let podID = localTarget, let port = allPorts.first(where: { $0.podID == podID }) {
-            write(frame, to: port.fd)
+            send(frame, to: port)
             lock.lock(); framesLocal += 1; lock.unlock()
             return
         }
@@ -164,7 +191,7 @@ final class PodSwitch: @unchecked Sendable {
         // out to the machines, or two switches would trade it forever.
         let origin = peer == nil ? sourcePod(of: frame) : nil
         for port in allPorts where port.podID != origin {
-            write(frame, to: port.fd)
+            send(frame, to: port)
         }
         if peer == nil {
             for target in allPeers { relayFrame(frame, to: target) }
@@ -195,6 +222,12 @@ final class PodSwitch: @unchecked Sendable {
         _ = frame.withUnsafeBytes { raw in
             Darwin.send(fd, raw.baseAddress, raw.count, MSG_DONTWAIT)
         }
+    }
+
+    /// Deliver to a port, un-DNATing a macOS pod's Service replies on the way in
+    /// (an endpoint's source rewritten back to the ClusterIP the pod dialed).
+    private func send(_ frame: Data, to port: Port) {
+        write(port.nat.map { $0.ingress(frame) } ?? frame, to: port.fd)
     }
 
     // MARK: - Other machines
@@ -235,6 +268,7 @@ final class PodSwitch: @unchecked Sendable {
             guard n >= 14 else { continue }
             let sender = "\(String(cString: inet_ntoa(from.sin_addr))):\(UInt16(bigEndian: from.sin_port))"
             let frame = Data(buffer[0..<n])
+            learnIP(frame)
             learn(source: mac(frame, at: 6), fromPeer: sender)
             deliver(frame, destination: mac(frame, at: 0), cameFromPeer: sender)
         }
@@ -272,5 +306,54 @@ final class PodSwitch: @unchecked Sendable {
         var value: UInt64 = 0
         for i in 0..<6 { value = (value << 8) | UInt64(frame[frame.startIndex + offset + i]) }
         return value
+    }
+
+    // MARK: - IPv4 -> MAC, for the Service DNAT
+
+    /// Learned IPv4 -> MAC, so a DNATed Service frame can be unicast to the
+    /// backend pod rather than flooded. Filled by snooping every frame's source
+    /// (and ARP senders) as they cross the switch.
+    private var ipToMAC: [UInt32: UInt64] = [:]
+
+    private func u32be(_ d: Data, _ o: Int) -> UInt32 {
+        var v: UInt32 = 0; for i in 0..<4 { v = (v << 8) | UInt32(d[d.startIndex + o + i]) }; return v
+    }
+
+    private func learnIP(_ frame: Data) {
+        guard frame.count >= 14 else { return }
+        let et = (UInt16(frame[frame.startIndex + 12]) << 8) | UInt16(frame[frame.startIndex + 13])
+        let ip: UInt32, m: UInt64
+        if et == 0x0800, frame.count >= 34 { ip = u32be(frame, 26); m = mac(frame, at: 6) }        // IPv4 src
+        else if et == 0x0806, frame.count >= 42 { ip = u32be(frame, 28); m = mac(frame, at: 22) }   // ARP sender
+        else { return }
+        guard ip != 0, m != 0, (m & 0x0100_0000_0000) == 0 else { return }
+        lock.lock(); if ipToMAC[ip] != m { ipToMAC[ip] = m }; lock.unlock()
+    }
+
+    private func macForIP(_ ip: UInt32) -> UInt64? { lock.lock(); defer { lock.unlock() }; return ipToMAC[ip] }
+
+    /// The IPv4 destination of a frame, when it is IPv4.
+    private func dstIPv4(_ frame: Data) -> UInt32? {
+        guard frame.count >= 34,
+              (UInt16(frame[frame.startIndex + 12]) << 8 | UInt16(frame[frame.startIndex + 13])) == 0x0800
+        else { return nil }
+        return u32be(frame, 30)
+    }
+
+    private func setDstMAC(_ frame: inout Data, _ m: UInt64) {
+        for i in 0..<6 { frame[frame.startIndex + i] = UInt8((m >> (8 * (5 - i))) & 0xff) }
+    }
+
+    /// Broadcast an ARP request for a backend, sent as the Service gateway, so its
+    /// reply is snooped into `ipToMAC` and the next DNATed frame can be unicast.
+    private func arpFor(_ targetIP: UInt32, senderIP: UInt32, senderMAC: [UInt8]) {
+        var f = Data(count: 42)
+        for i in 0..<6 { f[i] = 0xff; f[6 + i] = senderMAC[i] }          // dst broadcast, src gateway
+        f[12] = 0x08; f[13] = 0x06
+        f[14] = 0; f[15] = 1; f[16] = 0x08; f[17] = 0; f[18] = 6; f[19] = 4; f[20] = 0; f[21] = 1  // request
+        for i in 0..<6 { f[22 + i] = senderMAC[i] }                       // sender = gateway
+        for i in 0..<4 { f[28 + i] = UInt8((senderIP >> (8 * (3 - i))) & 0xff) }
+        for i in 0..<4 { f[38 + i] = UInt8((targetIP >> (8 * (3 - i))) & 0xff) }
+        deliver(f, destination: 0xffff_ffff_ffff, cameFromPeer: nil)
     }
 }

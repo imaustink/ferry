@@ -71,26 +71,7 @@ spec:
                   type: string
                   description: >-
                     Path to a node disk image. A registry reference belongs here
-                    eventually; for now the machine boots what is on disk. For
-                    os: darwin, a macOS golden VM bundle directory instead.
-                os:
-                  type: string
-                  enum: [linux, darwin]
-                  default: linux
-                  description: >-
-                    darwin boots a macOS machine from a golden VM bundle: its
-                    pods are macOS processes sharing its kernel, it registers
-                    ferry.dev/mode=shared-macos, and it is always tainted, so
-                    only pods whose RuntimeClass tolerates that land there.
-                isolation:
-                  type: string
-                  enum: [shared, vm]
-                  default: shared
-                  description: >-
-                    For os: darwin. vm makes the machine a VM of one pod --
-                    ferry.dev/mode=macos-vm, maxPods 1 -- so that pod has a
-                    macOS kernel of its own: mode 1, for macOS. shared lets
-                    many pods share the machine's kernel.
+                    eventually; for now the machine boots what is on disk.
                 role:
                   type: string
                   enum: [worker, controlPlane]

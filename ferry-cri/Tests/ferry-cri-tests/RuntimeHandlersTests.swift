@@ -17,6 +17,18 @@ import Testing
         #expect(RuntimeHandlers.refusal(for: "ferry-vm") == nil)
     }
 
+    @Test func ferryMacosVMIsServed() {
+        #expect(RuntimeHandlers.refusal(for: "ferry-macos-vm") == nil)
+    }
+
+    // ferry-macos-vm is the only darwin handler; the empty one and ferry-vm are
+    // Linux.
+    @Test func onlyMacosVMIsDarwin() {
+        #expect(RuntimeHandlers.kind(for: "ferry-macos-vm") == .darwin)
+        #expect(RuntimeHandlers.kind(for: "ferry-vm") == .linux)
+        #expect(RuntimeHandlers.kind(for: "") == .linux)
+    }
+
     @Test(arguments: ["runc", "kata", "gvisor", "ferry-shared", "FERRY-VM", " ferry-vm"])
     func anyOtherHandlerIsRefused(_ handler: String) throws {
         let refusal = try #require(RuntimeHandlers.refusal(for: handler))
@@ -32,7 +44,7 @@ import Testing
     // What node.status.runtimeHandlers is built from: every handler that runs,
     // and nothing that is refused.
     @Test func theServedListMatchesWhatRuns() {
-        #expect(RuntimeHandlers.served == ["", "ferry-vm"])
+        #expect(RuntimeHandlers.served == ["", "ferry-vm", "ferry-macos-vm"])
         for handler in RuntimeHandlers.served {
             #expect(RuntimeHandlers.refusal(for: handler) == nil)
         }
