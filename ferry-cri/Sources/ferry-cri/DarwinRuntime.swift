@@ -162,12 +162,18 @@ actor DarwinRuntime {
         let podMAC: String?
         let podPrefix: Int
         let switchInterface: SwitchInterface?
+        /// The pod's DNS config from the kubelet (CRI dns_config): the cluster
+        /// DNS server (CoreDNS's reserved pod address) and the search domains.
+        /// Used to point the guest's resolver at cluster DNS over the switch.
+        let dnsServers: [String]
+        let dnsSearches: [String]
         /// Set once the guest's cluster NIC has been configured, so a restart of
         /// the container does not reconfigure it.
         var networkConfigured = false
         init(info: DarwinSandboxInfo, sandbox: DarwinSandbox, logDirectory: String,
              podIP: String? = nil, podMAC: String? = nil, podPrefix: Int = 16,
-             switchInterface: SwitchInterface? = nil) {
+             switchInterface: SwitchInterface? = nil,
+             dnsServers: [String] = [], dnsSearches: [String] = []) {
             self.info = info
             self.sandbox = sandbox
             self.logDirectory = logDirectory
@@ -175,6 +181,8 @@ actor DarwinRuntime {
             self.podMAC = podMAC
             self.podPrefix = podPrefix
             self.switchInterface = switchInterface
+            self.dnsServers = dnsServers
+            self.dnsSearches = dnsSearches
         }
     }
 
@@ -271,7 +279,8 @@ actor DarwinRuntime {
             ip: podIP ?? config.nodeIP, createdAt: Self.now(), ready: true)
         sandboxes[id] = Sandbox(info: info, sandbox: sandbox, logDirectory: cfg.logDirectory,
                                 podIP: podIP, podMAC: podMAC, podPrefix: podPrefix,
-                                switchInterface: switchIface)
+                                switchInterface: switchIface,
+                                dnsServers: cfg.dnsConfig.servers, dnsSearches: cfg.dnsConfig.searches)
         return id
     }
 
@@ -456,6 +465,7 @@ actor DarwinRuntime {
         ifconfig "$dev" inet \(ip) netmask \(maskHex) up || exit 1
         route -q -n add -net \(clusterCIDR) -interface "$dev" 2>/dev/null || true
         echo "cluster NIC $dev = \(ip)/\(bits)"
+        \(dnsSetupScript(s))
         """
         let r = try? await s.sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", script]))
         if let r, r.exit != 0 {
@@ -463,6 +473,48 @@ actor DarwinRuntime {
                 "darwin \(s.info.id): cluster NIC setup failed (exit \(r.exit)): \(Self.text(r.stderr))\n"
                     .data(using: .utf8)!)
         }
+    }
+
+    /// Points the guest's resolver at cluster DNS. mDNSResponder resolves fine in
+    /// the guest (external names go out the NAT NIC); this adds a *scoped*
+    /// resolver, via `/etc/resolver/<cluster-domain>`, so names under the cluster
+    /// domain go to CoreDNS while everything else keeps the NAT resolver. A
+    /// chrooted workload reaches this same mDNSResponder through the socket
+    /// hard-linked into its root (assembleRoot).
+    ///
+    /// `/etc/resolver` -- not `scutil`: injecting a `State:/Network/Service/.../DNS`
+    /// with `scutil` for a phantom service (no real interface) makes macOS 26's
+    /// mDNSResponder drop *all* resolution, external included (measured). A
+    /// resolver file configd reads adds the scoped resolver cleanly and leaves the
+    /// default resolver intact. Empty when the kubelet gave no DNS config.
+    private func dnsSetupScript(_ s: Sandbox) -> String {
+        guard !s.dnsServers.isEmpty else { return "" }
+        // The cluster search domains are those the kubelet built from the cluster
+        // domain -- suffixes of the first entry (<ns>.svc.<domain>): itself,
+        // svc.<domain>, <domain>. The kubelet also appends the *node's* own search
+        // domain (e.g. localdomain), which is NOT a cluster domain and must not go
+        // to CoreDNS. A resolver file per cluster domain sends every *.svc.<domain>
+        // and the bare <domain> to CoreDNS; the search line lets a short name
+        // (kubernetes.default) be qualified against them.
+        let first = s.dnsSearches.first ?? "svc.cluster.local"
+        var clusterDomains = s.dnsSearches.filter { first == $0 || first.hasSuffix("." + $0) }
+        if clusterDomains.isEmpty { clusterDomains = ["cluster.local"] }
+        let searchList = clusterDomains.joined(separator: " ")
+        var lines = s.dnsServers.map { "nameserver \($0)" }
+        lines.append("search \(searchList)")
+        let body = lines.joined(separator: "\\n")
+        let writes = clusterDomains.map {
+            "printf '\(body)\\n' > /etc/resolver/\($0)"
+        }.joined(separator: "\n        ")
+        // Also publish the search list (and ndots) in /etc/resolv.conf so a
+        // multi-label short name (svc.namespace) is qualified against the cluster
+        // domains, not just the single-label case the scoped resolvers cover.
+        return """
+        mkdir -p /etc/resolver
+        \(writes)
+        printf 'search \(searchList)\\noptions ndots:5\\n' > /etc/resolv.conf
+        echo "cluster DNS via \(s.dnsServers.joined(separator: " ")) for \(clusterDomains.joined(separator: ","))"
+        """
     }
 
     /// Builds the container root in the guest: the baked OS base (dyld + the
@@ -479,7 +531,17 @@ actor DarwinRuntime {
         if [ -d "\(osBase)" ]; then
             cp -cR "\(osBase)/." "$R/" 2>/dev/null || cp -R "\(osBase)/." "$R/"
         fi
-        mkdir -p "$R/dev" "$R/tmp" "$R/private/tmp" "$R/var/tmp"
+        mkdir -p "$R/dev" "$R/tmp" "$R/private/tmp" "$R/var/tmp" "$R/private/var/run" "$R/var/run"
+        # The resolver socket, hard-linked in so a chrooted workload can reach the
+        # guest's mDNSResponder -- without it getaddrinfo resolves nothing inside
+        # the chroot, even though the guest resolves fine. The client opens
+        # /var/run/mDNSResponder; link it there (and at /private/var/run for a base
+        # whose /var is a symlink). The prior in-guest CRI did the same
+        # (experiments/39: ferry-darwin runtime.go).
+        if [ -S /private/var/run/mDNSResponder ]; then
+            ln -f /private/var/run/mDNSResponder "$R/private/var/run/mDNSResponder" 2>/dev/null || true
+            ln -f /private/var/run/mDNSResponder "$R/var/run/mDNSResponder" 2>/dev/null || true
+        fi
         """
         let (ac, _, ae) = try await sandbox.exec(DarwinRunRequest(argv: ["/bin/sh", "-c", assemble, root]))
         guard ac == 0 else {
