@@ -292,6 +292,7 @@ actor DarwinRuntime {
                 if !config.serviceCIDR.isEmpty, let ipV = ipToUInt32(ip), let gw = gatewayIP() {
                     let n = MacServiceNAT(podIP: ipV, gatewayIP: gw, gatewayMAC: Self.gatewayMAC)
                     n.update(serviceTable)
+                    n.setEgressPolicy(MacNetpol.egressPolicy(section: netpolSection(ip)))
                     nat = n
                 }
                 fabric.podSwitch.attach(podID: id, fd: nic.hostFD, nat: nat)
@@ -681,6 +682,12 @@ actor DarwinRuntime {
         netpolDocument = document
         for s in sandboxes.values where s.booted {
             if let ip = s.podIP { await applyNetpol(s, podIP: ip) }
+        }
+        // Egress is enforced host-side (post-DNAT); push each pod's egress policy
+        // to its NAT. Not gated on `booted` -- the NAT exists from runPodSandbox.
+        for s in sandboxes.values {
+            guard let ip = s.podIP, let nat = s.nat else { continue }
+            nat.setEgressPolicy(MacNetpol.egressPolicy(section: netpolSection(ip)))
         }
     }
 

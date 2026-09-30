@@ -35,6 +35,37 @@ import Testing
         #expect(rules.contains("block drop in quick inet from 10.194.0.0/16 to 10.194.255.2"))
     }
 
+    @Test func parsesEgressPolicy() {
+        let section = """
+        add chain ip ferry-netpol output { type filter hook output priority 0 ; policy accept ; }
+        add rule ip ferry-netpol output oifname "lo" accept
+        add rule ip ferry-netpol output ct state established,related accept
+        add rule ip ferry-netpol output ip daddr { 10.194.0.5 } tcp dport 5432 accept
+        add rule ip ferry-netpol output udp dport 53 accept
+        add rule ip ferry-netpol output drop
+        """
+        let pol = MacNetpol.egressPolicy(section: section)
+        #expect(pol?.defaultDeny == true)
+        #expect(pol?.allows.count == 2)
+        // the db allow: dst 10.194.0.5/32, tcp, 5432
+        let db = pol?.allows.first { $0.proto == 6 }
+        #expect(db?.dsts.first?.base == ipToUInt32("10.194.0.5"))
+        #expect(db?.dsts.first?.mask == 0xffff_ffff)
+        #expect(db?.ports == [5432])
+        // the DNS allow: any dst, udp, 53
+        let dns = pol?.allows.first { $0.proto == 17 }
+        #expect(dns?.dsts.isEmpty == true)
+        #expect(dns?.ports == [53])
+    }
+
+    @Test func noOutputDropMeansEgressOpen() {
+        let section = """
+        add rule ip ferry-netpol input ip saddr { 10.194.0.1 } accept
+        add rule ip ferry-netpol input drop
+        """
+        #expect(MacNetpol.egressPolicy(section: section) == nil)   // ingress-only policy
+    }
+
     @Test func parsesAPortSet() {
         let section = """
         add rule ip ferry-netpol input ip saddr { 10.0.0.0/8 } tcp dport { 80, 443 } accept

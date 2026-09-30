@@ -177,6 +177,15 @@ final class MacServiceNAT: @unchecked Sendable {
     private struct AffinityKey: Hashable { let svc: ServiceKey; let client: UInt32 }
     private var affinity: [AffinityKey: (ep: Endpoint, seen: Date)] = [:]
 
+    /// Egress NetworkPolicy, enforced here rather than in the guest because a
+    /// ClusterIP is DNATed to its endpoint here -- so this sees the endpoint the
+    /// policy is written against, which guest pf would not. Nil = egress open.
+    private var egressPolicy: EgressPolicy?
+    /// Inbound connections seen (peer -> pod), so an egress reply to one is
+    /// allowed as established even under an egress default-deny.
+    private struct InKey: Hashable { let proto: UInt8; let peer: UInt32; let peerPort: UInt16; let podPort: UInt16 }
+    private var inbound: [InKey: Date] = [:]
+
     struct ConnKey: Hashable { let proto: UInt8; let aIP: UInt32; let aPort: UInt16; let bIP: UInt32; let bPort: UInt16 }
 
     init(podIP: UInt32, gatewayIP: UInt32, gatewayMAC: [UInt8]) {
@@ -192,6 +201,25 @@ final class MacServiceNAT: @unchecked Sendable {
 
     func update(_ table: ServiceTable) {
         lock.lock(); self.table = table; lock.unlock()
+    }
+
+    func setEgressPolicy(_ p: EgressPolicy?) {
+        lock.lock(); egressPolicy = p; lock.unlock()
+    }
+
+    /// Whether the pod may send to this destination: open when there is no egress
+    /// policy, else allowed if a rule matches or it replies to a tracked inbound
+    /// connection (established). Caller holds the lock.
+    private func egressAllowedLocked(dst: UInt32, proto: UInt8, dstPort: UInt16, srcPort: UInt16) -> Bool {
+        guard let pol = egressPolicy, pol.defaultDeny else { return true }
+        if inbound[InKey(proto: proto, peer: dst, peerPort: dstPort, podPort: srcPort)] != nil { return true }
+        for a in pol.allows {
+            if let p = a.proto, p != proto { continue }
+            if !a.ports.isEmpty, !a.ports.contains(dstPort) { continue }
+            if !a.dsts.isEmpty, !a.dsts.contains(where: { (dst & $0.mask) == $0.base }) { continue }
+            return true
+        }
+        return false
     }
 
     /// What the switch should do with a frame the pod just sent.
@@ -211,16 +239,25 @@ final class MacServiceNAT: @unchecked Sendable {
             if let reply = arpReply(frame) { return .reply(reply) }
             return .pass
         }
-        guard ethertype == 0x0800 else { return .pass }
-        // Only frames sent to the virtual gateway are Service traffic; pod-to-pod
-        // goes straight to the peer's MAC and must pass through untouched.
-        guard macBytes(frame, 0) == gatewayMAC else { return .pass }
-        guard frame.count >= 34 else { return .drop }
+        guard ethertype == 0x0800, frame.count >= 34 else { return .pass }
         let ihl = Int(frame[14] & 0x0f) * 4
         let proto = frame[23]
-        // TCP, UDP and SCTP all carry src/dst port in the first four L4 bytes.
-        guard proto == 6 || proto == 17 || proto == 132, frame.count >= 14 + ihl + 4 else { return .drop }
+        let hasL4 = (proto == 6 || proto == 17 || proto == 132) && frame.count >= 14 + ihl + 4
         let l4 = 14 + ihl
+
+        // Anything not to the virtual gateway is direct pod-to-pod: enforce egress
+        // NetworkPolicy on its real destination, then pass it through untouched.
+        guard macBytes(frame, 0) == gatewayMAC else {
+            if hasL4 {
+                let dstIP = u32(frame, 30), srcPort = u16(frame, l4), dstPort = u16(frame, l4 + 2)
+                lock.lock()
+                let ok = egressAllowedLocked(dst: dstIP, proto: proto, dstPort: dstPort, srcPort: srcPort)
+                lock.unlock()
+                if !ok { return .drop }
+            }
+            return .pass
+        }
+        guard hasL4 else { return .drop }
         let srcIP = u32(frame, 26), dstIP = u32(frame, 30)
         let srcPort = u16(frame, l4), dstPort = u16(frame, l4 + 2)
         let key = ServiceKey(ip: dstIP, proto: proto, port: dstPort)
@@ -244,6 +281,11 @@ final class MacServiceNAT: @unchecked Sendable {
             if svc.affinityTimeout != nil, let ep = chosen { affinity[affKey] = (ep, now) }
         }
         if let ep = chosen {
+            // Egress NetworkPolicy applies to the endpoint the ClusterIP resolves
+            // to, which is exactly what we have here.
+            if !egressAllowedLocked(dst: ep.ip, proto: proto, dstPort: ep.port, srcPort: srcPort) {
+                lock.unlock(); return .drop
+            }
             // Record the reverse so the endpoint's replies restore the ClusterIP.
             let rev = ConnKey(proto: proto, aIP: ep.ip, aPort: ep.port, bIP: srcIP, bPort: srcPort)
             conntrack[rev] = Reverse(clusterIP: dstIP, clusterPort: dstPort, seen: Date())
@@ -272,6 +314,12 @@ final class MacServiceNAT: @unchecked Sendable {
         let key = ConnKey(proto: proto, aIP: srcIP, aPort: u16(frame, l4),
                           bIP: dstIP, bPort: u16(frame, l4 + 2))
         lock.lock()
+        // Track the inbound connection so the pod's reply to it is allowed as
+        // established even under an egress default-deny (peer -> pod here; the
+        // reply out is pod -> peer).
+        if egressPolicy != nil {
+            inbound[InKey(proto: proto, peer: srcIP, peerPort: u16(frame, l4), podPort: u16(frame, l4 + 2))] = Date()
+        }
         guard var rev = conntrack[key] else { lock.unlock(); return frame }
         rev.seen = Date(); conntrack[key] = rev
         lock.unlock()
@@ -409,6 +457,7 @@ final class MacServiceNAT: @unchecked Sendable {
         // Affinity entries expire on their own (checked against each service's
         // timeout on use); sweep the stalest so the table cannot grow unbounded.
         affinity = affinity.filter { now.timeIntervalSince($0.value.seen) < 10800 }
+        inbound = inbound.filter { now.timeIntervalSince($0.value) < 300 }
         // forward/rr are bounded by live services; drop forward entries older than
         // conntrack's window by clearing those with no reverse still live is hard
         // without back-refs, so cap the table instead.

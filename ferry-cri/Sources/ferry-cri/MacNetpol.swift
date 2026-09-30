@@ -24,6 +24,22 @@
 
 import Foundation
 
+/// An egress allow parsed from the `output` chain, matched host-side in ferry-cri
+/// (post-Service-DNAT) rather than in the guest -- see MacNetpol's header and the
+/// egress note in MacServiceNAT.
+struct EgressAllow: Sendable {
+    var dsts: [(base: UInt32, mask: UInt32)]   // empty = any destination
+    var proto: UInt8?                          // 6/17/132, nil = any
+    var ports: [UInt16]                        // empty = any port
+}
+
+/// A pod's egress policy: default-deny (set only when the `output` chain ends in
+/// `drop`, i.e. an egress policy selects the pod) plus the allowed flows.
+struct EgressPolicy: Sendable {
+    var defaultDeny: Bool
+    var allows: [EgressAllow]
+}
+
 enum MacNetpol {
     /// An ingress allow, translated from one `ip saddr {..} [proto dport ..] accept`.
     private struct Allow {
@@ -66,6 +82,54 @@ enum MacNetpol {
         // connections are already allowed by state above.
         pf.append("block drop in quick inet from \(clusterCIDR) to \(podIP)")
         return pf.joined(separator: "\n") + "\n"
+    }
+
+    /// A pod's egress policy from its `output` chain, or nil when there is no
+    /// `output drop` (no egress policy -> egress stays open). Matched in ferry-cri
+    /// against the post-DNAT destination (MacServiceNAT).
+    static func egressPolicy(section: String) -> EgressPolicy? {
+        var allows: [EgressAllow] = []
+        var hasDrop = false
+        for raw in section.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("add rule ip ferry-netpol output ") else { continue }
+            let body = String(line.dropFirst("add rule ip ferry-netpol output ".count))
+            if body == "drop" { hasDrop = true; continue }
+            if body.hasPrefix("oifname") || body.hasPrefix("iifname") { continue }   // lo
+            if body.contains("ct state") { continue }                                // established
+            guard body.contains("accept") else { continue }
+            allows.append(parseEgressAllow(body))
+        }
+        guard hasDrop else { return nil }
+        return EgressPolicy(defaultDeny: true, allows: allows)
+    }
+
+    /// Parse `[ip daddr { a, b/n }] [tcp|udp|sctp] [dport N | dport { N, M }] accept`.
+    private static func parseEgressAllow(_ body: String) -> EgressAllow {
+        var a = EgressAllow(dsts: [], proto: nil, ports: [])
+        let f = body.split(separator: " ").map(String.init)
+        if f.contains("daddr") {
+            a.dsts = braced(f, after: "daddr").compactMap(cidr)
+        }
+        if f.contains("tcp") { a.proto = 6 } else if f.contains("udp") { a.proto = 17 }
+        else if f.contains("sctp") { a.proto = 132 }
+        if let di = f.firstIndex(of: "dport") {
+            let toks: [String]
+            if di + 1 < f.count, f[di + 1] == "{" { toks = braced(f, after: "dport") }
+            else if di + 1 < f.count { toks = [f[di + 1].trimmingCharacters(in: CharacterSet(charactersIn: ","))] }
+            else { toks = [] }
+            a.ports = toks.compactMap { UInt16($0) }
+        }
+        return a
+    }
+
+    /// "10.194.0.5" or "10.0.0.0/8" -> (base, mask), host byte order.
+    private static func cidr(_ s: String) -> (base: UInt32, mask: UInt32)? {
+        let parts = s.split(separator: "/")
+        guard let ip = ipToUInt32(String(parts[0])) else { return nil }
+        let bits = parts.count == 2 ? (Int(parts[1]) ?? 32) : 32
+        let mask: UInt32 = bits <= 0 ? 0 : (bits >= 32 ? 0xffff_ffff : (0xffff_ffff << (32 - bits)))
+        return (ip & mask, mask)
     }
 
     /// Parse `ip saddr { a, b } [tcp|udp] [dport N | dport { N, M }] accept`.
