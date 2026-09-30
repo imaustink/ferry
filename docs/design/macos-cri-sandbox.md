@@ -107,19 +107,31 @@ Mac's taint. The handler stays `ferry-darwin`'s successor served by `ferry-cri`.
 
 ## Increments
 
-1. **CRI recognition + design (this PR).** `RuntimeHandlers` learns
+1. **CRI recognition + design (done).** `RuntimeHandlers` learns
    `ferry-macos-vm` and a `RuntimeKind`; the darwin path is guarded with a clear
    "not yet implemented on this node" error. Safe and inert: the RuntimeClass
    still pins darwin pods to Machine nodes, so host `ferry-cri` receives none
    yet. Unit-tested; no behaviour change.
-2. **The `DarwinSandbox` backend.** Clone + boot the golden bundle as a sandbox,
-   drive `ferry-darwin`/`ferry-macagent` over vsock, wire network/logs/exec/
-   stats, enforce the ceiling. Requires on-Mac iteration (a golden image and the
-   Virtualization entitlements — cannot be verified in CI).
-3. **Flip scheduling + remove the Machine path.** Repoint the RuntimeClass to the
+2. **The `DarwinSandbox` VM backend (done — `DarwinSandbox.swift`).** The
+   reusable core, adapted from `ferry-macvm`'s proven build coprocess: clone the
+   golden bundle (APFS `clonefile`), boot a `VZMacOSVirtualMachineConfiguration`
+   on its own queue, connect the guest agent over vsock, run a command streaming
+   its stdout/stderr frames and returning the exit status, and tear down. The
+   guest wire protocol (`DarwinFrameParser`, `DarwinRunRequest`) is a pure,
+   unit-tested core (`DarwinFrameTests`). It compiles in CI; a real boot needs a
+   golden image and Virtualization entitlements on Mac hardware.
+3. **Wire `DarwinSandbox` into the CRI lifecycle.** `SandboxRecord` hard-requires
+   a `LinuxPod` today, so the sandbox record has to become OS-agnostic (an
+   optional/`enum` backend) before `runPodSandbox`/`startContainer`/
+   `stopPodSandbox` and the status/list/exec/stats methods can dispatch a darwin
+   sandbox. This also adds the guest-side container-root assembly (the image
+   layers plus the OS base, via `ferry-darwin` in the guest) and streams the
+   container log. Invasive to the Linux paths and only meaningfully testable on
+   hardware, so it is kept separate from increment 2.
+4. **Flip scheduling + remove the Machine path.** Repoint the RuntimeClass to the
    host node, advertise `ferry.dev/macos-guest`, and delete the darwin code in
    ferry-karpenter and ferry-machined and the `macos-vm` NodePool. Do this only
-   once increment 2 is verified, so macOS pods never regress.
+   once increment 3 is verified, so macOS pods never regress.
 
 ## Reusable building blocks (with paths)
 
