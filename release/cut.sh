@@ -71,6 +71,11 @@ bold "syncing main with origin"
 git -C "$root" fetch origin main --tags >/dev/null 2>&1 || die "could not fetch origin"
 git -C "$root" merge --ff-only origin/main >/dev/null 2>&1 \
   || die "local main is not a fast-forward of origin/main -- reconcile them first"
+# A main that is *ahead* of origin passes the fast-forward as a no-op, so the
+# release would be cut and tagged from a commit that was never pushed to the
+# branch it claims to come from. Require HEAD to be exactly origin/main.
+[ "$(git -C "$root" rev-parse HEAD)" = "$(git -C "$root" rev-parse origin/main)" ] \
+  || die "local main is ahead of origin/main -- push it first so the tag lands on a published commit"
 ok "main at $(git -C "$root" rev-parse --short HEAD)"
 
 # --- the version ----------------------------------------------------------
@@ -139,4 +144,8 @@ echo; bold "publishing"
 publish_args=(--version "$version")
 [ -n "$notes" ] && publish_args+=(--notes "$notes")
 [ -n "$publish" ] && publish_args+=(--publish)
-"$here/publish.sh" "${publish_args[@]}" || die "release/publish.sh failed"
+# The tag is already pushed by now, so a transient publish failure must not be a
+# dead end: point the operator at the idempotent re-run rather than the
+# "tag already exists" wall a fresh cut.sh would hit.
+"$here/publish.sh" "${publish_args[@]}" \
+  || die "release/publish.sh failed -- the tag is already pushed; re-run: release/publish.sh ${publish_args[*]}"
