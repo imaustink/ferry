@@ -412,6 +412,7 @@ One-container-per-VM is the `container` CLI's policy, not a framework limit.
 install.sh                           what get.ferry.kurpuis.com serves: curl | sh
 CNAME                                the domain, copied into the published site
 .github/workflows/pages.yml          publishes install.sh to that domain from main
+release/cut.sh                       build, package, tag and publish a release from main
 release/build.sh                     package a built checkout into a release tarball
 release/publish.sh                   put one on GitHub Releases
 ferry                                the CLI: doctor, build, init, config, up, down,
@@ -741,22 +742,36 @@ Containerization framework requires to build.
 
 ### Cutting a release
 
+From the **main checkout** — never a git worktree, which has none of the kernel,
+node image, nft or CNI artifacts a release carries — one command does it all:
+
 ```sh
-./ferry build && ./ferry up   # kubelet, runtime, guest kernel, then a cluster
-                               # to build the rest against
-./ferry kernel && ./ferry restart   # new kernel, then a restart so it's what
-                                     # ferry-cri actually boots pods on
-./ferry node-image             # everything else the tarball carries
-git tag -a v0.1.0 -m "..." && git push origin v0.1.0
-./release/build.sh --version v0.1.0
-./release/publish.sh --version v0.1.0      # a draft; --publish to go live
+./release/cut.sh --version v0.15.0 --publish   # omit --publish for a draft
+./release/cut.sh --bump minor                  # or let it pick the next version
+```
+
+`cut.sh` refuses to run anywhere but a clean `main` that is up to date with
+origin, rebuilds the binaries with `ferry build` so they match the tag it is
+about to create, then drives `release/build.sh` and `release/publish.sh` in the
+right order (package, then tag, then publish, so a failed build leaves no
+dangling tag). It is the one-command answer to a process that used to be a
+handful of easy-to-get-wrong steps.
+
+The kernel and node image are the exception: `cut.sh` rebuilds binaries but not
+those, because they need a running cluster to make. The first time, or whenever
+they change, build them once:
+
+```sh
+./ferry build && ./ferry up    # kubelet, runtime, guest kernel, then a cluster
+./ferry kernel && ./ferry restart   # new kernel, then the restart that boots it
+./ferry node-image             # the node image the tarball carries
 ```
 
 `release/build.sh` packages the runtime subset of the checkout and refuses to
 ship one that is missing a piece. That includes mode 2's node image, unless it
 is told `--without-node-image`, which the release then records.
 `release/publish.sh` refuses a dirty tree, or a tarball built from a commit
-other than the tag's.
+other than the tag's — the checks `cut.sh` leans on.
 
 `install.sh` itself is served from GitHub Pages, republished from `main`
 whenever it changes, so the installer people run is the one in this repository.

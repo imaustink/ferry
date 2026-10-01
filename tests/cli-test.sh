@@ -763,5 +763,29 @@ contains "and the macOS major read from the sibling version marker" \
 lacks "so the version is not unknown" "$found" "unknown"
 echo
 
+printf '\033[1m%s\033[0m\n' "release/cut.sh refuses the footguns and composes the steps"
+# cut.sh is the one-command release path; its value is the guards it never skips.
+# These assert the guards and the ordering by source, because the real thing
+# tags and publishes -- not something a test should run. The guards are what
+# stop a release going out from a worktree, off a stale or diverged main, or
+# with a tag that does not match the tarball.
+cut_src="$(cat "$repo/release/cut.sh")"
+contains "it refuses a linked git worktree (no release artifacts there)" \
+  "$cut_src" "linked git worktree"
+contains "it requires being on main" "$cut_src" "not main"
+contains "it refuses a dirty tree" "$cut_src" "tree is dirty"
+contains "it fast-forwards main to origin before cutting" \
+  "$cut_src" "merge --ff-only origin/main"
+contains "it rebuilds binaries so they match the tag" "$cut_src" "ferry build"
+cut_pkg_line="$(grep -n '"\$here/build.sh"' "$repo/release/cut.sh" | head -1 | cut -d: -f1)"
+cut_tag_line="$(grep -n 'tag -a' "$repo/release/cut.sh" | head -1 | cut -d: -f1)"
+is "it packages before tagging, so a failed build leaves no tag" \
+  "$([ -n "$cut_pkg_line" ] && [ -n "$cut_tag_line" ] && [ "$cut_pkg_line" -lt "$cut_tag_line" ] && echo ok)" "ok"
+contains "publishing is live only with --publish; otherwise a draft" \
+  "$cut_src" 'publish_args+=(--publish)'
+contains "and the README documents the one-command path" \
+  "$(cat "$repo/README.md")" "./release/cut.sh --version"
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]
