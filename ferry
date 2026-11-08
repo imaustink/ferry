@@ -5281,8 +5281,16 @@ cmd_down() {
   # run, and the symptom -- "address already in use" buried in a log -- is a poor
   # way to find that out. Matched on this profile's kubeconfig: every checkout runs
   # one, and a bare name here stopped every other profile's ferry-proxy too.
-  pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
-  sudo pkill -f "bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf" 2>/dev/null
+  #
+  # sudo only for a root-owned leftover, which only a ClusterIP-binding proxy is.
+  # Asking unconditionally put a password prompt in every 'ferry down', even on
+  # a cluster that never ran anything as root. pgrep sees root's processes
+  # without privilege, so finding out costs nothing.
+  local proxy_match="bin/ferry-proxy --kubeconfig $FERRY_HOME/admin.conf"
+  pkill -f "$proxy_match" 2>/dev/null
+  if pgrep -U 0 -f "$proxy_match" >/dev/null 2>&1; then
+    sudo pkill -f "$proxy_match" 2>/dev/null
+  fi
 
   # After the streamer, which would otherwise put it straight back, and before
   # the control plane, which has to be up to accept the patch.
