@@ -1596,12 +1596,20 @@ actor PodRuntime {
                 let began = ContinuousClock.now
                 do {
                     guard let provider else { throw RuntimeFailure.unsupported("no rootfs provider") }
+                    // This actor re-enters at every await below, and a
+                    // concurrent call may rebuild the pod meanwhile. What was
+                    // mounted into the old VM is not the new VM's, so it is
+                    // recorded only while the sandbox still runs `pod`.
+                    let stillPod = { self.sandboxes[sandboxID]?.pod === pod }
                     if needsImage {
                         try await provider.attachLate(image: base.source)
                         // Counted as the VM's from here: a container of this
                         // image joins, and a rebuild boots with it attached.
-                        let index = sandboxes[sandboxID]?.rootfsLayout.images.count ?? 0
-                        sandboxes[sandboxID]?.rootfsLayout.images[base.source] = PodRootfsLayout.imageVolume(index)
+                        guard stillPod() else { throw RuntimeFailure.unsupported("pod VM replaced during attach") }
+                        if sandboxes[sandboxID]?.rootfsLayout.images[base.source] == nil {
+                            let index = sandboxes[sandboxID]?.rootfsLayout.images.count ?? 0
+                            sandboxes[sandboxID]?.rootfsLayout.images[base.source] = PodRootfsLayout.imageVolume(index)
+                        }
                     }
                     for volume in missing {
                         if let bytes = volume.tmpfsBytes {
@@ -1610,7 +1618,10 @@ actor PodRuntime {
                             try await provider.attachLateVolume(name: volume.name, image: volume.image,
                                                                 mountpoint: volume.guestPath)
                         }
-                        sandboxes[sandboxID]?.podVolumes.append(volume)
+                        guard stillPod() else { throw RuntimeFailure.unsupported("pod VM replaced during attach") }
+                        if sandboxes[sandboxID]?.podVolumes.contains(volume) == false {
+                            sandboxes[sandboxID]?.podVolumes.append(volume)
+                        }
                     }
                     if !missing.isEmpty { await makeBlockSubPaths(sandboxID) }
                     let what = [needsImage ? "image" : nil, missing.isEmpty ? nil : "\(missing.count) volume(s)"]

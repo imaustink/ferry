@@ -122,6 +122,60 @@ struct PodRootfsLayout: Sendable {
     }
 }
 
+/// Things mounted into a running VM after boot, each under a name of its own
+/// and each mounted once.
+///
+/// PodRuntime is an actor, and it re-enters at every await of an attach, so
+/// two CreateContainer calls for one pod can overlap. The index that names an
+/// attachment's file and mountpoint is taken from a counter that only grows,
+/// so no two attempts share one -- not even a failed attempt and its retry,
+/// whose mount may yet complete after its timeout. And callers attaching the
+/// same key await the one attach in flight instead of starting a second.
+final class LateAttachments: Sendable {
+    private let next = Atomic<Int>(0)
+    private let state = Mutex<(done: [String: String], inFlight: [String: Task<String, any Error>])>(([:], [:]))
+
+    /// A fresh index, never handed out before.
+    func reserveIndex() -> Int { next.wrappingAdd(1, ordering: .relaxed).oldValue }
+
+    /// Where `key` is mounted, once its attach has finished.
+    func mounted(_ key: String) -> String? { state.withLock { $0.done[key] } }
+
+    var isEmpty: Bool { state.withLock { $0.done.isEmpty } }
+    var mounts: [String] { state.withLock { Array($0.done.values) } }
+    func removeAll() { state.withLock { $0.done.removeAll() } }
+
+    /// Attaches `key` once: `body`, given a fresh index, mounts it and returns
+    /// where. A caller that arrives while it runs awaits the same result; one
+    /// that arrives after it failed tries again with a new index.
+    @discardableResult
+    func attach(_ key: String, _ body: @escaping @Sendable (Int) async throws -> String) async throws -> String {
+        let found: (done: String?, task: Task<String, any Error>?) = state.withLock { state in
+            if let done = state.done[key] { return (done, nil) }
+            if let running = state.inFlight[key] { return (nil, running) }
+            let index = reserveIndex()
+            let task = Task<String, any Error> { try await body(index) }
+            state.inFlight[key] = task
+            return (nil, task)
+        }
+        if let done = found.done { return done }
+        guard let task = found.task else { preconditionFailure("neither mounted nor attaching") }
+        do {
+            let mountpoint = try await task.value
+            state.withLock { state in
+                state.done[key] = mountpoint
+                state.inFlight[key] = nil
+            }
+            return mountpoint
+        } catch {
+            state.withLock { state in
+                if state.inFlight[key] == task { state.inFlight[key] = nil }
+            }
+            throw error
+        }
+    }
+}
+
 /// Installs the provider on the VM instance the pod makes, and seeds the
 /// VM's virtiofs share with the directories already known.
 struct PodRootfsExtension: VZInstanceExtension {
@@ -165,10 +219,10 @@ final class PodRootfsProvider: HotplugProvider {
     private let uppers = Mutex<[String: (base: String, lower: String)]>([:])
     /// Images mounted after boot by attachLate: the image's disk on the Mac ->
     /// where it is mounted in the VM.
-    private let late = Mutex<[String: String]>([:])
+    private let late = LateAttachments()
     /// Block volumes mounted after boot by attachLateVolume: pod volume name ->
     /// where it is mounted in the VM.
-    private let lateVolumes = Mutex<[String: String]>([:])
+    private let lateVolumes = LateAttachments()
 
     init(instance: VZVirtualMachineInstance, layout: PodRootfsLayout) {
         self.instance = instance
@@ -178,7 +232,7 @@ final class PodRootfsProvider: HotplugProvider {
     func hotplug(_ rootfs: Containerization.Mount, id: String) async throws -> AttachedFilesystem {
         guard let scratch = layout.scratch,
               let lower = layout.images[rootfs.source].map(PodRootfsLayout.guestPath)
-                ?? late.withLock({ $0[rootfs.source] }) else {
+                ?? late.mounted(rootfs.source) else {
             throw ContainerizationError(.unsupported, message: "image \(rootfs.source) is not attached to this pod")
         }
         // A slot made when the disk was formatted costs nothing here; past
@@ -208,7 +262,7 @@ final class PodRootfsProvider: HotplugProvider {
 
     /// Whether this VM can take a container of `image` without a new device.
     func has(image: String) -> Bool {
-        layout.images[image] != nil || late.withLock { $0[image] != nil }
+        layout.images[image] != nil || late.mounted(image) != nil
     }
 
     /// Mounts an image the VM was not booted with, so a container of it can
@@ -226,27 +280,51 @@ final class PodRootfsProvider: HotplugProvider {
     /// The loop device is autoclear and goes with the VM; the directory on
     /// the Mac goes with the sandbox (removeLateDirectory).
     func attachLate(image: String) async throws {
-        guard !has(image: image) else { return }
-        guard let directory = layout.lateDirectory, let helper = layout.loopHelper else {
+        guard layout.images[image] == nil else { return }
+        guard let directory = layout.lateDirectory, layout.loopHelper != nil else {
             throw ContainerizationError(.unsupported, message: "late images are off for this pod")
+        }
+        try await late.attach(image) { [self] index in
+            let fm = FileManager.default
+            try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            let file = "late-\(index).ext4"
+            let hostFile = (directory as NSString).appendingPathComponent(file)
+            try? fm.removeItem(atPath: hostFile)
+            try fm.copyItem(atPath: image, toPath: hostFile)   // clonefile on APFS
+            let shared = try await shareReadOnly()
+            let mountpoint = PodRootfsLayout.guestPath("ferry_late_\(index)")
+            try await loopMount(helper: shared.helper, file: "\(shared.directory)/\(file)",
+                                at: mountpoint, mode: "ro", id: "ferry-late-\(index)")
+            return mountpoint
+        }
+    }
+
+    /// Puts ferry-loop in this pod's late directory and shares the directory
+    /// read-only, returning where both are in the VM. The helper runs as VM
+    /// root with CAP_SYS_ADMIN, so it is only ever run from this share, which
+    /// nothing in the guest can write -- never from the read-write one.
+    private func shareReadOnly() async throws -> (directory: String, helper: String) {
+        guard let directory = layout.lateDirectory, let helper = layout.loopHelper else {
+            throw ContainerizationError(.unsupported, message: "late mounts are off for this pod")
         }
         let fm = FileManager.default
         try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        let index = late.withLock { $0.count }
-        let file = "late-\(index).ext4"
-        let hostFile = (directory as NSString).appendingPathComponent(file)
-        try? fm.removeItem(atPath: hostFile)
-        try fm.copyItem(atPath: image, toPath: hostFile)   // clonefile on APFS
         let hostHelper = (directory as NSString).appendingPathComponent("ferry-loop")
-        if !fm.fileExists(atPath: hostHelper) { try fm.copyItem(atPath: helper, toPath: hostHelper) }
-
+        if !fm.fileExists(atPath: hostHelper) {
+            // Copied beside and renamed into place, so a concurrent attach
+            // never sees half a binary.
+            let partial = hostHelper + ".\(UUID().uuidString)"
+            try fm.copyItem(atPath: helper, toPath: partial)
+            if rename(partial, hostHelper) != 0 {
+                let reason = String(cString: strerror(errno))
+                try? fm.removeItem(atPath: partial)
+                throw RuntimeFailure.invalid("cannot place \(hostHelper): \(reason)")
+            }
+        }
         let share = try Containerization.Mount.share(source: directory, destination: "/", options: ["ro"])
         try await hotplugVirtioFS([share], id: "late")
         let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
-        let mountpoint = PodRootfsLayout.guestPath("ferry_late_\(index)")
-        try await loopMount(helper: "\(guestDirectory)/ferry-loop", file: "\(guestDirectory)/\(file)",
-                            at: mountpoint, mode: "ro", id: "ferry-late-\(index)")
-        late.withLock { $0[image] = mountpoint }
+        return (guestDirectory, "\(guestDirectory)/ferry-loop")
     }
 
     /// Mounts a block volume the VM was not booted with where LinuxPod would
@@ -266,29 +344,29 @@ final class PodRootfsProvider: HotplugProvider {
     /// was not synced; it does not know of these. flushLateVolumes does it,
     /// and has to be called before the VM is stopped.
     func attachLateVolume(name: String, image: String, mountpoint: String) async throws {
-        guard lateVolumes.withLock({ $0[name] }) == nil else { return }
-        guard let base = layout.lateDirectory, let helper = layout.loopHelper else {
+        guard let base = layout.lateDirectory, layout.loopHelper != nil else {
             throw ContainerizationError(.unsupported, message: "late volumes are off for this pod")
         }
-        let fm = FileManager.default
-        let directory = (base as NSString).appendingPathComponent("rw")
-        try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        let file = "\(name).ext4"
-        let hostFile = (directory as NSString).appendingPathComponent(file)
-        try? fm.removeItem(atPath: hostFile)
-        // A hard link, not a copy: the guest writes the volume itself. Fails
-        // across file systems, and the caller falls back to a rebuild.
-        try fm.linkItem(atPath: image, toPath: hostFile)
-        let hostHelper = (directory as NSString).appendingPathComponent("ferry-loop")
-        try? fm.removeItem(atPath: hostHelper)   // the guest can write here
-        try fm.copyItem(atPath: helper, toPath: hostHelper)
-
-        let share = try Containerization.Mount.share(source: directory, destination: "/", options: [])
-        try await hotplugVirtioFS([share], id: "late-rw")
-        let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
-        try await loopMount(helper: "\(guestDirectory)/ferry-loop", file: "\(guestDirectory)/\(file)",
-                            at: mountpoint, mode: "rw", id: "ferry-late-vol-\(name)")
-        lateVolumes.withLock { $0[name] = mountpoint }
+        try await lateVolumes.attach(name) { [self] index in
+            let fm = FileManager.default
+            let directory = (base as NSString).appendingPathComponent("rw")
+            try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            let file = "\(name).ext4"
+            let hostFile = (directory as NSString).appendingPathComponent(file)
+            try? fm.removeItem(atPath: hostFile)
+            // A hard link, not a copy: the guest writes the volume itself. Fails
+            // across file systems, and the caller falls back to a rebuild.
+            try fm.linkItem(atPath: image, toPath: hostFile)
+            // The helper comes from the read-only share; only the volume's
+            // file is in this one, which the guest can write.
+            let shared = try await shareReadOnly()
+            let share = try Containerization.Mount.share(source: directory, destination: "/", options: [])
+            try await hotplugVirtioFS([share], id: "late-rw")
+            let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
+            try await loopMount(helper: shared.helper, file: "\(guestDirectory)/\(file)",
+                                at: mountpoint, mode: "rw", id: "ferry-late-vol-\(index)")
+            return mountpoint
+        }
     }
 
     /// Mounts a `medium: Memory` emptyDir the VM was not booted with: a tmpfs
@@ -310,7 +388,7 @@ final class PodRootfsProvider: HotplugProvider {
 
     /// Whether any block volume was mounted after boot, and so has to be
     /// flushed before the VM stops.
-    var hasLateVolumes: Bool { lateVolumes.withLock { !$0.isEmpty } }
+    var hasLateVolumes: Bool { !lateVolumes.isEmpty }
 
     /// Writes back and unmounts every late volume, so what the pod wrote
     /// without syncing reaches the Mac before the VM goes: the guest's sync
@@ -318,7 +396,7 @@ final class PodRootfsProvider: HotplugProvider {
     /// fsync(). An unmount that fails (something still holds the mount) is
     /// left; the sync has already written everything back.
     func flushLateVolumes() async {
-        let mounts = lateVolumes.withLock { Array($0.values) }
+        let mounts = lateVolumes.mounts
         guard !mounts.isEmpty else { return }
         guard let agent = try? await instance.dialAgent() else { return }
         do {
@@ -334,7 +412,7 @@ final class PodRootfsProvider: HotplugProvider {
             }
         }
         try? await agent.close()
-        lateVolumes.withLock { $0.removeAll() }
+        lateVolumes.removeAll()
     }
 
     /// Runs ferry-loop as a root-of-VM process with CAP_SYS_ADMIN: FILE under
