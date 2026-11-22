@@ -129,7 +129,7 @@ but not yet acknowledged.
 ## Late block volumes in ferry-cri
 
 `PodRootfsProvider.attachLateVolume`, called when a booted VM lacks block
-volumes the container mounts, and nothing in memory:
+volumes the container mounts:
 
 1. hard-link the volume's own image (a claim's `disk.ext4`, an emptyDir's
    `.ferry-disk.ext4`) into `<state>/late/<sandbox>/rw/`. A clone would not see
@@ -140,28 +140,40 @@ volumes the container mounts, and nothing in memory:
    attached at boot, so the container's bind mounts and subPaths are the same;
 4. create the subPaths the container names, with the volume root's mode.
 
+A `medium: Memory` emptyDir needs no file: `attachLateMemory` has the guest
+agent mount a tmpfs at `/run/volumes/<name>`, the mount LinuxPod makes at
+boot, and it is carried across a later rebuild like any memory volume.
+
 LinuxPod.stop unmounts the volumes it was made with, which writes back what
-was never synced. It does not know of late ones, so `flushLateVolumes` runs
-the guest's `sync` and unmounts each before every stop of a pod VM. The
-exception is ferry-cri's own shutdown: it kills containers that are still
-running, so anything one writes, unsynced, between that sync and the kill is
-lost.
+was never synced. It does not know of late ones. So before every stop of a
+pod VM that has any (pod deletion, rebuild, ferry-cri's own shutdown),
+ferry-cri stops the pod's containers, as the pod's stop would a moment
+later, then runs the guest's `sync` and unmounts each one. Stopping them
+first means nothing writes between the sync and the end.
 
 | | before | now |
 |---|---|---|
 | native sidecar, then main mounting a RWO claim | `SandboxChanged`, pod recreated | mounted in **24 ms**, 0 restarts; `chown` kept |
 | init container, then main mounting an emptyDir whole and by subPath, as uid 1000 | VM stopped and rebooted | mounted in **49 ms**; one loop device, subPath writable |
 | main writes 4-8 MiB without syncing, pod deleted within ~1 s, new pod reads the claim (×4) | n/a | every file intact, md5 matches, no journal recovery |
+| the same, then `ferry restart` rather than a delete | n/a | intact, no journal recovery |
+| init container, then main with a 64 MiB `medium: Memory` emptyDir as uid 1000 | VM rebooted | tmpfs mounted in **2 ms**, `size=65536k`, 1777, writable |
 
-Not tried: the same delete without the flush, to see what it saves.
+What the flush saves (`CONTROL_ONLY=1`): 4 MiB written to a late ext4 volume
+without syncing, the VM stopped ~650 ms later, and a second VM booted with
+the volume attached as a disk, as the next pod would be:
+
+| | runs | the next VM reads |
+|---|---|---|
+| stopped as LinuxPod.stop does | 5 | journal recovered, **the file does not exist** |
+| guest `sync` and unmount first, as ferry-cri does | 4 | the file, md5 matching, no recovery |
 
 ## What this leaves
 
-- **A `medium: Memory` volume that arrives after boot still costs a VM
-  rebuild.** It is a tmpfs, carried across rebuilds in memory. A root-of-VM
-  `mount -t tmpfs` would do, but has not been needed.
-- **A late volume's synced writes cost twice a boot disk's** until something
-  else rebuilds the VM and attaches it as a disk.
+- **A late volume's synced writes cost twice a boot disk's** (166 µs against
+  82) until something else rebuilds the VM and attaches it as a disk. That is
+  the price of the virtiofs round trip. Nothing else that arrives after boot
+  costs the VM any more.
 - **ferry-loop's errors are an exit code.** A root-of-VM process run without
   stdio has nowhere to write. ferry-cri logs `ferry-loop exited N` and falls
   back.
@@ -179,6 +191,7 @@ FERRY_LOOP=../../bin/ferry-loop HELPER_ONLY=1 WORK=/tmp .build/release/late-disk
 (cd fsyncbench && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o fsyncbench .)
 DURABILITY_ONLY=1 FSYNCBENCH=$PWD/fsyncbench/fsyncbench WORK=/tmp .build/release/late-disks run ...
 CRASH_ONLY=1 CRASH_AFTER=2000 FSYNCBENCH=$PWD/fsyncbench/fsyncbench WORK=/tmp .build/release/late-disks run ...
+CONTROL_ONLY=1 CONTROL_FLUSH=0 WORK=/tmp .build/release/late-disks run ...   # 1: flush first
 ```
 
 The durability runs `sample` and `SIGKILL` the newest

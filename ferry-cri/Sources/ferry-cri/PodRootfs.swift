@@ -291,6 +291,27 @@ final class PodRootfsProvider: HotplugProvider {
         lateVolumes.withLock { $0[name] = mountpoint }
     }
 
+    /// Mounts a `medium: Memory` emptyDir the VM was not booted with: a tmpfs
+    /// where LinuxPod would have mounted it, the same mount it makes at boot.
+    /// No device and no helper, so the guest agent does it. PodRuntime carries
+    /// it across a rebuild as it does any memory volume.
+    func attachLateMemory(mountpoint: String, bytes: UInt64) async throws {
+        let agent = try await instance.dialAgent()
+        do {
+            try await agent.mount(ContainerizationOCI.Mount(
+                type: "tmpfs", source: "tmpfs", destination: mountpoint,
+                options: bytes > 0 ? ["size=\(bytes)"] : []))
+            try? await agent.close()
+        } catch {
+            try? await agent.close()
+            throw error
+        }
+    }
+
+    /// Whether any block volume was mounted after boot, and so has to be
+    /// flushed before the VM stops.
+    var hasLateVolumes: Bool { lateVolumes.withLock { !$0.isEmpty } }
+
     /// Writes back and unmounts every late volume, so what the pod wrote
     /// without syncing reaches the Mac before the VM goes: the guest's sync
     /// commits each ext4 journal with a flush, which reaches the Mac as a host

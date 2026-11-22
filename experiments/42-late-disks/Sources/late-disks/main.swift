@@ -146,6 +146,59 @@ func say(_ title: String, _ code: Int32) {
     print(output().split(separator: "\n").map { "   " + $0 }.joined(separator: "\n"))
 }
 
+// 8. What ferry-cri's flush saves (CONTROL_ONLY=1, CONTROL_FLUSH=0|1). A
+// late ext4 volume gets 4 MiB written without syncing, and the VM is stopped
+// at once the way LinuxPod.stop does it -- with CONTROL_FLUSH=1, after the
+// guest's sync and an unmount, as PodRootfsProvider.flushLateVolumes does.
+// Then a second VM boots with the volume attached as a disk, as the next pod
+// would, and reads the file: its kernel replays the journal, which the EXT4
+// reader on the Mac would not.
+if ProcessInfo.processInfo.environment["CONTROL_ONLY"] == "1" {
+    let flush = ProcessInfo.processInfo.environment["CONTROL_FLUSH"] == "1"
+    let volume = share.appending(component: "ctl.ext4")
+    try formatVolume(volume, bytes: 512 << 20)
+    let code = try await root("""
+        d=$($B losetup -f) && $B losetup $d /run/volumes/late/ctl.ext4 || exit 60
+        $B mkdir -p /run/volumes/ctl && $B mount -t ext4 $d /run/volumes/ctl || exit 61
+        $B head -c 4194304 /dev/urandom > /run/volumes/ctl/data
+        echo "expected: $($B md5sum /run/volumes/ctl/data)"
+        """)
+    say("control: 4 MiB written, unsynced", code)
+    let t = Date()
+    if flush {
+        try await agent.sync()
+        try await agent.umount(path: "/run/volumes/ctl", flags: 0)
+    }
+    try await pod.stop()
+    print("   stopped \(String(format: "%.0f", Date().timeIntervalSince(t) * 1000)) ms after the write, flush=\(flush)")
+
+    let verifyShare = work.appending(component: "verify")
+    try FileManager.default.createDirectory(at: verifyShare, withIntermediateDirectories: true)
+    let shell2 = work.appending(component: "shell2.ext4")
+    try clone(shellDisk, to: shell2)
+    let check = try LinuxPod("verify", vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs, group: group),
+                             vm: VMResources(cpus: 1, memoryInBytes: 512 << 20)) { c in
+        c.volumes = [
+            .init(name: "v", source: .diskImage(path: volume, readOnly: false), format: "ext4"),
+            .init(name: "out", source: .virtiofs(path: verifyShare, readOnly: false), format: "virtiofs"),
+        ]
+    }
+    try await check.addContainer("c", rootfs: .block(format: "ext4", source: shell2.path(), destination: "/", options: [])) { c in
+        c.process.arguments = ["/bin/sh", "-c",
+            "{ md5sum /v/data; wc -c < /v/data; dmesg | grep -iE 'recover|EXT4-fs' ; } > /out/verify.txt 2>&1"]
+        c.mounts.append(.sharedMount(name: "v", destination: "/v"))
+        c.mounts.append(.sharedMount(name: "out", destination: "/out"))
+    }
+    try await check.create()
+    try await check.startContainer("c")
+    _ = try await check.waitContainer("c")
+    try await check.stop()
+    let seen = (try? String(contentsOf: verifyShare.appending(component: "verify.txt"), encoding: .utf8)) ?? "(no output)"
+    print("\n== the next VM, with the volume attached at boot, reads:")
+    print(seen.split(separator: "\n").map { "   " + $0 }.joined(separator: "\n"))
+    exit(0)
+}
+
 // 7. A VM killed mid-stream (CRASH_ONLY=1). The guest writes a counter to a
 // raw late loop device, syncs it, then acknowledges it on the share. The Mac
 // SIGKILLs the VM process and checks that the disk file holds at least the

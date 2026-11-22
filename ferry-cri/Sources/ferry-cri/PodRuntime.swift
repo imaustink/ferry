@@ -1026,7 +1026,7 @@ actor PodRuntime {
             containers[containerID]?.finishedAt = Self.now()
         }
         if wasBooted {
-            await flushLateVolumes(record.pod)
+            await flushLateVolumes(id, record.pod)
             try? await record.pod.stop()
         }
         // After the stop, not before: the VM has to have let go of the image
@@ -1579,16 +1579,16 @@ actor PodRuntime {
         // image and every volume it mounts -- which is what a restart, and
         // most containers that arrive late, look like. Otherwise it needs a
         // device the VM cannot be given, and so a VM it can.
-        // An image or a block volume the VM was not booted with is mounted
-        // into it instead (PodRootfsProvider.attachLate, attachLateVolume). A
-        // memory volume still costs the VM: it is carried across a rebuild.
+        // An image or a volume the VM was not booted with is mounted into it
+        // instead (PodRootfsProvider.attachLate, attachLateVolume,
+        // attachLateMemory).
         if let current = sandboxes[sandboxID], current.booted, current.ready, !current.needsRecreate,
            current.rootfsLayout.lateDirectory != nil {
             // A suffix of blockVolumes: the ones claimed since the VM booted.
             // Appended to podVolumes in the same order, the two compare equal.
             let missing = current.blockVolumes.filter { !current.podVolumes.contains($0) }
             let needsImage = !current.rootfsLayout.canRun(image: base.source)
-            if (needsImage || !missing.isEmpty), !missing.contains(where: \.isMemory) {
+            if needsImage || !missing.isEmpty {
                 let pod = current.pod
                 let provider = try? await pod.withVirtualMachineInstance { vm in
                     (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
@@ -1604,8 +1604,12 @@ actor PodRuntime {
                         sandboxes[sandboxID]?.rootfsLayout.images[base.source] = PodRootfsLayout.imageVolume(index)
                     }
                     for volume in missing {
-                        try await provider.attachLateVolume(name: volume.name, image: volume.image,
-                                                            mountpoint: volume.guestPath)
+                        if let bytes = volume.tmpfsBytes {
+                            try await provider.attachLateMemory(mountpoint: volume.guestPath, bytes: bytes)
+                        } else {
+                            try await provider.attachLateVolume(name: volume.name, image: volume.image,
+                                                                mountpoint: volume.guestPath)
+                        }
                         sandboxes[sandboxID]?.podVolumes.append(volume)
                     }
                     if !missing.isEmpty { await makeBlockSubPaths(sandboxID) }
@@ -1917,11 +1921,19 @@ actor PodRuntime {
     /// Writes back and unmounts the block volumes mounted into a pod's VM after
     /// boot, which LinuxPod.stop does not know to unmount. Called before every
     /// stop of a booted pod; a no-op for a pod without any.
-    private func flushLateVolumes(_ pod: LinuxPod) async {
+    ///
+    /// The pod's containers are stopped first, as the pod's stop would a
+    /// moment later: a container still running after the sync could write
+    /// something that the stop then throws away.
+    private func flushLateVolumes(_ sandboxID: String, _ pod: LinuxPod) async {
         let provider = try? await pod.withVirtualMachineInstance { vm in
             (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
         }
-        await provider?.flushLateVolumes()
+        guard let provider, provider.hasLateVolumes else { return }
+        for id in containers.values.filter({ $0.sandboxID == sandboxID }).map(\.id) {
+            try? await pod.stopContainer(id)
+        }
+        await provider.flushLateVolumes()
     }
 
     /// Hands back every block volume a sandbox holds. Only once its VM has
@@ -2197,7 +2209,7 @@ actor PodRuntime {
                 """)
         }
         await carryMemoryVolumes(sandboxID)
-        await flushLateVolumes(sandbox.pod)
+        await flushLateVolumes(sandboxID, sandbox.pod)
         try? await sandbox.pod.stop()
         // The old containers keep their records, and with them their exit
         // codes and log paths: the kubelet reads the previous attempt's status
@@ -3110,9 +3122,7 @@ actor PodRuntime {
     /// the same subnet fails with VMNET_FAILURE.
     func shutdown() async {
         for record in sandboxes.values {
-            // Containers still running are killed by the stop, after this
-            // sync: what one writes in between, unsynced, is lost.
-            await flushLateVolumes(record.pod)
+            await flushLateVolumes(record.id, record.pod)
             try? await record.pod.stop()
             releaseBlockVolumes(sandboxID: record.id)
             network.releaseInterface(record.id)
