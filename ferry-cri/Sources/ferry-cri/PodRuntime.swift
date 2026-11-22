@@ -20,6 +20,12 @@ struct RuntimeConfig: Sendable {
     var stateDir: URL
     var kernelPath: String
     var podSubnet: String
+    /// ferry-netd's socket. When set, the pod network comes from ferry-netd,
+    /// which holds it across a ferry-cri that dies (see ferry-netd/main.swift).
+    var networkOwnerSocket: String? = nil
+    /// bin/ferry-loop, the guest helper that mounts an image arriving after a
+    /// pod VM booted. Nil: such an image costs the pod its VM, as before.
+    var loopHelper: String? = nil
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
@@ -353,9 +359,32 @@ actor PodRuntime {
     /// init so failures surface with context before the server starts serving.
     func setStreamer(_ client: StreamerClient) { self.streamer = client }
 
+    /// "sha256:0123…" -> "init-0123456789abcdef.ext4".
+    static func initFilesystemName(digest: String) -> String {
+        let hex = digest.split(separator: ":").last.map(String.init) ?? digest
+        return "init-\(hex.prefix(16)).ext4"
+    }
+
+    /// Every unpacked guest agent but the one in use, including the unversioned
+    /// init.ext4 that came before them.
+    static func removeStaleInitFilesystems(in dir: URL, keeping name: String) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path())) ?? []
+        for other in names where other != name
+            && (other == "init.ext4" || (other.hasPrefix("init-") && other.hasSuffix(".ext4"))) {
+            try? FileManager.default.removeItem(at: dir.appending(component: other))
+        }
+    }
+
     func prepare() async throws {
         let initImage = try await store.getInitImage(reference: config.initImage)
-        let initPath = config.stateDir.appending(component: "init.ext4")
+        // Named for the agent it holds. It was init.ext4, kept whenever it
+        // existed, and the state directory outlives restarts, so a ferry-cri
+        // upgraded to a newer framework went on booting every pod with the old
+        // guest agent -- the host/guest drift Package.swift pins against. The
+        // VMs that used an older one died with the process that made them.
+        let digest = try await store.get(reference: config.initImage).digest
+        let initPath = config.stateDir.appending(component: Self.initFilesystemName(digest: digest))
+        Self.removeStaleInitFilesystems(in: config.stateDir, keeping: initPath.lastPathComponent)
         do {
             self.initfs = try await initImage.initBlock(at: initPath, for: .linuxArm)
         } catch let error as ContainerizationError where error.code == .exists {
@@ -363,12 +392,15 @@ actor PodRuntime {
         }
         await rehydrateImages()
         sweepContainerDisks()
-        // A vmnet subnet stays reserved for about a minute after the process
-        // using it exits -- measured, not guessed: see experiments/07-vmnet-leak.
-        // So a restart normally cannot have its previous subnet back, and waiting
-        // for it would cost the user a minute of startup for nothing. Moving to
-        // another is right; what it costs is a changed gateway, which is part of
-        // the CoreDNS manifest and so rolls CoreDNS out again.
+        // A vmnet subnet stays reserved after the process that created it dies
+        // without releasing it -- fifteen minutes and more when VMs were
+        // attached (experiment 41). A clean shutdown releases it (experiment
+        // 22), and with ferry-netd holding the network a ferry-cri that died
+        // is handed the same one back, so the slice is normally there. When it
+        // is not -- something else holds it, or ferry-netd itself died -- waiting
+        // is no use alone and moving is right; what it costs is a changed
+        // gateway, which is part of the CoreDNS manifest and so rolls CoreDNS
+        // out again.
         // When there is a cluster network, the node's slice of it *is* the vmnet
         // subnet -- that is what puts the Mac on the pod network.
         let preferredSubnet = config.clusterCIDR
@@ -401,7 +433,7 @@ actor PodRuntime {
             var announced = false
             while true {
                 do {
-                    chosen = try PodNetwork(subnet: try CIDRv4(preferredSubnet))
+                    chosen = try PodNetwork(subnet: try CIDRv4(preferredSubnet), owner: config.networkOwnerSocket)
                     lastError = nil
                     break
                 } catch {
@@ -452,7 +484,7 @@ actor PodRuntime {
         } else {
             for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
                 do {
-                    chosen = try PodNetwork(subnet: try CIDRv4(candidate))
+                    chosen = try PodNetwork(subnet: try CIDRv4(candidate), owner: config.networkOwnerSocket)
                     chosenSubnet = candidate
                     if candidate != preferredSubnet {
                         print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")
@@ -954,13 +986,15 @@ actor PodRuntime {
                          cpus: Int? = nil,
                          volumes: [BlockVolume] = [],
                          layout: PodRootfsLayout = PodRootfsLayout()) throws -> LinuxPod {
-        try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs,
-                                                     group: eventLoops)) { c in
-            c.cpus = cpus ?? config.defaultCPUs
+        // The VM's size, apart from the containers' own limits, which each
+        // container's configuration carries.
+        let vm = VMResources(cpus: cpus ?? config.defaultCPUs,
+                             memoryInBytes: memoryBytes ?? config.defaultMemoryBytes)
+        return try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs,
+                                                            group: eventLoops), vm: vm) { c in
             c.volumes = volumes.map(\.podVolume) + layout.podVolumes
             // Every container reaches the VM through this, at boot or after.
             c.extensions = [PodRootfsExtension(layout: layout)]
-            c.memoryInBytes = memoryBytes ?? config.defaultMemoryBytes
             // eth0 is vmnet and keeps the default route; eth1, when there is a
             // cluster, is ferry's own segment.
             c.interfaces = clusterInterface.map { [interface, $0] } ?? [interface]
@@ -991,7 +1025,10 @@ actor PodRuntime {
             containers[containerID]?.state = .exited
             containers[containerID]?.finishedAt = Self.now()
         }
-        if wasBooted { try? await record.pod.stop() }
+        if wasBooted {
+            await flushLateVolumes(id, record.pod)
+            try? await record.pod.stop()
+        }
         // After the stop, not before: the VM has to have let go of the image
         // before another pod's VM may attach it.
         releaseBlockVolumes(sandboxID: id)
@@ -1031,6 +1068,7 @@ actor PodRuntime {
         }
         // Every container's writes, current and past, went to this.
         try? FileManager.default.removeItem(atPath: scratchPath(id))
+        removeLateDirectory(id)
         // The reserved DNS address stays reserved across CoreDNS restarts; only
         // ordinary pod addresses go back to the allocator.
         if sandboxes[id]?.usesReservedAddress == true {
@@ -1143,7 +1181,7 @@ actor PodRuntime {
     private func applyNftables(sandboxID: String, payload: Data, label: String) async {
         guard config.nftBundlePath != nil, !payload.isEmpty else { return }
         guard let target = containers.values.first(where: {
-            $0.sandboxID == sandboxID && $0.state == .running
+            $0.sandboxID == sandboxID && $0.state == .running && !stopping.contains($0.id)
         }) else { return }
 
         var launched: LinuxProcess?
@@ -1199,8 +1237,9 @@ actor PodRuntime {
         guard let sandbox = sandboxes[sandboxID] else { return }
         // Any running container in the pod will do: one VM is one network
         // stack, so they all share the netns the plugin is about to program.
+        // Not one being stopped, for the reason `stopping` gives.
         guard let target = containers.values.first(where: {
-            $0.sandboxID == sandboxID && $0.state == .running
+            $0.sandboxID == sandboxID && $0.state == .running && !stopping.contains($0.id)
         }) else { return }
 
         // A host port of 0 is explicitly "do not expose this", not "pick one",
@@ -1435,6 +1474,30 @@ actor PodRuntime {
         return Int((quota + period - 1) / period)
     }
 
+    /// A container's cgroup limits inside its pod's machine: what the kubelet
+    /// set, and the machine's own size for what it did not. A CPU limit bounds
+    /// the container; see containerCPUs for why a request deliberately does not.
+    static func containerLimits(memoryLimit: Int64, cpuQuota: Int64, cpuPeriod: Int64,
+                                vm: VMResources) -> (cpus: Int, memoryInBytes: UInt64) {
+        (containerCPUs(quota: cpuQuota, period: cpuPeriod) ?? vm.cpus,
+         memoryLimit > 0 ? UInt64(memoryLimit) : vm.memoryInBytes)
+    }
+
+    /// The cgroup v2 files written in a container's cgroup in the guest.
+    ///
+    /// memory.oom.group=1 makes an out-of-memory kill take the whole container
+    /// rather than the one process the kernel picked, so a container that runs
+    /// out of memory dies and is restarted instead of carrying on without, say,
+    /// a worker it depends on. It is what the kubelet asks for on a cgroup v2
+    /// node unless singleProcessOOMKill is set, and the guest is cgroup v2 --
+    /// but ferry's kubelet answers "is this host cgroup v2?" for macOS, which
+    /// has no cgroups, so it never asks. ferry-cri asks on its behalf.
+    ///
+    /// Whatever the kubelet does send wins, key by key, as it would with runc.
+    static func containerUnified(kubelet: [String: String]) -> [String: String] {
+        ["memory.oom.group": "1"].merging(kubelet) { _, fromKubelet in fromKubelet }
+    }
+
     /// Who a container's process runs as, in the "user[:group]" form the guest
     /// agent resolves against the container's own /etc/passwd and /etc/group.
     /// Nil leaves the framework's default, root.
@@ -1516,6 +1579,60 @@ actor PodRuntime {
         // image and every volume it mounts -- which is what a restart, and
         // most containers that arrive late, look like. Otherwise it needs a
         // device the VM cannot be given, and so a VM it can.
+        // An image or a volume the VM was not booted with is mounted into it
+        // instead (PodRootfsProvider.attachLate, attachLateVolume,
+        // attachLateMemory).
+        if let current = sandboxes[sandboxID], current.booted, current.ready, !current.needsRecreate,
+           current.rootfsLayout.lateDirectory != nil {
+            // A suffix of blockVolumes: the ones claimed since the VM booted.
+            // Appended to podVolumes in the same order, the two compare equal.
+            let missing = current.blockVolumes.filter { !current.podVolumes.contains($0) }
+            let needsImage = !current.rootfsLayout.canRun(image: base.source)
+            if needsImage || !missing.isEmpty {
+                let pod = current.pod
+                let provider = try? await pod.withVirtualMachineInstance { vm in
+                    (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
+                }
+                let began = ContinuousClock.now
+                do {
+                    guard let provider else { throw RuntimeFailure.unsupported("no rootfs provider") }
+                    // This actor re-enters at every await below, and a
+                    // concurrent call may rebuild the pod meanwhile. What was
+                    // mounted into the old VM is not the new VM's, so it is
+                    // recorded only while the sandbox still runs `pod`.
+                    let stillPod = { self.sandboxes[sandboxID]?.pod === pod }
+                    if needsImage {
+                        try await provider.attachLate(image: base.source)
+                        // Counted as the VM's from here: a container of this
+                        // image joins, and a rebuild boots with it attached.
+                        guard stillPod() else { throw RuntimeFailure.unsupported("pod VM replaced during attach") }
+                        if sandboxes[sandboxID]?.rootfsLayout.images[base.source] == nil {
+                            let index = sandboxes[sandboxID]?.rootfsLayout.images.count ?? 0
+                            sandboxes[sandboxID]?.rootfsLayout.images[base.source] = PodRootfsLayout.imageVolume(index)
+                        }
+                    }
+                    for volume in missing {
+                        if let bytes = volume.tmpfsBytes {
+                            try await provider.attachLateMemory(mountpoint: volume.guestPath, bytes: bytes)
+                        } else {
+                            try await provider.attachLateVolume(name: volume.name, image: volume.image,
+                                                                mountpoint: volume.guestPath)
+                        }
+                        guard stillPod() else { throw RuntimeFailure.unsupported("pod VM replaced during attach") }
+                        if sandboxes[sandboxID]?.podVolumes.contains(volume) == false {
+                            sandboxes[sandboxID]?.podVolumes.append(volume)
+                        }
+                    }
+                    if !missing.isEmpty { await makeBlockSubPaths(sandboxID) }
+                    let what = [needsImage ? "image" : nil, missing.isEmpty ? nil : "\(missing.count) volume(s)"]
+                        .compactMap { $0 }.joined(separator: " and ")
+                    print("    \(cfg.metadata.name): \(what) mounted into running \(sandboxID) in "
+                          + "\((ContinuousClock.now - began).formatted(.units(allowed: [.milliseconds])))")
+                } catch {
+                    print("    \(cfg.metadata.name): could not mount into running \(sandboxID): \(error)")
+                }
+            }
+        }
         if let current = sandboxes[sandboxID], current.booted,
            !current.rootfsLayout.canRun(image: base.source) || current.blockVolumes != current.podVolumes {
             try await replaceBootedPod(sandboxID, arriving: cfg.metadata.name)
@@ -1584,6 +1701,14 @@ actor PodRuntime {
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
+        let unified = Self.containerUnified(kubelet: cfg.linux.resources.unified)
+        // A container without a limit is bounded by its pod's machine and
+        // nothing else. Containerization applies a container's cpus and
+        // memoryInBytes as its cgroup limits unconditionally since 0.47, at 4
+        // CPUs and 1 GiB unless told otherwise, so "no limit" has to be said
+        // as the size of the VM.
+        let limits = Self.containerLimits(memoryLimit: memoryLimit, cpuQuota: cpuQuota,
+                                          cpuPeriod: cpuPeriod, vm: sandbox.pod.vm)
 
         // The kubelet assembles volume contents on the host -- projected
         // ServiceAccount tokens, ConfigMaps, Secrets, emptyDir -- and passes
@@ -1692,12 +1817,8 @@ actor PodRuntime {
             if !supplementalGroups.isEmpty { c.process.user.additionalGids = supplementalGroups }
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
-            if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
-            // A CPU limit bounds the container within the pod's machine; see
-            // containerCPUs for why a request deliberately does not.
-            if let cpus = Self.containerCPUs(quota: cpuQuota, period: cpuPeriod) {
-                c.cpus = cpus
-            }
+            (c.cpus, c.memoryInBytes) = limits
+            c.unified = unified
             // Append rather than replace: the defaults carry /proc, /sys and
             // the rest of the standard container filesystem.
             c.mounts.append(contentsOf: shares)
@@ -1806,6 +1927,24 @@ actor PodRuntime {
             throw error
         }
         sandboxes[sandboxID]?.blockVolumes.append(volume)
+    }
+
+    /// Writes back and unmounts the block volumes mounted into a pod's VM after
+    /// boot, which LinuxPod.stop does not know to unmount. Called before every
+    /// stop of a booted pod; a no-op for a pod without any.
+    ///
+    /// The pod's containers are stopped first, as the pod's stop would a
+    /// moment later: a container still running after the sync could write
+    /// something that the stop then throws away.
+    private func flushLateVolumes(_ sandboxID: String, _ pod: LinuxPod) async {
+        let provider = try? await pod.withVirtualMachineInstance { vm in
+            (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
+        }
+        guard let provider, provider.hasLateVolumes else { return }
+        for id in containers.values.filter({ $0.sandboxID == sandboxID }).map(\.id) {
+            try? await pod.stopContainer(id)
+        }
+        await provider.flushLateVolumes()
     }
 
     /// Hands back every block volume a sandbox holds. Only once its VM has
@@ -1982,6 +2121,13 @@ actor PodRuntime {
         }
         layout.scratch = PodRootfsLayout.scratchVolume
         layout.scratchPath = try await makeScratch(sandboxID)
+        if let helper = config.loopHelper {
+            // A fresh directory for each VM: what a previous VM of this sandbox
+            // mounted from it went with that VM.
+            removeLateDirectory(sandboxID)
+            layout.lateDirectory = lateDirectory(sandboxID)
+            layout.loopHelper = helper
+        }
         mark("scratch")
 
         let pod = try makePod(id: sandboxID, interface: sandbox.interface, cfg: sandbox.config,
@@ -2074,6 +2220,7 @@ actor PodRuntime {
                 """)
         }
         await carryMemoryVolumes(sandboxID)
+        await flushLateVolumes(sandboxID, sandbox.pod)
         try? await sandbox.pod.stop()
         // The old containers keep their records, and with them their exit
         // codes and log paths: the kubelet reads the previous attempt's status
@@ -2116,6 +2263,18 @@ actor PodRuntime {
                 || (name.hasPrefix("scratch-template") && name != Self.scratchTemplateName)) {
             try? FileManager.default.removeItem(at: config.stateDir.appending(component: name))
         }
+        // Every late image of a previous run: its VMs went with it.
+        try? FileManager.default.removeItem(at: config.stateDir.appending(component: "late"))
+    }
+
+    /// Images that reached this sandbox's VM after it booted; see
+    /// PodRootfsProvider.attachLate. Clones, so it costs no space.
+    private func lateDirectory(_ sandboxID: String) -> String {
+        config.stateDir.appending(component: "late").appending(component: sandboxID).path()
+    }
+
+    private func removeLateDirectory(_ sandboxID: String) {
+        try? FileManager.default.removeItem(atPath: lateDirectory(sandboxID))
     }
 
     private func scratchPath(_ sandboxID: String) -> String {
@@ -2315,6 +2474,14 @@ actor PodRuntime {
     /// then came up anyway holding its ports. The pod crash-looped on
     /// "address already in use" until it was deleted (experiment 38).
     private var starting: [String: Task<Void, Error>] = [:]
+    /// Containers between StopContainer's SIGTERM and their exit. Nothing ferry
+    /// runs for itself should exec beside one: the guest refuses a process in a
+    /// container on its way out, and Containerization's LinuxProcess.start
+    /// does not close the stdio it had already connected when startProcess
+    /// fails, so every refusal left three host sockets open for good. A Service
+    /// change during a scale-down did it to every pod being stopped
+    /// (experiment 38's soak, 28 sockets in 30 cycles).
+    private var stopping: Set<String> = []
 
     private func start(_ id: String, in pod: LinuxPod) async throws {
         if let inFlight = starting[id] {
@@ -2383,6 +2550,10 @@ actor PodRuntime {
             return
         }
         var code: Int32 = 128 + 9
+        // Still .running until recordExit, across awaits during which the
+        // actor serves other calls; see `stopping`.
+        stopping.insert(id)
+        defer { stopping.remove(id) }
         if let sandbox = sandboxes[record.sandboxID] {
             if timeout > 0, (try? await sandbox.pod.killContainer(id, signal: .term)) != nil,
                let status = try? await sandbox.pod.waitContainer(id, timeoutInSeconds: timeout) {
@@ -2962,10 +3133,12 @@ actor PodRuntime {
     /// the same subnet fails with VMNET_FAILURE.
     func shutdown() async {
         for record in sandboxes.values {
+            await flushLateVolumes(record.id, record.pod)
             try? await record.pod.stop()
             releaseBlockVolumes(sandboxID: record.id)
             network.releaseInterface(record.id)
             try? FileManager.default.removeItem(atPath: scratchPath(record.id))
+            removeLateDirectory(record.id)
         }
         sandboxes.removeAll()
         containers.removeAll()

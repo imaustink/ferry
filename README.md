@@ -309,8 +309,7 @@ the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
   user, which cannot give a file away, and an init container that chowns its
   data directory, as most stateful charts have, crashlooped forever on a share.
   An emptyDir with `medium: Memory` is a tmpfs inside the pod's VM, sized by
-  its `sizeLimit`, and carried across the VM rebuilds that container restarts
-  and init containers cause. See
+  its `sizeLimit`, and carried across a rebuild of the VM. See
   [experiments/30-volumes-and-logs](experiments/30-volumes-and-logs/FINDINGS.md).
 - **Resource limits and securityContext work.** The kubelet does not send
   `ContainerConfig.Linux` on darwin, so every pod silently ran unbounded with
@@ -630,15 +629,15 @@ a VM of roughly 300 MiB, so the addons are the lean variants, and
 
 ### Limits worth knowing
 
-- **A container can join a running pod only with an image the pod already
-  runs.** Images are disks, and `Virtualization.framework` attaches a disk to a
-  running VM only over USB, which a pod's VM is not given. So the VM attaches
-  every image the pod spec names that is pulled when it boots. A restart, a
-  sidecar, and a `kubectl debug` container of one of those images join in
-  place. A regular container with any other image, such as one still pulling at
-  boot, has the pod recreated around it. A `kubectl debug` container with
-  another image is refused rather than restarting the pod. A block volume that
-  arrives after the boot also costs a VM rebuild.
+- **A volume that arrives after boot has slower synced writes until the pod's
+  VM is rebuilt.** A pod VM cannot be given a disk once it is running, but
+  nothing that arrives late costs it the VM any more. An image -- a main
+  container's pulled after its sidecar started, or a `kubectl debug`
+  container's -- is mounted into the running VM in about 40 ms, and a claim
+  or emptyDir in 2-50 ms, and the container joins in place
+  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). A late volume's
+  flush is a host `fsync()`, as a boot volume disk's is, but costs about twice
+  as much (166 µs against 82).
 - **The cluster starts at login, not at boot.** `Virtualization.framework` will
   not make a VM from a process outside a user session, so the login agent is a
   LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
@@ -672,12 +671,17 @@ a VM of roughly 300 MiB, so the addons are the lean variants, and
   `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared. Every
   other VM, Docker Desktop included, takes one of ferry's slots. See also
   [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
-- **Restarting in quick succession moves the pod network.** A vmnet subnet stays
-  reserved for about a minute after the run using it stops, and there are 32
-  networks across the whole Mac, so a restart takes the next free subnet. Pods
-  and Services are unaffected. CoreDNS rolls out again because the gateway is
-  part of its config. See
-  [experiments/07-vmnet-leak](experiments/07-vmnet-leak/FINDINGS.md).
+- **A ferry-cri that dies keeps its pod network.** vmnet holds a subnet long
+  after the process that created it dies with VMs attached -- fifteen minutes
+  and more in [experiment 41](experiments/41-vmnet-owner/FINDINGS.md) -- so the
+  next start used to land on another subnet, changing every pod address, and a
+  Mac joined to others refused to start at all. `ferry-netd` now creates and
+  holds the network and outlives a ferry-cri that did not stop cleanly, so the
+  next start gets the same subnet. A clean `ferry down` releases it at once, as
+  it has since [experiment 22](experiments/22-vmnet-lifecycle/FINDINGS.md). If
+  ferry-netd itself dies, ferry-cri stops rather than leave pods nothing can
+  reach, and the cluster comes back on a new subnet. vmnet allows 32 networks
+  across the whole Mac.
 - **`ferry down` leaves the cluster's objects in etcd.** It stops processes and
   deletes nothing. Pods come back on the next `ferry up`.
 

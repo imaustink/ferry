@@ -390,7 +390,7 @@ fi
 # remembering to add it to a release.
 # shellcheck source=../lib/versions.sh
 . "$repo/lib/versions.sh"
-for binary in ferry-cri ferry-cni ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-proxy \
+for binary in ferry-cri ferry-netd ferry-loop ferry-cni ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-proxy \
               ferry-machined ferry-node ferry-registry; do
   if grep -q "$binary" "$repo/release/build.sh"; then ok "packages $binary"
   else bad "release/build.sh does not package $binary"; fi
