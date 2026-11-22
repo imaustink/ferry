@@ -126,16 +126,42 @@ acknowledgement file on the share. The Mac waits for a given acknowledgement,
 Every acknowledged write was on the Mac. One ahead is a write that was synced
 but not yet acknowledged.
 
+## Late block volumes in ferry-cri
+
+`PodRootfsProvider.attachLateVolume`, called when a booted VM lacks block
+volumes the container mounts, and nothing in memory:
+
+1. hard-link the volume's own image (a claim's `disk.ext4`, an emptyDir's
+   `.ferry-disk.ext4`) into `<state>/late/<sandbox>/rw/`. A clone would not see
+   the guest's writes, and sharing the volume's real directory would show the
+   pod every other volume beside it;
+2. share `rw/` read-write;
+3. `ferry-loop FILE /run/volumes/<name> rw`: where LinuxPod mounts a volume
+   attached at boot, so the container's bind mounts and subPaths are the same;
+4. create the subPaths the container names, with the volume root's mode.
+
+LinuxPod.stop unmounts the volumes it was made with, which writes back what
+was never synced. It does not know of late ones, so `flushLateVolumes` runs
+the guest's `sync` and unmounts each before every stop of a pod VM. The
+exception is ferry-cri's own shutdown: it kills containers that are still
+running, so anything one writes, unsynced, between that sync and the kill is
+lost.
+
+| | before | now |
+|---|---|---|
+| native sidecar, then main mounting a RWO claim | `SandboxChanged`, pod recreated | mounted in **24 ms**, 0 restarts; `chown` kept |
+| init container, then main mounting an emptyDir whole and by subPath, as uid 1000 | VM stopped and rebooted | mounted in **49 ms**; one loop device, subPath writable |
+| main writes 4-8 MiB without syncing, pod deleted within ~1 s, new pod reads the claim (×4) | n/a | every file intact, md5 matches, no journal recovery |
+
+Not tried: the same delete without the flush, to see what it saves.
+
 ## What this leaves
 
-- **A block volume that arrives after boot still costs a VM rebuild.** It no
-  longer has to on durability grounds: a late volume meets the `.fsync`
-  contract a boot volume disk has, and survives the VM being killed. What is
-  left is the work. The volume's own file has to reach the VM, and a clone
-  will not do for something written to. Sharing its directory would show the
-  pod the other volumes beside it, so it needs a hard link into the late
-  directory. And synced writes are twice as slow until the next rebuild
-  attaches it properly.
+- **A `medium: Memory` volume that arrives after boot still costs a VM
+  rebuild.** It is a tmpfs, carried across rebuilds in memory. A root-of-VM
+  `mount -t tmpfs` would do, but has not been needed.
+- **A late volume's synced writes cost twice a boot disk's** until something
+  else rebuilds the VM and attaches it as a disk.
 - **ferry-loop's errors are an exit code.** A root-of-VM process run without
   stdio has nowhere to write. ferry-cri logs `ferry-loop exited N` and falls
   back.
