@@ -661,10 +661,17 @@ ip_in_cidr() { # address cidr
 }
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
 
-bold() { printf '\033[1m%s\033[0m\n' "$1"; }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
-bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
-warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
+# Colour only for a terminal, and never under NO_COLOR (https://no-color.org):
+# escape codes in a CI log, a pipe or 'ferry logs --bundle' are noise.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  C_B=$'\033[1m' C_G=$'\033[32m' C_R=$'\033[31m' C_Y=$'\033[33m' C_0=$'\033[0m'
+else
+  C_B="" C_G="" C_R="" C_Y="" C_0=""
+fi
+bold() { printf '%s%s%s\n' "$C_B" "$1" "$C_0"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$1"; }
+bad()  { printf '  %s✗%s %s\n' "$C_R" "$C_0" "$1"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_0" "$1"; }
 
 usage() {
   cat <<EOF
@@ -687,6 +694,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
+                    --bundle to collect every log and the cluster's state for a bug report
+  ferry completion  zsh|bash|fish shell completion, e.g. source <(ferry completion zsh)
   ferry kubeconfig  print the path to the admin kubeconfig ('ferry up' already
                     merges it into ~/.kube/config; --merge to do that again)
   ferry service     start the cluster at login (install|uninstall|status)
@@ -6618,13 +6627,212 @@ cmd_init() {
   fi
 }
 
+FERRY_LOG_COMPONENTS="ferry-cri kubelet control-plane apiserver etcd ferry-proxy ferry-proxyd ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-machined ferry-node ferry-karpenter ferry-registry"
+
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
+    --bundle) shift; cmd_logs_bundle "$@"; return ;;
     ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter|ferry-registry) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter|ferry-registry>"; return 1 ;;
+    *) echo "usage: ferry logs <component>   follow one component's log"
+       echo "       ferry logs --bundle [file] everything a bug report needs, in one tarball"
+       echo "  components: $FERRY_LOG_COMPONENTS"
+       [ -z "$which" ] && return 0; return 1 ;;
+  esac
+}
+
+# Everything someone needs to see to help with a broken cluster, in one file:
+# every component's log, what ferry thinks of the Mac and the cluster, and what
+# the API server says is running. kind has 'kind export logs' and minikube
+# 'minikube logs --file' for the same reason: "attach this" beats ten rounds of
+# "now run this". Credentials are left out -- no admin.conf, no pki, no
+# Secrets -- but logs are logs, so it says to look before posting it.
+cmd_logs_bundle() {
+  local out="${1:-$PWD/ferry-logs-$PROFILE-$(date +%Y%m%d-%H%M%S).tar.gz}"
+  case "$out" in /*) : ;; *) out="$PWD/$out" ;; esac
+  local work; work="$(mktemp -d)"
+  local dir="$work/ferry-logs"
+  mkdir -p "$dir/logs/run" "$dir/logs/state" "$dir/cluster"
+
+  # A log can be hundreds of megabytes after a long run; the end is what
+  # matters, and a bundle nobody can attach helps nobody.
+  local f
+  for f in "$FERRY_RUN"/logs/*.log; do
+    [ -f "$f" ] && tail -c 10000000 "$f" > "$dir/logs/run/$(basename "$f")"
+  done
+  for f in "$FERRY_HOME"/logs/*.log; do
+    [ -f "$f" ] && tail -c 10000000 "$f" > "$dir/logs/state/$(basename "$f")"
+  done
+
+  # The CLI's own reports, each from a fresh run of this ferry so one that
+  # fails does not stop the rest. NO_COLOR keeps escape codes out of files.
+  local self="$here/ferry" cmd
+  for cmd in version status profile config doctor "service status" "upgrade status"; do
+    # shellcheck disable=SC2086
+    FERRY_PROFILE="$PROFILE" NO_COLOR=1 "$self" $cmd > "$dir/ferry-${cmd// /-}.txt" 2>&1 < /dev/null
+  done
+
+  {
+    sw_vers 2>&1
+    echo "model  $(sysctl -n hw.model 2>/dev/null)"
+    echo "chip   $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+    echo "cpus   $(sysctl -n hw.ncpu 2>/dev/null)"
+    echo "memory $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GiB"
+    echo
+    df -h "$HOME" /tmp 2>&1
+    echo
+    vm_stat 2>&1
+  } > "$dir/mac.txt"
+  ps -axo pid,ppid,rss,%cpu,etime,command 2>/dev/null | grep -E 'ferry|kube|etcd' | grep -v grep \
+    > "$dir/processes.txt"
+
+  if [ -f "$FERRY_HOME/admin.conf" ] && command -v kubectl >/dev/null 2>&1 \
+     && KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get --raw /readyz >/dev/null 2>&1; then
+    local k="kubectl --kubeconfig $FERRY_HOME/admin.conf --request-timeout=10s"
+    $k version -o yaml                > "$dir/cluster/version.yaml" 2>&1
+    $k get nodes -o wide              > "$dir/cluster/nodes.txt" 2>&1
+    $k describe nodes                 > "$dir/cluster/nodes-describe.txt" 2>&1
+    $k get pods -A -o wide            > "$dir/cluster/pods.txt" 2>&1
+    $k get events -A --sort-by=.lastTimestamp > "$dir/cluster/events.txt" 2>&1
+    $k get svc,endpointslices -A -o wide > "$dir/cluster/services.txt" 2>&1
+    $k get machines -A -o wide        > "$dir/cluster/machines.txt" 2>&1
+    $k -n kube-system describe pods   > "$dir/cluster/kube-system-pods.txt" 2>&1
+  else
+    echo "the API server did not answer; no cluster objects collected" > "$dir/cluster/NOT-REACHABLE.txt"
+  fi
+
+  if tar -C "$work" -czf "$out" ferry-logs; then
+    rm -rf "$work"
+    ok "wrote $out ($(du -h "$out" | cut -f1))"
+    echo "  It holds component logs and cluster state, not credentials. Look"
+    echo "  through it before attaching it to an issue:"
+    echo "  https://github.com/imaustink/ferry/issues/new"
+  else
+    rm -rf "$work"; bad "could not write $out"; return 1
+  fi
+}
+
+# Shell completion. One table of commands and their subcommands, rendered for
+# each shell, so adding a command means adding it here once.
+FERRY_COMPLETE_COMMANDS="doctor version kernel node-image build init config up down restart status logs kubeconfig service uninstall node image profile addons token join machines mac-image upgrade completion help"
+ferry_complete_sub() { # command -> its subcommands or flags
+  case "$1" in
+    up)         echo "--disposable --durability --mac-image" ;;
+    down)       echo "--purge" ;;
+    uninstall)  echo "--purge" ;;
+    build)      echo "--kubernetes-version --rebuild" ;;
+    init)       echo "--purpose --yes --force" ;;
+    config)     echo "show get set unset path" ;;
+    logs)       echo "--bundle $FERRY_LOG_COMPONENTS" ;;
+    kubeconfig) echo "--merge" ;;
+    service)    echo "install uninstall status" ;;
+    node)       echo "add rm ls" ;;
+    image)      echo "build load ls" ;;
+    profile)    echo "ls" ;;
+    addons)     echo "list enable disable images" ;;
+    token)      echo "create" ;;
+    machines)   echo "status enable disable ls" ;;
+    mac-image)  echo "bake status" ;;
+    upgrade)    echo "status plan apply nodes node rollback prune" ;;
+    completion) echo "zsh bash fish" ;;
+  esac
+}
+
+cmd_completion() {
+  local cmds="$FERRY_COMPLETE_COMMANDS" c cases=""
+  for c in $cmds; do
+    local sub; sub="$(ferry_complete_sub "$c")"
+    [ -n "$sub" ] && cases="$cases    $c) cands=\"$sub\" ;;
+"
+  done
+  # Profile names from 'ferry profile ls': the first column of its table rows.
+  local profiles="ferry profile ls 2>/dev/null | awk 'NR>1 && \$1 ~ /^[A-Za-z0-9_-]+\$/ {print \$1}'"
+  local addons="ferry addons list 2>/dev/null | awk '/^    [a-z]/ {print \$1}'"
+  case "${1:-}" in
+    zsh)
+      # 'words' and 'CURRENT' are zsh's own completion state; the candidate
+      # list is called cands so as not to shadow them.
+      cat <<EOF
+#compdef ferry
+# ferry completion for zsh. Load it with:  source <(ferry completion zsh)
+# or save it as _ferry somewhere on \$fpath.
+_ferry() {
+  local -a list
+  local cands="" cmd="" prev="\${words[CURRENT-1]}" i
+  for (( i = 2; i < CURRENT; i++ )); do
+    case "\${words[i]}" in
+      -p|--profile) (( i++ )) ;;
+      -*) ;;
+      *) cmd="\${words[i]}"; break ;;
+    esac
+  done
+  if [[ "\$prev" == -p || "\$prev" == --profile ]]; then
+    cands="\$($profiles)"
+  elif [[ -z "\$cmd" ]]; then
+    cands="$cmds -p --profile"
+  elif [[ "\$cmd" == addons && "\$prev" == (enable|disable|images) ]]; then
+    cands="\$($addons)"
+  elif [[ "\$cmd" == image && "\$prev" == load ]]; then
+    _files; return
+  else
+    case "\$cmd" in
+$cases    esac
+  fi
+  list=(\${=cands})
+  compadd -a list
+}
+if [ "\$funcstack[1]" = "_ferry" ]; then _ferry "\$@"; else compdef _ferry ferry; fi
+EOF
+      ;;
+    bash)
+      cat <<EOF
+# ferry completion for bash. Load it with:  source <(ferry completion bash)
+_ferry() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}" prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  local cmd="" i cands=""
+  for (( i = 1; i < COMP_CWORD; i++ )); do
+    case "\${COMP_WORDS[i]}" in
+      -p|--profile) (( i++ )) ;;
+      -*) ;;
+      *) cmd="\${COMP_WORDS[i]}"; break ;;
+    esac
+  done
+  if [ "\$prev" = -p ] || [ "\$prev" = --profile ]; then
+    cands="\$($profiles)"
+  elif [ -z "\$cmd" ]; then
+    cands="$cmds -p --profile"
+  elif [ "\$cmd" = addons ] && case "\$prev" in enable|disable|images) true ;; *) false ;; esac; then
+    cands="\$($addons)"
+  elif [ "\$cmd" = image ] && [ "\$prev" = load ]; then
+    COMPREPLY=(\$(compgen -f -- "\$cur")); return
+  else
+    case "\$cmd" in
+$cases    esac
+  fi
+  COMPREPLY=(\$(compgen -W "\$cands" -- "\$cur"))
+}
+complete -F _ferry ferry
+EOF
+      ;;
+    fish)
+      echo "# ferry completion for fish. Load it with:  ferry completion fish | source"
+      echo "complete -c ferry -f"
+      echo "complete -c ferry -s p -l profile -x -a '(ferry profile ls 2>/dev/null | string match -r \"^[A-Za-z0-9_-]+(?= )\" | string match -v PROFILE)'"
+      echo "complete -c ferry -n '__fish_use_subcommand' -a '$cmds'"
+      for c in $cmds; do
+        local sub; sub="$(ferry_complete_sub "$c")"
+        [ -n "$sub" ] && echo "complete -c ferry -n '__fish_seen_subcommand_from $c' -a '$sub'"
+      done
+      ;;
+    *)
+      echo "usage: ferry completion zsh|bash|fish"
+      echo
+      echo "  zsh:   echo 'source <(ferry completion zsh)' >> ~/.zshrc"
+      echo "  bash:  echo 'source <(ferry completion bash)' >> ~/.bashrc"
+      echo "  fish:  ferry completion fish > ~/.config/fish/completions/ferry.fish"
+      [ -z "${1:-}" ] && return 0; return 2 ;;
   esac
 }
 
@@ -6679,6 +6887,7 @@ case "${1:-}" in
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
   kubeconfig) shift; cmd_kubeconfig "$@" ;;
+  completion) shift; cmd_completion "$@" ;;
   version|--version) shift; cmd_version ;;
   -h|--help|help|"") usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 1 ;;

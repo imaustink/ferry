@@ -845,5 +845,45 @@ pferry -p gone profile >/dev/null
 lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
 echo
 
+# --- completion --------------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "ferry completion"
+comp_dir="$sandbox/completion"; mkdir -p "$comp_dir"
+"$repo/ferry" completion bash > "$comp_dir/ferry.bash"
+"$repo/ferry" completion zsh > "$comp_dir/_ferry"
+is "the bash script parses" "$(bash -n "$comp_dir/ferry.bash" 2>&1; echo $?)" 0
+is "the zsh script parses" "$(zsh -n "$comp_dir/_ferry" 2>&1; echo $?)" 0
+complete_bash() { # words... -> candidates
+  bash -c 'source "$1"; shift; COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); _ferry; echo "${COMPREPLY[*]}"' \
+    _ "$comp_dir/ferry.bash" "$@"
+}
+is "commands complete" "$(complete_bash ferry up)" "up upgrade"
+is "  after -p <name> too" "$(complete_bash ferry -p demo do)" "doctor down"
+is "subcommands complete" "$(complete_bash ferry upgrade r)" "rollback"
+is "log components complete" "$(complete_bash ferry logs ferry-cr)" "ferry-cri"
+# Every command the dispatcher runs is one completion offers, so a new one
+# cannot be added and left out.
+dispatched="$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$repo/ferry" | grep -oE '^  [a-z-]+(\|[a-z-]+)*\)' | tr -d ' )' | tr '|' '\n' | grep -v '^-' | sort -u)"
+offered="$(sed -n 's/^FERRY_COMPLETE_COMMANDS="\(.*\)"$/\1/p' "$repo/ferry" | tr ' ' '\n' | sort -u)"
+is "every dispatched command is completed" "$(comm -23 <(echo "$dispatched") <(echo "$offered") | tr '\n' ' ')" ""
+echo
+
+# --- logs --bundle -----------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "ferry logs --bundle"
+lb="$sandbox/bundle"; mkdir -p "$lb/run/logs" "$lb/home/logs"
+echo "cri says hello" > "$lb/run/logs/ferry-cri.log"
+echo "etcd says hello" > "$lb/home/logs/etcd.log"
+echo "secret" > "$lb/home/admin.conf"
+bundle_out="$(cd "$lb" && env -u FERRY_PROFILE HOME="$lb" FERRY_PROFILE=bundletest FERRY_PROFILES="$lb/profiles" \
+  FERRY_RUN="$lb/run" FERRY_HOME="$lb/home" "$repo/ferry" logs --bundle out.tgz 2>&1)"
+contains "it says where it wrote the bundle" "$bundle_out" "$lb/out.tgz"
+listing="$(tar -tzf "$lb/out.tgz" 2>/dev/null)"
+contains "  with the runtime's logs" "$listing" "ferry-logs/logs/run/ferry-cri.log"
+contains "  and the control plane's" "$listing" "ferry-logs/logs/state/etcd.log"
+contains "  and ferry's own reports" "$listing" "ferry-logs/ferry-status.txt"
+contains "  and says when the API server could not be asked" "$listing" "NOT-REACHABLE.txt"
+lacks "  and never the admin credentials" "$listing" "admin.conf"
+lacks "the reports carry no colour codes" "$(tar -xzOf "$lb/out.tgz" ferry-logs/ferry-version.txt)" $'\033['
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]
