@@ -53,7 +53,7 @@ control frames 200: ping data=(2, 4, 16, 16, 9, 14, 7, 7): 198, settings: 1, set
 
 ## The fix
 
-- **The limit.** `ferry-cri/vendor/grpc-swift-nio-transport` is 2.9.2 plus one new server setting, `http2.controlFrameRateLimit`. It is passed through to NIO's own `controlFrameRateLimit`. ferry-cri sets it to 10,000 per second. The socket is this user's and its only client is the kubelet. The limiter preallocates room for the whole count, which is why the limit is raised rather than removed. See `vendor/grpc-swift-nio-transport/FERRY.md`, including the SwiftPM identity warning this causes.
+- **The limit.** ferry-cri raises the server's `http2.rateLimits.controlFrames` to 10,000 per second. The socket is this user's and its only client is the kubelet. The limiter preallocates room for the whole count, which is why the limit is raised rather than removed. grpc-swift-nio-transport exposes the setting from 2.12.0. Before that, ferry-cri carried a vendored 2.9.2 with the one setting added, which is how this run was made.
 - **A duplicate StartContainer waits.** A second StartContainer for a container already being started now waits for that start to finish, instead of returning at once. That makes ferry-cri safe against the retry whatever causes it. On its own it fixed only half: one 20-cycle run with just this change still crash-looped 8 pods, from calls the kubelet could not resend.
 - **Traces behind `FERRY_CRI_TRACE=1`.** StartContainer begin and end with a timestamp, a start that joins one already under way, and a stop that finds nothing running.
 
