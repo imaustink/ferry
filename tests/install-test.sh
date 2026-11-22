@@ -306,6 +306,37 @@ contains "and the installer's fallback bin directory" "$agent_src" '$HOME/.local
 contains "and says so when there is no kubectl to record" "$agent_src" "will not find one either"
 echo
 
+# --- whether the installer registers the agent ----------------------------
+#
+# Opt-in, like kind and minikube, which start nothing unasked. A join keeps it
+# (a node that does not come back after a reboot is a hole in another Mac's
+# cluster), and an upgrade keeps what was already there. Run for real: start()
+# from install.sh against a stand-in ferry that records what it was asked.
+printf '\033[1m%s\033[0m\n' "the installer registers the login agent only when it should"
+install_start="$(sed -n '/^start() {/,/^}/p' "$repo/install.sh")"
+agent_case() { # registered(0|1) env... -> prints "yes" or "no"
+  local registered="$1"; shift
+  local fake; fake="$(mktemp -d)"
+  cat > "$fake/ferry" <<FAKE
+#!/bin/sh
+echo "\$*" >> "$fake/calls"
+case "\$1 \$2" in "service status") [ "$registered" = 1 ] ;; *) exit 0 ;; esac
+FAKE
+  chmod +x "$fake/ferry"
+  env -i PATH=/usr/bin:/bin HOME="$fake" "$@" sh -c '
+    bold() { :; }; ok() { :; }; warn() { :; }; die() { exit 1; }
+    ROOT="$1"; eval "$2"; start >/dev/null' _ "$fake" "$install_start"
+  if grep -q '^service install' "$fake/calls" 2>/dev/null; then echo yes; else echo no; fi
+  rm -rf "$fake"
+}
+is "a new cluster does not get one"            "$(agent_case 0)" no
+is "  unless FERRY_SERVICE=1 asks"              "$(agent_case 0 FERRY_SERVICE=1)" yes
+is "a join does"                                "$(agent_case 0 FERRY_URL=mac1:6443 FERRY_TOKEN=t)" yes
+is "  unless FERRY_SERVICE=0 says not to"       "$(agent_case 0 FERRY_URL=mac1:6443 FERRY_TOKEN=t FERRY_SERVICE=0)" no
+is "an upgrade keeps one already registered"    "$(agent_case 1)" yes
+is "FERRY_SKIP_SERVICE=1 still means no"        "$(agent_case 1 FERRY_SKIP_SERVICE=1)" no
+echo
+
 # --- joining ---------------------------------------------------------------
 printf '\033[1m%s\033[0m\n' "joining"
 join_src="$(sed -n '/^cmd_join/,/^}/p' "$repo/ferry")"

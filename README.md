@@ -389,7 +389,7 @@ the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
   GPU into machines is not built. See [docs/MACHINES.md](docs/MACHINES.md).
 - **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
   sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
-  on the PATH, registers a login agent and starts a cluster. Apple silicon and
+  on the PATH and starts a cluster. Apple silicon and
   macOS 26 are the only requirements, with no Swift, no Go, no Kubernetes
   source tree and no `sudo`. Another Mac joins with one line carrying a token,
   so nobody copies binaries by hand any more. See [docs/INSTALL.md](docs/INSTALL.md).
@@ -491,7 +491,7 @@ curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 That downloads a release, puts `ferry` and a matching `kubectl` on your PATH,
-registers a login agent so the cluster comes back after a reboot, and starts it.
+and starts a cluster. `ferry service install` makes it come back at every login.
 It needs no Swift, no Go, no Kubernetes source tree, and no `sudo`. The release
 carries the kubelet, the control plane, etcd, the runtime and the guest kernel
 already built.

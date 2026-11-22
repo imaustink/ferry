@@ -22,8 +22,10 @@ ferry and an unreasonable thing to ask of someone trying it.
 4. Links `ferry` into the first writable of `/usr/local/bin` then
    `~/.local/bin`, and says so if that directory is not on your `PATH`.
 5. Installs a matching `kubectl` there if you do not already have one.
-6. Registers a LaunchAgent so the cluster starts at login.
-7. Runs `ferry up`, or `ferry join` if `FERRY_URL` and `FERRY_TOKEN` are set.
+6. Runs `ferry up`, or `ferry join` if `FERRY_URL` and `FERRY_TOKEN` are set.
+7. Registers a LaunchAgent so the cluster starts at login, only if you ask
+   (`FERRY_SERVICE=1`), if this Mac is joining a cluster, or if an earlier
+   install already registered one. Otherwise nothing starts unless you run it.
 
 ## The install paths
 
@@ -36,12 +38,16 @@ curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 The default. Downloads the latest release, verifies it, links `ferry` and
-`kubectl`, registers the login agent, and starts a cluster.
+`kubectl`, and starts a cluster. To have it come back at every login as well:
+
+```sh
+curl -sfL https://get.ferry.kurpuis.com | FERRY_SERVICE=1 sh -
+```
 
 ### Install without starting anything
 
 ```sh
-curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 FERRY_SKIP_SERVICE=1 sh -
+curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 sh -
 ```
 
 Nothing binds a port, claims a vmnet subnet, or touches `~/.ferry`. Useful on a
@@ -353,7 +359,8 @@ in the installer.
 | `FERRY_INSTALL_DIR` | `~/.ferry-dist` | where releases are unpacked |
 | `FERRY_BIN_DIR` | `/usr/local/bin`, else `~/.local/bin` | where `ferry` is linked |
 | `FERRY_SKIP_START` | unset | `1` to install without starting a cluster |
-| `FERRY_SKIP_SERVICE` | unset | `1` to not register the login agent |
+| `FERRY_SERVICE` | off; on for a join; kept on upgrade | `1` to register the login agent that starts the cluster at login, `0` never to. `ferry service install` does the same later |
+| `FERRY_SKIP_SERVICE` | unset | `1`, the older spelling of `FERRY_SERVICE=0` |
 | `FERRY_SKIP_KUBECTL` | unset | `1` to not install kubectl even if missing |
 | `FERRY_DOWNLOAD_BASE` | the release's GitHub URL | where to fetch the tarball; needs `FERRY_VERSION` |
 | `FERRY_REPO` | `imaustink/ferry` | which repository to install from |
@@ -543,7 +550,8 @@ ferry service install
 ferry service uninstall
 ```
 
-The installer registers this for you. It is a LaunchAgent, not a LaunchDaemon,
+The installer registers this only when asked (`FERRY_SERVICE=1`), when the Mac
+joins a cluster, or when it was registered already. It is a LaunchAgent, not a LaunchDaemon,
 for two reasons:
 
 - `Virtualization.framework` will not create a VM from a process outside a user
