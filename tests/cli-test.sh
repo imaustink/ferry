@@ -822,5 +822,28 @@ contains "and the README documents the one-command path" \
   "$(cat "$repo/README.md")" "./release/cut.sh --version"
 echo
 
+# --- named profiles ----------------------------------------------------------
+#
+# An installed release has no worktree to key on, so a second cluster is asked
+# for by name: minikube's -p, kind's --name.
+printf '\033[1m%s\033[0m\n' "ferry -p names a cluster"
+pf="$sandbox/profiles-home"; mkdir -p "$pf"
+pferry() { env -u FERRY_PROFILE HOME="$pf" "$release/ferry" "$@" 2>&1; }
+contains "-p before the command selects it" "$(pferry -p demo profile)" "profile demo"
+contains "--profile after it does too" "$(pferry profile --profile demo)" "profile demo"
+contains "--profile=name as well" "$(pferry --profile=demo profile)" "profile demo"
+contains "  with its own state directory" "$(pferry -p demo profile)" "$pf/.ferry-demo"
+contains "  and its own API server port" "$(pferry -p demo profile)" ":7443"
+is "a name that is not safe in a path is refused" "$(pferry -p ../x profile >/dev/null; echo $?)" 2
+contains "-p with no name says so" "$(pferry profile -p)" "needs a name"
+mkdir -p "$pf/.ferry" "$pf/.ferry-demo"; echo x > "$pf/.ferry-demo/admin.conf"
+printf 'kubernetes=v1.37.0\n' > "$pf/.ferry-demo/version"
+ls_out="$(pferry profile ls)"
+contains "profile ls lists the default cluster" "$ls_out" "default *"
+contains "  and a named one, stopped, at its version" "$ls_out" "$(printf '%-26s %-10s %-10s' demo stopped v1.37.0)"
+pferry -p gone profile >/dev/null
+lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
+echo
+
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"
 [ "$fail" -eq 0 ]

@@ -73,6 +73,36 @@ ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
 # branch: a branch changes under a running cluster the moment someone checks
 # something else out, two worktrees can sit on the same branch, and a detached
 # HEAD has no branch at all.
+#
+# On an installed release there is no checkout to key on, so a second cluster
+# is asked for by name, the way minikube's -p and kind's --name do:
+#   ferry -p demo up        ferry --profile demo status        ferry profile ls
+# The flag may come anywhere before a bare "--", and is the same as setting
+# FERRY_PROFILE for that one command.
+ferry_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) ferry_args+=("$@"); break ;;
+    -p|--profile)
+      [ -n "${2:-}" ] || { echo "ferry: $1 needs a name" >&2; exit 2; }
+      FERRY_PROFILE="$2"; shift 2 ;;
+    --profile=*) FERRY_PROFILE="${1#--profile=}"; shift ;;
+    *) ferry_args+=("$1"); shift ;;
+  esac
+done
+set -- ${ferry_args[@]+"${ferry_args[@]}"}
+unset ferry_args
+if [ -n "${FERRY_PROFILE:-}" ]; then
+  # A profile names directories, sockets under /tmp (104-byte limit), launchd
+  # labels and a kubeconfig context, so it is held to what is safe in all four.
+  case "$FERRY_PROFILE" in
+    *[!a-zA-Z0-9_-]*|-*|"")
+      echo "ferry: profile '$FERRY_PROFILE': use letters, digits, - and _" >&2; exit 2 ;;
+  esac
+  [ "${#FERRY_PROFILE}" -le 24 ] || { echo "ferry: profile '$FERRY_PROFILE' is longer than 24 characters" >&2; exit 2; }
+  export FERRY_PROFILE
+fi
+
 ferry_profile() {
   [ -n "${FERRY_PROFILE:-}" ] && { echo "$FERRY_PROFILE"; return; }
   local common top
@@ -668,7 +698,10 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
                           -t <name:tag>, -f <Dockerfile>, --os darwin for a macOS
                           image, --stop to end the builder
   ferry image load <x>    run an image you built elsewhere, without a registry
-  ferry profile           which cluster this checkout runs, and on what ports
+  ferry profile           which cluster this command runs, and on what ports
+  ferry profile ls        every cluster on this Mac, and which are running
+  ferry -p <name> <cmd>   run any command against another cluster, e.g.
+                          'ferry -p demo up' (minikube's -p, kind's --name)
   ferry addons list       what can be turned on, and what is
   ferry addons enable <n> turn one on and wait for it (--no-wait not to)
   ferry addons disable <n> remove exactly what enable applied
@@ -5113,7 +5146,41 @@ cmd_image_load() {
 #
 # Worth being able to ask: when two clusters are running on one Mac the first
 # question is always which one you are talking to.
+# Every cluster on this Mac: the default one and each profile ever given a
+# number, with whether it is running and whether it still has any data.
+cmd_profile_ls() {
+  local index name state run status
+  printf '%-26s %-10s %-10s %s\n' PROFILE STATUS KUBERNETES STATE
+  {
+    echo "0 default"
+    [ -f "$FERRY_PROFILES" ] && sort -n "$FERRY_PROFILES"
+  } | while read -r index name; do
+    [ -n "$name" ] || continue
+    if [ "$name" = default ]; then
+      state="$HOME/.ferry"; run="/tmp/ferry-run"
+    else
+      state="$HOME/.ferry-$name"; run="/tmp/ferry-run-$name"
+    fi
+    # A register entry outlives its cluster; one with no state is not listed.
+    [ -d "$state" ] || [ "$name" = "$PROFILE" ] || continue
+    if [ -f "$run/kubelet.pid" ] && kill -0 "$(cat "$run/kubelet.pid")" 2>/dev/null; then
+      status=running
+    elif [ -f "$state/admin.conf" ]; then status=stopped
+    else status=empty; fi
+    local k8s; k8s="$(sed -n 's/^kubernetes=//p' "$state/version" 2>/dev/null | head -1)"
+    printf '%-26s %-10s %-10s %s\n' "$name$([ "$name" = "$PROFILE" ] && echo ' *')" \
+      "$status" "${k8s:--}" "${state/#$HOME/~}"
+  done
+  echo
+  echo "  * is the profile this command runs as. Another: ferry -p <name> up"
+}
+
 cmd_profile() {
+  case "${1:-}" in
+    ls|list) cmd_profile_ls; return ;;
+    "") : ;;
+    *) bad "usage: ferry profile [ls]"; return 2 ;;
+  esac
   bold "profile $PROFILE"
   echo "  kubernetes  $(ferry_cluster_field kubernetes 2>/dev/null || ferry_active_version || echo 'not built')"
   echo "  state       $FERRY_HOME"
@@ -5134,11 +5201,14 @@ cmd_profile() {
   echo
   if [ "$PROFILE" = default ]; then
     echo "  This is the main checkout, so nothing is renamed or moved."
+  elif [ -n "${FERRY_PROFILE:-}" ]; then
+    echo "  A named profile, so it has its own state, ports and pod network"
+    echo "  and will not disturb any other cluster on this Mac."
   else
     echo "  This is a worktree, so it has its own state, ports and pod network"
     echo "  and will not disturb a cluster running from another checkout."
   fi
-  echo "  Set FERRY_PROFILE to override."
+  echo "  Another cluster: ferry -p <name> up. All of them: ferry profile ls"
 }
 
 # Wait for a pid to go, polling finely.
@@ -6575,7 +6645,7 @@ case "${1:-}" in
   up)         shift; cmd_up "$@" ;;
   init)       shift; cmd_init "$@" ;;
   config)     shift; cmd_config "$@" ;;
-  profile)    shift; cmd_profile ;;
+  profile)    shift; cmd_profile "$@" ;;
   addons)     shift; cmd_addons "$@" ;;
   image)      shift
               case "${1:-}" in

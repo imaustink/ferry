@@ -41,6 +41,31 @@ profile gpu-work
 
 Both clusters then run at the same time and do not notice each other.
 
+## Named clusters, on an installed ferry
+
+An installed release has no worktree, so a second cluster is asked for by
+name. `-p` (or `--profile`) goes anywhere on the command line, like minikube's
+`-p` and kind's `--name`:
+
+```sh
+ferry -p demo up            # a second cluster, beside the default one
+ferry -p demo status
+kubectl --context ferry-demo get nodes
+ferry profile ls            # every cluster on this Mac
+ferry -p demo down --purge  # and it is gone, context included
+```
+
+```
+$ ferry profile ls
+PROFILE                    STATUS     KUBERNETES STATE
+default *                  running    v1.37.0    ~/.ferry
+demo                       stopped    v1.37.0    ~/.ferry-demo
+```
+
+A name is letters, digits, `-` and `_`, up to 24 characters, since it becomes
+directory names, sockets under `/tmp`, a launchd label and a kubeconfig
+context. `-p demo` is the same as `FERRY_PROFILE=demo` for that one command.
+
 ## Why this exists
 
 ferry kept its state at fixed paths and bound fixed ports, which is right until a
@@ -87,7 +112,7 @@ something else out, two worktrees can sit on the same branch, names contain
 slashes, and a detached HEAD has no branch at all. A worktree's directory is
 stable for as long as the worktree is.
 
-`FERRY_PROFILE` overrides it.
+`-p <name>` or `FERRY_PROFILE` overrides it.
 
 ## The number is allocated, not hashed
 
