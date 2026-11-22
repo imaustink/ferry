@@ -146,6 +146,136 @@ func say(_ title: String, _ code: Int32) {
     print(output().split(separator: "\n").map { "   " + $0 }.joined(separator: "\n"))
 }
 
+// 7. A VM killed mid-stream (CRASH_ONLY=1). The guest writes a counter to a
+// raw late loop device, syncs it, then acknowledges it on the share. The Mac
+// SIGKILLs the VM process and checks that the disk file holds at least the
+// last acknowledgement it saw: nothing synced was left in a guest cache.
+if ProcessInfo.processInfo.environment["CRASH_ONLY"] == "1",
+   let bench = ProcessInfo.processInfo.environment["FSYNCBENCH"] {
+    try clone(URL(filePath: bench), to: share.appending(component: "fsyncbench"))
+    let raw = share.appending(component: "raw.bin")
+    FileManager.default.createFile(atPath: raw.path(), contents: nil)
+    let rfd = open(raw.path(), O_RDWR); ftruncate(rfd, 64 << 20); close(rfd)
+    let ack = share.appending(component: "ack")
+    func value(_ url: URL) -> UInt64 {
+        guard let d = FileManager.default.contents(atPath: url.path()) else { return 0 }
+        return UInt64(String(decoding: d.prefix(20), as: UTF8.self)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\0 \n"))) ?? 0
+    }
+    let writer = Task {
+        try? await root("""
+            d=$($B losetup -f) && $B losetup $d /run/volumes/late/raw.bin || exit 50
+            exec /run/volumes/late/fsyncbench counter $d /run/volumes/late/ack
+            """)
+    }
+    let target = UInt64(ProcessInfo.processInfo.environment["CRASH_AFTER"] ?? "") ?? 2000
+    let t0 = Date()
+    while value(ack) < target, Date().timeIntervalSince(t0) < 30 { try await Task.sleep(for: .milliseconds(5)) }
+    let seen = value(ack)
+    let pgrep = Process()
+    pgrep.executableURL = URL(filePath: "/usr/bin/pgrep")
+    pgrep.arguments = ["-n", "-f", "com.apple.Virtualization.VirtualMachine"]
+    let pipe = Pipe(); pgrep.standardOutput = pipe
+    try pgrep.run(); pgrep.waitUntilExit()
+    let pid = Int32(String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    kill(pid, SIGKILL)
+    try await Task.sleep(for: .milliseconds(500))
+    let acked = value(ack), onDisk = value(raw)
+    print("\n== VM \(pid) SIGKILLed after ack \(seen) (\(String(format: "%.1f", Date().timeIntervalSince(t0))) s)")
+    print("   last ack on the Mac: \(acked); counter in the disk file: \(onDisk)")
+    print("   \(onDisk >= acked ? "PASS" : "FAIL"): \(onDisk >= acked ? "every acknowledged write" : "an acknowledged write is missing") (disk ahead by \(Int64(onDisk) - Int64(acked)))")
+    _ = writer
+    exit(onDisk >= acked ? 0 : 1)
+}
+
+// 6. Durability (DURABILITY_ONLY=1). A pod volume disk is attached with
+// Containerization's default, VZDiskImageSynchronizationMode.fsync: a guest
+// flush is a host fsync(). Does a late volume's flush, which reaches the Mac as
+// a virtiofs FUSE_FSYNC from the loop driver, get the same? Timed in one guest
+// process (fsyncbench), timed on the Mac, and the VM process sampled while
+// each guest storm runs, to see which call its threads are in.
+if ProcessInfo.processInfo.environment["DURABILITY_ONLY"] == "1",
+   let bench = ProcessInfo.processInfo.environment["FSYNCBENCH"] {
+    try clone(URL(filePath: bench), to: share.appending(component: "fsyncbench"))
+    try formatVolume(share.appending(component: "dur-late.ext4"), bytes: 512 << 20)
+    var code = try await root("""
+        d=$($B losetup -f) && $B losetup $d /run/volumes/late/dur-late.ext4 || exit 40
+        $B mkdir -p /run/volumes/dur && $B mount -t ext4 $d /run/volumes/dur || exit 41
+        echo "late volume on $d: $($B grep /run/volumes/dur /proc/self/mounts)"
+        """)
+    say("durability: late volume mounted", code)
+
+    /// The same loop on the Mac, on a file beside the late volume's image.
+    func hostBench(_ mode: String, n: Int) -> String {
+        let path = share.appending(component: "host-\(mode).bin").path()
+        let fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0o644)
+        defer { close(fd); unlink(path) }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        let t = Date()
+        for i in 0..<n {
+            buf[0] = UInt8(truncatingIfNeeded: i)
+            _ = buf.withUnsafeBytes { pwrite(fd, $0.baseAddress, 4096, off_t(i % 256) * 4096) }
+            switch mode {
+            case "fsync": fsync(fd)
+            case "fullfsync": _ = fcntl(fd, F_FULLFSYNC)
+            default: break
+            }
+        }
+        return String(format: "Mac %@ %d x 4 KiB: %.1f us each", mode, n, Date().timeIntervalSince(t) * 1e6 / Double(n))
+    }
+    print("\n== on the Mac, same directory")
+    for (mode, n) in [("none", 5000), ("fsync", 2000), ("fullfsync", 300)] { print("   " + hostBench(mode, n: n)) }
+
+    /// Samples the newest Virtualization XPC process -- this VM's -- and
+    /// counts the system calls its stacks end in.
+    let workDir = work
+    let sampleVM: @Sendable (Int, String) -> String = { seconds, tag in
+        let pgrep = Process()
+        pgrep.executableURL = URL(filePath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-n", "-f", "com.apple.Virtualization.VirtualMachine"]
+        let pipe = Pipe(); pgrep.standardOutput = pipe
+        try? pgrep.run(); pgrep.waitUntilExit()
+        let pid = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let file = workDir.appending(component: "sample-\(tag).txt").path()
+        let s = Process()
+        s.executableURL = URL(filePath: "/usr/bin/sample")
+        s.arguments = [pid, "\(seconds)", "-mayDie", "-file", file]
+        s.standardOutput = FileHandle.nullDevice; s.standardError = FileHandle.nullDevice
+        try? s.run(); s.waitUntilExit()
+        let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
+        var counts: [String: Int] = [:]
+        for line in text.split(separator: "\n") {
+            for call in ["fsync", "fcntl", "fdatasync", "pwrite", "pwritev", "preadv", "pread", "write", "fullfsync"] {
+                if line.contains(" \(call)  (in libsystem_kernel.dylib)") || line.contains(" __\(call)  (in libsystem_kernel.dylib)") {
+                    // "+ 1234 fsync  (in ...)": the leading count is samples.
+                    let n = line.split(separator: " ").compactMap { Int($0) }.first ?? 0
+                    counts[call, default: 0] += n
+                }
+            }
+        }
+        return "VM process \(pid) leaf calls over \(seconds) s: "
+            + counts.sorted { $0.value > $1.value }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+            + " (\(file))"
+    }
+
+    // Each storm long enough to outlast the sample.
+    for (target, mode, n) in [("bootvol", "sync", 40000), ("dur", "sync", 40000), ("late", "sync", 20000),
+                              ("dur", "nosync", 200000), ("bootvol", "nosync", 200000)] {
+        let tag = "\(target)-\(mode)"
+        let sampler = Task.detached { () -> String in
+            try? await Task.sleep(for: .milliseconds(300))
+            return sampleVM(2, tag)
+        }
+        code = try await root("/run/volumes/late/fsyncbench /run/volumes/\(target)/bench-\(tag).bin \(n) \(mode)")
+        say("guest \(tag)", code)
+        print("   " + (await sampler.value))
+    }
+    try await pod.stop()
+    exit(0)
+}
+
 // 0. ferry-cri's own helper, bin/ferry-loop, on the same kind of late disk.
 if let helper = ProcessInfo.processInfo.environment["FERRY_LOOP"] {
     try clone(URL(filePath: helper), to: share.appending(component: "ferry-loop"))

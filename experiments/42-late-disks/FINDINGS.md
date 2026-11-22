@@ -83,14 +83,59 @@ until the mount has its own reference, and so does ferry-loop now.
 | `kubectl debug --image=<another image>` | refused | mounted in **28 ms**; debug container running, main untouched |
 | three more debug containers, three new images, one pod | refused | 31-37 ms each, all running |
 
+## Is a late volume as durable as a boot volume disk?
+
+The bar is what a pod volume disk has today. ferry-cri attaches one with
+Containerization's default, `VZDiskImageSynchronizationMode.fsync`: a guest
+flush is a host `fsync()`, not `F_FULLFSYNC`. The cluster's `durability`
+setting governs etcd and machine roots, not pod volume disks.
+
+`DURABILITY_ONLY=1` runs `fsyncbench` (4 KiB `pwrite` + `fdatasync`, in one
+process) in the guest, the same loop on the Mac, and `sample`s the VM process
+while each guest loop runs:
+
+| per 4 KiB write | µs | VM process stacks during it |
+|---|---|---|
+| guest, no sync (either disk) | 0.3 | idle |
+| Mac, `fsync()` | 21 | |
+| guest, boot volume disk, `fdatasync` | 82 | no I/O calls on any stack |
+| guest, late loop volume, `fdatasync` | 166 | `fsync` 854 samples, `fcntl` 0 |
+| guest, file on the virtiofs share, `fdatasync` | 127 | `fsync` 1012 samples |
+| Mac, `F_FULLFSYNC` | 4,630 | |
+
+A late volume's flush goes guest ext4 → loop → virtiofs `FUSE_FSYNC`, and
+the VM process turns it into a host `fsync()`. That is what `.fsync`
+documents for a block device. Neither kind of disk pays for an `F_FULLFSYNC`
+per flush. VZ serves the block device without a thread sitting in a system
+call, so the sample says nothing about it. A late volume's synced write costs
+twice a boot disk's, 166 µs against 82.
+
+`CRASH_ONLY=1` checks that nothing synced is left in a guest cache. The guest
+writes a counter to a raw late loop device, syncs it, then writes it to an
+acknowledgement file on the share. The Mac waits for a given acknowledgement,
+`SIGKILL`s the VM process, and reads the disk file:
+
+| killed after ack | last ack on the Mac | counter in the disk file |
+|---|---|---|
+| 528 | 584 | 585 |
+| 1003 | 1089 | 1089 |
+| 2002 | 2090 | 2090 |
+| 3013 | 3109 | 3109 |
+| 5026 | 5117 | 5118 |
+
+Every acknowledged write was on the Mac. One ahead is a write that was synced
+but not yet acknowledged.
+
 ## What this leaves
 
-- **A block volume that arrives after boot still costs a VM rebuild.** The
-  probe says the same route would work, with a writable mount, working
-  `chown`, and synced writes reaching the Mac's file. What is not yet
-  measured is whether `F_FULLFSYNC` reaches the SSD through virtiofs, which is
-  what ferry's `power-loss` durability promises for volumes. Until it is,
-  volumes stay on boot disks.
+- **A block volume that arrives after boot still costs a VM rebuild.** It no
+  longer has to on durability grounds: a late volume meets the `.fsync`
+  contract a boot volume disk has, and survives the VM being killed. What is
+  left is the work. The volume's own file has to reach the VM, and a clone
+  will not do for something written to. Sharing its directory would show the
+  pod the other volumes beside it, so it needs a hard link into the late
+  directory. And synced writes are twice as slow until the next rebuild
+  attaches it properly.
 - **ferry-loop's errors are an exit code.** A root-of-VM process run without
   stdio has nowhere to write. ferry-cri logs `ferry-loop exited N` and falls
   back.
@@ -105,7 +150,14 @@ codesign --force --sign - --entitlements entitlements.plist .build/release/late-
 .build/release/late-disks list
 WORK=/tmp .build/release/late-disks run docker.io/library/busybox:latest <a large image>
 FERRY_LOOP=../../bin/ferry-loop HELPER_ONLY=1 WORK=/tmp .build/release/late-disks run ...
+(cd fsyncbench && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o fsyncbench .)
+DURABILITY_ONLY=1 FSYNCBENCH=$PWD/fsyncbench/fsyncbench WORK=/tmp .build/release/late-disks run ...
+CRASH_ONLY=1 CRASH_AFTER=2000 FSYNCBENCH=$PWD/fsyncbench/fsyncbench WORK=/tmp .build/release/late-disks run ...
 ```
+
+The durability runs `sample` and `SIGKILL` the newest
+`com.apple.Virtualization.VirtualMachine` process, which is the probe's own
+VM only if nothing else booted one after it.
 
 It reads ferry-cri's state directory (`FERRY_CRI_STATE`, default
 `/tmp/ferry-run/cri`) for image disks and the unpacked guest agent, so start a
