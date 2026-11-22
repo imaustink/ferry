@@ -47,9 +47,16 @@ address translation, and the map `ferry-cri` published for them to read.
 ### What happens when vmnet will not give up the slice
 
 The design depends on getting one particular subnet, and vmnet does not always
-grant it. A network stays reserved for a while after the process using it stops,
-and only 32 exist across the whole Mac, so a few restarts in a row can leave the
-slice unavailable for minutes.
+grant it. A network whose creator dies without releasing it, with VMs attached,
+stays reserved for fifteen minutes and more, and only 32 exist across the whole
+Mac.
+
+That creator is `ferry-netd`, not `ferry-cri`. It holds the slice and hands
+`ferry-cri` the network, and `ferry down` leaves it running when `ferry-cri` did
+not stop cleanly, so the next start is given the same network rather than
+asking vmnet for a subnet a dead process still holds. A clean stop releases the
+slice at once. What can still lose it is `ferry-netd` dying, or another process
+holding it. See [experiment 41](../experiments/41-vmnet-owner/FINDINGS.md).
 
 Falling back to another subnet is harmless while this Mac is the whole cluster.
 The gateway changes, CoreDNS rolls out again, and nothing else notices. With another

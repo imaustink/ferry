@@ -174,13 +174,13 @@ ok "kubernetes $k8s"
 
 # ferry's own binaries, which are this checkout's code rather than Kubernetes'
 # and so are not in the version store.
-for name in ferry-cri ferry-cni ferry-gpud ferry-netpol ferry-proxy ferry-storage ferry-streamer \
+for name in ferry-cri ferry-netd ferry-cni ferry-gpud ferry-netpol ferry-proxy ferry-storage ferry-streamer \
             ferry-machined ferry-node ferry-karpenter ferry-registry ferry-handover ferry-mkimage ferry-macvm; do
   [ -x "$root/bin/$name" ] || die "bin/$name is missing -- run: ./ferry build"
   cp "$root/bin/$name" "$dir/bin/$name"
   chmod +x "$dir/bin/$name"
 done
-ok "runtime, streamer, cni, proxy, netpol, storage, gpud, machined, node, karpenter, registry, handover, mkimage, macvm"
+ok "runtime, netd, streamer, cni, proxy, netpol, storage, gpud, machined, node, karpenter, registry, handover, mkimage, macvm"
 
 # The entitlement is the one thing in here that copying the file again cannot
 # repair, so it is checked rather than assumed.
@@ -197,7 +197,12 @@ fi
 if ! codesign -d --entitlements - "$dir/bin/ferry-macvm" 2>&1 | grep -q virtualization; then
   die "bin/ferry-macvm has no virtualization entitlement -- rebuild it: (cd ferry-macvm && ./build.sh)"
 fi
-ok "ferry-cri, ferry-node and ferry-macvm carry com.apple.security.virtualization"
+# ferry-netd creates the pod network, and vmnet refuses an unsigned process
+# with VMNET_MEM_FAILURE rather than anything that says why.
+if ! codesign -d --entitlements - "$dir/bin/ferry-netd" 2>&1 | grep -q virtualization; then
+  die "bin/ferry-netd has no virtualization entitlement -- rebuild it: (cd ferry-cri && ./build.sh)"
+fi
+ok "ferry-cri, ferry-netd, ferry-node and ferry-macvm carry com.apple.security.virtualization"
 
 # --- the mode 2 node image ------------------------------------------------
 # The OCI layout rather than the unpacked ext4: the layout is the compressed

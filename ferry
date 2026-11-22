@@ -246,6 +246,8 @@ FERRY_NETPOL_SOCK="${FERRY_NETPOL_SOCK:-/tmp/ferry-netpol$SUFFIX.sock}"
 # out from the address it was given to join at. See start_netpol.
 NETPOL_PEER_PORT="${FERRY_NETPOL_PEER_PORT:-$(( 6444 + PORT_SHIFT ))}"
 FERRY_GPUD_SOCK="${FERRY_GPUD_SOCK:-/tmp/ferry-gpud$SUFFIX.sock}"
+# ferry-netd's: where ferry-cri gets the pod network from. See start_netd.
+FERRY_NETD_SOCK="${FERRY_NETD_SOCK:-/tmp/ferry-netd$SUFFIX.sock}"
 # Pod sockets are named by pod uid, and macOS caps a unix socket path near 104
 # bytes, so this directory is deliberately short.
 FERRY_GPU_DIR="${FERRY_GPU_DIR:-$FERRY_RUN/gpu}"
@@ -879,7 +881,7 @@ cmd_doctor() {
     # etcdutl is here because rollback restores a snapshot with it, and a
     # rollback is a bad moment to find out the binary will not launch.
     check_binaries_run etcd etcdctl etcdutl kube-apiserver kube-controller-manager \
-      kube-scheduler kubelet ferry-cri ferry-gpud ferry-cni ferry-streamer \
+      kube-scheduler kubelet ferry-cri ferry-netd ferry-gpud ferry-cni ferry-streamer \
       ferry-proxyd ferry-netpol ferry-storage ferry-proxy || fatal=1
   fi
 
@@ -1525,6 +1527,7 @@ cmd_up() {
   fi
 
   start_gpud
+  start_netd
 
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
@@ -1544,6 +1547,7 @@ cmd_up() {
     --peers-file "$PEERS_FILE" --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
     $(mac_image_flag) \
+    $(netd_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1809,6 +1813,60 @@ ferry_netpol_rbac_remove() {
 # macOS process. So the work does not move into the pod -- ferry-gpud holds the
 # GPU here, and a pod that asks for ferry.dev/gpu is handed a unix socket to it,
 # relayed into its VM over vsock. See docs/GPU.md.
+# ferry-netd holds this node's vmnet network, so its subnet outlives a
+# ferry-cri that dies (ferry-cri/Sources/ferry-netd/main.swift).
+#
+# A ferry-cri that dies without releasing -- a crash, kill -9, the stop timeout
+# below -- leaves its pod VMs' interfaces behind, and vmnet keeps the subnet
+# reserved for a while after them. The next start found it taken: alone, it
+# moved to another subnet, which changes every pod address and rolls CoreDNS;
+# joined to other Macs, it cannot move, so it waited and then refused to start.
+# With ferry-netd holding the network, the next ferry-cri is handed the same one.
+#
+# Left running by 'ferry down' only when ferry-cri did not shut down cleanly,
+# which is the one case it is for; reused here when it is. A clean stop
+# releases the subnet at once anyway (experiment 22), so ferry-netd goes too and
+# a stopped ferry holds nothing.
+start_netd() {
+  [ -x "$here/bin/ferry-netd" ] || return 0
+  if running ferry-netd && [ -S "$FERRY_NETD_SOCK" ]; then
+    ok "pod network held over from the last run by ferry-netd"
+    return 0
+  fi
+  "$here/bin/ferry-netd" --socket "$FERRY_NETD_SOCK" >>"$FERRY_RUN/logs/ferry-netd.log" 2>&1 &
+  echo $! > "$FERRY_RUN/ferry-netd.pid"
+  local _
+  for _ in $(seq 1 50); do
+    [ -S "$FERRY_NETD_SOCK" ] && return 0
+    running ferry-netd || break
+    sleep 0.02
+  done
+  # ferry-cri holds the network itself when this is missing, as it always did,
+  # so a ferry-netd that will not start costs the protection and nothing else.
+  warn "ferry-netd did not start; ferry-cri will hold the pod network itself"
+  rm -f "$FERRY_RUN/ferry-netd.pid"
+}
+
+# --network-owner, when ferry-netd is up to answer it.
+netd_flag() {
+  running ferry-netd && [ -S "$FERRY_NETD_SOCK" ] && printf -- '--network-owner %s' "$FERRY_NETD_SOCK"
+}
+
+# After ferry-cri has stopped: release the network if ferry-cri let go of its
+# own cleanly, keep it held for the next start if it did not.
+stop_netd() { # clean|unclean
+  running ferry-netd || { rm -f "$FERRY_RUN/ferry-netd.pid"; return 0; }
+  if [ "$1" = unclean ]; then
+    ok "ferry-netd kept: ferry-cri did not stop cleanly, so the next start reuses its subnet"
+    return 0
+  fi
+  local pid; pid="$(cat "$FERRY_RUN/ferry-netd.pid")"
+  kill -TERM "$pid" 2>/dev/null
+  ferry_await_exit "$pid" || kill -KILL "$pid" 2>/dev/null
+  rm -f "$FERRY_RUN/ferry-netd.pid" "$FERRY_NETD_SOCK"
+  ok "ferry-netd stopped"
+}
+
 start_gpud() {
   [ -x "$here/bin/ferry-gpud" ] || { warn "ferry-gpud not built; ferry.dev/gpu will not be offered"; return 0; }
   rm -f "$FERRY_GPUD_SOCK"
@@ -3124,6 +3182,7 @@ start_worker() { # name index server(host:port)
   # own capacity -- unlike 'node add', which is another node on this Mac and
   # shares the one that is already running.
   start_gpud
+  start_netd
 
   FERRY_VERSION="$(ferry_runtime_version)" "$here/bin/ferry-cri" \
     --endpoint "$FERRY_SOCK" --state "$FERRY_RUN/cri" --kernel "$KERNEL" \
@@ -3143,6 +3202,7 @@ start_worker() { # name index server(host:port)
     --relay-endpoint "$LAN_IP:$RELAY_PORT" \
     $(image_mirror_flag) \
     $(mac_image_flag) \
+    $(netd_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a
@@ -5253,6 +5313,11 @@ cmd_down() {
   # ferry-cri must still finish releasing its vmnet network before another run
   # can claim the same subnet, so it is waited for -- just not on its own.
   local stopping=() stopnames=() component pidfile pid
+  # Whether ferry-cri let go of its network itself: it has to be alive to be
+  # asked, and gone before the timeout rather than killed. Anything else -- it
+  # had already died, or had to be killed -- leaves ferry-netd holding the
+  # subnet for the next start. See start_netd.
+  local cri_stop=unclean
   for component in kubelet ferry-cri ferry-streamer ferry-proxyd ferry-netpol ferry-storage ferry-gpud ferry-registry; do
     pidfile="$FERRY_RUN/$component.pid"
     [ -f "$pidfile" ] || continue
@@ -5273,10 +5338,17 @@ cmd_down() {
 
   local i=0
   while [ "$i" -lt "${#stopping[@]}" ]; do
-    ferry_await_exit "${stopping[$i]}" || kill -KILL "${stopping[$i]}" 2>/dev/null
+    if ferry_await_exit "${stopping[$i]}"; then
+      [ "${stopnames[$i]}" = ferry-cri ] && cri_stop=clean
+    else
+      kill -KILL "${stopping[$i]}" 2>/dev/null
+    fi
     ok "${stopnames[$i]} stopped"
     i=$((i + 1))
   done
+  # A purged cluster is not coming back, so nothing is worth holding for it.
+  [ -n "$purge" ] && cri_stop=clean
+  stop_netd "$cri_stop"
   # A listener that outlives its pid file holds the node port against the next
   # run, and the symptom -- "address already in use" buried in a log -- is a poor
   # way to find that out. Matched on this profile's kubeconfig: every checkout runs
@@ -5854,6 +5926,8 @@ cmd_uninstall() {
   # relaunch -- and the relaunch wins, because cmd_down's waits give it time.
   cmd_service_uninstall
   cmd_down ${purge:+--purge} || true
+  # Not left for a next start that an uninstall says is not coming.
+  stop_netd clean
 
   # The launcher, but only when it is a link to the ferry that is running right
   # now. A prefix match on the install directory would be close enough and is
@@ -6069,6 +6143,9 @@ cmd_status() {
     if running "$component"; then ok "$component (pid $(cat "$FERRY_RUN/$component.pid"))"
     else bad "$component"; fi
   done
+  # Optional, so absent is not a failure: ferry-cri holds the network itself
+  # without it, as it did before ferry-netd existed.
+  running ferry-netd && ok "ferry-netd (pid $(cat "$FERRY_RUN/ferry-netd.pid")), holding the pod network"
   for component in etcd kube-apiserver kube-controller-manager kube-scheduler; do
     if [ -f "$FERRY_HOME/$component.pid" ] && kill -0 "$(cat "$FERRY_HOME/$component.pid")" 2>/dev/null
     then ok "$component"; else bad "$component"; fi

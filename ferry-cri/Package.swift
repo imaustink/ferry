@@ -46,6 +46,10 @@ let package = Package(
                 .plugin(name: "GRPCProtobufGenerator", package: "grpc-swift-protobuf")
             ]
         ),
+        // Holds the node's vmnet network so its subnet outlives a ferry-cri
+        // that dies; see Sources/ferry-netd/main.swift. vmnet and Foundation
+        // only, so it starts in milliseconds and has nothing to crash with.
+        .executableTarget(name: "ferry-netd"),
         // `swift test`, run by tests/run.sh. An executable target can be
         // imported @testable on macOS, so the tests reach the runtime's own
         // types without a library split.

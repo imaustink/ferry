@@ -20,6 +20,9 @@ struct RuntimeConfig: Sendable {
     var stateDir: URL
     var kernelPath: String
     var podSubnet: String
+    /// ferry-netd's socket. When set, the pod network comes from ferry-netd,
+    /// which holds it across a ferry-cri that dies (see ferry-netd/main.swift).
+    var networkOwnerSocket: String? = nil
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
@@ -386,12 +389,15 @@ actor PodRuntime {
         }
         await rehydrateImages()
         sweepContainerDisks()
-        // A vmnet subnet stays reserved for about a minute after the process
-        // using it exits -- measured, not guessed: see experiments/07-vmnet-leak.
-        // So a restart normally cannot have its previous subnet back, and waiting
-        // for it would cost the user a minute of startup for nothing. Moving to
-        // another is right; what it costs is a changed gateway, which is part of
-        // the CoreDNS manifest and so rolls CoreDNS out again.
+        // A vmnet subnet stays reserved after the process that created it dies
+        // without releasing it -- fifteen minutes and more when VMs were
+        // attached (experiment 41). A clean shutdown releases it (experiment
+        // 22), and with ferry-netd holding the network a ferry-cri that died
+        // is handed the same one back, so the slice is normally there. When it
+        // is not -- something else holds it, or ferry-netd itself died -- waiting
+        // is no use alone and moving is right; what it costs is a changed
+        // gateway, which is part of the CoreDNS manifest and so rolls CoreDNS
+        // out again.
         // When there is a cluster network, the node's slice of it *is* the vmnet
         // subnet -- that is what puts the Mac on the pod network.
         let preferredSubnet = config.clusterCIDR
@@ -424,7 +430,7 @@ actor PodRuntime {
             var announced = false
             while true {
                 do {
-                    chosen = try PodNetwork(subnet: try CIDRv4(preferredSubnet))
+                    chosen = try PodNetwork(subnet: try CIDRv4(preferredSubnet), owner: config.networkOwnerSocket)
                     lastError = nil
                     break
                 } catch {
@@ -475,7 +481,7 @@ actor PodRuntime {
         } else {
             for candidate in Self.subnetCandidates(preferred: preferredSubnet) {
                 do {
-                    chosen = try PodNetwork(subnet: try CIDRv4(candidate))
+                    chosen = try PodNetwork(subnet: try CIDRv4(candidate), owner: config.networkOwnerSocket)
                     chosenSubnet = candidate
                     if candidate != preferredSubnet {
                         print("    \(preferredSubnet) is still reserved by a recent run; using \(candidate)")

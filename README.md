@@ -672,12 +672,17 @@ a VM of roughly 300 MiB, so the addons are the lean variants, and
   `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared. Every
   other VM, Docker Desktop included, takes one of ferry's slots. See also
   [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
-- **Restarting in quick succession moves the pod network.** A vmnet subnet stays
-  reserved for about a minute after the run using it stops, and there are 32
-  networks across the whole Mac, so a restart takes the next free subnet. Pods
-  and Services are unaffected. CoreDNS rolls out again because the gateway is
-  part of its config. See
-  [experiments/07-vmnet-leak](experiments/07-vmnet-leak/FINDINGS.md).
+- **A ferry-cri that dies keeps its pod network.** vmnet holds a subnet long
+  after the process that created it dies with VMs attached -- fifteen minutes
+  and more in [experiment 41](experiments/41-vmnet-owner/FINDINGS.md) -- so the
+  next start used to land on another subnet, changing every pod address, and a
+  Mac joined to others refused to start at all. `ferry-netd` now creates and
+  holds the network and outlives a ferry-cri that did not stop cleanly, so the
+  next start gets the same subnet. A clean `ferry down` releases it at once, as
+  it has since [experiment 22](experiments/22-vmnet-lifecycle/FINDINGS.md). If
+  ferry-netd itself dies, ferry-cri stops rather than leave pods nothing can
+  reach, and the cluster comes back on a new subnet. vmnet allows 32 networks
+  across the whole Mac.
 - **`ferry down` leaves the cluster's objects in etcd.** It stops processes and
   deletes nothing. Pods come back on the next `ferry up`.
 
