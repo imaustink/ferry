@@ -100,6 +100,7 @@ mkdir -p "$dir"
 # --- the CLI and what it sources -----------------------------------------
 cp "$root/ferry" "$dir/ferry"
 chmod +x "$dir/ferry"
+cp "$root/LICENSE" "$dir/LICENSE"
 mkdir -p "$dir/lib"
 # The whole directory rather than the files ferry happens to source today. A
 # named list is a second place to remember, and the way it fails is a release
