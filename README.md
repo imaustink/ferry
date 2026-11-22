@@ -309,8 +309,7 @@ the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
   user, which cannot give a file away, and an init container that chowns its
   data directory, as most stateful charts have, crashlooped forever on a share.
   An emptyDir with `medium: Memory` is a tmpfs inside the pod's VM, sized by
-  its `sizeLimit`, and carried across the VM rebuilds that container restarts
-  and init containers cause. See
+  its `sizeLimit`, and carried across a rebuild of the VM. See
   [experiments/30-volumes-and-logs](experiments/30-volumes-and-logs/FINDINGS.md).
 - **Resource limits and securityContext work.** The kubelet does not send
   `ContainerConfig.Linux` on darwin, so every pod silently ran unbounded with
@@ -630,14 +629,15 @@ a VM of roughly 300 MiB, so the addons are the lean variants, and
 
 ### Limits worth knowing
 
-- **A block volume that arrives after the boot costs a VM rebuild.** A pod VM
-  cannot be given a disk once it is running. Images can: one that arrives late
-  -- a main container's image pulled after its sidecar started, or a `kubectl
-  debug` container's -- is mounted into the running VM in about 40 ms and the
-  container joins in place
-  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). Volumes could go
-  the same way, but whether a synced write through it reaches the SSD is not
-  yet measured, so they stay on boot disks.
+- **A volume that arrives after boot has slower synced writes until the pod's
+  VM is rebuilt.** A pod VM cannot be given a disk once it is running, but
+  nothing that arrives late costs it the VM any more. An image -- a main
+  container's pulled after its sidecar started, or a `kubectl debug`
+  container's -- is mounted into the running VM in about 40 ms, and a claim
+  or emptyDir in 2-50 ms, and the container joins in place
+  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). A late volume's
+  flush is a host `fsync()`, as a boot volume disk's is, but costs about twice
+  as much (166 µs against 82).
 - **The cluster starts at login, not at boot.** `Virtualization.framework` will
   not make a VM from a process outside a user session, so the login agent is a
   LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
