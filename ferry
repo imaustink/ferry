@@ -488,6 +488,12 @@ ferry_default_runtime() {
   local v="${FERRY_DEFAULT_RUNTIME:-$(ferry_config_get defaultRuntime)}"
   case "$v" in ferry-vm|ferry-shared) echo "$v" ;; *) echo none ;; esac
 }
+# Whether 'ferry up' merges the admin credentials into ~/.kube/config, as
+# 'kind create cluster' does, so kubectl works with no export. 1 or 0.
+ferry_merge_kubeconfig() {
+  local v="${FERRY_MERGE_KUBECONFIG:-$(ferry_config_get mergeKubeconfig)}"
+  case "$v" in 0|false|no) echo 0 ;; *) echo 1 ;; esac
+}
 # What can actually be honoured. A ferry-shared default with no machines would
 # taint every node that can run a pod, so it is none until machines run.
 ferry_default_runtime_effective() {
@@ -651,8 +657,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
-  ferry kubeconfig  print the path to the admin kubeconfig
-                    --merge to add it to ~/.kube/config as a context
+  ferry kubeconfig  print the path to the admin kubeconfig ('ferry up' already
+                    merges it into ~/.kube/config; --merge to do that again)
   ferry service     start the cluster at login (install|uninstall|status)
   ferry uninstall   stop everything and unlink ferry (--purge to delete the cluster)
   ferry node add <name>   add another node on this Mac
@@ -698,6 +704,7 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_MERGE_KUBECONFIG 0 to stop 'ferry up' merging into ~/.kube/config
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS true to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
@@ -1711,8 +1718,15 @@ EOF
 
   echo
   bold "ferry is up"
-  echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
-  echo "  ferry kubeconfig --merge      to put it in ~/.kube/config instead"
+  # kubectl should simply work afterwards, as it does after 'kind create
+  # cluster'. The merge never moves anyone off a context that is not ferry's;
+  # FERRY_MERGE_KUBECONFIG=0 (or 'ferry config set mergeKubeconfig false')
+  # leaves ~/.kube/config alone entirely.
+  if [ "$(ferry_merge_kubeconfig)" = 1 ] && command -v kubectl >/dev/null 2>&1; then
+    cmd_kubeconfig --merge-and-use 2>&1 | grep -v '^$' || true
+  else
+    echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+  fi
   echo "  ferry token create            to add another Mac to this cluster"
 }
 
@@ -5338,6 +5352,7 @@ cmd_down() {
       echo "  machines are off again; 'ferry machines enable' after the next 'ferry up'"
     fi
     ok "cluster data purged"
+    kubeconfig_forget
     # The config file is the other kind of thing: not the cluster's data but
     # what it is meant to be, written on purpose and named by every start. So
     # it stays, and says so, which is the difference from the marker above.
@@ -5915,10 +5930,13 @@ cmd_uninstall() {
 # matter, and an installer that rewrites it uninvited is an installer that
 # eventually breaks someone's day.
 cmd_kubeconfig() {
-  local conf="$FERRY_HOME/admin.conf"
+  local conf="$FERRY_HOME/admin.conf" switch=0 backup_always=1
   case "${1:-}" in
     "") echo "$conf"; return 0 ;;
     --merge) : ;;
+    # What 'ferry up' runs: merge, switch to it when that is safe, and back the
+    # file up only the first time rather than on every start.
+    --merge-and-use) switch=1; backup_always=0 ;;
     *) bad "usage: ferry kubeconfig [--merge]"; return 2 ;;
   esac
 
@@ -5942,7 +5960,9 @@ cmd_kubeconfig() {
   fi
   mkdir -p "$(dirname "$target")"
 
-  if [ -f "$target" ]; then
+  local earlier="" f
+  for f in "$target".before-ferry.*; do [ -e "$f" ] && { earlier="$f"; break; }; done
+  if [ -f "$target" ] && { [ "$backup_always" = 1 ] || [ -z "$earlier" ]; }; then
     local backup; backup="$target.before-ferry.$(date -u +%Y%m%dT%H%M%SZ)"
     cp "$target" "$backup"
     ok "backed up $target to $(basename "$backup")"
@@ -5993,7 +6013,45 @@ cmd_kubeconfig() {
   fi
 
   ok "merged into $target as context '$context'"
+  if [ "$switch" = 1 ]; then
+    # Switched only when that cannot move anyone off something real: there is
+    # no current context, it names a context that no longer exists, or it is
+    # already one of ferry's. Someone pointed at production stays there.
+    local current; current="$(KUBECONFIG="$target" kubectl config current-context 2>/dev/null || true)"
+    local exists=""
+    [ -n "$current" ] && KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null \
+      | grep -qxF "$current" && exists=1
+    case "$current" in
+      "$context") ok "kubectl is using '$context'"; return 0 ;;
+    esac
+    if [ -z "$current" ] || [ -z "$exists" ] || [ "$current" = ferry ] || [ "${current#ferry-}" != "$current" ]; then
+      KUBECONFIG="$target" kubectl config use-context "$context" >/dev/null 2>&1 \
+        && { ok "kubectl is now using '$context'${current:+ (was '$current')}"; return 0; }
+    fi
+    echo "  kubectl is still using '$current'; to use ferry:"
+  fi
   echo "  kubectl config use-context $context"
+}
+
+# The other half of the merge 'ferry up' does: on --purge the credentials
+# point at a cluster that no longer exists, so its context, cluster and user
+# leave ~/.kube/config, as 'kind delete cluster' does. Only this profile's
+# names are touched; a current context that was this cluster is unset rather
+# than pointed somewhere the person did not choose.
+kubeconfig_forget() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  local context="ferry${SUFFIX}" target="${KUBECONFIG:-$HOME/.kube/config}"
+  target="${target%%:*}"
+  [ "$target" = "$FERRY_HOME/admin.conf" ] && target="$HOME/.kube/config"
+  [ -f "$target" ] || return 0
+  KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$context" || return 0
+  if [ "$(KUBECONFIG="$target" kubectl config current-context 2>/dev/null)" = "$context" ]; then
+    KUBECONFIG="$target" kubectl config unset current-context >/dev/null 2>&1
+  fi
+  KUBECONFIG="$target" kubectl config delete-context "$context" >/dev/null 2>&1
+  KUBECONFIG="$target" kubectl config delete-cluster "$context" >/dev/null 2>&1
+  KUBECONFIG="$target" kubectl config delete-user "$context" >/dev/null 2>&1
+  ok "removed context '$context' from $target"
 }
 
 cmd_version() {
@@ -6125,7 +6183,7 @@ cmd_status() {
 # The file itself, and why it exists, is described where FERRY_CONFIG is set.
 
 # Every key the file may carry, in the order `ferry config` shows them.
-FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
+FERRY_CONFIG_KEYS="purpose durability defaultRuntime mergeKubeconfig machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
 
 # A value as it should be written, or a failure: 1 for a value the key does
 # not take, 2 for a key there is no such thing as.
@@ -6133,7 +6191,7 @@ ferry_config_check() { # key value
   case "$1" in
     purpose)    case "$2" in dev|ci|node) echo "$2" ;; *) return 1 ;; esac ;;
     durability) local v; v="$(durability_normalize "$2")"; [ -n "$v" ] || return 1; echo "$v" ;;
-    machines)   case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
+    machines|mergeKubeconfig) case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
     defaultRuntime) case "$2" in ferry-vm|ferry-shared|none) echo "$2" ;; *) return 1 ;; esac ;;
     machineDurability) case "$2" in power-loss|os-crash|process-crash) echo "$2" ;; *) return 1 ;; esac ;;
     podMemoryMiB|podCPUs|maxPods|machineLimitCPUs|machineLimitMemoryGi)
@@ -6145,7 +6203,7 @@ ferry_config_values() { # key
   case "$1" in
     purpose)    echo "dev | ci | node" ;;
     durability) echo "power-loss | process-crash" ;;
-    machines)   echo "true | false" ;;
+    machines|mergeKubeconfig) echo "true | false" ;;
     defaultRuntime) echo "ferry-vm | ferry-shared | none" ;;
     machineDurability) echo "power-loss | os-crash | process-crash" ;;
     *)          echo "a whole number" ;;
@@ -6172,6 +6230,10 @@ ferry_config_effective() { # key -> "value<TAB>source"
       if [ -n "${FERRY_DEFAULT_RUNTIME:-}" ]; then printf '%s\tFERRY_DEFAULT_RUNTIME, this run only%s\n' "$want" "$note"
       elif [ -n "$file_value" ]; then printf '%s\tfile%s\n' "$want" "$note"
       else printf 'none\tdefault: wherever a pod fits\n'; fi ;;
+    mergeKubeconfig)
+      if [ -n "${FERRY_MERGE_KUBECONFIG:-}" ]; then printf '%s\tFERRY_MERGE_KUBECONFIG, this run only\n' "$( [ "$(ferry_merge_kubeconfig)" = 1 ] && echo true || echo false)"
+      elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$file_value"
+      else printf 'true\tdefault: ferry up merges into ~/.kube/config\n'; fi ;;
     machineDurability)
       if [ -n "${FERRY_MACHINE_DURABILITY:-}" ]; then printf '%s\tFERRY_MACHINE_DURABILITY, this run only\n' "$(ferry_machine_durability)"
       elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_machine_durability)"
@@ -6247,6 +6309,7 @@ ferry_config_takes_effect() { # key
   case "$1" in
     machines) echo "    the cluster is up: 'ferry machines enable' or 'disable' changes it now" ;;
     purpose)  ferry_config_publish ;;
+    mergeKubeconfig) echo "    read by the next 'ferry up'; 'ferry kubeconfig --merge' does it now" ;;
     # Applied to the running cluster at once: it is taints and a ConfigMap,
     # and nothing about it needs a restart.
     defaultRuntime)

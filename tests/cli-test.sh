@@ -110,6 +110,41 @@ YAML
     "$(field ferry-e2e '.users[0].user.client-key-data' | base64 -d)" "key-e2e-recreated"
   is "without leaving a second copy of the context" \
     "$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-contexts -o name | grep -c '^ferry-e2e$')" 1
+  echo
+
+  # What 'ferry up' does: merge, then switch only where nothing real is lost.
+  printf '\033[1m%s\033[0m\n' "ferry up switches kubectl to ferry only when that is safe"
+  use() { HOME="$sandbox" FERRY_PROFILE="$1" KUBECONFIG="" "$repo/ferry" kubeconfig --merge-and-use 2>&1; }
+  current() { KUBECONFIG="$sandbox/.kube/config" kubectl config current-context 2>/dev/null; }
+  backups() { find "$sandbox/.kube" -name 'config.before-ferry.*' | wc -l | tr -d ' '; }
+  before="$(backups)"
+  out="$(use default)"
+  is "someone on another cluster stays on it" "$(current)" "minikube"
+  contains "  and is told how to switch" "$out" "kubectl config use-context ferry"
+  is "  and the file is not backed up again on every start" "$(backups)" "$before"
+  KUBECONFIG="$sandbox/.kube/config" kubectl config unset current-context >/dev/null
+  use default >/dev/null
+  is "with no current context, ferry becomes it" "$(current)" "ferry"
+  use e2e >/dev/null
+  is "from one ferry profile, another ferry profile's up takes over" "$(current)" "ferry-e2e"
+  KUBECONFIG="$sandbox/.kube/config" kubectl config set current-context gone >/dev/null
+  use default >/dev/null
+  is "a current context that no longer exists is replaced" "$(current)" "ferry"
+  rm -rf "$sandbox/.kube"
+  use default >/dev/null
+  is "with no kubeconfig at all, one is made and used" "$(current)" "ferry"
+  use e2e >/dev/null; use default >/dev/null
+
+  # 'ferry down --purge' takes the context back out, as 'kind delete cluster' does.
+  forget="$(sed -n '/^kubeconfig_forget() {/,/^}/p' "$repo/ferry")"
+  ( ok() { :; }; HOME="$sandbox"; FERRY_HOME="$sandbox/.ferry"; SUFFIX=""; KUBECONFIG=""
+    eval "$forget"; kubeconfig_forget )
+  contexts="$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-contexts -o name | tr '\n' ' ')"
+  lacks "--purge removes the purged profile's context" "$contexts" "ferry "
+  contains "  and leaves the other profile's" "$contexts" "ferry-e2e"
+  is "  and unsets current-context rather than choosing one" "$(current)" ""
+  is "  and its cluster entry goes too" \
+    "$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-clusters | grep -cx ferry)" 0
 fi
 echo
 

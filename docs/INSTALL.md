@@ -452,6 +452,7 @@ own.
 | `FERRY_MAC_IMAGE` | — | **override** for the golden **macOS** VM bundle cloned for `spec.os: darwin` machines — what makes [macOS pods](RUNTIMES.md#macos-pods) schedulable. Normally you don't set this: `ferry mac-image bake` (or `ferry machines enable --mac-image`) caches the bundle at `$FERRY_HOME/mac-image/golden-node` and ferry finds it automatically. Set it only to point at a bundle kept elsewhere. `ferry mac-image status` shows what is in use. Building the bundle is [experiment 39](../experiments/39-macos-pods/FINDINGS.md), and [RUNTIMES.md](RUNTIMES.md#building-the-image) has the steps |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
 | `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
+| `FERRY_MERGE_KUBECONFIG` | the config file's `mergeKubeconfig`, else on | `0` to stop `ferry up` merging into `~/.kube/config` for this run. See [kubeconfig](#kubeconfig) |
 | `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
@@ -696,13 +697,28 @@ ferry kubeconfig            # prints the path
 ferry kubeconfig --merge    # adds it to ~/.kube/config as context "ferry"
 ```
 
-The merge leaves your current context where it was, and gives each profile
-its own cluster, user and context name (`ferry-e2e` for the `e2e` profile), so
-two clusters on one Mac cannot end up sharing one API server's entry.
+`ferry up` merges for you, so `kubectl` works as soon as it returns, the way
+it does after `kind create cluster`. Each profile gets its own cluster, user
+and context name (`ferry-e2e` for the `e2e` profile), so two clusters on one
+Mac cannot end up sharing one API server's entry.
 
-Merging is offered rather than done. `~/.kube/config` usually points at clusters
-that matter, and an installer that rewrites it uninvited will eventually break
-one. `--merge` backs the file up first, and uses kubectl's own merge.
+It switches kubectl to the new context only when that cannot take you off
+something that matters:
+
+| current context before `ferry up` | after |
+|---|---|
+| none, or one that no longer exists | ferry's |
+| another ferry profile's | ferry's |
+| anything else (a cloud cluster, kind, minikube) | unchanged; `ferry up` prints the `use-context` line |
+
+The first merge backs `~/.kube/config` up as `config.before-ferry.<time>`; a
+plain `ferry kubeconfig --merge` backs it up every time. Merging uses kubectl's
+own merge. To leave `~/.kube/config` alone entirely:
+
+```sh
+ferry config set mergeKubeconfig false     # or FERRY_MERGE_KUBECONFIG=0 for one run
+export KUBECONFIG=$(ferry kubeconfig)
+```
 
 ## Upgrading ferry
 
