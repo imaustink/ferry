@@ -88,7 +88,7 @@ let config = RuntimeConfig(
     stateDir: URL(filePath: option("--state", "/tmp/ferry-cri")),
     kernelPath: option("--kernel", "experiments/03-vm-ceiling/assets/vmlinux-arm64"),
     podSubnet: option("--pod-subnet", "192.168.66.1/24"),
-    initImage: option("--init-image", "ghcr.io/apple/containerization/vminit:0.45.0"),
+    initImage: option("--init-image", "ghcr.io/apple/containerization/vminit:0.57.0"),
     defaultCPUs: Int(option("--pod-cpus", "2")) ?? 2,
     defaultMemoryBytes: (UInt64(option("--pod-memory-mib", "512")) ?? 512) * 1024 * 1024,
     nftBundlePath: {

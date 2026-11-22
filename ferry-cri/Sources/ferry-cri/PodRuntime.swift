@@ -954,13 +954,15 @@ actor PodRuntime {
                          cpus: Int? = nil,
                          volumes: [BlockVolume] = [],
                          layout: PodRootfsLayout = PodRootfsLayout()) throws -> LinuxPod {
-        try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs,
-                                                     group: eventLoops)) { c in
-            c.cpus = cpus ?? config.defaultCPUs
+        // The VM's size, apart from the containers' own limits, which each
+        // container's configuration carries.
+        let vm = VMResources(cpus: cpus ?? config.defaultCPUs,
+                             memoryInBytes: memoryBytes ?? config.defaultMemoryBytes)
+        return try LinuxPod(id, vmm: VZVirtualMachineManager(kernel: kernel, initialFilesystem: initfs,
+                                                            group: eventLoops), vm: vm) { c in
             c.volumes = volumes.map(\.podVolume) + layout.podVolumes
             // Every container reaches the VM through this, at boot or after.
             c.extensions = [PodRootfsExtension(layout: layout)]
-            c.memoryInBytes = memoryBytes ?? config.defaultMemoryBytes
             // eth0 is vmnet and keeps the default route; eth1, when there is a
             // cluster, is ferry's own segment.
             c.interfaces = clusterInterface.map { [interface, $0] } ?? [interface]
@@ -1435,6 +1437,30 @@ actor PodRuntime {
         return Int((quota + period - 1) / period)
     }
 
+    /// A container's cgroup limits inside its pod's machine: what the kubelet
+    /// set, and the machine's own size for what it did not. A CPU limit bounds
+    /// the container; see containerCPUs for why a request deliberately does not.
+    static func containerLimits(memoryLimit: Int64, cpuQuota: Int64, cpuPeriod: Int64,
+                                vm: VMResources) -> (cpus: Int, memoryInBytes: UInt64) {
+        (containerCPUs(quota: cpuQuota, period: cpuPeriod) ?? vm.cpus,
+         memoryLimit > 0 ? UInt64(memoryLimit) : vm.memoryInBytes)
+    }
+
+    /// The cgroup v2 files written in a container's cgroup in the guest.
+    ///
+    /// memory.oom.group=1 makes an out-of-memory kill take the whole container
+    /// rather than the one process the kernel picked, so a container that runs
+    /// out of memory dies and is restarted instead of carrying on without, say,
+    /// a worker it depends on. It is what the kubelet asks for on a cgroup v2
+    /// node unless singleProcessOOMKill is set, and the guest is cgroup v2 --
+    /// but ferry's kubelet answers "is this host cgroup v2?" for macOS, which
+    /// has no cgroups, so it never asks. ferry-cri asks on its behalf.
+    ///
+    /// Whatever the kubelet does send wins, key by key, as it would with runc.
+    static func containerUnified(kubelet: [String: String]) -> [String: String] {
+        ["memory.oom.group": "1"].merging(kubelet) { _, fromKubelet in fromKubelet }
+    }
+
     /// Who a container's process runs as, in the "user[:group]" form the guest
     /// agent resolves against the container's own /etc/passwd and /etc/group.
     /// Nil leaves the framework's default, root.
@@ -1584,6 +1610,14 @@ actor PodRuntime {
         let memoryLimit = cfg.linux.resources.memoryLimitInBytes
         let cpuQuota = cfg.linux.resources.cpuQuota
         let cpuPeriod = cfg.linux.resources.cpuPeriod
+        let unified = Self.containerUnified(kubelet: cfg.linux.resources.unified)
+        // A container without a limit is bounded by its pod's machine and
+        // nothing else. Containerization applies a container's cpus and
+        // memoryInBytes as its cgroup limits unconditionally since 0.47, at 4
+        // CPUs and 1 GiB unless told otherwise, so "no limit" has to be said
+        // as the size of the VM.
+        let limits = Self.containerLimits(memoryLimit: memoryLimit, cpuQuota: cpuQuota,
+                                          cpuPeriod: cpuPeriod, vm: sandbox.pod.vm)
 
         // The kubelet assembles volume contents on the host -- projected
         // ServiceAccount tokens, ConfigMaps, Secrets, emptyDir -- and passes
@@ -1692,12 +1726,8 @@ actor PodRuntime {
             if !supplementalGroups.isEmpty { c.process.user.additionalGids = supplementalGroups }
             if !environment.isEmpty { c.process.environmentVariables = environment }
             if !workingDir.isEmpty { c.process.workingDirectory = workingDir }
-            if memoryLimit > 0 { c.memoryInBytes = UInt64(memoryLimit) }
-            // A CPU limit bounds the container within the pod's machine; see
-            // containerCPUs for why a request deliberately does not.
-            if let cpus = Self.containerCPUs(quota: cpuQuota, period: cpuPeriod) {
-                c.cpus = cpus
-            }
+            (c.cpus, c.memoryInBytes) = limits
+            c.unified = unified
             // Append rather than replace: the defaults carry /proc, /sys and
             // the rest of the standard container filesystem.
             c.mounts.append(contentsOf: shares)

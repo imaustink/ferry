@@ -1,13 +1,19 @@
 // swift-tools-version:6.2
 import PackageDescription
 
-// Pinned to the Containerization release that vminit:0.45.0 is built from, so
-// the host framework and the in-guest agent cannot drift.
+// Pinned to the Containerization release that vminit:0.57.0 is built from, so
+// the host framework and the in-guest agent cannot drift. ferry-node
+// (experiments/18-node-image) pins the same one.
+//
+// kernel/build-kernel.sh reads Apple's kernel configuration from its own
+// CONTAINERIZATION_REF, still 0.45.0 on purpose: config-arm64 is identical up
+// to 0.57.0, and that script is part of the kernel's recorded inputs, so moving
+// the ref would rebuild the guest kernel for nothing.
 let package = Package(
     name: "ferry-cri",
     platforms: [.macOS("26.0")],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", exact: "0.45.0"),
+        .package(url: "https://github.com/apple/containerization.git", exact: "0.57.0"),
         .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.3.0"),
         // 2.12.0 is the first release whose server config sets the HTTP/2
         // control-frame rate limit, which CRITransport.swift raises (experiment 38).
