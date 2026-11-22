@@ -845,6 +845,28 @@ pferry -p gone profile >/dev/null
 lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
 echo
 
+# --- update notice -----------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "a newer release is mentioned, and only then"
+newer="$(sed -n '/^ferry_version_newer() {/,/^}/p' "$repo/ferry")"
+vn() { bash -c "$newer"'; ferry_version_newer "$1" "$2" && echo yes || echo no' _ "$1" "$2"; }
+is "v1.0.0 is newer than v0.16.0" "$(vn v1.0.0 v0.16.0)" yes
+is "v0.16.0 is newer than v0.9.0, numerically" "$(vn v0.16.0 v0.9.0)" yes
+is "v0.16.0 is not newer than itself" "$(vn v0.16.0 v0.16.0)" no
+is "v0.15.2 is not newer than v0.16.0" "$(vn v0.15.2 v0.16.0)" no
+un="$sandbox/update"; mkdir -p "$un/.ferry-dist"
+# A fresh cache, so nothing is fetched. 'script' gives ferry a terminal: the
+# notice is never printed into a pipe.
+notice() { # cached-version [env...]
+  echo "$1" > "$un/.ferry-dist/latest-release"; shift
+  env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$@" \
+    script -q /dev/null "$release/ferry" status 2>&1 | tr -d '\r'
+}
+contains "a newer release is announced on 'ferry status'" "$(notice v99.0.0)" "ferry v99.0.0 is out (this is v9.9.9)"
+lacks "  but not the release already installed" "$(notice v9.9.9)" "is out"
+lacks "  and not with FERRY_NO_UPDATE_CHECK=1" "$(notice v99.0.0 FERRY_NO_UPDATE_CHECK=1)" "is out"
+lacks "  and never into a pipe" "$(echo v99.0.0 > "$un/.ferry-dist/latest-release"; env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$release/ferry" status 2>&1)" "is out"
+echo
+
 # --- completion --------------------------------------------------------------
 printf '\033[1m%s\033[0m\n' "ferry completion"
 comp_dir="$sandbox/completion"; mkdir -p "$comp_dir"

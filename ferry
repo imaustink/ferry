@@ -629,6 +629,39 @@ ferry_release_version() {
   sed -n 's/^ferry=//p' "$here/VERSION" | head -1
 }
 is_release() { [ -f "$here/VERSION" ]; }
+
+# Whether a newer release is out, said in one line after 'ferry up' and
+# 'ferry status' on an installed ferry, the way minikube does. Never in the
+# way: the answer is read from a cache, the cache is refreshed in the
+# background at most once a day, nothing is said off a terminal, and
+# FERRY_NO_UPDATE_CHECK=1 turns it off. The request is one anonymous GET to
+# GitHub's releases API, the same one the installer makes.
+FERRY_UPDATE_CACHE="${FERRY_UPDATE_CACHE:-$HOME/.ferry-dist/latest-release}"
+ferry_version_newer() { # a b -> true when a is a later vX.Y.Z than b
+  local a="${1#v}" b="${2#v}"
+  [ "$a" != "$b" ] && [ "$(printf '%s\n%s\n' "$a" "$b" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$a" ]
+}
+ferry_update_notice() {
+  [ "${FERRY_NO_UPDATE_CHECK:-}" = 1 ] && return 0
+  is_release || return 0
+  [ -t 1 ] || return 0
+  local current latest
+  current="$(ferry_release_version)" || return 0
+  case "$current" in v[0-9]*) : ;; *) return 0 ;; esac
+  # Stale or missing: ask again, in the background, for the next run.
+  if [ -z "$(find "$FERRY_UPDATE_CACHE" -mtime -1 2>/dev/null)" ]; then
+    mkdir -p "$(dirname "$FERRY_UPDATE_CACHE")" 2>/dev/null
+    ( v="$(curl -sfL -m 5 "https://api.github.com/repos/${FERRY_REPO:-imaustink/ferry}/releases/latest" 2>/dev/null \
+          | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+      [ -n "$v" ] && echo "$v" > "$FERRY_UPDATE_CACHE.tmp" && mv "$FERRY_UPDATE_CACHE.tmp" "$FERRY_UPDATE_CACHE"
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  latest="$(head -1 "$FERRY_UPDATE_CACHE" 2>/dev/null)"
+  [ -n "$latest" ] && ferry_version_newer "$latest" "$current" || return 0
+  echo
+  warn "ferry $latest is out (this is $current). Upgrade: curl -sfL https://get.ferry.kurpuis.com | sh -"
+}
 # What ferry-cri tells the kubelet it is, and so what `kubectl get nodes` shows
 # as ferry://<version>. It was a constant, 0.1.0, through every release since.
 #
@@ -747,6 +780,8 @@ Environment:
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
   FERRY_MERGE_KUBECONFIG 0 to stop 'ferry up' merging into ~/.kube/config
+  FERRY_NO_UPDATE_CHECK 1 to stop 'ferry up' and 'ferry status' saying when a
+                         newer release is out (checked at most once a day)
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS true to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
@@ -1770,6 +1805,7 @@ EOF
     echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
   fi
   echo "  ferry token create            to add another Mac to this cluster"
+  ferry_update_notice
 }
 
 # NetworkPolicy, enforced where the packets are.
@@ -6255,6 +6291,7 @@ cmd_status() {
     echo
     KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes 2>/dev/null
   fi
+  ferry_update_notice
 }
 
 # --- configuration: ferry config, ferry init ---------------------------------

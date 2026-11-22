@@ -453,6 +453,8 @@ own.
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
 | `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
 | `FERRY_MERGE_KUBECONFIG` | the config file's `mergeKubeconfig`, else on | `0` to stop `ferry up` merging into `~/.kube/config` for this run. See [kubeconfig](#kubeconfig) |
+| `FERRY_NO_UPDATE_CHECK` | unset | `1` to stop `ferry up` and `ferry status` saying when a newer release is out. It is never said off a terminal. The check is one anonymous request to GitHub's releases API, made in the background at most once a day |
+| `FERRY_UPDATE_CACHE` | `~/.ferry-dist/latest-release` | where that check keeps the latest version it saw |
 | `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
