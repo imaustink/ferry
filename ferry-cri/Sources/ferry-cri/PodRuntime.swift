@@ -353,9 +353,32 @@ actor PodRuntime {
     /// init so failures surface with context before the server starts serving.
     func setStreamer(_ client: StreamerClient) { self.streamer = client }
 
+    /// "sha256:0123…" -> "init-0123456789abcdef.ext4".
+    static func initFilesystemName(digest: String) -> String {
+        let hex = digest.split(separator: ":").last.map(String.init) ?? digest
+        return "init-\(hex.prefix(16)).ext4"
+    }
+
+    /// Every unpacked guest agent but the one in use, including the unversioned
+    /// init.ext4 that came before them.
+    static func removeStaleInitFilesystems(in dir: URL, keeping name: String) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path())) ?? []
+        for other in names where other != name
+            && (other == "init.ext4" || (other.hasPrefix("init-") && other.hasSuffix(".ext4"))) {
+            try? FileManager.default.removeItem(at: dir.appending(component: other))
+        }
+    }
+
     func prepare() async throws {
         let initImage = try await store.getInitImage(reference: config.initImage)
-        let initPath = config.stateDir.appending(component: "init.ext4")
+        // Named for the agent it holds. It was init.ext4, kept whenever it
+        // existed, and the state directory outlives restarts, so a ferry-cri
+        // upgraded to a newer framework went on booting every pod with the old
+        // guest agent -- the host/guest drift Package.swift pins against. The
+        // VMs that used an older one died with the process that made them.
+        let digest = try await store.get(reference: config.initImage).digest
+        let initPath = config.stateDir.appending(component: Self.initFilesystemName(digest: digest))
+        Self.removeStaleInitFilesystems(in: config.stateDir, keeping: initPath.lastPathComponent)
         do {
             self.initfs = try await initImage.initBlock(at: initPath, for: .linuxArm)
         } catch let error as ContainerizationError where error.code == .exists {
