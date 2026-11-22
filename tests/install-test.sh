@@ -352,6 +352,7 @@ not_shipped="
   ferry-registry                                go sources
   ferry-handover                                go sources; only 'upgrade' runs it, which a release refuses
   ferry-mkimage                                 go sources; a release ships bin/ferry-mkimage instead
+  ferry-macvm                                   swift sources; a release ships bin/ferry-macvm instead
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
@@ -500,7 +501,7 @@ contains "an existing Mac node is labelled too, not just a new one" \
 contains "and 'ferry up' asserts it once the node is Ready" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" 'ensure_mode_label "$NODE_NAME"'
 contains "and it is applied where the controller already has the Node" \
-  "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
+  "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node, modeFor(item))"
 
 # The same choice, spelled the way Kubernetes spells a runtime. Each class
 # selects the label above rather than replacing it, so the two spellings place
