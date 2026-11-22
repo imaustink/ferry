@@ -135,6 +135,18 @@ YAML
   is "with no kubeconfig at all, one is made and used" "$(current)" "ferry"
   use e2e >/dev/null; use default >/dev/null
 
+  # The person's KUBECONFIG is where the merge goes -- including from inside
+  # 'ferry up', which exports KUBECONFIG=admin.conf long before it merges. Read
+  # at that point, the merge went to ~/.kube/config whatever the person had set.
+  other="$sandbox/other-kubeconfig"
+  HOME="$sandbox" FERRY_PROFILE=default KUBECONFIG="$other" "$repo/ferry" kubeconfig --merge-and-use >/dev/null 2>&1
+  is "a KUBECONFIG the person set is the file merged into" \
+    "$(KUBECONFIG="$other" kubectl config current-context 2>/dev/null)" "ferry"
+  for fn in cmd_kubeconfig kubeconfig_forget; do
+    lacks "  $fn never takes the target from KUBECONFIG, which ferry itself overwrites" \
+      "$(awk -v f="$fn() " 'index($0, f) == 1 {on=1} on {print} on && /^}/ {exit}' "$repo/ferry")" '${KUBECONFIG:-'
+  done
+
   # 'ferry down --purge' takes the context back out, as 'kind delete cluster' does.
   forget="$(sed -n '/^kubeconfig_forget() {/,/^}/p' "$repo/ferry")"
   ( ok() { :; }; HOME="$sandbox"; FERRY_HOME="$sandbox/.ferry"; SUFFIX=""; KUBECONFIG=""

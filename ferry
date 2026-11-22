@@ -35,6 +35,10 @@ here="$(cd "$(dirname "$ferry_self")" && pwd)"
 unset ferry_self link
 FERRY_ROOT="$here"
 export FERRY_ROOT
+# The KUBECONFIG the person ran ferry with, before any command points it at
+# ferry's own admin.conf -- which most do, early. The merge into kubectl's
+# config has to go to the file the person uses, not to admin.conf.
+user_kubeconfig="${KUBECONFIG-}"
 # Which Kubernetes this checkout has built, where those binaries live, and what
 # may legally follow what. Shared with build-kubelet.sh and the control-plane
 # scripts, which have to agree with this one about all three.
@@ -6059,7 +6063,7 @@ cmd_kubeconfig() {
   command -v kubectl >/dev/null || { bad "kubectl is not installed"; return 1; }
 
   local context="ferry${SUFFIX}"
-  local target="${KUBECONFIG:-$HOME/.kube/config}"
+  local target="${user_kubeconfig:-$HOME/.kube/config}"
   # KUBECONFIG can be a list; the first entry is where kubectl writes, so that
   # is the file being merged into and the one to back up.
   target="${target%%:*}"
@@ -6155,7 +6159,7 @@ cmd_kubeconfig() {
 # than pointed somewhere the person did not choose.
 kubeconfig_forget() {
   command -v kubectl >/dev/null 2>&1 || return 0
-  local context="ferry${SUFFIX}" target="${KUBECONFIG:-$HOME/.kube/config}"
+  local context="ferry${SUFFIX}" target="${user_kubeconfig:-$HOME/.kube/config}"
   target="${target%%:*}"
   [ "$target" = "$FERRY_HOME/admin.conf" ] && target="$HOME/.kube/config"
   [ -f "$target" ] || return 0
