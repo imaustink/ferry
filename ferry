@@ -2738,6 +2738,7 @@ cmd_node_add() {
     --relay-port "$relay" --peers-file "$PEERS_FILE" \
     --relay-endpoint "$LAN_IP:$relay" \
     $(image_mirror_flag) \
+    $(loop_flag) \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
   local ready= waited=0 limit=90

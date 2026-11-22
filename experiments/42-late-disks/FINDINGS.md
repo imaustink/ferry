@@ -94,8 +94,8 @@ until the mount has its own reference, and so does ferry-loop now.
 - **ferry-loop's errors are an exit code.** A root-of-VM process run without
   stdio has nowhere to write. ferry-cri logs `ferry-loop exited N` and falls
   back.
-- **`ferry node add` nodes keep the old behaviour.** Only the main node and a
-  joined Mac pass `--loop-helper` today.
+- Every node gets it: the main node, a joined Mac, and a `ferry node add` node
+  (a sidecar pod on one mounted its main image in 34 ms).
 
 ## Reproducing
 
