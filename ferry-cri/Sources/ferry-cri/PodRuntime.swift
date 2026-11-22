@@ -1174,7 +1174,7 @@ actor PodRuntime {
     private func applyNftables(sandboxID: String, payload: Data, label: String) async {
         guard config.nftBundlePath != nil, !payload.isEmpty else { return }
         guard let target = containers.values.first(where: {
-            $0.sandboxID == sandboxID && $0.state == .running
+            $0.sandboxID == sandboxID && $0.state == .running && !stopping.contains($0.id)
         }) else { return }
 
         var launched: LinuxProcess?
@@ -1230,8 +1230,9 @@ actor PodRuntime {
         guard let sandbox = sandboxes[sandboxID] else { return }
         // Any running container in the pod will do: one VM is one network
         // stack, so they all share the netns the plugin is about to program.
+        // Not one being stopped, for the reason `stopping` gives.
         guard let target = containers.values.first(where: {
-            $0.sandboxID == sandboxID && $0.state == .running
+            $0.sandboxID == sandboxID && $0.state == .running && !stopping.contains($0.id)
         }) else { return }
 
         // A host port of 0 is explicitly "do not expose this", not "pick one",
@@ -2374,6 +2375,14 @@ actor PodRuntime {
     /// then came up anyway holding its ports. The pod crash-looped on
     /// "address already in use" until it was deleted (experiment 38).
     private var starting: [String: Task<Void, Error>] = [:]
+    /// Containers between StopContainer's SIGTERM and their exit. Nothing ferry
+    /// runs for itself should exec beside one: the guest refuses a process in a
+    /// container on its way out, and Containerization's LinuxProcess.start
+    /// does not close the stdio it had already connected when startProcess
+    /// fails, so every refusal left three host sockets open for good. A Service
+    /// change during a scale-down did it to every pod being stopped
+    /// (experiment 38's soak, 28 sockets in 30 cycles).
+    private var stopping: Set<String> = []
 
     private func start(_ id: String, in pod: LinuxPod) async throws {
         if let inFlight = starting[id] {
@@ -2442,6 +2451,10 @@ actor PodRuntime {
             return
         }
         var code: Int32 = 128 + 9
+        // Still .running until recordExit, across awaits during which the
+        // actor serves other calls; see `stopping`.
+        stopping.insert(id)
+        defer { stopping.remove(id) }
         if let sandbox = sandboxes[record.sandboxID] {
             if timeout > 0, (try? await sandbox.pod.killContainer(id, signal: .term)) != nil,
                let status = try? await sandbox.pod.waitContainer(id, timeoutInSeconds: timeout) {
