@@ -630,15 +630,14 @@ a VM of roughly 300 MiB, so the addons are the lean variants, and
 
 ### Limits worth knowing
 
-- **A container can join a running pod only with an image the pod already
-  runs.** Images are disks, and `Virtualization.framework` attaches a disk to a
-  running VM only over USB, which a pod's VM is not given. So the VM attaches
-  every image the pod spec names that is pulled when it boots. A restart, a
-  sidecar, and a `kubectl debug` container of one of those images join in
-  place. A regular container with any other image, such as one still pulling at
-  boot, has the pod recreated around it. A `kubectl debug` container with
-  another image is refused rather than restarting the pod. A block volume that
-  arrives after the boot also costs a VM rebuild.
+- **A block volume that arrives after the boot costs a VM rebuild.** A pod VM
+  cannot be given a disk once it is running. Images can: one that arrives late
+  -- a main container's image pulled after its sidecar started, or a `kubectl
+  debug` container's -- is mounted into the running VM in about 40 ms and the
+  container joins in place
+  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). Volumes could go
+  the same way, but whether a synced write through it reaches the SSD is not
+  yet measured, so they stay on boot disks.
 - **The cluster starts at login, not at boot.** `Virtualization.framework` will
   not make a VM from a process outside a user session, so the login agent is a
   LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window

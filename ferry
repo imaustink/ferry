@@ -1093,6 +1093,13 @@ cmd_build() {
   # nft, for applying those rules inside pods.
   "$here/guest/build-nft.sh" || return 1
   echo
+  # Runs inside a pod VM, so linux/arm64 and static: it mounts an image that
+  # arrives after the VM booted (guest/ferry-loop/main.go).
+  echo "==> ferry-loop"
+  ( cd "$here/guest/ferry-loop" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+      go build -trimpath -ldflags='-s -w' -o "$here/bin/ferry-loop" . ) || return 1
+  echo "==> $here/bin/ferry-loop"
+  echo
   bold "built -- run: ferry up"
   if [ ! -d "$NODE_IMAGE_LAYOUT" ]; then
     echo "  For mode 2 machines as well: ferry node-image  (slow, needs 'ferry up' first)"
@@ -1548,6 +1555,7 @@ cmd_up() {
     $(image_mirror_flag) \
     $(mac_image_flag) \
     $(netd_flag) \
+    $(loop_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1848,6 +1856,12 @@ start_netd() {
 }
 
 # --network-owner, when ferry-netd is up to answer it.
+# --loop-helper, when ferry-loop is built. Without it ferry-cri gives a pod a
+# new VM for a container whose image the running one was not booted with.
+loop_flag() {
+  [ -x "$here/bin/ferry-loop" ] && printf -- '--loop-helper %s' "$here/bin/ferry-loop"
+}
+
 netd_flag() {
   running ferry-netd && [ -S "$FERRY_NETD_SOCK" ] && printf -- '--network-owner %s' "$FERRY_NETD_SOCK"
 }
@@ -3203,6 +3217,7 @@ start_worker() { # name index server(host:port)
     $(image_mirror_flag) \
     $(mac_image_flag) \
     $(netd_flag) \
+    $(loop_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a

@@ -23,6 +23,9 @@ struct RuntimeConfig: Sendable {
     /// ferry-netd's socket. When set, the pod network comes from ferry-netd,
     /// which holds it across a ferry-cri that dies (see ferry-netd/main.swift).
     var networkOwnerSocket: String? = nil
+    /// bin/ferry-loop, the guest helper that mounts an image arriving after a
+    /// pod VM booted. Nil: such an image costs the pod its VM, as before.
+    var loopHelper: String? = nil
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
@@ -1062,6 +1065,7 @@ actor PodRuntime {
         }
         // Every container's writes, current and past, went to this.
         try? FileManager.default.removeItem(atPath: scratchPath(id))
+        removeLateDirectory(id)
         // The reserved DNS address stays reserved across CoreDNS restarts; only
         // ordinary pod addresses go back to the allocator.
         if sandboxes[id]?.usesReservedAddress == true {
@@ -1572,6 +1576,29 @@ actor PodRuntime {
         // image and every volume it mounts -- which is what a restart, and
         // most containers that arrive late, look like. Otherwise it needs a
         // device the VM cannot be given, and so a VM it can.
+        // An image the VM was not booted with is mounted into it instead, when
+        // that is the only thing missing. A block volume still costs the VM.
+        if let current = sandboxes[sandboxID], current.booted, current.ready, !current.needsRecreate,
+           current.blockVolumes == current.podVolumes,
+           !current.rootfsLayout.canRun(image: base.source), current.rootfsLayout.lateDirectory != nil {
+            let pod = current.pod
+            let provider = try? await pod.withVirtualMachineInstance { vm in
+                (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
+            }
+            let began = ContinuousClock.now
+            do {
+                guard let provider else { throw RuntimeFailure.unsupported("no rootfs provider") }
+                try await provider.attachLate(image: base.source)
+                // Counted as the VM's from here: a container of this image
+                // joins, and a rebuild of this sandbox boots with it attached.
+                let index = sandboxes[sandboxID]?.rootfsLayout.images.count ?? 0
+                sandboxes[sandboxID]?.rootfsLayout.images[base.source] = PodRootfsLayout.imageVolume(index)
+                print("    \(cfg.metadata.name): image mounted into running \(sandboxID) in "
+                      + "\((ContinuousClock.now - began).formatted(.units(allowed: [.milliseconds])))")
+            } catch {
+                print("    \(cfg.metadata.name): could not mount its image into running \(sandboxID): \(error)")
+            }
+        }
         if let current = sandboxes[sandboxID], current.booted,
            !current.rootfsLayout.canRun(image: base.source) || current.blockVolumes != current.podVolumes {
             try await replaceBootedPod(sandboxID, arriving: cfg.metadata.name)
@@ -2042,6 +2069,13 @@ actor PodRuntime {
         }
         layout.scratch = PodRootfsLayout.scratchVolume
         layout.scratchPath = try await makeScratch(sandboxID)
+        if let helper = config.loopHelper {
+            // A fresh directory for each VM: what a previous VM of this sandbox
+            // mounted from it went with that VM.
+            removeLateDirectory(sandboxID)
+            layout.lateDirectory = lateDirectory(sandboxID)
+            layout.loopHelper = helper
+        }
         mark("scratch")
 
         let pod = try makePod(id: sandboxID, interface: sandbox.interface, cfg: sandbox.config,
@@ -2176,6 +2210,18 @@ actor PodRuntime {
                 || (name.hasPrefix("scratch-template") && name != Self.scratchTemplateName)) {
             try? FileManager.default.removeItem(at: config.stateDir.appending(component: name))
         }
+        // Every late image of a previous run: its VMs went with it.
+        try? FileManager.default.removeItem(at: config.stateDir.appending(component: "late"))
+    }
+
+    /// Images that reached this sandbox's VM after it booted; see
+    /// PodRootfsProvider.attachLate. Clones, so it costs no space.
+    private func lateDirectory(_ sandboxID: String) -> String {
+        config.stateDir.appending(component: "late").appending(component: sandboxID).path()
+    }
+
+    private func removeLateDirectory(_ sandboxID: String) {
+        try? FileManager.default.removeItem(atPath: lateDirectory(sandboxID))
     }
 
     private func scratchPath(_ sandboxID: String) -> String {
@@ -3038,6 +3084,7 @@ actor PodRuntime {
             releaseBlockVolumes(sandboxID: record.id)
             network.releaseInterface(record.id)
             try? FileManager.default.removeItem(atPath: scratchPath(record.id))
+            removeLateDirectory(record.id)
         }
         sandboxes.removeAll()
         containers.removeAll()

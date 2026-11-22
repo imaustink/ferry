@@ -50,6 +50,11 @@ struct PodRootfsLayout: Sendable {
     /// Host directories every known container shares over virtiofs, put in the
     /// VM's share from the start so a boot-time container need not change it.
     var shares: [String: Bool] = [:]
+    /// Where images that arrive after boot are put on the Mac, this pod's
+    /// alone, and the guest helper that mounts them. Nil leaves a late image
+    /// to cost the VM, as it always did. See PodRootfsProvider.attachLate.
+    var lateDirectory: String?
+    var loopHelper: String?
 
     /// Underscores cannot appear in a Kubernetes volume name, so these never
     /// collide with an emptyDir's pod volume, which is named after the volume.
@@ -158,6 +163,9 @@ final class PodRootfsProvider: HotplugProvider {
     private let nextSlot = Atomic<Int>(0)
     /// Each container's upper directory, and the image beneath it.
     private let uppers = Mutex<[String: (base: String, lower: String)]>([:])
+    /// Images mounted after boot by attachLate: the image's disk on the Mac ->
+    /// where it is mounted in the VM.
+    private let late = Mutex<[String: String]>([:])
 
     init(instance: VZVirtualMachineInstance, layout: PodRootfsLayout) {
         self.instance = instance
@@ -165,7 +173,9 @@ final class PodRootfsProvider: HotplugProvider {
     }
 
     func hotplug(_ rootfs: Containerization.Mount, id: String) async throws -> AttachedFilesystem {
-        guard let image = layout.images[rootfs.source], let scratch = layout.scratch else {
+        guard let scratch = layout.scratch,
+              let lower = layout.images[rootfs.source].map(PodRootfsLayout.guestPath)
+                ?? late.withLock({ $0[rootfs.source] }) else {
             throw ContainerizationError(.unsupported, message: "image \(rootfs.source) is not attached to this pod")
         }
         // A slot made when the disk was formatted costs nothing here; past
@@ -187,11 +197,77 @@ final class PodRootfsProvider: HotplugProvider {
                 throw error
             }
         }
-        uppers.withLock { $0[id] = (base, PodRootfsLayout.guestPath(image)) }
+        uppers.withLock { $0[id] = (base, lower) }
         return AttachedFilesystem(
             type: "overlay", source: "overlay", destination: rootfs.destination,
-            options: ["lowerdir=\(PodRootfsLayout.guestPath(image))",
-                      "upperdir=\(base)/upper", "workdir=\(base)/work"])
+            options: ["lowerdir=\(lower)", "upperdir=\(base)/upper", "workdir=\(base)/work"])
+    }
+
+    /// Whether this VM can take a container of `image` without a new device.
+    func has(image: String) -> Bool {
+        layout.images[image] != nil || late.withLock { $0[image] != nil }
+    }
+
+    /// Mounts an image the VM was not booted with, so a container of it can
+    /// join the running pod instead of costing the pod its VM.
+    ///
+    /// Virtualization.framework cannot add a disk to a running VM, but the
+    /// VM's virtiofs share can grow (hotplugVirtioFS). So the image's disk is
+    /// cloned -- free on APFS -- into this pod's late directory, the directory
+    /// is shared, and ferry-loop, run as a root-of-VM process with
+    /// CAP_SYS_ADMIN, puts a read-only loop device under it and mounts it in
+    /// PID 1's mount namespace, where container roots are assembled. Reads run
+    /// at 2.6-4.2 GB/s against 3.2-12 for a disk attached at boot
+    /// (experiments/42-late-disks), which an image's start-up does not notice.
+    ///
+    /// The loop device is autoclear and goes with the VM; the directory on
+    /// the Mac goes with the sandbox (removeLateDirectory).
+    func attachLate(image: String) async throws {
+        guard !has(image: image) else { return }
+        guard let directory = layout.lateDirectory, let helper = layout.loopHelper else {
+            throw ContainerizationError(.unsupported, message: "late images are off for this pod")
+        }
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let index = late.withLock { $0.count }
+        let file = "late-\(index).ext4"
+        let hostFile = (directory as NSString).appendingPathComponent(file)
+        try? fm.removeItem(atPath: hostFile)
+        try fm.copyItem(atPath: image, toPath: hostFile)   // clonefile on APFS
+        let hostHelper = (directory as NSString).appendingPathComponent("ferry-loop")
+        if !fm.fileExists(atPath: hostHelper) { try fm.copyItem(atPath: helper, toPath: hostHelper) }
+
+        let share = try Containerization.Mount.share(source: directory, destination: "/", options: ["ro"])
+        try await hotplugVirtioFS([share], id: "late")
+        let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
+        let mountpoint = PodRootfsLayout.guestPath("ferry_late_\(index)")
+
+        var process = ContainerizationOCI.Process(
+            args: ["\(guestDirectory)/ferry-loop", "\(guestDirectory)/\(file)", mountpoint, "ro"],
+            env: ["PATH=/usr/bin:/bin"],
+            capabilities: Containerization.LinuxCapabilities(capabilities: [.sysAdmin]).toOCI())
+        process.user = ContainerizationOCI.User(uid: 0, gid: 0)
+        let id = "ferry-late-\(index)"
+        let agent = try await instance.dialAgent()
+        do {
+            // containerID nil: a process in the VM's own root and namespaces,
+            // not in any container's (Containerization 0.51, #1020).
+            try await agent.createProcess(id: id, containerID: nil, stdinPort: nil, stdoutPort: nil,
+                                          stderrPort: nil, ociRuntimePath: nil,
+                                          configuration: ContainerizationOCI.Spec(process: process), options: nil)
+            _ = try await agent.startProcess(id: id, containerID: nil)
+            let status = try await agent.waitProcess(id: id, containerID: nil, timeoutInSeconds: 30)
+            try? await agent.deleteProcess(id: id, containerID: nil)
+            try? await agent.close()
+            guard status.exitCode == 0 else {
+                throw ContainerizationError(.internalError, message: "ferry-loop exited \(status.exitCode) for \(file)")
+            }
+        } catch {
+            try? await agent.deleteProcess(id: id, containerID: nil)
+            try? await agent.close()
+            throw error
+        }
+        late.withLock { $0[image] = mountpoint }
     }
 
     func registerMounts(id: String, rootfs: AttachedFilesystem, additionalMounts: [Containerization.Mount]) throws {
