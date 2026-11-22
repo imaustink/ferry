@@ -1725,22 +1725,22 @@ actor PodRuntime {
                 throw RuntimeFailure.invalid("mount source \(mount.hostPath) does not exist")
             }
             // A block-backed volume is already attached to the pod, once, and
-            // mounted in the VM; each use of it is a bind mount of that mount.
-            // The whole volume goes through the framework's own shared-volume
-            // mount. A subPath has to name a path beneath the volume, which
-            // that cannot, so it is a plain bind from the guest path.
+            // mounted in the VM; each use of it is a bind mount of that mount,
+            // through the framework's shared-volume mount.
+            //
+            // A subPath is resolved by the guest agent beneath the volume and
+            // the opened directory is bound (Containerization #987), so a
+            // symlink a container planted in the volume cannot point the bind
+            // anywhere else: one that leaves the volume fails with EXDEV, as it
+            // does in Kubernetes. A plain bind of the guest path used to
+            // follow it -- `escape -> /` gave the next container the VM's
+            // root, and a link to /run/container/<id>/rootfs would have given
+            // it another container's.
             if let block = blockMounts[mount.hostPath] {
-                let readOnly = mount.readonly ? ["ro"] : []
-                if block.subPath.isEmpty {
-                    collected.append(.sharedMount(
-                        name: block.volume.name, destination: mount.containerPath, options: readOnly))
-                } else {
-                    collected.append(.any(
-                        type: "none",
-                        source: "\(block.volume.guestPath)/\(block.subPath)",
-                        destination: mount.containerPath,
-                        options: ["bind"] + readOnly))
-                }
+                collected.append(.sharedMount(
+                    name: block.volume.name, destination: mount.containerPath,
+                    options: mount.readonly ? ["ro"] : [],
+                    subpath: block.subPath.isEmpty ? nil : block.subPath))
                 continue
             }
             collected.append(.share(
