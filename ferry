@@ -5214,7 +5214,11 @@ cmd_profile_ls() {
     [ -d "$state" ] || [ "$name" = "$PROFILE" ] || continue
     if [ -f "$run/kubelet.pid" ] && kill -0 "$(cat "$run/kubelet.pid")" 2>/dev/null; then
       status=running
-    elif [ -f "$state/admin.conf" ]; then status=stopped
+    # A cluster's data is etcd's directory, or for a Mac that joined another
+    # cluster, its worker role. --purge removes the first and keeps the
+    # certificates, so admin.conf alone means the cluster is gone.
+    elif [ -d "$state/etcd" ] || [ "$(cat "$state/role" 2>/dev/null)" = worker ]; then status=stopped
+    elif [ -f "$state/admin.conf" ]; then status=purged
     else status=empty; fi
     local k8s; k8s="$(sed -n 's/^kubernetes=//p' "$state/version" 2>/dev/null | head -1)"
     printf '%-26s %-10s %-10s %s\n' "$name$([ "$name" = "$PROFILE" ] && echo ' *')" \

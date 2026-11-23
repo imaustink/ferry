@@ -848,11 +848,14 @@ contains "  with its own state directory" "$(pferry -p demo profile)" "$pf/.ferr
 contains "  and its own API server port" "$(pferry -p demo profile)" ":7443"
 is "a name that is not safe in a path is refused" "$(pferry -p ../x profile >/dev/null; echo $?)" 2
 contains "-p with no name says so" "$(pferry profile -p)" "needs a name"
-mkdir -p "$pf/.ferry" "$pf/.ferry-demo"; echo x > "$pf/.ferry-demo/admin.conf"
+mkdir -p "$pf/.ferry" "$pf/.ferry-demo/etcd"; echo x > "$pf/.ferry-demo/admin.conf"
 printf 'kubernetes=v1.37.0\n' > "$pf/.ferry-demo/version"
+# What 'down --purge' leaves: certificates and admin.conf, no etcd, no version.
+pferry -p wiped profile >/dev/null; mkdir -p "$pf/.ferry-wiped"; echo x > "$pf/.ferry-wiped/admin.conf"
 ls_out="$(pferry profile ls)"
 contains "profile ls lists the default cluster" "$ls_out" "default *"
 contains "  and a named one, stopped, at its version" "$ls_out" "$(printf '%-26s %-10s %-10s' demo stopped v1.37.0)"
+contains "  and one whose data was purged, as purged" "$ls_out" "$(printf '%-26s %-10s' wiped purged)"
 pferry -p gone profile >/dev/null
 lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
 echo
