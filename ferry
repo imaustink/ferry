@@ -1528,14 +1528,69 @@ ferry_fetch_k8s_version() { # version
   if ! tar -xzf "$tmp/$name" -C "$tmp" || [ ! -d "$tmp/kubernetes-$v" ]; then
     rm -rf "$tmp"; bad "$name did not unpack to kubernetes-$v/"; return 1
   fi
-  local dir; dir="$(ferry_version_dir "$v")"
-  mkdir -p "$(dirname "$dir")"
-  rm -rf "$dir.partial"; mv "$tmp/kubernetes-$v" "$dir.partial"
-  rm -rf "$dir"; mv "$dir.partial" "$dir"
+  ferry_place_k8s_version "$v" "$tmp/kubernetes-$v"
   rm -rf "$tmp"
   ferry_version_complete "$v" || { bad "Kubernetes $v unpacked incomplete"; return 1; }
-  ok "Kubernetes $v ($(du -sh "$dir" | cut -f1))"
+  ok "Kubernetes $v ($(du -sh "$(ferry_version_dir "$v")" | cut -f1))"
 }
+
+# Move an unpacked version into the store. The store is shared by every
+# profile, so two of them can be fetching the same version at once: each
+# stages under its own name, and the one that finishes second leaves the
+# first one's copy alone rather than deleting it from under a cluster.
+ferry_place_k8s_version() { # version unpacked-dir
+  local v="$1" dir; dir="$(ferry_version_dir "$1")"
+  mkdir -p "$(dirname "$dir")"
+  local partial="$dir.partial.$$"
+  rm -rf "$partial"; mv "$2" "$partial"
+  if ferry_version_complete "$v"; then rm -rf "$partial"   # another profile finished first
+  else rm -rf "$dir"; mv "$partial" "$dir"; fi
+}
+
+# The stores of the other releases installed beside this one, newest first.
+# Each release has its own, so after 'ferry upgrade' a cluster's Kubernetes
+# may only be in the store of the release that created it. The curl installer
+# keeps releases side by side in .../versions/ferry-<release>/, and Homebrew in
+# Cellar/ferry/<version>/libexec/.
+ferry_other_release_stores() {
+  local self; self="$(cd "$here" 2>/dev/null && pwd -P)" || return 0
+  local parent; parent="$(dirname "$self")"
+  local d
+  for d in "$parent"/*/ "$(dirname "$parent")"/*/libexec/; do
+    d="${d%/}"
+    [ -d "$d/bin/versions" ] || continue
+    [ "$(cd "$d" && pwd -P)" = "$self" ] && continue
+    echo "$d"
+  done | sort -rV | while read -r d; do echo "$d/bin/versions"; done
+}
+
+# Copy a version this release does not offer from an older release's store.
+ferry_copy_k8s_version() { # version
+  local v="$1" store src="" name
+  while read -r store; do
+    [ -n "$store" ] || continue
+    for name in kubelet kube-apiserver kube-controller-manager kube-scheduler etcd; do
+      [ -f "$store/$v/$name" ] || continue 2
+    done
+    src="$store/$v"; break
+  done < <(ferry_other_release_stores)
+  [ -n "$src" ] || return 1
+  echo "  copying Kubernetes $v from $(dirname "$(dirname "$src")")"
+  local tmp; tmp="$(mktemp -d)"
+  # A clone on APFS, so it costs nothing until either copy changes.
+  cp -Rpc "$src" "$tmp/kubernetes-$v" 2>/dev/null \
+    || { rm -rf "$tmp/kubernetes-$v"; cp -Rp "$src" "$tmp/kubernetes-$v"; } \
+    || { rm -rf "$tmp"; bad "could not copy $src"; return 1; }
+  ferry_place_k8s_version "$v" "$tmp/kubernetes-$v"
+  rm -rf "$tmp"
+  ferry_version_complete "$v" || { bad "Kubernetes $v copied incomplete"; return 1; }
+  ok "Kubernetes $v (from an older ferry)"
+}
+
+# Is there a cluster here yet, or only the version chosen for one? The record
+# is written when a version is chosen, before anything is created; etcd's
+# member directory appears once the control plane has started for real.
+ferry_cluster_created() { [ -d "${FERRY_HOME:?}/etcd/member" ]; }
 
 # Make sure the store can run this version: present, downloaded, or built.
 ferry_ensure_k8s_version() { # version
@@ -1553,6 +1608,11 @@ ferry_ensure_k8s_version() { # version
 choose_cluster_version() { # request
   local want; want="$(ferry_resolve_k8s_version "$1")" || return 2
   local have; have="$(ferry_cluster_field kubernetes 2>/dev/null || true)"
+  # A version chosen for a cluster whose first 'up' never got as far as the
+  # control plane is not a cluster's version; asking again replaces it.
+  if [ -n "$have" ] && [ "$have" != "$want" ] && ! ferry_cluster_created; then
+    have=""
+  fi
   if [ -n "$have" ] && [ "$have" != "$want" ]; then
     bad "this cluster already runs Kubernetes $have"
     echo "    A cluster keeps the version it was created with. For $want, either:"
@@ -1564,6 +1624,9 @@ choose_cluster_version() { # request
   ferry_ensure_k8s_version "$want" || return 1
   cluster_version_chosen=1
   [ "$have" = "$want" ] && return 0
+  # Replacing a choice, not a cluster: no version.previous for rollback to
+  # find, since nothing ever ran at it.
+  ferry_cluster_created || rm -f "$(ferry_cluster_version_file)"
   ferry_write_cluster_version "$want" "$(ferry_manifest_field "$want" control-plane 2>/dev/null \
     || ferry_control_plane_version "$want")" "$(ferry_manifest_field "$want" etcd 2>/dev/null \
     || ferry_etcd_version "$want")"
@@ -1576,10 +1639,24 @@ align_to_cluster_version() {
   [ -n "$want" ] && [ "$want" != "$have" ] || return 0
 
   # A release that was upgraded since this cluster was created does not carry
-  # the cluster's Kubernetes in its tarball; it offers it as a download.
-  if ! ferry_version_complete "$want" && is_release \
-     && ferry_k8s_available | grep -qxF "$want"; then
-    ferry_fetch_k8s_version "$want" || return 1
+  # the cluster's Kubernetes in its tarball. It offers it as a download, or --
+  # once its versions have moved on to a newer patch -- the release that
+  # created the cluster still has it in its own store.
+  if ! ferry_version_complete "$want" && is_release; then
+    if ferry_k8s_available | grep -qxF "$want"; then
+      ferry_fetch_k8s_version "$want" || return 1
+    else
+      ferry_copy_k8s_version "$want" || true
+    fi
+  fi
+  if ! ferry_version_complete "$want" && is_release; then
+    bad "this cluster last ran Kubernetes $want, which this ferry does not offer"
+    echo "    and no other installed ferry has it. It offers: $(ferry_k8s_available | tr '\n' ' ')"
+    echo "    Either run a second cluster beside it, or replace it:"
+    echo
+    echo "        ferry -p <name> up --kubernetes-version <version>"
+    echo "        ferry down --purge && ferry up"
+    return 1
   fi
   if ! ferry_version_complete "$want"; then
     bad "this cluster last ran $want, and the binaries for it are gone"

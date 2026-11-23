@@ -922,14 +922,16 @@ bundle="ferry-v9.9.9-kubernetes-v1.34.0-darwin-arm64.tar.gz"
 fake_version "$kr/stage/kubernetes-v1.34.0" v1.34.0
 ( cd "$kr/stage" && tar -czf "$kr/dist/$bundle" kubernetes-v1.34.0 && cd "$kr/dist" && shasum -a 256 "$bundle" > "$bundle.sha256" )
 k8s_fns="$(for f in is_release ferry_release_version ferry_k8s_available ferry_resolve_k8s_version \
-  ferry_fetch_k8s_version ferry_ensure_k8s_version choose_cluster_version; do
+  ferry_fetch_k8s_version ferry_place_k8s_version ferry_other_release_stores ferry_copy_k8s_version \
+  ferry_cluster_created ferry_ensure_k8s_version choose_cluster_version align_to_cluster_version; do
   awk -v f="$f() " 'index($0, f) == 1 {on=1} on {print} on && /^}/ {exit}' "$repo/ferry"; done)"
-k8s() { # function args... -- run one of them as the fake release would
+k8s() { # function args... -- run one of them as the fake release would ($KR: another release)
+  local r="${KR:-$kr}"
   env FERRY_DOWNLOAD_BASE="file://$kr/dist" bash -c '
     here="$1"; FERRY_ROOT="$1"; FERRY_HOME="$2"; shift 2
     . "$here/lib/versions.sh"
-    ok() { echo "ok: $1"; }; bad() { echo "bad: $1"; }
-    eval "$K8S_FNS"; "$@"' _ "$kr" "$kr/home" "$@" 2>&1
+    ok() { echo "ok: $1"; }; bad() { echo "bad: $1"; }; warn() { echo "warn: $1"; }
+    eval "$K8S_FNS"; "$@"' _ "$r" "$r/home" "$@" 2>&1
 }
 export K8S_FNS="$k8s_fns"
 is "a minor resolves to the patch the release offers" "$(k8s ferry_resolve_k8s_version v1.34)" "v1.34.0"
@@ -940,13 +942,34 @@ out="$(k8s choose_cluster_version v1.34)"
 contains "a new cluster at v1.34 downloads it" "$out" "ok: Kubernetes v1.34.0"
 is "  into the store, complete" "$("$kr/bin/versions/v1.34.0/kubelet")" "kubelet v1.34.0"
 contains "  and records it as the cluster's version" "$(cat "$kr/home/version")" "kubernetes=v1.34.0"
+contains "a version chosen for a cluster that never started can be chosen again" \
+  "$(k8s choose_cluster_version v1.37)" "will run Kubernetes v1.37.0"
+is "  with no previous version left for rollback" "$([ -e "$kr/home/version.previous" ] && echo left || echo none)" none
+k8s choose_cluster_version v1.34 >/dev/null
+mkdir -p "$kr/home/etcd/member"   # what the control plane's first start leaves
 contains "an existing cluster keeps its version" "$(k8s choose_cluster_version v1.37)" "already runs Kubernetes v1.34.0"
-rm -rf "$kr/bin/versions/v1.34.0" "$kr/home/version"
+rm -rf "$kr/bin/versions/v1.34.0" "$kr/home/version" "$kr/home/etcd"
 echo "0000000000000000000000000000000000000000000000000000000000000000  $bundle" > "$kr/dist/$bundle.sha256"
 contains "a download that fails its checksum is refused" "$(k8s choose_cluster_version v1.34)" "checksum mismatch"
 is "  and leaves nothing in the store" "$([ -e "$kr/bin/versions/v1.34.0" ] && echo left || echo clean)" clean
 is "  and no version recorded" "$([ -e "$kr/home/version" ] && echo recorded || echo none)" none
 lacks "the release's own Kubernetes needs no download" "$(k8s choose_cluster_version v1.37)" "downloading"
+# After 'ferry upgrade' the new release may offer only a newer patch of the
+# cluster's minor. The release that created the cluster still has it.
+kd="$sandbox/k8sdist/versions"; kn="$kd/ferry-v9.9.10"; mkdir -p "$kn/lib" "$kn/home/etcd/member"
+cp "$repo"/lib/*.sh "$kn/lib/"
+printf 'ferry=v9.9.10\nkubernetes=v1.37.0\nkubernetes-available=v1.36.5 v1.37.0\n' > "$kn/VERSION"
+fake_version "$kn/bin/versions/v1.37.0" v1.37.0
+printf 'kubernetes=v1.36.4\ncontrol-plane=v1.36.4\netcd=v3.6.5\n' > "$kn/home/version"
+out="$(KR="$kn" k8s align_to_cluster_version)"
+contains "a release without the cluster's patch says what it offers instead" "$out" "offers: v1.36.5 v1.37.0"
+lacks "  and does not suggest a build a release cannot run" "$out" "ferry build"
+contains "  but a second cluster or a purge" "$out" "ferry down --purge"
+fake_version "$kd/ferry-v9.9.9/bin/versions/v1.36.4" v1.36.4
+out="$(KR="$kn" k8s align_to_cluster_version)"
+contains "a release copies the cluster's version from the release that created it" "$out" "copying Kubernetes v1.36.4"
+is "  into its own store, complete" "$("$kn/bin/versions/v1.36.4/kubelet")" "kubelet v1.36.4"
+is "  and starts the cluster at it" "$(cat "$kn/bin/.active-version" 2>/dev/null)" "v1.36.4"
 contains "the version a release carries is among those it offers" \
   " $(sed -n 's/^FERRY_RELEASE_K8S_VERSIONS="\(.*\)"$/\1/p' "$repo/lib/versions.sh") " \
   " $(sed -n 's/^FERRY_DEFAULT_K8S_VERSION="\(.*\)"$/\1/p' "$repo/lib/versions.sh") "
