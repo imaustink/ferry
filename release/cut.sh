@@ -158,3 +158,13 @@ publish_args=(--version "$version")
 # "tag already exists" wall a fresh cut.sh would hit.
 "$here/publish.sh" "${publish_args[@]}" \
   || die "release/publish.sh failed -- the tag is already pushed; re-run: release/publish.sh ${publish_args[*]}"
+
+# The Homebrew tap follows a live release only. A draft is not downloadable,
+# and a formula pointing at it would break 'brew install' until it went live.
+echo; bold "homebrew tap"
+if [ -n "$publish" ]; then
+  "$here/tap.sh" "$version" \
+    || echo "  the tap was not updated; the release is published. Re-run: release/tap.sh $version"
+else
+  echo "  after making the draft live: release/tap.sh $version"
+fi

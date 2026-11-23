@@ -818,10 +818,12 @@ is told `--without-node-image`, which the release then records.
 `release/publish.sh` refuses a dirty tree, or a tarball built from a commit
 other than the tag's — the checks `cut.sh` leans on.
 
-Then the Homebrew tap, a separate repository holding one generated file:
+With `--publish`, `cut.sh` then points the Homebrew tap
+([imaustink/homebrew-ferry](https://github.com/imaustink/homebrew-ferry)) at
+the release. For a draft, run that step once the draft is live:
 
 ```sh
-./release/homebrew.sh v0.15.0 > ../homebrew-ferry/Formula/ferry.rb
+./release/tap.sh v0.15.0
 ```
 
 `install.sh` itself is served from GitHub Pages, republished from `main`
