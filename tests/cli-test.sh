@@ -993,7 +993,9 @@ fi
 is "a version that is not vX.Y.Z is refused" "$("$repo/release/homebrew.sh" 1.2 >/dev/null 2>&1; echo $?)" 2
 
 # release/tap.sh, against an empty bare repository standing in for the tap.
-tapdir="$sandbox/tap.git"; git init --quiet --bare "$tapdir"
+# Its HEAD names master, as git init's default does on CI's runners: a clone of
+# it checks nothing out, which made every run look like the first.
+tapdir="$sandbox/tap.git"; git -c init.defaultBranch=master init --quiet --bare "$tapdir"
 tap() { FERRY_TAP_REPO="$tapdir" FERRY_FORMULA_SHA256="$(printf '%064d' 0)" \
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
   "$repo/release/tap.sh" "$1" 2>&1; }
