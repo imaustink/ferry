@@ -6864,7 +6864,7 @@ EOF
       echo "complete -c ferry -n '__fish_use_subcommand' -a '$cmds'"
       for c in $cmds; do
         local sub; sub="$(ferry_complete_sub "$c")"
-        [ -n "$sub" ] && echo "complete -c ferry -n '__fish_seen_subcommand_from $c' -a '$sub'"
+        [ -z "$sub" ] || echo "complete -c ferry -n '__fish_seen_subcommand_from $c' -a '$sub'"
       done
       ;;
     *)

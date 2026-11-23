@@ -886,6 +886,11 @@ comp_dir="$sandbox/completion"; mkdir -p "$comp_dir"
 "$repo/ferry" completion zsh > "$comp_dir/_ferry"
 is "the bash script parses" "$(bash -n "$comp_dir/ferry.bash" 2>&1; echo $?)" 0
 is "the zsh script parses" "$(zsh -n "$comp_dir/_ferry" 2>&1; echo $?)" 0
+# Homebrew's generate_completions_from_executable fails the install on a
+# non-zero exit, which the fish branch once had from a trailing '&&'.
+for sh in zsh bash fish; do
+  is "  'completion $sh' exits 0" "$("$repo/ferry" completion "$sh" >/dev/null 2>&1; echo $?)" 0
+done
 complete_bash() { # words... -> candidates
   bash -c 'source "$1"; shift; COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); _ferry; echo "${COMPREPLY[*]}"' \
     _ "$comp_dir/ferry.bash" "$@"
@@ -899,6 +904,20 @@ is "log components complete" "$(complete_bash ferry logs ferry-cr)" "ferry-cri"
 dispatched="$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$repo/ferry" | grep -oE '^  [a-z-]+(\|[a-z-]+)*\)' | tr -d ' )' | tr '|' '\n' | grep -v '^-' | sort -u)"
 offered="$(sed -n 's/^FERRY_COMPLETE_COMMANDS="\(.*\)"$/\1/p' "$repo/ferry" | tr ' ' '\n' | sort -u)"
 is "every dispatched command is completed" "$(comm -23 <(echo "$dispatched") <(echo "$offered") | tr '\n' ' ')" ""
+echo
+
+# --- the Homebrew formula ----------------------------------------------------
+printf '\033[1m%s\033[0m\n' "release/homebrew.sh"
+formula="$(FERRY_FORMULA_SHA256="$(printf '%064d' 0)" "$repo/release/homebrew.sh" v1.2.3 2>&1)"
+contains "it names the release's tarball" "$formula" "releases/download/v1.2.3/ferry-v1.2.3-darwin-arm64.tar.gz"
+contains "  at its version" "$formula" 'version "1.2.3"'
+contains "it runs ferry through opt/, which survives brew upgrade" "$formula" 'exec "#{opt_libexec}/ferry"'
+lacks "  rather than a symlink into the versioned Cellar" "$formula" "install_symlink"
+contains "it installs shell completion" "$formula" 'generate_completions_from_executable(libexec/"ferry", "completion")'
+if command -v ruby >/dev/null 2>&1; then
+  is "it is valid Ruby" "$(echo "$formula" | ruby -c 2>&1)" "Syntax OK"
+fi
+is "a version that is not vX.Y.Z is refused" "$("$repo/release/homebrew.sh" 1.2 >/dev/null 2>&1; echo $?)" 2
 echo
 
 # --- logs --bundle -----------------------------------------------------------

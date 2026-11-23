@@ -815,6 +815,12 @@ is told `--without-node-image`, which the release then records.
 `release/publish.sh` refuses a dirty tree, or a tarball built from a commit
 other than the tag's — the checks `cut.sh` leans on.
 
+Then the Homebrew tap, a separate repository holding one generated file:
+
+```sh
+./release/homebrew.sh v0.15.0 > ../homebrew-ferry/Formula/ferry.rb
+```
+
 `install.sh` itself is served from GitHub Pages, republished from `main`
 whenever it changes, so the installer people run is the one in this repository.
 The one-time DNS and Pages setup is in [docs/INSTALL.md](docs/INSTALL.md).

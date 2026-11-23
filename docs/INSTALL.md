@@ -90,6 +90,26 @@ Installs, then joins instead of starting a cluster of its own. See
 [Adding nodes](#adding-nodes). Run it from a Terminal window on that Mac, not
 over SSH.
 
+### Homebrew
+
+```sh
+brew install imaustink/ferry/ferry
+ferry up
+```
+
+The same release tarball, installed under Homebrew's prefix with shell
+completion for zsh, bash and fish, and `kubectl` from `kubernetes-cli`. It
+starts nothing: `ferry up` is the next step, and `ferry service install` makes
+the cluster start at every login. `brew upgrade ferry` is the upgrade.
+Homebrew 7 asks you to trust a third-party tap before it uses it; naming the
+formula in full, as above, is enough.
+
+`bin/ferry` is a two-line script that runs
+`$(brew --prefix)/opt/ferry/libexec/ferry` rather than a symlink into the
+versioned Cellar, so the login agent keeps working across `brew upgrade`. Use
+one install method per Mac: both put a `ferry` on the `PATH`, and the first one
+wins.
+
 ### Build from source
 
 For changing ferry. Needs Swift 6.4, Go 1.26+, and `buildctl`
