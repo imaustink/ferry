@@ -7,7 +7,7 @@ let package = Package(
     name: "ferry-node",
     platforms: [.macOS("26.0")],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", exact: "0.45.0")
+        .package(url: "https://github.com/apple/containerization.git", exact: "0.57.0")
     ],
     targets: [
         .executableTarget(

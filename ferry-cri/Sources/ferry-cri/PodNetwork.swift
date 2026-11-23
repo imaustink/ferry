@@ -43,7 +43,38 @@ final class PodNetwork: @unchecked Sendable {
     private var released = false
     private let lock = NSLock()
 
-    init(subnet requested: CIDRv4) throws {
+    /// The network for `requested`: from ferry-netd when `owner` names its
+    /// socket, created here when it does not or ferry-netd cannot be reached.
+    ///
+    /// Either way this process holds a reference and releases it on shutdown.
+    /// What differs is who else does: with ferry-netd, the subnet stays held
+    /// if this process dies without releasing, so the next ferry-cri gets the
+    /// same one back instead of finding it reserved (ferry-netd's header).
+    init(subnet requested: CIDRv4, owner: String? = nil) throws {
+        if let owner, let owned = try Self.fromOwner(owner, subnet: requested) {
+            self.reference = owned
+        } else {
+            self.reference = try Self.create(subnet: requested)
+        }
+        let ref = self.reference
+
+        var got = in_addr()
+        var mask = in_addr()
+        vmnet_network_get_ipv4_subnet(ref, &got, &mask)
+        let base = UInt32(bigEndian: got.s_addr)
+        let maskValue = UInt32(bigEndian: mask.s_addr)
+        let lower = IPv4Address(base & maskValue)
+        let upper = IPv4Address(lower.value + ~maskValue)
+        self.subnet = try CIDRv4(lower: lower, upper: upper)
+
+        // .1 is the gateway vmnet answers on, so the first thing ferry hands
+        // out is .2 -- which is where cluster DNS lands, and what the manifests
+        // and every node's resolv.conf already expect.
+        self.next = self.subnet.lower.value + 2
+    }
+
+    /// Asks vmnet for the subnet directly, as ferry-cri always did.
+    private static func create(subnet requested: CIDRv4) throws -> vmnet_network_ref {
         var status: vmnet_return_t = .VMNET_FAILURE
         guard let config = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status) else {
             throw RuntimeFailure.unsupported("failed to create vmnet config with status \(status)")
@@ -65,21 +96,55 @@ final class PodNetwork: @unchecked Sendable {
         guard let ref = vmnet_network_create(config, &status), status == .VMNET_SUCCESS else {
             throw RuntimeFailure.unsupported("failed to create vmnet network with status \(status)")
         }
-        self.reference = ref
+        return ref
+    }
 
-        var got = in_addr()
-        var mask = in_addr()
-        vmnet_network_get_ipv4_subnet(ref, &got, &mask)
-        let base = UInt32(bigEndian: got.s_addr)
-        let maskValue = UInt32(bigEndian: mask.s_addr)
-        let lower = IPv4Address(base & maskValue)
-        let upper = IPv4Address(lower.value + ~maskValue)
-        self.subnet = try CIDRv4(lower: lower, upper: upper)
-
-        // .1 is the gateway vmnet answers on, so the first thing ferry hands
-        // out is .2 -- which is where cluster DNS lands, and what the manifests
-        // and every node's resolv.conf already expect.
-        self.next = self.subnet.lower.value + 2
+    /// The network ferry-netd holds for `requested`, rehydrated in this process.
+    /// Nil when ferry-netd cannot be reached, so the caller creates the network
+    /// itself rather than not starting; a subnet ferry-netd was refused throws,
+    /// exactly as a refused create here does, so the callers' choice of subnet
+    /// and their spacing of retries are unchanged.
+    private static func fromOwner(_ socketPath: String, subnet requested: CIDRv4) throws -> vmnet_network_ref? {
+        let request = "network \(requested.gateway)/\(requested.prefix.length)"
+        guard let (reply, connection) = NetworkOwnerClient.ask(socketPath, request, keep: true) else {
+            print("    ferry-netd is not answering on \(socketPath); holding the network here")
+            return nil
+        }
+        // Only an ok keeps the connection; close it on every other way out.
+        var watching = false
+        defer { if !watching, let connection { close(connection) } }
+        if reply.hasPrefix("refused ") {
+            throw RuntimeFailure.unsupported("failed to create vmnet network with status \(reply.dropFirst(8))")
+        }
+        guard reply.hasPrefix("ok "), let bytes = Data(base64Encoded: String(reply.dropFirst(3))) else {
+            print("    ferry-netd: \(reply); holding the network here")
+            return nil
+        }
+        let dict = xpc_dictionary_create(nil, nil, 0)
+        bytes.withUnsafeBytes { xpc_dictionary_set_data(dict, "networkSerialization", $0.baseAddress!, $0.count) }
+        var status: vmnet_return_t = .VMNET_FAILURE
+        guard let ref = vmnet_network_create_with_serialization(dict, &status) else {
+            print("    could not rehydrate ferry-netd's network (status \(status)); holding the network here")
+            return nil
+        }
+        print("    \(requested) held by ferry-netd")
+        // The network ends with ferry-netd, whatever this process holds: a
+        // vmnet network does not outlive the process that created it. Its pods
+        // would go on running and reporting Ready with nothing able to reach
+        // them -- measured in experiment 41 -- so this process stops instead,
+        // through the same clean shutdown 'ferry down' asks for, and whatever
+        // restarts the cluster (the login agent, or 'ferry up') brings it back
+        // on a network that exists.
+        if let connection {
+            watching = true
+            NetworkOwnerClient.watch(connection) {
+                guard !shutdownRequested.load(ordering: .sequentiallyConsistent) else { return }
+                print("==> ferry-netd has gone, and the pod network with it; stopping so the cluster restarts")
+                fflush(stdout)
+                kill(getpid(), SIGTERM)
+            }
+        }
+        return ref
     }
 
     var ipv4Gateway: IPv4Address { subnet.gateway }

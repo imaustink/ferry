@@ -17,6 +17,11 @@ SWIFT="${SWIFT:-swift}"
 cp "$("$SWIFT" build -c release --show-bin-path)/ferry-cri" ../bin/ferry-cri
 codesign --force --sign - --entitlements entitlements.plist ../bin/ferry-cri
 echo "==> $(cd .. && pwd)/bin/ferry-cri"
+# The same entitlement: vmnet refuses every call from an unsigned process
+# (VMNET_MEM_FAILURE), and ferry-netd is the process that creates the network.
+cp "$("$SWIFT" build -c release --show-bin-path)/ferry-netd" ../bin/ferry-netd
+codesign --force --sign - --entitlements entitlements.plist ../bin/ferry-netd
+echo "==> $(cd .. && pwd)/bin/ferry-netd"
 
 # The interactive guest agent (kubectl exec -i/-it). A tiny macOS binary ferry-cri
 # uploads into a booted guest and launches on vsock 7001 -- no change to the

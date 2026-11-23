@@ -86,6 +86,8 @@ for ref in $refs; do
     # with a message naming the reason. Shipping them would mean shipping the
     # sources they drive.
     build-kubelet.sh|ferry-cni/build.sh|guest/build-nft.sh|kernel/build-kernel.sh) continue ;;
+    # Go source, cross-built by 'ferry build' into bin/ferry-loop, which ships.
+    guest/ferry-loop) continue ;;
     experiments/*) continue ;;
     # The Go and Swift source trees, each reached as '( cd "$here/<x>" && build )'.
     # bin/<x> is the shipped half and is checked above.
