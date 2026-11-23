@@ -522,6 +522,13 @@ NODE_IMAGE_LAYOUT="${FERRY_NODE_IMAGE:-$here/node-image/oci}"
 # it on every start would be minutes of nothing. FERRY_HOME rather than
 # FERRY_RUN because /tmp does not survive a reboot.
 NODE_DISK="${FERRY_NODE_DISK:-$FERRY_HOME/node.ext4}"
+# Kept out of Time Machine, as apple/container 1.7 keeps the data it can make
+# again: the node disk is unpacked from the node image whenever it is missing,
+# and backing it up is ~400MB a rebuild for nothing. An item exclusion, which
+# needs no sudo and moves with the file. Not the registry beside it: its blobs
+# are the only lasting copy of an image loaded from a tarball, since ferry-cri's
+# own store is in /tmp. Nor etcd or machined, which are the cluster.
+tm_exclude() { tmutil addexclusion "$1" >/dev/null 2>&1 || true; }
 # Every machine sits on one vmnet network -- that is what makes mode 2's pod
 # networking ordinary routing rather than mode 1's flooded switch. Profiles get
 # their own, because a vmnet network is claimed for the whole Mac and a second
@@ -2410,6 +2417,8 @@ machines_ready() {
   # silently, because everything still works, just not with their changes in it.
   local stamp="$NODE_DISK.layout"
   local want; want="$(node_layout_id)"
+  # One unpacked before the exclusion existed.
+  [ -f "$NODE_DISK" ] && tm_exclude "$NODE_DISK"
   if [ ! -f "$NODE_DISK" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
     # Not while ferry-machined is running. This function is reached before the
     # "already running" check below, so re-running 'ferry machines enable' after
@@ -2445,6 +2454,7 @@ machines_ready() {
         rm -f "$tmp"
         [ -f "$NODE_DISK" ] && echo "    The node disk already there was left alone."
         return 1; }
+    tm_exclude "$tmp"
     mv -f "$tmp" "$NODE_DISK" || {
       bad "could not put the unpacked node disk at $NODE_DISK"
       rm -f "$tmp"
