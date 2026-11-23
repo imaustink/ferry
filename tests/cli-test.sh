@@ -858,6 +858,28 @@ contains "  and a named one, stopped, at its version" "$ls_out" "$(printf '%-26s
 contains "  and one whose data was purged, as purged" "$ls_out" "$(printf '%-26s %-10s' wiped purged)"
 pferry -p gone profile >/dev/null
 lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
+
+# profile rm: everything a profile owns goes, and its number is freed.
+mkdir -p "$pf/.ferry-old/etcd" "$pf/Library/LaunchAgents"
+echo x > "$pf/.ferry-old/admin.conf"
+pferry -p old profile >/dev/null
+touch "$pf/Library/LaunchAgents/dev.ferry.old.plist"
+old_index="$(awk '$2 == "old" {print $1}' "$pf/.ferry-profiles")"
+contains "profile rm asks before deleting" "$(echo n | pferry profile rm old)" "nothing deleted"
+is "  and keeps everything when told no" "$([ -d "$pf/.ferry-old" ] && echo kept)" kept
+rm_out="$(pferry profile rm old --yes)"
+contains "profile rm --yes removes it" "$rm_out" "removed old"
+is "  its state directory" "$([ -e "$pf/.ferry-old" ] && echo left || echo gone)" gone
+is "  its login agent" "$([ -e "$pf/Library/LaunchAgents/dev.ferry.old.plist" ] && echo left || echo gone)" gone
+is "  and its line in the register" "$(grep -c ' old$' "$pf/.ferry-profiles")" 0
+is "  so the next new profile gets its number" \
+  "$(pferry -p fresh profile >/dev/null; awk '$2 == "fresh" {print $1}' "$pf/.ferry-profiles")" "$old_index"
+contains "the default cluster is not removed this way" "$(pferry profile rm default --yes)" "down --purge"
+lacks "  and a name with a path in it is refused" "$(pferry profile rm ../x --yes)" "removed"
+# A running profile is refused: an etcd pid that is alive (this shell's own).
+mkdir -p "$pf/.ferry-busy"; echo $$ > "$pf/.ferry-busy/etcd.pid"; pferry -p busy profile >/dev/null
+contains "a running profile is refused" "$(pferry profile rm busy --yes)" "busy is running"
+is "  and left in place" "$([ -d "$pf/.ferry-busy" ] && echo kept)" kept
 echo
 
 # --- update notice -----------------------------------------------------------

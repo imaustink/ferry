@@ -746,6 +746,7 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry image load <x>    run an image you built elsewhere, without a registry
   ferry profile           which cluster this command runs, and on what ports
   ferry profile ls        every cluster on this Mac, and which are running
+  ferry profile rm <name>  delete a stopped cluster and everything it owns
   ferry -p <name> <cmd>   run any command against another cluster, e.g.
                           'ferry -p demo up' (minikube's -p, kind's --name)
   ferry addons list       what can be turned on, and what is
@@ -5228,11 +5229,77 @@ cmd_profile_ls() {
   echo "  * is the profile this command runs as. Another: ferry -p <name> up"
 }
 
+# Delete clusters outright: everything a profile owns on this Mac, and its
+# number in the register, so the number can be given to a new profile. The
+# numbers matter: ports are 1000 apart per number, so the register runs out
+# in the fifties, and every worktree ever used holds one until it is removed.
+#
+# Each name is removed by a fresh run of ferry as that profile, so the paths
+# come from the same variables everything else uses rather than being
+# rebuilt here. The default cluster is not removed this way: 'ferry down
+# --purge' is that, and it keeps the config file on purpose.
+cmd_profile_rm() {
+  local yes="" names=() name
+  for name in "$@"; do
+    case "$name" in -y|--yes) yes=1 ;; *) names+=("$name") ;; esac
+  done
+  [ "${#names[@]}" -gt 0 ] || { bad "usage: ferry profile rm <name>... [--yes]"; return 2; }
+  for name in "${names[@]}"; do
+    case "$name" in
+      default) bad "the default cluster is removed with: ferry down --purge"; return 2 ;;
+      *[!a-zA-Z0-9_-]*|-*) bad "profile '$name': not a profile name"; return 2 ;;
+    esac
+  done
+  if [ -z "$yes" ]; then
+    echo "  This deletes each cluster's data, certificates, volumes and config:"
+    for name in "${names[@]}"; do echo "    $HOME/.ferry-$name"; done
+    ferry_yes "Delete ${#names[@]} profile(s)?" n || { echo "  nothing deleted"; return 1; }
+  fi
+  local failed=0
+  for name in "${names[@]}"; do
+    FERRY_PROFILE="$name" "$here/ferry" profile __remove-self || failed=1
+  done
+  return "$failed"
+}
+
+# Run as the profile being removed; see cmd_profile_rm.
+cmd_profile_remove_self() {
+  [ "$PROFILE" != default ] || return 2
+  # The kubelet's pid is under the runtime directory, the control plane's
+  # beside its data; either one alive means the cluster is up.
+  local alive="" pidfile
+  running kubelet && alive=1
+  for pidfile in "$FERRY_HOME"/etcd.pid "$FERRY_HOME"/kube-apiserver.pid; do
+    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && alive=1
+  done
+  if [ -n "$alive" ]; then
+    bad "$PROFILE is running; stop it first: ferry -p $PROFILE down"
+    return 1
+  fi
+  launchctl bootout "gui/$(id -u)/$(service_label)" 2>/dev/null
+  rm -f "$(service_plist)"
+  kubeconfig_forget >/dev/null
+  # The state directory is named from the profile, never from FERRY_HOME
+  # alone: an override pointing somewhere else is not this command's to delete.
+  local state="$HOME/.ferry-$PROFILE"
+  [ -n "$PROFILE" ] && [ -d "$state" ] && rm -rf "${state:?}"
+  [ -n "$PROFILE" ] && [ -d "/tmp/ferry-run-$PROFILE" ] && rm -rf "/tmp/ferry-run-${PROFILE:?}"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" \
+        "$FERRY_NETPOL_SOCK" "$FERRY_GPUD_SOCK"
+  if [ -f "$FERRY_PROFILES" ]; then
+    local tmp; tmp="$(mktemp)"
+    awk -v p="$PROFILE" '$2 != p' "$FERRY_PROFILES" > "$tmp" && mv "$tmp" "$FERRY_PROFILES"
+  fi
+  ok "removed $PROFILE"
+}
+
 cmd_profile() {
   case "${1:-}" in
     ls|list) cmd_profile_ls; return ;;
+    rm|remove|delete) shift; cmd_profile_rm "$@"; return ;;
+    __remove-self) cmd_profile_remove_self; return ;;
     "") : ;;
-    *) bad "usage: ferry profile [ls]"; return 2 ;;
+    *) bad "usage: ferry profile [ls | rm <name>... [--yes]]"; return 2 ;;
   esac
   bold "profile $PROFILE"
   echo "  kubernetes  $(ferry_cluster_field kubernetes 2>/dev/null || ferry_active_version || echo 'not built')"
@@ -6775,7 +6842,7 @@ ferry_complete_sub() { # command -> its subcommands or flags
     service)    echo "install uninstall status" ;;
     node)       echo "add rm ls" ;;
     image)      echo "build load ls" ;;
-    profile)    echo "ls" ;;
+    profile)    echo "ls rm" ;;
     addons)     echo "list enable disable images" ;;
     token)      echo "create" ;;
     machines)   echo "status enable disable ls" ;;
