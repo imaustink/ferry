@@ -170,7 +170,7 @@ the volume attached as a disk, as the next pod would be:
 | | runs | the next VM reads |
 |---|---|---|
 | stopped as LinuxPod.stop does | 5 | journal recovered, **the file does not exist** |
-| guest `sync` and unmount first, as ferry-cri does | 4 | the file, md5 matching, no recovery |
+| guest `sync` and unmount first, as LinuxPod.stop unmounts an attached volume | 4 | the file, md5 matching, no recovery |
 
 ## What this leaves
 
