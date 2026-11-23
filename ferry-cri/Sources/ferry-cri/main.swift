@@ -96,6 +96,10 @@ let config = RuntimeConfig(
         let path = option("--loop-helper", "")
         return path.isEmpty ? nil : path
     }(),
+    snapshotsDir: {
+        let path = option("--snapshots", "")
+        return path.isEmpty ? nil : URL(filePath: path)
+    }(),
     initImage: option("--init-image", "ghcr.io/apple/containerization/vminit:0.57.0"),
     defaultCPUs: Int(option("--pod-cpus", "2")) ?? 2,
     defaultMemoryBytes: (UInt64(option("--pod-memory-mib", "512")) ?? 512) * 1024 * 1024,

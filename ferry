@@ -1563,6 +1563,7 @@ cmd_up() {
     $(mac_image_flag) \
     $(netd_flag) \
     $(loop_flag) \
+    $(snapshots_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
 
@@ -1865,6 +1866,12 @@ start_netd() {
 # --network-owner, when ferry-netd is up to answer it.
 # --loop-helper, when ferry-loop is built. Without it ferry-cri gives a pod a
 # new VM for a container whose image the running one was not booted with.
+# One directory of unpacked images for every node on this Mac: ferry-cri
+# unpacks an image there once, under a lock the nodes share, and each node
+# runs from a hard link of its own. In FERRY_RUN, beside every node's state, so
+# the links are on the same volume. See PodRuntime.snapshotDisk.
+snapshots_flag() { printf -- '--snapshots %s' "$FERRY_RUN/snapshots"; }
+
 loop_flag() {
   [ -x "$here/bin/ferry-loop" ] && printf -- '--loop-helper %s' "$here/bin/ferry-loop"
 }
@@ -2749,6 +2756,7 @@ cmd_node_add() {
     --relay-endpoint "$LAN_IP:$relay" \
     $(image_mirror_flag) \
     $(loop_flag) \
+    $(snapshots_flag) \
     >"$FERRY_RUN/logs/node-$index-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/node-$index.pid"
   local ready= waited=0 limit=90
@@ -3229,6 +3237,7 @@ start_worker() { # name index server(host:port)
     $(mac_image_flag) \
     $(netd_flag) \
     $(loop_flag) \
+    $(snapshots_flag) \
     >"$FERRY_RUN/logs/ferry-cri.log" 2>&1 &
   echo $! > "$FERRY_RUN/ferry-cri.pid"
   # Same budget rule as cmd_up, and it matters more here: a Mac joining a
