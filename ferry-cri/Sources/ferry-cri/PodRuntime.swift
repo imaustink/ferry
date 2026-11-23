@@ -240,6 +240,14 @@ enum ContainerRunState {
 actor PodRuntime {
     private let config: RuntimeConfig
     private let store: ImageStore
+    /// The unpacked root filesystem of each image (Containerization #1013):
+    /// keyed by the image's layer digests, so two images with the same layers
+    /// that differ only in their config -- a rebuild that changed ENV or CMD,
+    /// one build tagged twice -- share a disk; written to a temporary file and renamed into place, so a
+    /// ferry-cri killed mid-unpack never leaves half a disk that a later start
+    /// takes for a whole one; and locked per snapshot, so concurrent pulls of
+    /// one image unpack it once.
+    private let snapshots: SnapshotManager
     private let kernel: Kernel
     private var initfs: Containerization.Mount!
     private var network: PodNetwork!
@@ -320,6 +328,12 @@ actor PodRuntime {
         self.config = config
         try FileManager.default.createDirectory(at: config.stateDir, withIntermediateDirectories: true)
         self.store = try ImageStore(path: config.stateDir)
+        // Each snapshot grows to fit its image, so this is only a floor: the
+        // 2 GiB every image used to get, kept for small ones. A pod attaches it
+        // read-only and its containers write to an overlay on the scratch
+        // disk, so nothing more is needed than the image itself.
+        self.snapshots = try SnapshotManager(path: config.stateDir.appending(component: Self.snapshotDirectory),
+                                             capacityInBytes: UInt64(2.gib()))
         var commandLine = Kernel.CommandLine(debug: false, panic: 0)
         commandLine.kernelArgs += Self.podKernelArgs + config.extraKernelArgs
         self.kernel = Kernel(path: URL(filePath: config.kernelPath), platform: .linuxArm,
@@ -2798,18 +2812,35 @@ actor PodRuntime {
     /// only ever reached through rootfsCache, so one it does not name is
     /// garbage: nothing can clone it.
     private func sweepImageDisks() {
-        // By name: every one of them is made in the state directory.
-        let live = Set(rootfsCache.values.map { ($0.source as NSString).lastPathComponent })
-        let directory = config.stateDir.path(percentEncoded: false)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+        let live = Set(rootfsCache.values.map(\.source))
+        let fm = FileManager.default
         var freed: UInt64 = 0
         var removed = 0
-        for name in names where name.hasPrefix("image-") && name.hasSuffix(".ext4") && !live.contains(name) {
-            let path = (directory as NSString).appendingPathComponent(name)
-            let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? UInt64) ?? 0
-            if (try? FileManager.default.removeItem(atPath: path)) != nil {
+        func remove(_ path: String) {
+            let size = ((try? fm.attributesOfItem(atPath: path))?[.size] as? UInt64) ?? 0
+            if (try? fm.removeItem(atPath: path)) != nil {
                 freed += size
                 removed += 1
+            }
+        }
+        // What an older ferry-cri unpacked beside the store and rehydration
+        // did not move into the snapshots: an image no longer in the store.
+        let state = config.stateDir.path(percentEncoded: false)
+        for name in (try? fm.contentsOfDirectory(atPath: state)) ?? []
+        where name.hasPrefix("image-") && name.hasSuffix(".ext4") {
+            remove((state as NSString).appendingPathComponent(name))
+        }
+        // Snapshots no image resolves to any more, and what a fill that died
+        // left. Nothing else unpacks into this directory: it is this node's,
+        // and this runs before the kubelet can ask for a pull.
+        let directory = snapshots.path.path(percentEncoded: false)
+        for name in (try? fm.contentsOfDirectory(atPath: directory)) ?? [] {
+            let path = (directory as NSString).appendingPathComponent(name)
+            if name.hasSuffix(".ext4"), !live.contains(path) {
+                remove(path)
+                try? fm.removeItem(atPath: String(path.dropLast(".ext4".count)) + ".lock")
+            } else if name.hasPrefix("."), name.hasSuffix(".tmp") {
+                remove(path)
             }
         }
         if removed > 0 {
@@ -2839,41 +2870,37 @@ actor PodRuntime {
                                platform: platform)
     }
 
-    /// How big a filesystem an image needs.
-    ///
-    /// This was a flat 2 GiB, which is generous for busybox and too small for
-    /// anything real: `python:3.12` unpacks to about 1.4 GiB and leaves no room
-    /// for a container to write, and an image past roughly 1.5 GiB could not be
-    /// run at all -- which is most of the ML images anyone would want a GPU for.
-    ///
-    /// A manifest reports compressed layer sizes, and unpacked is larger by a
-    /// factor that has to be guessed at because nothing in the manifest records
-    /// it. Measured on arm64: python:3.12-slim 45 MiB compressed to 145 MiB
-    /// unpacked (3.2x), python:3.12 381 MiB to 1070 MiB (2.8x). Four is that
-    /// with room to be wrong.
-    ///
-    /// Plus 2 GiB for the container's own writes, which is what an image got to
-    /// itself under the old flat figure, and never below that old figure so
-    /// small images are unaffected.
-    ///
-    /// Over-provisioning is close to free: the file is sparse and costs what is
-    /// written to it rather than what it may hold.
-    static let rootfsCompressionFactor: UInt64 = 4
+    /// Where SnapshotManager keeps root filesystems, under the state directory.
+    static let snapshotDirectory = "snapshots"
 
-    static func rootfsCapacity(for image: Containerization.Image,
-                               platform: ContainerizationOCI.Platform) async -> UInt64 {
-        let floor = UInt64(2.gib())
-        guard let manifest = try? await image.manifest(for: platform) else { return floor }
-        let compressed = manifest.layers.reduce(Int64(0)) { $0 + $1.size }
-        guard compressed > 0 else { return floor }
-        return max(floor, UInt64(compressed) * rootfsCompressionFactor + UInt64(2.gib()))
-    }
-
-    /// Where the root filesystem unpacked for a digest lives.
-    private func imageDisk(_ digest: String) -> URL {
+    /// Where an older ferry-cri put the root filesystem it unpacked for a
+    /// digest, before SnapshotManager. Only read, to move it into place.
+    private func legacyImageDisk(_ digest: String) -> URL {
         let safe = digest.replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
         return config.stateDir.appending(component: "image-\(safe).ext4")
+    }
+
+    /// The image's snapshot, unpacking it if there is none. A disk an older
+    /// ferry-cri unpacked -- named by the manifest digest, or before that the
+    /// index digest -- is moved into place rather than unpacked again, or the
+    /// first start after an upgrade would re-expand every image before the
+    /// kubelet got an answer. A pod running from the old name holds the file
+    /// open and does not notice.
+    private func snapshotDisk(_ image: Containerization.Image,
+                              platform: ContainerizationOCI.Platform) async throws -> URL {
+        if let existing = try await snapshots.get(image, for: platform) { return existing }
+        let key = try await SnapshotManager.key(of: image, for: platform)
+        let entry = snapshots.path.appending(component: "\(key.encoded).ext4")
+        let manifest = try? await image.descriptor(for: platform).digest
+        for digest in [manifest, image.digest].compactMap({ $0 }) where !digest.isEmpty {
+            let legacy = legacyImageDisk(digest)
+            if FileManager.default.fileExists(atPath: legacy.path(percentEncoded: false)),
+               (try? FileManager.default.moveItem(at: legacy, to: entry)) != nil {
+                return entry
+            }
+        }
+        return try await snapshots.unpack(image, for: platform)
     }
 
     /// Unpacks an image to a root filesystem and records it where the kubelet
@@ -2896,40 +2923,18 @@ actor PodRuntime {
         let identity = image.digest.isEmpty ? canonical : image.digest
         let previous = rootfsCache[canonical]
 
-        // The disk, though, belongs to what it unpacks, which is the platform's
-        // manifest and not the index around it. An index also records the name
-        // it was pushed or loaded as, so the same build tagged twice -- skaffold
-        // tags every image by content hash and `latest` -- is two index digests
-        // over one manifest, and each unpacked its own copy: 10 such pairs,
-        // 2.2 GiB, on a cluster of 42 images (the v0.5.0 verification's
-        // "stored twice"). The identity above is still what the kubelet is told
-        // and what a lookup resolves; only the file is shared.
-        let content = (try? await image.descriptor(for: platform).digest) ?? identity
-        let path = imageDisk(content)
-
-        if rootfsCache[identity] == nil,
-           let shared = rootfsCache.values.first(where: {
-               ($0.source as NSString).lastPathComponent == path.lastPathComponent
-           }) {
-            rootfsCache[identity] = shared
-        }
+        // The disk, though, belongs to what it unpacks: the layers, not the
+        // name or the index around them. The same build tagged twice --
+        // skaffold tags every image by content hash and `latest` -- used to
+        // unpack two copies (10 such pairs, 2.2 GiB, on a cluster of 42
+        // images), and so did a rebuild that changed only ENV or CMD. A
+        // snapshot is keyed by the layers, so they share one. The
+        // identity above is still what the kubelet is told and what a lookup
+        // resolves; only the file is shared.
         if rootfsCache[identity] == nil {
-            // Disks used to be named by the index digest. Renamed rather than
-            // unpacked again, or the first start after an upgrade re-expands
-            // every image before the kubelet gets an answer. A pod running from
-            // the old name holds the file open and does not notice.
-            let legacy = imageDisk(identity)
-            if legacy != path, !FileManager.default.fileExists(atPath: path.path(percentEncoded: false)) {
-                try? FileManager.default.moveItem(at: legacy, to: path)
-            }
-            let mount: Containerization.Mount
-            do {
-                mount = try await EXT4Unpacker(capacityInBytes: Self.rootfsCapacity(for: image, platform: platform))
-                    .unpack(image, for: platform, at: path)
-            } catch let error as ContainerizationError where error.code == .exists {
-                mount = .block(format: "ext4", source: path.path(), destination: "/", options: [])
-            }
-            rootfsCache[identity] = mount
+            let disk = try await snapshotDisk(image, platform: platform)
+            rootfsCache[identity] = .block(format: "ext4", source: disk.path(percentEncoded: false),
+                                           destination: "/", options: [])
         }
         for key in keys { rootfsCache[key] = rootfsCache[identity] }
 
@@ -2988,7 +2993,7 @@ actor PodRuntime {
         // anyone comparing against `docker images` or a registry expects. It
         // used to be the size of the unpacked ext4 file, and that is a sparse
         // file whose length is its capacity -- never below the 2 GiB floor in
-        // rootfsCapacity -- so every small image reported exactly 2176 MiB and
+        // the old per-image capacity -- so every small image reported exactly 2176 MiB and
         // image GC could not tell busybox from python. The file's allocated
         // blocks are the fallback when the manifest cannot be read.
         let digest = image.digest.isEmpty ? canonical : image.digest
