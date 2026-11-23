@@ -27,6 +27,9 @@ all passing, about a minute on a warm cluster).
 - Racing nodes only cost time: a link that is already there is used, a
   snapshot deleted between unpack and link is unpacked again, and a link that
   can't cross devices falls back to a clone.
+- A node that ran #96, with snapshots under its own `<state>/snapshots`,
+  moves them into the shared store on its first start (5d1a6ae). run.sh
+  does not exercise this; it has unit tests.
 - An old `image-*.ext4` is adopted into the store only if its ext4 superblock
   reads back (`EXT4Reader`). The formatter writes the superblock last, so a
   disk that was never finished has none; it is deleted and unpacked again.
