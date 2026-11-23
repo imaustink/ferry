@@ -101,12 +101,12 @@ if [ -n "$extra_k8s" ]; then
   for v in $FERRY_RELEASE_K8S_VERSIONS; do
     [ "$v" = "$k8s" ] && continue
     ferry_version_complete "$v" \
-      || die "the version store has no complete $v -- run: ./ferry build --kubernetes-version $v (or --without-extra-kubernetes)"
+      || die "the version store has no complete $v -- run: ./ferry build --kubernetes-version $v --kubernetes-only (or --without-extra-kubernetes)"
     [ -f "$(ferry_version_dir "$v")/ferry-proxyd" ] \
-      || die "$v has no ferry-proxyd -- run: ./ferry build --kubernetes-version $v"
+      || die "$v has no ferry-proxyd -- run: ./ferry build --kubernetes-version $v --kubernetes-only"
     inputs="$(ferry_kubelet_inputs "$v")"
     [ -z "$inputs" ] || [ "$inputs" = "$(cat "$(ferry_version_dir "$v")/kubelet.inputs" 2>/dev/null)" ] \
-      || die "kubelet $v was built from other patches -- run: ./ferry build --kubernetes-version $v"
+      || die "kubelet $v was built from other patches -- run: ./ferry build --kubernetes-version $v --kubernetes-only"
     extras="$extras $v"
   done
 fi

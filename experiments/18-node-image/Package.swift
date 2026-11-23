@@ -24,5 +24,10 @@ let package = Package(
             name: "ferry-node-tests",
             dependencies: ["ferry-node"]
         ),
-    ]
+    ],
+    // Swift 5 mode: each VZVirtualMachine here is confined to its own serial
+    // queue, which strict concurrency checking cannot see, so Swift 6 mode only
+    // printed Sendable warnings on every build -- false alarms, and enough of
+    // them to bury a real one.
+    swiftLanguageModes: [.v5]
 )

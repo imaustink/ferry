@@ -1064,26 +1064,39 @@ build_kubernetes_binaries() { # version
   # predate any patch; it is rebuilt once to find out.
   local inputs; inputs="$(ferry_kubelet_inputs "$version")"
   local built; built="$(cat "$dir/kubelet.inputs" 2>/dev/null || true)"
+  local rebuilt=0
   if [ ! -x "$dir/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    rebuilt=1
   elif [ -n "$inputs" ] && [ "$inputs" != "$built" ]; then
     echo "==> kubelet $version was built from other patches; rebuilding"
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    rebuilt=1
   else
     echo "==> kubelet present, $version (--rebuild to force)"
   fi
   echo
 
-  # kube-proxy's own rule generation, built for darwin from the patched tree.
+  # kube-proxy's own rule generation, built for darwin from the patched tree --
+  # the same tree, and so the same patches, as the kubelet beside it. It is
+  # built when the kubelet was, and otherwise left alone: the source under
+  # $TMPDIR is shared by every checkout on this Mac, so a kubelet that is
+  # current says nothing about what that tree holds now. Rebuilding from it
+  # anyway could pair a current kubelet with another checkout's proxyd, and
+  # its absence used to print "source missing" over a build that was fine.
   echo "==> ferry-proxyd"
-  local src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${version}}"
-  if [ -d "$src" ]; then
+  if [ "$rebuilt" = 0 ] && [ -x "$dir/ferry-proxyd" ]; then
+    echo "==> ferry-proxyd present, $version"
+  else
+    if [ "$rebuilt" = 0 ]; then
+      echo "==> no ferry-proxyd for $version; preparing its source"
+      K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    fi
+    local src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${version}}"
     rm -f "$dir/ferry-proxyd"
     ( cd "$src" && GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
         go build -o "$dir/ferry-proxyd" ./cmd/ferry-proxyd ) || return 1
     echo "==> $dir/ferry-proxyd"
-  else
-    warn "kubernetes source missing; run build-kubelet.sh first"
   fi
   echo
 
@@ -1092,6 +1105,7 @@ build_kubernetes_binaries() { # version
 }
 
 cmd_build() {
+  local kubernetes_only=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --kubernetes-version)
@@ -1099,7 +1113,8 @@ cmd_build() {
         K8S_VERSION="$2"; shift 2 ;;
       --kubernetes-version=*) K8S_VERSION="${1#*=}"; shift ;;
       --rebuild) FERRY_REBUILD=1; shift ;;
-      *) bad "usage: ferry build [--kubernetes-version <vX.Y.Z>] [--rebuild]"; return 2 ;;
+      --kubernetes-only) kubernetes_only=1; shift ;;
+      *) bad "usage: ferry build [--kubernetes-version <vX.Y.Z>] [--kubernetes-only] [--rebuild]"; return 2 ;;
     esac
   done
   ferry_version_valid "$K8S_VERSION" || {
@@ -1121,6 +1136,18 @@ cmd_build() {
     echo "    To build ferry from source instead:"
     echo "        git clone https://github.com/imaustink/ferry && cd ferry && ./ferry build"
     return 1
+  fi
+
+  # Just the version store's half: kubelet, ferry-proxyd and the control plane
+  # for one Kubernetes, without making it this checkout's active version and
+  # without the runtime, which does not depend on the Kubernetes version. What
+  # release/cut.sh wants for each version a release offers as a download --
+  # building all of ferry for each one compiled the same Swift four times.
+  if [ -n "$kubernetes_only" ]; then
+    bold "building Kubernetes $K8S_VERSION"
+    echo "  control plane $(ferry_control_plane_version "$K8S_VERSION"), etcd $(ferry_etcd_version "$K8S_VERSION")"
+    build_kubernetes_binaries "$K8S_VERSION" || return 1
+    return 0
   fi
 
   bold "building ferry"
@@ -7201,7 +7228,7 @@ ferry_complete_sub() { # command -> its subcommands or flags
     up)         echo "--kubernetes-version --disposable --durability --mac-image" ;;
     down)       echo "--purge" ;;
     uninstall)  echo "--purge" ;;
-    build)      echo "--kubernetes-version --rebuild" ;;
+    build)      echo "--kubernetes-version --kubernetes-only --rebuild" ;;
     init)       echo "--purpose --yes --force" ;;
     config)     echo "show get set unset path" ;;
     logs)       echo "--bundle $FERRY_LOG_COMPONENTS" ;;

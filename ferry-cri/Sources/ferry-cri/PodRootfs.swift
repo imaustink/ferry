@@ -327,7 +327,7 @@ final class PodRootfsProvider: HotplugProvider {
                 throw RuntimeFailure.invalid("cannot place \(hostHelper): \(reason)")
             }
         }
-        let share = try Containerization.Mount.share(source: directory, destination: "/", options: ["ro"])
+        let share = Containerization.Mount.share(source: directory, destination: "/", options: ["ro"])
         try await hotplugVirtioFS([share], id: "late")
         let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
         return (guestDirectory, "\(guestDirectory)/ferry-loop")
@@ -392,7 +392,7 @@ final class PodRootfsProvider: HotplugProvider {
         // The helper comes from the read-only share; only the volume's file
         // is in this one, which the guest can write.
         let shared = try await shareReadOnly()
-        let share = try Containerization.Mount.share(source: directory, destination: "/", options: [])
+        let share = Containerization.Mount.share(source: directory, destination: "/", options: [])
         try await hotplugVirtioFS([share], id: "late-rw")
         let readOnly = mount.options.contains("ro")
         let device = Self.volumeDeviceBase + index
