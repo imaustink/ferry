@@ -62,18 +62,25 @@ contains "the unpack guard asks about the identity" "$runtime" \
 lacks "the unpack guard no longer asks about the name" "$runtime" \
   'if rootfsCache[canonical] == nil {'
 
-# The file name, which collided for the same reason the key did. It is the
-# platform manifest's digest rather than the image's: an index records the name
-# it was tagged as, so one build under two tags is two identities over one
-# filesystem, and naming the file by the index unpacked it twice.
-contains "the ext4 path is derived from the platform manifest" "$runtime" \
-  'let content = (try? await image.descriptor(for: platform).digest) ?? identity'
-contains "the ext4 path is derived from that content digest" "$runtime" \
-  'let path = imageDisk(content)'
+# The file, which collided for the same reason the key did. It belongs to the
+# layers rather than the name or the index: an index records the name it was
+# tagged as, so one build under two tags is two identities over one
+# filesystem, and naming the file by the index unpacked it twice. Containers'
+# SnapshotManager keys it by the layer digests, and writes it to a temporary
+# file renamed into place, so a ferry-cri killed mid-unpack leaves no half disk
+# behind under the real name.
+contains "the disk comes from SnapshotManager" "$runtime" \
+  'return try await snapshots.unpack(image, for: platform)'
+contains "an existing snapshot is reused without unpacking" "$runtime" \
+  'if let existing = try await snapshots.get(image, for: platform) { return existing }'
+contains "the identity's disk is the image's snapshot" "$runtime" \
+  'let disk = try await snapshotDisk(image, platform: platform)'
 lacks "the ext4 path is no longer derived from the index" "$runtime" \
   'let safe = identity.replacingOccurrences'
-contains "a second identity over the same content reuses the disk" "$runtime" \
-  'rootfsCache[identity] = shared'
+lacks "nothing unpacks straight to the final path any more" "$runtime" \
+  'EXT4Unpacker('
+contains "an older ferry-cri's disk is moved into place, not unpacked again" "$runtime" \
+  'let legacy = legacyImageDisk(digest)'
 
 # Names are aliases for the identity, never the other way round.
 contains "names resolve to the identity" "$runtime" \
