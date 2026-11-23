@@ -190,6 +190,23 @@ v="$(here="$sandbox" ferry_runtime_version)"
 if [[ "${v#v}" =~ $semver ]]; then ok "neither: $v"; else bad "neither gives '$v'"; fi
 echo
 
+printf '\033[1m%s\033[0m\n' "an upgrade under a running cluster says to restart it"
+# The installer moves ~/.ferry-dist/current under a cluster that is up, which
+# keeps the old release's processes; 'ferry up' then said only "already up".
+eval "$(sed -n '/^is_release()/p; /^ferry_note_started_by()/,/^}/p; /^ferry_started_by_other()/,/^}/p' "$repo/ferry")"
+sb="$sandbox/started-by"
+other="$(here="$release" FERRY_RUN="$sb" ferry_started_by_other)"
+contains "a cluster with no record was started by an earlier release" "$other" "an earlier ferry"
+here="$release" FERRY_RUN="$sb" ferry_note_started_by
+if here="$release" FERRY_RUN="$sb" ferry_started_by_other >/dev/null; then bad "one this release started is flagged"
+else ok "one this release started is not"; fi
+echo v0.16.0 > "$sb/started-by"
+contains "one an older release started is named" "$(here="$release" FERRY_RUN="$sb" ferry_started_by_other)" v0.16.0
+if here="$repo" FERRY_RUN="$sb" ferry_started_by_other >/dev/null; then bad "a checkout is flagged"
+else ok "a checkout, rebuilt all the time, is not"; fi
+contains "ferry up records it" "$(sed -n '/^  ferry_note_started_by$/,/bold "ferry is up"/p' "$repo/ferry")" 'bold "ferry is up"'
+echo
+
 printf '\033[1m%s\033[0m\n' "a mode 2 pod's claim has somewhere to go"
 # Each link in the chain is in a different process, and dropping any one of
 # them puts the claim back to Pending with no event.
