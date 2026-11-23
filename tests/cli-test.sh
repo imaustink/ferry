@@ -904,6 +904,54 @@ lacks "  and not with FERRY_NO_UPDATE_CHECK=1" "$(notice v99.0.0 FERRY_NO_UPDATE
 lacks "  and never into a pipe" "$(echo v99.0.0 > "$un/.ferry-dist/latest-release"; env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$release/ferry" status 2>&1)" "is out"
 echo
 
+# --- choosing the Kubernetes version ----------------------------------------
+#
+# The functions 'ferry up --kubernetes-version' runs, against a fake release
+# that carries v1.37.0 and offers v1.34.0 as a download served from file://.
+printf '\033[1m%s\033[0m\n' "ferry up --kubernetes-version"
+kr="$sandbox/k8srel"; mkdir -p "$kr/lib" "$kr/dist" "$kr/home"
+cp "$repo"/lib/*.sh "$kr/lib/"
+printf 'ferry=v9.9.9\nkubernetes=v1.37.0\nkubernetes-available=v1.34.0 v1.37.0\n' > "$kr/VERSION"
+fake_version() { # dir version -- a store entry ferry_version_complete accepts
+  mkdir -p "$1"; for b in kubelet kube-apiserver kube-controller-manager kube-scheduler etcd ferry-proxyd; do
+    printf '#!/bin/sh\necho %s %s\n' "$b" "$2" > "$1/$b"; chmod +x "$1/$b"; done
+  printf 'kubernetes=%s\ncontrol-plane=%s\netcd=v3.6.5\n' "$2" "$2" > "$1/MANIFEST"
+}
+fake_version "$kr/bin/versions/v1.37.0" v1.37.0
+bundle="ferry-v9.9.9-kubernetes-v1.34.0-darwin-arm64.tar.gz"
+fake_version "$kr/stage/kubernetes-v1.34.0" v1.34.0
+( cd "$kr/stage" && tar -czf "$kr/dist/$bundle" kubernetes-v1.34.0 && cd "$kr/dist" && shasum -a 256 "$bundle" > "$bundle.sha256" )
+k8s_fns="$(for f in is_release ferry_release_version ferry_k8s_available ferry_resolve_k8s_version \
+  ferry_fetch_k8s_version ferry_ensure_k8s_version choose_cluster_version; do
+  awk -v f="$f() " 'index($0, f) == 1 {on=1} on {print} on && /^}/ {exit}' "$repo/ferry"; done)"
+k8s() { # function args... -- run one of them as the fake release would
+  env FERRY_DOWNLOAD_BASE="file://$kr/dist" bash -c '
+    here="$1"; FERRY_ROOT="$1"; FERRY_HOME="$2"; shift 2
+    . "$here/lib/versions.sh"
+    ok() { echo "ok: $1"; }; bad() { echo "bad: $1"; }
+    eval "$K8S_FNS"; "$@"' _ "$kr" "$kr/home" "$@" 2>&1
+}
+export K8S_FNS="$k8s_fns"
+is "a minor resolves to the patch the release offers" "$(k8s ferry_resolve_k8s_version v1.34)" "v1.34.0"
+is "  'v' is optional" "$(k8s ferry_resolve_k8s_version 1.37)" "v1.37.0"
+contains "a version the release does not offer is refused" "$(k8s ferry_resolve_k8s_version v1.36)" "available: v1.34.0 v1.37.0"
+contains "  and so is an exact one it does not offer" "$(k8s ferry_resolve_k8s_version v1.34.5)" "does not offer Kubernetes v1.34.5"
+out="$(k8s choose_cluster_version v1.34)"
+contains "a new cluster at v1.34 downloads it" "$out" "ok: Kubernetes v1.34.0"
+is "  into the store, complete" "$("$kr/bin/versions/v1.34.0/kubelet")" "kubelet v1.34.0"
+contains "  and records it as the cluster's version" "$(cat "$kr/home/version")" "kubernetes=v1.34.0"
+contains "an existing cluster keeps its version" "$(k8s choose_cluster_version v1.37)" "already runs Kubernetes v1.34.0"
+rm -rf "$kr/bin/versions/v1.34.0" "$kr/home/version"
+echo "0000000000000000000000000000000000000000000000000000000000000000  $bundle" > "$kr/dist/$bundle.sha256"
+contains "a download that fails its checksum is refused" "$(k8s choose_cluster_version v1.34)" "checksum mismatch"
+is "  and leaves nothing in the store" "$([ -e "$kr/bin/versions/v1.34.0" ] && echo left || echo clean)" clean
+is "  and no version recorded" "$([ -e "$kr/home/version" ] && echo recorded || echo none)" none
+lacks "the release's own Kubernetes needs no download" "$(k8s choose_cluster_version v1.37)" "downloading"
+contains "the version a release carries is among those it offers" \
+  " $(sed -n 's/^FERRY_RELEASE_K8S_VERSIONS="\(.*\)"$/\1/p' "$repo/lib/versions.sh") " \
+  " $(sed -n 's/^FERRY_DEFAULT_K8S_VERSION="\(.*\)"$/\1/p' "$repo/lib/versions.sh") "
+echo
+
 # --- completion --------------------------------------------------------------
 printf '\033[1m%s\033[0m\n' "ferry completion"
 comp_dir="$sandbox/completion"; mkdir -p "$comp_dir"

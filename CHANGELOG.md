@@ -31,6 +31,13 @@ Kubernetes v1.37.0, control plane v1.37.0, etcd v3.6.5.
 - **`ferry -p <name>`** (or `--profile`) runs any command against a named
   cluster, so an installed ferry can run several: `ferry -p demo up`.
   **`ferry profile ls`** lists every cluster on the Mac and which are running.
+- **`ferry up --kubernetes-version v1.35`** creates a cluster at another
+  Kubernetes, like kind's `--image` and minikube's `--kubernetes-version`. A
+  release offers v1.34, v1.35, v1.36 and v1.37. It carries the default in its
+  tarball and downloads the others, checksummed, the first time a cluster asks.
+  `ferry version` lists them. A cluster keeps its version across restarts and
+  ferry upgrades.
+- **`ferry profile rm <name>`** deletes a stopped cluster and frees its number.
 - **`ferry completion zsh|bash|fish`**.
 - **`ferry logs --bundle`** collects every component log, ferry's own reports
   and the cluster's state into one tarball for a bug report. `ferry logs` on

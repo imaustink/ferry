@@ -749,12 +749,37 @@ Run the installer again. It unpacks the new release beside the old one and moves
 being relinked. That is why `current` exists, and why ferry stops resolving
 symlinks there rather than pinning itself to the version directory.
 
-That also moves **Kubernetes**, because a release carries one: the kubelet,
-`ferry-proxyd`, the control plane and etcd, built and tested as a set. This is
-k3s' model, and here it is forced: `ferry upgrade apply` compiles a kubelet
-from a patched Kubernetes tree, and a release carries neither the tree nor a
-toolchain. In a release, `ferry upgrade` says so and stops, rather than finding
-out several minutes in.
+A cluster keeps the Kubernetes it was created with across a ferry upgrade.
+If the new release does not carry that version in its tarball, it downloads it
+the first time the cluster starts, as long as the release still offers it.
+New clusters start at the version the new release carries.
+
+`ferry upgrade apply`, which moves a running cluster to another Kubernetes
+while keeping its data, needs a checkout. It compiles a kubelet from a patched
+Kubernetes tree, and a release carries neither the tree nor a toolchain. In a
+release, `ferry upgrade` says so and stops, rather than finding out several
+minutes in. To try a cluster on another version, create one beside it:
+`ferry -p next up --kubernetes-version v1.37`.
+
+## Choosing the Kubernetes version
+
+```sh
+ferry version                                   # what this ferry offers
+ferry up --kubernetes-version v1.35             # a new cluster at v1.35
+ferry -p old up --kubernetes-version v1.34      # another, beside the first
+```
+
+A minor (`v1.35`) picks the newest patch offered for it. The version is
+chosen when a cluster is created and recorded beside its data. Every later
+`ferry up` starts it at that version, and asking an existing cluster for a
+different one is refused rather than silently ignored. A release carries one
+Kubernetes in its tarball and publishes each other version it offers as a
+separate download (about 150 MB), fetched and checksummed the first time a
+cluster asks for it. A checkout builds the version instead, which takes
+minutes because the kubelet compiles from source.
+
+`kubectl` warns when it is more than one minor away from the server. That is
+upstream's skew policy, not ferry's, and is harmless for most commands.
 
 In a checkout, where any version is a build input,
 `ferry upgrade plan|apply|nodes|rollback` works as documented in

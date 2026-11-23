@@ -434,6 +434,26 @@ else
 fi
 echo
 
+# --- the other Kubernetes versions -----------------------------------------
+#
+# 'ferry up --kubernetes-version' on a release downloads what the release
+# offers; a release that lists a version it did not publish fails on someone
+# else's Mac, so packaging, publishing and the cut all have to agree.
+printf '\033[1m%s\033[0m\n' "a release publishes every Kubernetes it offers"
+build_src="$(cat "$repo/release/build.sh")"
+contains "build.sh walks FERRY_RELEASE_K8S_VERSIONS" "$build_src" 'for v in $FERRY_RELEASE_K8S_VERSIONS'
+contains "  and refuses one whose kubelet predates the patches" "$build_src" "was built from other patches"
+contains "  and packages each as its own download" "$build_src" 'ferry-$version-kubernetes-$v-darwin-arm64.tar.gz'
+contains "  named the way ferry fetches it" "$(cat "$repo/ferry")" 'ferry-$release-kubernetes-$v-darwin-arm64.tar.gz'
+contains "  and unpacked from the directory ferry expects" "$build_src" 'kdir="$stage/kubernetes-$v"'
+contains "  and VERSION lists what it offers" "$build_src" 'kubernetes-available=$available'
+publish_src="$(cat "$repo/release/publish.sh")"
+contains "publish.sh uploads every version VERSION offers" "$publish_src" 'assets+=("$k" "$k.sha256")'
+contains "  and refuses when one is missing" "$publish_src" "VERSION offers Kubernetes"
+contains "cut.sh builds the offered versions before the default" \
+  "$(cat "$repo/release/cut.sh")" 'for v in $FERRY_RELEASE_K8S_VERSIONS'
+echo
+
 # --- mode 2 ----------------------------------------------------------------
 #
 # Mode 2 is opt-in on the Mac, but a release has to *carry* it or enabling it

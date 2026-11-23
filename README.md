@@ -53,7 +53,7 @@ nothing: when there is none, or it is another ferry cluster's.
 | list them | `kind get clusters` | `minikube profile list` | `ferry profile ls` |
 | stop it, keeping its data | — | `minikube stop` | `ferry down` |
 | delete it | `kind delete cluster` | `minikube delete` | `ferry down --purge` |
-| pick the Kubernetes version | `--image kindest/node:v1.x` | `--kubernetes-version` | each release carries one, tested as a set; `FERRY_VERSION=…` on the installer picks the release. A checkout builds any ([UPGRADES.md](docs/UPGRADES.md)) |
+| pick the Kubernetes version | `--image kindest/node:v1.x` | `--kubernetes-version` | `ferry up --kubernetes-version v1.35`, for a new cluster; `ferry version` lists what is offered |
 | use a local image | `kind load docker-image x` | `minikube image load x` | `ferry image load x` |
 | build one, with no Docker | — | `minikube image build` | `ferry image build -t x .` |
 | turn on an addon | — | `minikube addons enable x` | `ferry addons enable x` |

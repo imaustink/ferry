@@ -16,7 +16,7 @@ can change in any release.
 | **State on disk** | a cluster's data in `~/.ferry` (and `~/.ferry-<profile>`) is carried forward by every later 1.x. Upgrading is running the installer again, or `brew upgrade ferry`. You never have to delete a cluster to upgrade. |
 | **Profiles** | `-p <name>` / `FERRY_PROFILE` select the same cluster, ports and state directory across upgrades. |
 | **kubeconfig** | the context is called `ferry` for the default cluster and `ferry-<profile>` otherwise. |
-| **Kubernetes** | the control plane and kubelet are upstream Kubernetes, with the platform glue in `patches/`. Each ferry release carries one Kubernetes version, said in its release notes and by `ferry version`. A minor ferry release may move to a newer Kubernetes minor, within upstream's supported skew, and the release notes say so. |
+| **Kubernetes** | the control plane and kubelet are upstream Kubernetes, with the platform glue in `patches/`. `ferry up --kubernetes-version` and the versions `ferry version` lists are stable. A minor ferry release may add a newer Kubernetes minor, or move its default to one, and may drop an offered version only when upstream no longer supports it; the release notes say so. A cluster keeps the version it was created with across ferry upgrades for as long as a release offers it. |
 | **Labels and RuntimeClasses** | `ferry.dev/mode`, `ferry.dev/gpu`, and the RuntimeClasses `ferry-vm`, `ferry-shared` and `ferry-macos-vm`. |
 
 ## Supported upgrade paths

@@ -725,6 +725,8 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry config      show the settings the next 'ferry up' uses, and why
                     set <key> <value>, unset <key>, get <key>, path
   ferry up          start the cluster
+                    --kubernetes-version v1.36 to create it at another Kubernetes
+                    (a release downloads it once; 'ferry version' lists them)
                     --disposable to trade surviving a power loss for speed
                     (--durability power-loss|process-crash, remembered)
   ferry down        stop the cluster (--purge to drop its data as well)
@@ -1437,11 +1439,132 @@ cluster_version() {
 # ~/.ferry was last running something else, starting it again has to bring back
 # what it was -- otherwise a build quietly becomes an upgrade, which is the
 # thing this whole change exists to stop happening by accident.
+# --- choosing the Kubernetes version ------------------------------------------
+#
+# A cluster runs one Kubernetes, recorded beside its data when it is created,
+# and everything that starts -- the control plane, each kubelet, ferry-proxyd --
+# follows that record. So choosing a version is choosing the record for a new
+# cluster, after making sure the store has the binaries for it.
+#
+# A checkout builds what it does not have. A release cannot build a kubelet, so
+# it downloads one: every version in FERRY_RELEASE_K8S_VERSIONS is published
+# beside the release's own tarball, checksummed, and unpacked into the store
+# the first time it is asked for.
+
+# The versions this copy of ferry can run without building anything.
+ferry_k8s_available() {
+  local listed=""
+  if is_release; then
+    listed="$(sed -n 's/^kubernetes-available=//p' "$here/VERSION" | head -1)"
+    [ -n "$listed" ] || listed="$(sed -n 's/^kubernetes=//p' "$here/VERSION" | head -1)"
+  else
+    listed="$FERRY_RELEASE_K8S_VERSIONS"
+  fi
+  local v
+  { for v in $listed; do echo "$v"; done
+    for v in $(ferry_version_list); do ferry_version_complete "$v" && echo "$v"; done
+  } | sort -uV
+}
+
+# vX.Y.Z as asked, or the newest offered patch of vX.Y. "1.36" works too.
+ferry_resolve_k8s_version() { # request
+  local want="${1#v}"; want="v$want"
+  if ferry_version_valid "$want"; then
+    if is_release && ! ferry_k8s_available | grep -qxF "$want"; then
+      bad "this release does not offer Kubernetes $want" >&2
+      echo "    it offers: $(ferry_k8s_available | tr '\n' ' ')" >&2
+      return 2
+    fi
+    echo "$want"; return 0
+  fi
+  case "$want" in
+    v[0-9]*.[0-9]*) : ;;
+    *) bad "--kubernetes-version $1: expected a version such as v1.36 or v1.36.4" >&2; return 2 ;;
+  esac
+  local match
+  match="$(ferry_k8s_available | awk -v mm="$want" 'index($0, mm ".") == 1' | tail -1)"
+  if [ -z "$match" ]; then
+    bad "no Kubernetes $want here; available: $(ferry_k8s_available | tr '\n' ' ')" >&2
+    return 2
+  fi
+  echo "$match"
+}
+
+# Download one Kubernetes into a release's store. Verified against the
+# checksum published beside it, unpacked to the side and moved into place, so
+# an interrupted download never leaves a half version that looks complete.
+ferry_fetch_k8s_version() { # version
+  local v="$1" release; release="$(ferry_release_version)" || return 1
+  local name="ferry-$release-kubernetes-$v-darwin-arm64.tar.gz"
+  local base="${FERRY_DOWNLOAD_BASE:-https://github.com/${FERRY_REPO:-imaustink/ferry}/releases/download/$release}"
+  local tmp; tmp="$(mktemp -d)"
+  echo "  downloading Kubernetes $v for ferry $release"
+  if ! curl -fL --progress-bar -o "$tmp/$name" "$base/$name" \
+     || ! curl -sfL -o "$tmp/$name.sha256" "$base/$name.sha256"; then
+    rm -rf "$tmp"; bad "could not download $base/$name"; return 1
+  fi
+  local want got
+  want="$(awk '{print $1}' "$tmp/$name.sha256")"
+  got="$(shasum -a 256 "$tmp/$name" | awk '{print $1}')"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    rm -rf "$tmp"; bad "checksum mismatch for $name"; return 1
+  fi
+  if ! tar -xzf "$tmp/$name" -C "$tmp" || [ ! -d "$tmp/kubernetes-$v" ]; then
+    rm -rf "$tmp"; bad "$name did not unpack to kubernetes-$v/"; return 1
+  fi
+  local dir; dir="$(ferry_version_dir "$v")"
+  mkdir -p "$(dirname "$dir")"
+  rm -rf "$dir.partial"; mv "$tmp/kubernetes-$v" "$dir.partial"
+  rm -rf "$dir"; mv "$dir.partial" "$dir"
+  rm -rf "$tmp"
+  ferry_version_complete "$v" || { bad "Kubernetes $v unpacked incomplete"; return 1; }
+  ok "Kubernetes $v ($(du -sh "$dir" | cut -f1))"
+}
+
+# Make sure the store can run this version: present, downloaded, or built.
+ferry_ensure_k8s_version() { # version
+  ferry_version_complete "$1" && return 0
+  if is_release; then
+    ferry_fetch_k8s_version "$1"
+  else
+    echo "==> building Kubernetes $1 (the kubelet compiles from source; minutes)"
+    build_kubernetes_binaries "$1"
+  fi
+}
+
+# 'ferry up --kubernetes-version': choose the version of a cluster that does
+# not exist yet. An existing one keeps its own; changing that is an upgrade.
+choose_cluster_version() { # request
+  local want; want="$(ferry_resolve_k8s_version "$1")" || return 2
+  local have; have="$(ferry_cluster_field kubernetes 2>/dev/null || true)"
+  if [ -n "$have" ] && [ "$have" != "$want" ]; then
+    bad "this cluster already runs Kubernetes $have"
+    echo "    A cluster keeps the version it was created with. For $want, either:"
+    echo "        ferry -p <name> up --kubernetes-version $want    # a second cluster beside it"
+    echo "        ferry down --purge && ferry up --kubernetes-version $want    # replace it"
+    is_release || echo "        ferry upgrade apply $want    # move this one, keeping its data"
+    return 2
+  fi
+  ferry_ensure_k8s_version "$want" || return 1
+  cluster_version_chosen=1
+  [ "$have" = "$want" ] && return 0
+  ferry_write_cluster_version "$want" "$(ferry_manifest_field "$want" control-plane 2>/dev/null \
+    || ferry_control_plane_version "$want")" "$(ferry_manifest_field "$want" etcd 2>/dev/null \
+    || ferry_etcd_version "$want")"
+  ok "this cluster will run Kubernetes $want"
+}
+
 align_to_cluster_version() {
   local want; want="$(ferry_cluster_field kubernetes 2>/dev/null)" || return 0
   local have; have="$(ferry_active_version)"
   [ -n "$want" ] && [ "$want" != "$have" ] || return 0
 
+  # A release that was upgraded since this cluster was created does not carry
+  # the cluster's Kubernetes in its tarball; it offers it as a download.
+  if ! ferry_version_complete "$want" && is_release \
+     && ferry_k8s_available | grep -qxF "$want"; then
+    ferry_fetch_k8s_version "$want" || return 1
+  fi
   if ! ferry_version_complete "$want"; then
     bad "this cluster last ran $want, and the binaries for it are gone"
     echo "    The checkout is built at ${have:-nothing}. Either build $want back:"
@@ -1451,19 +1574,26 @@ align_to_cluster_version() {
     echo "    or start fresh:  ferry down --purge"
     return 1
   fi
-  warn "this cluster is $want; the checkout is built at $have"
-  # Which way to point depends on the direction. 'apply' refuses to go
-  # backwards, so offering it for an older build is offering a command that
-  # will decline -- the way back is rollback, and only if this is where the
-  # cluster came from.
-  if [ -z "$(ferry_skew_reason "$want" "$have")" ]; then
-    echo "      Starting it at $want. To move it: ferry upgrade apply $have"
-  elif [ "$(ferry_previous_field kubernetes 2>/dev/null)" = "$have" ]; then
-    echo "      Starting it at $want. $have is older, so the way back is:"
-    echo "      ferry upgrade rollback"
+  # A version chosen with --kubernetes-version a moment ago is not news.
+  if [ -n "${cluster_version_chosen:-}" ]; then :
+  elif is_release; then
+    # A release has no 'upgrade apply'; the cluster simply keeps its version.
+    ok "Kubernetes $want (this ferry's default is $have)"
   else
-    echo "      Starting it at $want, because $have is older and a control plane"
-    echo "      does not go backwards in place."
+    warn "this cluster is $want; the checkout is built at $have"
+    # Which way to point depends on the direction. 'apply' refuses to go
+    # backwards, so offering it for an older build is offering a command that
+    # will decline -- the way back is rollback, and only if this is where the
+    # cluster came from.
+    local reason; reason="$(ferry_skew_reason "$want" "$have")"
+    if [ -z "$reason" ]; then
+      echo "      Starting it at $want. To move it: ferry upgrade apply $have"
+    elif [ "$(ferry_previous_field kubernetes 2>/dev/null)" = "$have" ]; then
+      echo "      Starting it at $want. $have is older, so the way back is:"
+      echo "      ferry upgrade rollback"
+    else
+      echo "      Starting it at $want; it cannot move to $have in one step: $reason"
+    fi
   fi
   # The control plane's links only. Each node starts at the version it last
   # ran, recorded beside it, so bin/kubelet is not what decides that any more.
@@ -1534,9 +1664,13 @@ cmd_up() {
   # recreate from a script. --fast was the first spelling of it and still
   # works, but it named the gain and hid the cost. 'full' and 'relaxed' are
   # the old names of the two levels and are accepted and translated.
-  local want_durability="" asked_durability="" bake_mac=""
+  local want_durability="" asked_durability="" bake_mac="" asked_k8s=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --kubernetes-version)
+        [ -n "${2:-}" ] || { bad "--kubernetes-version needs a value, such as v1.36"; return 2; }
+        asked_k8s="$2"; shift 2 ;;
+      --kubernetes-version=*) asked_k8s="${1#*=}"; shift ;;
       --durability) asked_durability="${2:-}"; shift 2 ;;
       --durability=*) asked_durability="${1#*=}"; shift ;;
       --disposable) asked_durability=process-crash; shift ;;
@@ -1567,6 +1701,12 @@ cmd_up() {
       bad "ferry is up with durability $(ferry_durability); 'ferry down' first to change it"
       return 1
     fi
+    if [ -n "$asked_k8s" ]; then
+      local running_k8s want_k8s
+      running_k8s="$(ferry_cluster_field kubernetes 2>/dev/null)"
+      want_k8s="$(ferry_resolve_k8s_version "$asked_k8s")" || return 2
+      [ "$running_k8s" = "$want_k8s" ] || { bad "ferry is up at Kubernetes $running_k8s, not $want_k8s"; return 1; }
+    fi
     ok "ferry is already up"
     return 0
   fi
@@ -1574,6 +1714,13 @@ cmd_up() {
     bad "ferry is half up ($(running ferry-cri && echo ferry-cri || echo kubelet) alone); run 'ferry down' first"
     return 1
   fi
+  # A new cluster with no version asked for gets the one this release carries.
+  # Not the active version: starting another profile's older cluster moves
+  # that, and a fresh default cluster would quietly inherit it.
+  if [ -z "$asked_k8s" ] && is_release && [ -z "$(ferry_cluster_field kubernetes 2>/dev/null)" ]; then
+    asked_k8s="$(sed -n 's/^kubernetes=//p' "$here/VERSION" | head -1)"
+  fi
+  if [ -n "$asked_k8s" ]; then choose_cluster_version "$asked_k8s" || return $?; fi
   align_to_cluster_version || return 1
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
@@ -6272,6 +6419,7 @@ cmd_version() {
   echo "  control plane $(version_of control-plane)"
   echo "  etcd          $(version_of etcd)"
   unset -f version_of
+  echo "  available     $(ferry_k8s_available | tr '\n' ' ')(ferry up --kubernetes-version)"
   echo "  profile       $PROFILE"
   echo "  root          $here"
   local cluster; cluster="$(ferry_cluster_field kubernetes 2>/dev/null)"
@@ -6831,7 +6979,7 @@ cmd_logs_bundle() {
 FERRY_COMPLETE_COMMANDS="doctor version kernel node-image build init config up down restart status logs kubeconfig service uninstall node image profile addons token join machines mac-image upgrade completion help"
 ferry_complete_sub() { # command -> its subcommands or flags
   case "$1" in
-    up)         echo "--disposable --durability --mac-image" ;;
+    up)         echo "--kubernetes-version --disposable --durability --mac-image" ;;
     down)       echo "--purge" ;;
     uninstall)  echo "--purge" ;;
     build)      echo "--kubernetes-version --rebuild" ;;
