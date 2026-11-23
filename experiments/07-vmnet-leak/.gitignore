@@ -1,2 +1,8 @@
 probe
 one
+bridge
+joiner
+kind
+owner
+share
+vzbridge
