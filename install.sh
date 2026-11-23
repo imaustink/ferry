@@ -25,7 +25,10 @@
 #   FERRY_BIN_DIR       where 'ferry' is linked, default the first writable of
 #                       /usr/local/bin then ~/.local/bin
 #   FERRY_SKIP_START    1 to install without starting a cluster
-#   FERRY_SKIP_SERVICE  1 to not register the LaunchAgent that starts at login
+#   FERRY_SERVICE       1 to register the LaunchAgent that starts the cluster at
+#                       login, 0 to never. Default: off for a new cluster, on for
+#                       a join, and kept as it was when upgrading
+#   FERRY_SKIP_SERVICE  1, the older spelling of FERRY_SERVICE=0
 #   FERRY_SKIP_KUBECTL  1 to not install kubectl even if it is missing
 #   FERRY_DOWNLOAD_BASE where to fetch the tarball and its checksum from,
 #                       instead of this release's GitHub URL. For a mirror, an
@@ -231,9 +234,31 @@ start() {
   # Started first, the agent finds a healthy cluster and holds it.
   "$root/ferry" "$@" || return 1
 
-  if [ "${FERRY_SKIP_SERVICE:-}" != 1 ]; then
+  # The login agent is opt-in, the way kind and minikube start nothing a person
+  # did not ask for. Three cases register it anyway:
+  #   - FERRY_SERVICE=1 asked for it;
+  #   - this is a join: a node that does not come back after a reboot is a hole
+  #     in someone else's cluster, so a joined Mac keeps its agent unless
+  #     FERRY_SERVICE=0 says otherwise;
+  #   - it is already registered: re-running the installer is how ferry is
+  #     upgraded, and an upgrade should not quietly take away what a person set
+  #     up. Installing it again also refreshes the plist for the new release.
+  # FERRY_SKIP_SERVICE=1, the old spelling of "no", still wins over all three.
+  want="${FERRY_SERVICE:-}"
+  if [ -z "$want" ]; then
+    if [ -n "${FERRY_URL:-}" ] || "$root/ferry" service status >/dev/null 2>&1; then
+      want=1
+    else
+      want=0
+    fi
+  fi
+  [ "${FERRY_SKIP_SERVICE:-}" = 1 ] && want=0
+
+  if [ "$want" = 1 ]; then
     "$root/ferry" service install --quiet \
       || warn "could not register the login agent; ferry still runs by hand"
+  else
+    echo "  start it at login: ferry service install"
   fi
 }
 

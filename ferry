@@ -35,6 +35,10 @@ here="$(cd "$(dirname "$ferry_self")" && pwd)"
 unset ferry_self link
 FERRY_ROOT="$here"
 export FERRY_ROOT
+# The KUBECONFIG the person ran ferry with, before any command points it at
+# ferry's own admin.conf -- which most do, early. The merge into kubectl's
+# config has to go to the file the person uses, not to admin.conf.
+user_kubeconfig="${KUBECONFIG-}"
 # Which Kubernetes this checkout has built, where those binaries live, and what
 # may legally follow what. Shared with build-kubelet.sh and the control-plane
 # scripts, which have to agree with this one about all three.
@@ -73,6 +77,36 @@ ulimit -n 65536 2>/dev/null || ulimit -n unlimited 2>/dev/null || true
 # branch: a branch changes under a running cluster the moment someone checks
 # something else out, two worktrees can sit on the same branch, and a detached
 # HEAD has no branch at all.
+#
+# On an installed release there is no checkout to key on, so a second cluster
+# is asked for by name, the way minikube's -p and kind's --name do:
+#   ferry -p demo up        ferry --profile demo status        ferry profile ls
+# The flag may come anywhere before a bare "--", and is the same as setting
+# FERRY_PROFILE for that one command.
+ferry_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) ferry_args+=("$@"); break ;;
+    -p|--profile)
+      [ -n "${2:-}" ] || { echo "ferry: $1 needs a name" >&2; exit 2; }
+      FERRY_PROFILE="$2"; shift 2 ;;
+    --profile=*) FERRY_PROFILE="${1#--profile=}"; shift ;;
+    *) ferry_args+=("$1"); shift ;;
+  esac
+done
+set -- ${ferry_args[@]+"${ferry_args[@]}"}
+unset ferry_args
+if [ -n "${FERRY_PROFILE:-}" ]; then
+  # A profile names directories, sockets under /tmp (104-byte limit), launchd
+  # labels and a kubeconfig context, so it is held to what is safe in all four.
+  case "$FERRY_PROFILE" in
+    *[!a-zA-Z0-9_-]*|-*|"")
+      echo "ferry: profile '$FERRY_PROFILE': use letters, digits, - and _" >&2; exit 2 ;;
+  esac
+  [ "${#FERRY_PROFILE}" -le 24 ] || { echo "ferry: profile '$FERRY_PROFILE' is longer than 24 characters" >&2; exit 2; }
+  export FERRY_PROFILE
+fi
+
 ferry_profile() {
   [ -n "${FERRY_PROFILE:-}" ] && { echo "$FERRY_PROFILE"; return; }
   local common top
@@ -490,6 +524,12 @@ ferry_default_runtime() {
   local v="${FERRY_DEFAULT_RUNTIME:-$(ferry_config_get defaultRuntime)}"
   case "$v" in ferry-vm|ferry-shared) echo "$v" ;; *) echo none ;; esac
 }
+# Whether 'ferry up' merges the admin credentials into ~/.kube/config, as
+# 'kind create cluster' does, so kubectl works with no export. 1 or 0.
+ferry_merge_kubeconfig() {
+  local v="${FERRY_MERGE_KUBECONFIG:-$(ferry_config_get mergeKubeconfig)}"
+  case "$v" in 0|false|no) echo 0 ;; *) echo 1 ;; esac
+}
 # What can actually be honoured. A ferry-shared default with no machines would
 # taint every node that can run a pod, so it is none until machines run.
 ferry_default_runtime_effective() {
@@ -602,6 +642,39 @@ ferry_release_version() {
   sed -n 's/^ferry=//p' "$here/VERSION" | head -1
 }
 is_release() { [ -f "$here/VERSION" ]; }
+
+# Whether a newer release is out, said in one line after 'ferry up' and
+# 'ferry status' on an installed ferry, the way minikube does. Never in the
+# way: the answer is read from a cache, the cache is refreshed in the
+# background at most once a day, nothing is said off a terminal, and
+# FERRY_NO_UPDATE_CHECK=1 turns it off. The request is one anonymous GET to
+# GitHub's releases API, the same one the installer makes.
+FERRY_UPDATE_CACHE="${FERRY_UPDATE_CACHE:-$HOME/.ferry-dist/latest-release}"
+ferry_version_newer() { # a b -> true when a is a later vX.Y.Z than b
+  local a="${1#v}" b="${2#v}"
+  [ "$a" != "$b" ] && [ "$(printf '%s\n%s\n' "$a" "$b" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$a" ]
+}
+ferry_update_notice() {
+  [ "${FERRY_NO_UPDATE_CHECK:-}" = 1 ] && return 0
+  is_release || return 0
+  [ -t 1 ] || return 0
+  local current latest
+  current="$(ferry_release_version)" || return 0
+  case "$current" in v[0-9]*) : ;; *) return 0 ;; esac
+  # Stale or missing: ask again, in the background, for the next run.
+  if [ -z "$(find "$FERRY_UPDATE_CACHE" -mtime -1 2>/dev/null)" ]; then
+    mkdir -p "$(dirname "$FERRY_UPDATE_CACHE")" 2>/dev/null
+    ( v="$(curl -sfL -m 5 "https://api.github.com/repos/${FERRY_REPO:-imaustink/ferry}/releases/latest" 2>/dev/null \
+          | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+      [ -n "$v" ] && echo "$v" > "$FERRY_UPDATE_CACHE.tmp" && mv "$FERRY_UPDATE_CACHE.tmp" "$FERRY_UPDATE_CACHE"
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  latest="$(head -1 "$FERRY_UPDATE_CACHE" 2>/dev/null)"
+  [ -n "$latest" ] && ferry_version_newer "$latest" "$current" || return 0
+  echo
+  warn "ferry $latest is out (this is $current). Upgrade: curl -sfL https://get.ferry.kurpuis.com | sh -"
+}
 # What ferry-cri tells the kubelet it is, and so what `kubectl get nodes` shows
 # as ferry://<version>. It was a constant, 0.1.0, through every release since.
 #
@@ -634,10 +707,17 @@ ip_in_cidr() { # address cidr
 }
 count_vms() { pgrep -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null | wc -l | tr -d ' '; }
 
-bold() { printf '\033[1m%s\033[0m\n' "$1"; }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
-bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
-warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
+# Colour only for a terminal, and never under NO_COLOR (https://no-color.org):
+# escape codes in a CI log, a pipe or 'ferry logs --bundle' are noise.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+  C_B=$'\033[1m' C_G=$'\033[32m' C_R=$'\033[31m' C_Y=$'\033[33m' C_0=$'\033[0m'
+else
+  C_B="" C_G="" C_R="" C_Y="" C_0=""
+fi
+bold() { printf '%s%s%s\n' "$C_B" "$1" "$C_0"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$1"; }
+bad()  { printf '  %s✗%s %s\n' "$C_R" "$C_0" "$1"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_0" "$1"; }
 
 usage() {
   cat <<EOF
@@ -654,14 +734,18 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
   ferry config      show the settings the next 'ferry up' uses, and why
                     set <key> <value>, unset <key>, get <key>, path
   ferry up          start the cluster
+                    --kubernetes-version v1.36 to create it at another Kubernetes
+                    (a release downloads it once; 'ferry version' lists them)
                     --disposable to trade surviving a power loss for speed
                     (--durability power-loss|process-crash, remembered)
   ferry down        stop the cluster (--purge to drop its data as well)
   ferry restart     stop and start the cluster, e.g. after a component died
   ferry status      show what is running
   ferry logs <c>    tail a component log (ferry-cri, kubelet, ferry-proxy, apiserver, etcd)
-  ferry kubeconfig  print the path to the admin kubeconfig
-                    --merge to add it to ~/.kube/config as a context
+                    --bundle to collect every log and the cluster's state for a bug report
+  ferry completion  zsh|bash|fish shell completion, e.g. source <(ferry completion zsh)
+  ferry kubeconfig  print the path to the admin kubeconfig ('ferry up' already
+                    merges it into ~/.kube/config; --merge to do that again)
   ferry service     start the cluster at login (install|uninstall|status)
   ferry uninstall   stop everything and unlink ferry (--purge to delete the cluster)
   ferry node add <name>   add another node on this Mac
@@ -671,7 +755,11 @@ ferry -- Kubernetes on a Mac, one virtual machine per pod
                           -t <name:tag>, -f <Dockerfile>, --os darwin for a macOS
                           image, --stop to end the builder
   ferry image load <x>    run an image you built elsewhere, without a registry
-  ferry profile           which cluster this checkout runs, and on what ports
+  ferry profile           which cluster this command runs, and on what ports
+  ferry profile ls        every cluster on this Mac, and which are running
+  ferry profile rm <name>  delete a stopped cluster and everything it owns
+  ferry -p <name> <cmd>   run any command against another cluster, e.g.
+                          'ferry -p demo up' (minikube's -p, kind's --name)
   ferry addons list       what can be turned on, and what is
   ferry addons enable <n> turn one on and wait for it (--no-wait not to)
   ferry addons disable <n> remove exactly what enable applied
@@ -707,6 +795,9 @@ Environment:
   FERRY_POD_SUBNET       pod network, default 192.168.66.1/24
   FERRY_POD_CPUS         cpus per pod VM, default 2
   FERRY_CLUSTER_CIDR     the pod network, default 10.244.0.0/16 (empty = vmnet)
+  FERRY_MERGE_KUBECONFIG 0 to stop 'ferry up' merging into ~/.kube/config
+  FERRY_NO_UPDATE_CHECK 1 to stop 'ferry up' and 'ferry status' saying when a
+                         newer release is out (checked at most once a day)
   FERRY_EVICTION_DISK    free disk below which pods stop scheduling, default 4Gi
   FERRY_HOST_CLUSTER_IPS true to bind ClusterIPs on the Mac too, so the API server
                          can reach aggregated APIs like metrics.k8s.io (needs sudo)
@@ -1364,11 +1455,209 @@ cluster_version() {
 # ~/.ferry was last running something else, starting it again has to bring back
 # what it was -- otherwise a build quietly becomes an upgrade, which is the
 # thing this whole change exists to stop happening by accident.
+# --- choosing the Kubernetes version ------------------------------------------
+#
+# A cluster runs one Kubernetes, recorded beside its data when it is created,
+# and everything that starts -- the control plane, each kubelet, ferry-proxyd --
+# follows that record. So choosing a version is choosing the record for a new
+# cluster, after making sure the store has the binaries for it.
+#
+# A checkout builds what it does not have. A release cannot build a kubelet, so
+# it downloads one: every version in FERRY_RELEASE_K8S_VERSIONS is published
+# beside the release's own tarball, checksummed, and unpacked into the store
+# the first time it is asked for.
+
+# The versions this copy of ferry can run without building anything.
+ferry_k8s_available() {
+  local listed=""
+  if is_release; then
+    listed="$(sed -n 's/^kubernetes-available=//p' "$here/VERSION" | head -1)"
+    [ -n "$listed" ] || listed="$(sed -n 's/^kubernetes=//p' "$here/VERSION" | head -1)"
+  else
+    listed="$FERRY_RELEASE_K8S_VERSIONS"
+  fi
+  local v
+  { for v in $listed; do echo "$v"; done
+    for v in $(ferry_version_list); do ferry_version_complete "$v" && echo "$v"; done
+  } | sort -uV
+}
+
+# vX.Y.Z as asked, or the newest offered patch of vX.Y. "1.36" works too.
+ferry_resolve_k8s_version() { # request
+  local want="${1#v}"; want="v$want"
+  if ferry_version_valid "$want"; then
+    if is_release && ! ferry_k8s_available | grep -qxF "$want"; then
+      bad "this release does not offer Kubernetes $want" >&2
+      echo "    it offers: $(ferry_k8s_available | tr '\n' ' ')" >&2
+      return 2
+    fi
+    echo "$want"; return 0
+  fi
+  case "$want" in
+    v[0-9]*.[0-9]*) : ;;
+    *) bad "--kubernetes-version $1: expected a version such as v1.36 or v1.36.4" >&2; return 2 ;;
+  esac
+  local match
+  match="$(ferry_k8s_available | awk -v mm="$want" 'index($0, mm ".") == 1' | tail -1)"
+  if [ -z "$match" ]; then
+    bad "no Kubernetes $want here; available: $(ferry_k8s_available | tr '\n' ' ')" >&2
+    return 2
+  fi
+  echo "$match"
+}
+
+# Download one Kubernetes into a release's store. Verified against the
+# checksum published beside it, unpacked to the side and moved into place, so
+# an interrupted download never leaves a half version that looks complete.
+ferry_fetch_k8s_version() { # version
+  local v="$1" release; release="$(ferry_release_version)" || return 1
+  local name="ferry-$release-kubernetes-$v-darwin-arm64.tar.gz"
+  local base="${FERRY_DOWNLOAD_BASE:-https://github.com/${FERRY_REPO:-imaustink/ferry}/releases/download/$release}"
+  local tmp; tmp="$(mktemp -d)"
+  echo "  downloading Kubernetes $v for ferry $release"
+  if ! curl -fL --progress-bar -o "$tmp/$name" "$base/$name" \
+     || ! curl -sfL -o "$tmp/$name.sha256" "$base/$name.sha256"; then
+    rm -rf "$tmp"; bad "could not download $base/$name"; return 1
+  fi
+  local want got
+  want="$(awk '{print $1}' "$tmp/$name.sha256")"
+  got="$(shasum -a 256 "$tmp/$name" | awk '{print $1}')"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    rm -rf "$tmp"; bad "checksum mismatch for $name"; return 1
+  fi
+  if ! tar -xzf "$tmp/$name" -C "$tmp" || [ ! -d "$tmp/kubernetes-$v" ]; then
+    rm -rf "$tmp"; bad "$name did not unpack to kubernetes-$v/"; return 1
+  fi
+  ferry_place_k8s_version "$v" "$tmp/kubernetes-$v"
+  rm -rf "$tmp"
+  ferry_version_complete "$v" || { bad "Kubernetes $v unpacked incomplete"; return 1; }
+  ok "Kubernetes $v ($(du -sh "$(ferry_version_dir "$v")" | cut -f1))"
+}
+
+# Move an unpacked version into the store. The store is shared by every
+# profile, so two of them can be fetching the same version at once: each
+# stages under its own name, and the one that finishes second leaves the
+# first one's copy alone rather than deleting it from under a cluster.
+ferry_place_k8s_version() { # version unpacked-dir
+  local v="$1" dir; dir="$(ferry_version_dir "$1")"
+  mkdir -p "$(dirname "$dir")"
+  local partial="$dir.partial.$$"
+  rm -rf "$partial"; mv "$2" "$partial"
+  if ferry_version_complete "$v"; then rm -rf "$partial"   # another profile finished first
+  else rm -rf "$dir"; mv "$partial" "$dir"; fi
+}
+
+# The stores of the other releases installed beside this one, newest first.
+# Each release has its own, so after 'ferry upgrade' a cluster's Kubernetes
+# may only be in the store of the release that created it. The curl installer
+# keeps releases side by side in .../versions/ferry-<release>/, and Homebrew in
+# Cellar/ferry/<version>/libexec/.
+ferry_other_release_stores() {
+  local self; self="$(cd "$here" 2>/dev/null && pwd -P)" || return 0
+  local parent; parent="$(dirname "$self")"
+  local d
+  for d in "$parent"/*/ "$(dirname "$parent")"/*/libexec/; do
+    d="${d%/}"
+    [ -d "$d/bin/versions" ] || continue
+    [ "$(cd "$d" && pwd -P)" = "$self" ] && continue
+    echo "$d"
+  done | sort -rV | while read -r d; do echo "$d/bin/versions"; done
+}
+
+# Copy a version this release does not offer from an older release's store.
+ferry_copy_k8s_version() { # version
+  local v="$1" store src="" name
+  while read -r store; do
+    [ -n "$store" ] || continue
+    for name in kubelet kube-apiserver kube-controller-manager kube-scheduler etcd; do
+      [ -f "$store/$v/$name" ] || continue 2
+    done
+    src="$store/$v"; break
+  done < <(ferry_other_release_stores)
+  [ -n "$src" ] || return 1
+  echo "  copying Kubernetes $v from $(dirname "$(dirname "$src")")"
+  local tmp; tmp="$(mktemp -d)"
+  # A clone on APFS, so it costs nothing until either copy changes.
+  cp -Rpc "$src" "$tmp/kubernetes-$v" 2>/dev/null \
+    || { rm -rf "$tmp/kubernetes-$v"; cp -Rp "$src" "$tmp/kubernetes-$v"; } \
+    || { rm -rf "$tmp"; bad "could not copy $src"; return 1; }
+  ferry_place_k8s_version "$v" "$tmp/kubernetes-$v"
+  rm -rf "$tmp"
+  ferry_version_complete "$v" || { bad "Kubernetes $v copied incomplete"; return 1; }
+  ok "Kubernetes $v (from an older ferry)"
+}
+
+# Is there a cluster here yet, or only the version chosen for one? The record
+# is written when a version is chosen, before anything is created; etcd's
+# member directory appears once the control plane has started for real.
+ferry_cluster_created() { [ -d "${FERRY_HOME:?}/etcd/member" ]; }
+
+# Make sure the store can run this version: present, downloaded, or built.
+ferry_ensure_k8s_version() { # version
+  ferry_version_complete "$1" && return 0
+  if is_release; then
+    ferry_fetch_k8s_version "$1"
+  else
+    echo "==> building Kubernetes $1 (the kubelet compiles from source; minutes)"
+    build_kubernetes_binaries "$1"
+  fi
+}
+
+# 'ferry up --kubernetes-version': choose the version of a cluster that does
+# not exist yet. An existing one keeps its own; changing that is an upgrade.
+choose_cluster_version() { # request
+  local want; want="$(ferry_resolve_k8s_version "$1")" || return 2
+  local have; have="$(ferry_cluster_field kubernetes 2>/dev/null || true)"
+  # A version chosen for a cluster whose first 'up' never got as far as the
+  # control plane is not a cluster's version; asking again replaces it.
+  if [ -n "$have" ] && [ "$have" != "$want" ] && ! ferry_cluster_created; then
+    have=""
+  fi
+  if [ -n "$have" ] && [ "$have" != "$want" ]; then
+    bad "this cluster already runs Kubernetes $have"
+    echo "    A cluster keeps the version it was created with. For $want, either:"
+    echo "        ferry -p <name> up --kubernetes-version $want    # a second cluster beside it"
+    echo "        ferry down --purge && ferry up --kubernetes-version $want    # replace it"
+    is_release || echo "        ferry upgrade apply $want    # move this one, keeping its data"
+    return 2
+  fi
+  ferry_ensure_k8s_version "$want" || return 1
+  cluster_version_chosen=1
+  [ "$have" = "$want" ] && return 0
+  # Replacing a choice, not a cluster: no version.previous for rollback to
+  # find, since nothing ever ran at it.
+  ferry_cluster_created || rm -f "$(ferry_cluster_version_file)"
+  ferry_write_cluster_version "$want" "$(ferry_manifest_field "$want" control-plane 2>/dev/null \
+    || ferry_control_plane_version "$want")" "$(ferry_manifest_field "$want" etcd 2>/dev/null \
+    || ferry_etcd_version "$want")"
+  ok "this cluster will run Kubernetes $want"
+}
+
 align_to_cluster_version() {
   local want; want="$(ferry_cluster_field kubernetes 2>/dev/null)" || return 0
   local have; have="$(ferry_active_version)"
   [ -n "$want" ] && [ "$want" != "$have" ] || return 0
 
+  # A release that was upgraded since this cluster was created does not carry
+  # the cluster's Kubernetes in its tarball. It offers it as a download, or --
+  # once its versions have moved on to a newer patch -- the release that
+  # created the cluster still has it in its own store.
+  if ! ferry_version_complete "$want" && is_release; then
+    if ferry_k8s_available | grep -qxF "$want"; then
+      ferry_fetch_k8s_version "$want" || return 1
+    else
+      ferry_copy_k8s_version "$want" || true
+    fi
+  fi
+  if ! ferry_version_complete "$want" && is_release; then
+    bad "this cluster last ran Kubernetes $want, which this ferry does not offer"
+    echo "    and no other installed ferry has it. It offers: $(ferry_k8s_available | tr '\n' ' ')"
+    echo "    Either run a second cluster beside it, or replace it:"
+    echo
+    echo "        ferry -p <name> up --kubernetes-version <version>"
+    echo "        ferry down --purge && ferry up"
+    return 1
+  fi
   if ! ferry_version_complete "$want"; then
     bad "this cluster last ran $want, and the binaries for it are gone"
     echo "    The checkout is built at ${have:-nothing}. Either build $want back:"
@@ -1378,19 +1667,26 @@ align_to_cluster_version() {
     echo "    or start fresh:  ferry down --purge"
     return 1
   fi
-  warn "this cluster is $want; the checkout is built at $have"
-  # Which way to point depends on the direction. 'apply' refuses to go
-  # backwards, so offering it for an older build is offering a command that
-  # will decline -- the way back is rollback, and only if this is where the
-  # cluster came from.
-  if [ -z "$(ferry_skew_reason "$want" "$have")" ]; then
-    echo "      Starting it at $want. To move it: ferry upgrade apply $have"
-  elif [ "$(ferry_previous_field kubernetes 2>/dev/null)" = "$have" ]; then
-    echo "      Starting it at $want. $have is older, so the way back is:"
-    echo "      ferry upgrade rollback"
+  # A version chosen with --kubernetes-version a moment ago is not news.
+  if [ -n "${cluster_version_chosen:-}" ]; then :
+  elif is_release; then
+    # A release has no 'upgrade apply'; the cluster simply keeps its version.
+    ok "Kubernetes $want (this ferry's default is $have)"
   else
-    echo "      Starting it at $want, because $have is older and a control plane"
-    echo "      does not go backwards in place."
+    warn "this cluster is $want; the checkout is built at $have"
+    # Which way to point depends on the direction. 'apply' refuses to go
+    # backwards, so offering it for an older build is offering a command that
+    # will decline -- the way back is rollback, and only if this is where the
+    # cluster came from.
+    local reason; reason="$(ferry_skew_reason "$want" "$have")"
+    if [ -z "$reason" ]; then
+      echo "      Starting it at $want. To move it: ferry upgrade apply $have"
+    elif [ "$(ferry_previous_field kubernetes 2>/dev/null)" = "$have" ]; then
+      echo "      Starting it at $want. $have is older, so the way back is:"
+      echo "      ferry upgrade rollback"
+    else
+      echo "      Starting it at $want; it cannot move to $have in one step: $reason"
+    fi
   fi
   # The control plane's links only. Each node starts at the version it last
   # ran, recorded beside it, so bin/kubelet is not what decides that any more.
@@ -1461,9 +1757,13 @@ cmd_up() {
   # recreate from a script. --fast was the first spelling of it and still
   # works, but it named the gain and hid the cost. 'full' and 'relaxed' are
   # the old names of the two levels and are accepted and translated.
-  local want_durability="" asked_durability="" bake_mac=""
+  local want_durability="" asked_durability="" bake_mac="" asked_k8s=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --kubernetes-version)
+        [ -n "${2:-}" ] || { bad "--kubernetes-version needs a value, such as v1.36"; return 2; }
+        asked_k8s="$2"; shift 2 ;;
+      --kubernetes-version=*) asked_k8s="${1#*=}"; shift ;;
       --durability) asked_durability="${2:-}"; shift 2 ;;
       --durability=*) asked_durability="${1#*=}"; shift ;;
       --disposable) asked_durability=process-crash; shift ;;
@@ -1494,6 +1794,12 @@ cmd_up() {
       bad "ferry is up with durability $(ferry_durability); 'ferry down' first to change it"
       return 1
     fi
+    if [ -n "$asked_k8s" ]; then
+      local running_k8s want_k8s
+      running_k8s="$(ferry_cluster_field kubernetes 2>/dev/null)"
+      want_k8s="$(ferry_resolve_k8s_version "$asked_k8s")" || return 2
+      [ "$running_k8s" = "$want_k8s" ] || { bad "ferry is up at Kubernetes $running_k8s, not $want_k8s"; return 1; }
+    fi
     ok "ferry is already up"
     return 0
   fi
@@ -1501,6 +1807,13 @@ cmd_up() {
     bad "ferry is half up ($(running ferry-cri && echo ferry-cri || echo kubelet) alone); run 'ferry down' first"
     return 1
   fi
+  # A new cluster with no version asked for gets the one this release carries.
+  # Not the active version: starting another profile's older cluster moves
+  # that, and a fresh default cluster would quietly inherit it.
+  if [ -z "$asked_k8s" ] && is_release && [ -z "$(ferry_cluster_field kubernetes 2>/dev/null)" ]; then
+    asked_k8s="$(sed -n 's/^kubernetes=//p' "$here/VERSION" | head -1)"
+  fi
+  if [ -n "$asked_k8s" ]; then choose_cluster_version "$asked_k8s" || return $?; fi
   align_to_cluster_version || return 1
 
   mkdir -p "$FERRY_HOME" "$FERRY_RUN"/{kubelet,pki,podlogs,containerlogs,volume-plugins,logs}
@@ -1730,9 +2043,17 @@ EOF
 
   echo
   bold "ferry is up"
-  echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
-  echo "  ferry kubeconfig --merge      to put it in ~/.kube/config instead"
+  # kubectl should simply work afterwards, as it does after 'kind create
+  # cluster'. The merge never moves anyone off a context that is not ferry's;
+  # FERRY_MERGE_KUBECONFIG=0 (or 'ferry config set mergeKubeconfig false')
+  # leaves ~/.kube/config alone entirely.
+  if [ "$(ferry_merge_kubeconfig)" = 1 ] && command -v kubectl >/dev/null 2>&1; then
+    cmd_kubeconfig --merge-and-use 2>&1 | grep -v '^$' || true
+  else
+    echo "  export KUBECONFIG=$FERRY_HOME/admin.conf"
+  fi
   echo "  ferry token create            to add another Mac to this cluster"
+  ferry_update_notice
 }
 
 # NetworkPolicy, enforced where the packets are.
@@ -5185,7 +5506,111 @@ cmd_image_load() {
 #
 # Worth being able to ask: when two clusters are running on one Mac the first
 # question is always which one you are talking to.
+# Every cluster on this Mac: the default one and each profile ever given a
+# number, with whether it is running and whether it still has any data.
+cmd_profile_ls() {
+  local index name state run status
+  printf '%-26s %-10s %-10s %s\n' PROFILE STATUS KUBERNETES STATE
+  {
+    echo "0 default"
+    [ -f "$FERRY_PROFILES" ] && sort -n "$FERRY_PROFILES"
+  } | while read -r index name; do
+    [ -n "$name" ] || continue
+    if [ "$name" = default ]; then
+      state="$HOME/.ferry"; run="/tmp/ferry-run"
+    else
+      state="$HOME/.ferry-$name"; run="/tmp/ferry-run-$name"
+    fi
+    # A register entry outlives its cluster; one with no state is not listed.
+    [ -d "$state" ] || [ "$name" = "$PROFILE" ] || continue
+    if [ -f "$run/kubelet.pid" ] && kill -0 "$(cat "$run/kubelet.pid")" 2>/dev/null; then
+      status=running
+    # A cluster's data is etcd's directory, or for a Mac that joined another
+    # cluster, its worker role. --purge removes the first and keeps the
+    # certificates, so admin.conf alone means the cluster is gone.
+    elif [ -d "$state/etcd" ] || [ "$(cat "$state/role" 2>/dev/null)" = worker ]; then status=stopped
+    elif [ -f "$state/admin.conf" ]; then status=purged
+    else status=empty; fi
+    local k8s; k8s="$(sed -n 's/^kubernetes=//p' "$state/version" 2>/dev/null | head -1)"
+    printf '%-26s %-10s %-10s %s\n' "$name$([ "$name" = "$PROFILE" ] && echo ' *')" \
+      "$status" "${k8s:--}" "${state/#$HOME/~}"
+  done
+  echo
+  echo "  * is the profile this command runs as. Another: ferry -p <name> up"
+}
+
+# Delete clusters outright: everything a profile owns on this Mac, and its
+# number in the register, so the number can be given to a new profile. The
+# numbers matter: ports are 1000 apart per number, so the register runs out
+# in the fifties, and every worktree ever used holds one until it is removed.
+#
+# Each name is removed by a fresh run of ferry as that profile, so the paths
+# come from the same variables everything else uses rather than being
+# rebuilt here. The default cluster is not removed this way: 'ferry down
+# --purge' is that, and it keeps the config file on purpose.
+cmd_profile_rm() {
+  local yes="" names=() name
+  for name in "$@"; do
+    case "$name" in -y|--yes) yes=1 ;; *) names+=("$name") ;; esac
+  done
+  [ "${#names[@]}" -gt 0 ] || { bad "usage: ferry profile rm <name>... [--yes]"; return 2; }
+  for name in "${names[@]}"; do
+    case "$name" in
+      default) bad "the default cluster is removed with: ferry down --purge"; return 2 ;;
+      *[!a-zA-Z0-9_-]*|-*) bad "profile '$name': not a profile name"; return 2 ;;
+    esac
+  done
+  if [ -z "$yes" ]; then
+    echo "  This deletes each cluster's data, certificates, volumes and config:"
+    for name in "${names[@]}"; do echo "    $HOME/.ferry-$name"; done
+    ferry_yes "Delete ${#names[@]} profile(s)?" n || { echo "  nothing deleted"; return 1; }
+  fi
+  local failed=0
+  for name in "${names[@]}"; do
+    FERRY_PROFILE="$name" "$here/ferry" profile __remove-self || failed=1
+  done
+  return "$failed"
+}
+
+# Run as the profile being removed; see cmd_profile_rm.
+cmd_profile_remove_self() {
+  [ "$PROFILE" != default ] || return 2
+  # The kubelet's pid is under the runtime directory, the control plane's
+  # beside its data; either one alive means the cluster is up.
+  local alive="" pidfile
+  running kubelet && alive=1
+  for pidfile in "$FERRY_HOME"/etcd.pid "$FERRY_HOME"/kube-apiserver.pid; do
+    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && alive=1
+  done
+  if [ -n "$alive" ]; then
+    bad "$PROFILE is running; stop it first: ferry -p $PROFILE down"
+    return 1
+  fi
+  launchctl bootout "gui/$(id -u)/$(service_label)" 2>/dev/null
+  rm -f "$(service_plist)"
+  kubeconfig_forget >/dev/null
+  # The state directory is named from the profile, never from FERRY_HOME
+  # alone: an override pointing somewhere else is not this command's to delete.
+  local state="$HOME/.ferry-$PROFILE"
+  [ -n "$PROFILE" ] && [ -d "$state" ] && rm -rf "${state:?}"
+  [ -n "$PROFILE" ] && [ -d "/tmp/ferry-run-$PROFILE" ] && rm -rf "/tmp/ferry-run-${PROFILE:?}"
+  rm -f "$FERRY_SOCK" "$FERRY_EXEC_SOCK" "$FERRY_STREAMER_SOCK" "$FERRY_PROXYD_SOCK" \
+        "$FERRY_NETPOL_SOCK" "$FERRY_GPUD_SOCK"
+  if [ -f "$FERRY_PROFILES" ]; then
+    local tmp; tmp="$(mktemp)"
+    awk -v p="$PROFILE" '$2 != p' "$FERRY_PROFILES" > "$tmp" && mv "$tmp" "$FERRY_PROFILES"
+  fi
+  ok "removed $PROFILE"
+}
+
 cmd_profile() {
+  case "${1:-}" in
+    ls|list) cmd_profile_ls; return ;;
+    rm|remove|delete) shift; cmd_profile_rm "$@"; return ;;
+    __remove-self) cmd_profile_remove_self; return ;;
+    "") : ;;
+    *) bad "usage: ferry profile [ls | rm <name>... [--yes]]"; return 2 ;;
+  esac
   bold "profile $PROFILE"
   echo "  kubernetes  $(ferry_cluster_field kubernetes 2>/dev/null || ferry_active_version || echo 'not built')"
   echo "  state       $FERRY_HOME"
@@ -5206,11 +5631,14 @@ cmd_profile() {
   echo
   if [ "$PROFILE" = default ]; then
     echo "  This is the main checkout, so nothing is renamed or moved."
+  elif [ -n "${FERRY_PROFILE:-}" ]; then
+    echo "  A named profile, so it has its own state, ports and pod network"
+    echo "  and will not disturb any other cluster on this Mac."
   else
     echo "  This is a worktree, so it has its own state, ports and pod network"
     echo "  and will not disturb a cluster running from another checkout."
   fi
-  echo "  Set FERRY_PROFILE to override."
+  echo "  Another cluster: ferry -p <name> up. All of them: ferry profile ls"
 }
 
 # Wait for a pid to go, polling finely.
@@ -5436,6 +5864,7 @@ cmd_down() {
       echo "  machines are off again; 'ferry machines enable' after the next 'ferry up'"
     fi
     ok "cluster data purged"
+    kubeconfig_forget
     # The config file is the other kind of thing: not the cluster's data but
     # what it is meant to be, written on purpose and named by every start. So
     # it stays, and says so, which is the difference from the marker above.
@@ -6015,10 +6444,13 @@ cmd_uninstall() {
 # matter, and an installer that rewrites it uninvited is an installer that
 # eventually breaks someone's day.
 cmd_kubeconfig() {
-  local conf="$FERRY_HOME/admin.conf"
+  local conf="$FERRY_HOME/admin.conf" switch=0 backup_always=1
   case "${1:-}" in
     "") echo "$conf"; return 0 ;;
     --merge) : ;;
+    # What 'ferry up' runs: merge, switch to it when that is safe, and back the
+    # file up only the first time rather than on every start.
+    --merge-and-use) switch=1; backup_always=0 ;;
     *) bad "usage: ferry kubeconfig [--merge]"; return 2 ;;
   esac
 
@@ -6026,7 +6458,7 @@ cmd_kubeconfig() {
   command -v kubectl >/dev/null || { bad "kubectl is not installed"; return 1; }
 
   local context="ferry${SUFFIX}"
-  local target="${KUBECONFIG:-$HOME/.kube/config}"
+  local target="${user_kubeconfig:-$HOME/.kube/config}"
   # KUBECONFIG can be a list; the first entry is where kubectl writes, so that
   # is the file being merged into and the one to back up.
   target="${target%%:*}"
@@ -6042,7 +6474,9 @@ cmd_kubeconfig() {
   fi
   mkdir -p "$(dirname "$target")"
 
-  if [ -f "$target" ]; then
+  local earlier="" f
+  for f in "$target".before-ferry.*; do [ -e "$f" ] && { earlier="$f"; break; }; done
+  if [ -f "$target" ] && { [ "$backup_always" = 1 ] || [ -z "$earlier" ]; }; then
     local backup; backup="$target.before-ferry.$(date -u +%Y%m%dT%H%M%SZ)"
     cp "$target" "$backup"
     ok "backed up $target to $(basename "$backup")"
@@ -6093,7 +6527,45 @@ cmd_kubeconfig() {
   fi
 
   ok "merged into $target as context '$context'"
+  if [ "$switch" = 1 ]; then
+    # Switched only when that cannot move anyone off something real: there is
+    # no current context, it names a context that no longer exists, or it is
+    # already one of ferry's. Someone pointed at production stays there.
+    local current; current="$(KUBECONFIG="$target" kubectl config current-context 2>/dev/null || true)"
+    local exists=""
+    [ -n "$current" ] && KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null \
+      | grep -qxF "$current" && exists=1
+    case "$current" in
+      "$context") ok "kubectl is using '$context'"; return 0 ;;
+    esac
+    if [ -z "$current" ] || [ -z "$exists" ] || [ "$current" = ferry ] || [ "${current#ferry-}" != "$current" ]; then
+      KUBECONFIG="$target" kubectl config use-context "$context" >/dev/null 2>&1 \
+        && { ok "kubectl is now using '$context'${current:+ (was '$current')}"; return 0; }
+    fi
+    echo "  kubectl is still using '$current'; to use ferry:"
+  fi
   echo "  kubectl config use-context $context"
+}
+
+# The other half of the merge 'ferry up' does: on --purge the credentials
+# point at a cluster that no longer exists, so its context, cluster and user
+# leave ~/.kube/config, as 'kind delete cluster' does. Only this profile's
+# names are touched; a current context that was this cluster is unset rather
+# than pointed somewhere the person did not choose.
+kubeconfig_forget() {
+  command -v kubectl >/dev/null 2>&1 || return 0
+  local context="ferry${SUFFIX}" target="${user_kubeconfig:-$HOME/.kube/config}"
+  target="${target%%:*}"
+  [ "$target" = "$FERRY_HOME/admin.conf" ] && target="$HOME/.kube/config"
+  [ -f "$target" ] || return 0
+  KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$context" || return 0
+  if [ "$(KUBECONFIG="$target" kubectl config current-context 2>/dev/null)" = "$context" ]; then
+    KUBECONFIG="$target" kubectl config unset current-context >/dev/null 2>&1
+  fi
+  KUBECONFIG="$target" kubectl config delete-context "$context" >/dev/null 2>&1
+  KUBECONFIG="$target" kubectl config delete-cluster "$context" >/dev/null 2>&1
+  KUBECONFIG="$target" kubectl config delete-user "$context" >/dev/null 2>&1
+  ok "removed context '$context' from $target"
 }
 
 cmd_version() {
@@ -6124,6 +6596,7 @@ cmd_version() {
   echo "  control plane $(version_of control-plane)"
   echo "  etcd          $(version_of etcd)"
   unset -f version_of
+  echo "  available     $(ferry_k8s_available | tr '\n' ' ')(ferry up --kubernetes-version)"
   echo "  profile       $PROFILE"
   echo "  root          $here"
   local cluster; cluster="$(ferry_cluster_field kubernetes 2>/dev/null)"
@@ -6221,6 +6694,7 @@ cmd_status() {
     echo
     KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get nodes 2>/dev/null
   fi
+  ferry_update_notice
 }
 
 # --- configuration: ferry config, ferry init ---------------------------------
@@ -6228,7 +6702,7 @@ cmd_status() {
 # The file itself, and why it exists, is described where FERRY_CONFIG is set.
 
 # Every key the file may carry, in the order `ferry config` shows them.
-FERRY_CONFIG_KEYS="purpose durability defaultRuntime machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
+FERRY_CONFIG_KEYS="purpose durability defaultRuntime mergeKubeconfig machines machineDurability podMemoryMiB podCPUs maxPods machineLimitCPUs machineLimitMemoryGi"
 
 # A value as it should be written, or a failure: 1 for a value the key does
 # not take, 2 for a key there is no such thing as.
@@ -6236,7 +6710,7 @@ ferry_config_check() { # key value
   case "$1" in
     purpose)    case "$2" in dev|ci|node) echo "$2" ;; *) return 1 ;; esac ;;
     durability) local v; v="$(durability_normalize "$2")"; [ -n "$v" ] || return 1; echo "$v" ;;
-    machines)   case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
+    machines|mergeKubeconfig) case "$2" in true|false) echo "$2" ;; *) return 1 ;; esac ;;
     defaultRuntime) case "$2" in ferry-vm|ferry-shared|none) echo "$2" ;; *) return 1 ;; esac ;;
     machineDurability) case "$2" in power-loss|os-crash|process-crash) echo "$2" ;; *) return 1 ;; esac ;;
     podMemoryMiB|podCPUs|maxPods|machineLimitCPUs|machineLimitMemoryGi)
@@ -6248,7 +6722,7 @@ ferry_config_values() { # key
   case "$1" in
     purpose)    echo "dev | ci | node" ;;
     durability) echo "power-loss | process-crash" ;;
-    machines)   echo "true | false" ;;
+    machines|mergeKubeconfig) echo "true | false" ;;
     defaultRuntime) echo "ferry-vm | ferry-shared | none" ;;
     machineDurability) echo "power-loss | os-crash | process-crash" ;;
     *)          echo "a whole number" ;;
@@ -6275,6 +6749,10 @@ ferry_config_effective() { # key -> "value<TAB>source"
       if [ -n "${FERRY_DEFAULT_RUNTIME:-}" ]; then printf '%s\tFERRY_DEFAULT_RUNTIME, this run only%s\n' "$want" "$note"
       elif [ -n "$file_value" ]; then printf '%s\tfile%s\n' "$want" "$note"
       else printf 'none\tdefault: wherever a pod fits\n'; fi ;;
+    mergeKubeconfig)
+      if [ -n "${FERRY_MERGE_KUBECONFIG:-}" ]; then printf '%s\tFERRY_MERGE_KUBECONFIG, this run only\n' "$( [ "$(ferry_merge_kubeconfig)" = 1 ] && echo true || echo false)"
+      elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$file_value"
+      else printf 'true\tdefault: ferry up merges into ~/.kube/config\n'; fi ;;
     machineDurability)
       if [ -n "${FERRY_MACHINE_DURABILITY:-}" ]; then printf '%s\tFERRY_MACHINE_DURABILITY, this run only\n' "$(ferry_machine_durability)"
       elif [ -n "$file_value" ]; then printf '%s\tfile\n' "$(ferry_machine_durability)"
@@ -6350,6 +6828,7 @@ ferry_config_takes_effect() { # key
   case "$1" in
     machines) echo "    the cluster is up: 'ferry machines enable' or 'disable' changes it now" ;;
     purpose)  ferry_config_publish ;;
+    mergeKubeconfig) echo "    read by the next 'ferry up'; 'ferry kubeconfig --merge' does it now" ;;
     # Applied to the running cluster at once: it is taints and a ConfigMap,
     # and nothing about it needs a restart.
     defaultRuntime)
@@ -6588,13 +7067,212 @@ cmd_init() {
   fi
 }
 
+FERRY_LOG_COMPONENTS="ferry-cri kubelet control-plane apiserver etcd ferry-proxy ferry-proxyd ferry-streamer ferry-netpol ferry-storage ferry-gpud ferry-machined ferry-node ferry-karpenter ferry-registry"
+
 cmd_logs() {
   local which="${1:-}"
   case "$which" in
+    --bundle) shift; cmd_logs_bundle "$@"; return ;;
     ferry-cri|kubelet|control-plane|ferry-proxy|ferry-proxyd|ferry-streamer|ferry-netpol|ferry-storage|ferry-gpud|ferry-machined|ferry-node|ferry-karpenter|ferry-registry) tail -f "$FERRY_RUN/logs/$which.log" ;;
     apiserver|kube-apiserver)        tail -f "$FERRY_HOME/logs/kube-apiserver.log" ;;
     etcd)                            tail -f "$FERRY_HOME/logs/etcd.log" ;;
-    *) echo "usage: ferry logs <ferry-cri|kubelet|control-plane|apiserver|etcd|ferry-machined|ferry-node|ferry-karpenter|ferry-registry>"; return 1 ;;
+    *) echo "usage: ferry logs <component>   follow one component's log"
+       echo "       ferry logs --bundle [file] everything a bug report needs, in one tarball"
+       echo "  components: $FERRY_LOG_COMPONENTS"
+       [ -z "$which" ] && return 0; return 1 ;;
+  esac
+}
+
+# Everything someone needs to see to help with a broken cluster, in one file:
+# every component's log, what ferry thinks of the Mac and the cluster, and what
+# the API server says is running. kind has 'kind export logs' and minikube
+# 'minikube logs --file' for the same reason: "attach this" beats ten rounds of
+# "now run this". Credentials are left out -- no admin.conf, no pki, no
+# Secrets -- but logs are logs, so it says to look before posting it.
+cmd_logs_bundle() {
+  local out="${1:-$PWD/ferry-logs-$PROFILE-$(date +%Y%m%d-%H%M%S).tar.gz}"
+  case "$out" in /*) : ;; *) out="$PWD/$out" ;; esac
+  local work; work="$(mktemp -d)"
+  local dir="$work/ferry-logs"
+  mkdir -p "$dir/logs/run" "$dir/logs/state" "$dir/cluster"
+
+  # A log can be hundreds of megabytes after a long run; the end is what
+  # matters, and a bundle nobody can attach helps nobody.
+  local f
+  for f in "$FERRY_RUN"/logs/*.log; do
+    [ -f "$f" ] && tail -c 10000000 "$f" > "$dir/logs/run/$(basename "$f")"
+  done
+  for f in "$FERRY_HOME"/logs/*.log; do
+    [ -f "$f" ] && tail -c 10000000 "$f" > "$dir/logs/state/$(basename "$f")"
+  done
+
+  # The CLI's own reports, each from a fresh run of this ferry so one that
+  # fails does not stop the rest. NO_COLOR keeps escape codes out of files.
+  local self="$here/ferry" cmd
+  for cmd in version status profile config doctor "service status" "upgrade status"; do
+    # shellcheck disable=SC2086
+    FERRY_PROFILE="$PROFILE" NO_COLOR=1 "$self" $cmd > "$dir/ferry-${cmd// /-}.txt" 2>&1 < /dev/null
+  done
+
+  {
+    sw_vers 2>&1
+    echo "model  $(sysctl -n hw.model 2>/dev/null)"
+    echo "chip   $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+    echo "cpus   $(sysctl -n hw.ncpu 2>/dev/null)"
+    echo "memory $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GiB"
+    echo
+    df -h "$HOME" /tmp 2>&1
+    echo
+    vm_stat 2>&1
+  } > "$dir/mac.txt"
+  ps -axo pid,ppid,rss,%cpu,etime,command 2>/dev/null | grep -E 'ferry|kube|etcd' | grep -v grep \
+    > "$dir/processes.txt"
+
+  if [ -f "$FERRY_HOME/admin.conf" ] && command -v kubectl >/dev/null 2>&1 \
+     && KUBECONFIG="$FERRY_HOME/admin.conf" kubectl get --raw /readyz >/dev/null 2>&1; then
+    local k="kubectl --kubeconfig $FERRY_HOME/admin.conf --request-timeout=10s"
+    $k version -o yaml                > "$dir/cluster/version.yaml" 2>&1
+    $k get nodes -o wide              > "$dir/cluster/nodes.txt" 2>&1
+    $k describe nodes                 > "$dir/cluster/nodes-describe.txt" 2>&1
+    $k get pods -A -o wide            > "$dir/cluster/pods.txt" 2>&1
+    $k get events -A --sort-by=.lastTimestamp > "$dir/cluster/events.txt" 2>&1
+    $k get svc,endpointslices -A -o wide > "$dir/cluster/services.txt" 2>&1
+    $k get machines -A -o wide        > "$dir/cluster/machines.txt" 2>&1
+    $k -n kube-system describe pods   > "$dir/cluster/kube-system-pods.txt" 2>&1
+  else
+    echo "the API server did not answer; no cluster objects collected" > "$dir/cluster/NOT-REACHABLE.txt"
+  fi
+
+  if tar -C "$work" -czf "$out" ferry-logs; then
+    rm -rf "$work"
+    ok "wrote $out ($(du -h "$out" | cut -f1))"
+    echo "  It holds component logs and cluster state, not credentials. Look"
+    echo "  through it before attaching it to an issue:"
+    echo "  https://github.com/imaustink/ferry/issues/new?template=bug.yml"
+  else
+    rm -rf "$work"; bad "could not write $out"; return 1
+  fi
+}
+
+# Shell completion. One table of commands and their subcommands, rendered for
+# each shell, so adding a command means adding it here once.
+FERRY_COMPLETE_COMMANDS="doctor version kernel node-image build init config up down restart status logs kubeconfig service uninstall node image profile addons token join machines mac-image upgrade completion help"
+ferry_complete_sub() { # command -> its subcommands or flags
+  case "$1" in
+    up)         echo "--kubernetes-version --disposable --durability --mac-image" ;;
+    down)       echo "--purge" ;;
+    uninstall)  echo "--purge" ;;
+    build)      echo "--kubernetes-version --rebuild" ;;
+    init)       echo "--purpose --yes --force" ;;
+    config)     echo "show get set unset path" ;;
+    logs)       echo "--bundle $FERRY_LOG_COMPONENTS" ;;
+    kubeconfig) echo "--merge" ;;
+    service)    echo "install uninstall status" ;;
+    node)       echo "add rm ls" ;;
+    image)      echo "build load ls" ;;
+    profile)    echo "ls rm" ;;
+    addons)     echo "list enable disable images" ;;
+    token)      echo "create" ;;
+    machines)   echo "status enable disable ls" ;;
+    mac-image)  echo "bake status" ;;
+    upgrade)    echo "status plan apply nodes node rollback prune" ;;
+    completion) echo "zsh bash fish" ;;
+  esac
+}
+
+cmd_completion() {
+  local cmds="$FERRY_COMPLETE_COMMANDS" c cases=""
+  for c in $cmds; do
+    local sub; sub="$(ferry_complete_sub "$c")"
+    [ -n "$sub" ] && cases="$cases    $c) cands=\"$sub\" ;;
+"
+  done
+  # Profile names from 'ferry profile ls': the first column of its table rows.
+  local profiles="ferry profile ls 2>/dev/null | awk 'NR>1 && \$1 ~ /^[A-Za-z0-9_-]+\$/ {print \$1}'"
+  local addons="ferry addons list 2>/dev/null | awk '/^    [a-z]/ {print \$1}'"
+  case "${1:-}" in
+    zsh)
+      # 'words' and 'CURRENT' are zsh's own completion state; the candidate
+      # list is called cands so as not to shadow them.
+      cat <<EOF
+#compdef ferry
+# ferry completion for zsh. Load it with:  source <(ferry completion zsh)
+# or save it as _ferry somewhere on \$fpath.
+_ferry() {
+  local -a list
+  local cands="" cmd="" prev="\${words[CURRENT-1]}" i
+  for (( i = 2; i < CURRENT; i++ )); do
+    case "\${words[i]}" in
+      -p|--profile) (( i++ )) ;;
+      -*) ;;
+      *) cmd="\${words[i]}"; break ;;
+    esac
+  done
+  if [[ "\$prev" == -p || "\$prev" == --profile ]]; then
+    cands="\$($profiles)"
+  elif [[ -z "\$cmd" ]]; then
+    cands="$cmds -p --profile"
+  elif [[ "\$cmd" == addons && "\$prev" == (enable|disable|images) ]]; then
+    cands="\$($addons)"
+  elif [[ "\$cmd" == image && "\$prev" == load ]]; then
+    _files; return
+  else
+    case "\$cmd" in
+$cases    esac
+  fi
+  list=(\${=cands})
+  compadd -a list
+}
+if [ "\$funcstack[1]" = "_ferry" ]; then _ferry "\$@"; else compdef _ferry ferry; fi
+EOF
+      ;;
+    bash)
+      cat <<EOF
+# ferry completion for bash. Load it with:  source <(ferry completion bash)
+_ferry() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}" prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  local cmd="" i cands=""
+  for (( i = 1; i < COMP_CWORD; i++ )); do
+    case "\${COMP_WORDS[i]}" in
+      -p|--profile) (( i++ )) ;;
+      -*) ;;
+      *) cmd="\${COMP_WORDS[i]}"; break ;;
+    esac
+  done
+  if [ "\$prev" = -p ] || [ "\$prev" = --profile ]; then
+    cands="\$($profiles)"
+  elif [ -z "\$cmd" ]; then
+    cands="$cmds -p --profile"
+  elif [ "\$cmd" = addons ] && case "\$prev" in enable|disable|images) true ;; *) false ;; esac; then
+    cands="\$($addons)"
+  elif [ "\$cmd" = image ] && [ "\$prev" = load ]; then
+    COMPREPLY=(\$(compgen -f -- "\$cur")); return
+  else
+    case "\$cmd" in
+$cases    esac
+  fi
+  COMPREPLY=(\$(compgen -W "\$cands" -- "\$cur"))
+}
+complete -F _ferry ferry
+EOF
+      ;;
+    fish)
+      echo "# ferry completion for fish. Load it with:  ferry completion fish | source"
+      echo "complete -c ferry -f"
+      echo "complete -c ferry -s p -l profile -x -a '(ferry profile ls 2>/dev/null | string match -r \"^[A-Za-z0-9_-]+(?= )\" | string match -v PROFILE)'"
+      echo "complete -c ferry -n '__fish_use_subcommand' -a '$cmds'"
+      for c in $cmds; do
+        local sub; sub="$(ferry_complete_sub "$c")"
+        [ -z "$sub" ] || echo "complete -c ferry -n '__fish_seen_subcommand_from $c' -a '$sub'"
+      done
+      ;;
+    *)
+      echo "usage: ferry completion zsh|bash|fish"
+      echo
+      echo "  zsh:   echo 'source <(ferry completion zsh)' >> ~/.zshrc"
+      echo "  bash:  echo 'source <(ferry completion bash)' >> ~/.bashrc"
+      echo "  fish:  ferry completion fish > ~/.config/fish/completions/ferry.fish"
+      [ -z "${1:-}" ] && return 0; return 2 ;;
   esac
 }
 
@@ -6615,7 +7293,7 @@ case "${1:-}" in
   up)         shift; cmd_up "$@" ;;
   init)       shift; cmd_init "$@" ;;
   config)     shift; cmd_config "$@" ;;
-  profile)    shift; cmd_profile ;;
+  profile)    shift; cmd_profile "$@" ;;
   addons)     shift; cmd_addons "$@" ;;
   image)      shift
               case "${1:-}" in
@@ -6649,6 +7327,7 @@ case "${1:-}" in
   status)     shift; cmd_status "$@" ;;
   logs)       shift; cmd_logs "$@" ;;
   kubeconfig) shift; cmd_kubeconfig "$@" ;;
+  completion) shift; cmd_completion "$@" ;;
   version|--version) shift; cmd_version ;;
   -h|--help|help|"") usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 1 ;;

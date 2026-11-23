@@ -125,6 +125,15 @@ fi
 
 # --- build, package, tag, publish -----------------------------------------
 if [ -z "$skip_build" ]; then
+  # The other Kubernetes versions the release offers first, and the one it
+  # carries last, so that is the version this checkout is left active at.
+  # build_kubernetes_binaries only rebuilds a kubelet whose patches changed,
+  # so after the first cut these are quick.
+  for v in $FERRY_RELEASE_K8S_VERSIONS; do
+    [ "$v" = "$k8s" ] && continue
+    echo; bold "building Kubernetes $v (offered as a download)"
+    ( cd "$root" && ./ferry build --kubernetes-version "$v" ) || die "ferry build --kubernetes-version $v failed"
+  done
   echo; bold "building binaries (ferry build)"
   ( cd "$root" && ./ferry build --kubernetes-version "$k8s" ) || die "ferry build failed"
 fi
@@ -149,3 +158,13 @@ publish_args=(--version "$version")
 # "tag already exists" wall a fresh cut.sh would hit.
 "$here/publish.sh" "${publish_args[@]}" \
   || die "release/publish.sh failed -- the tag is already pushed; re-run: release/publish.sh ${publish_args[*]}"
+
+# The Homebrew tap follows a live release only. A draft is not downloadable,
+# and a formula pointing at it would break 'brew install' until it went live.
+echo; bold "homebrew tap"
+if [ -n "$publish" ]; then
+  "$here/tap.sh" "$version" \
+    || echo "  the tap was not updated; the release is published. Re-run: release/tap.sh $version"
+else
+  echo "  after making the draft live: release/tap.sh $version"
+fi

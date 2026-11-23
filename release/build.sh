@@ -40,6 +40,7 @@ version=""
 k8s=""
 out="$root/dist"
 node_image=1
+extra_k8s=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) version="${2:-}"; shift 2 ;;
@@ -55,7 +56,11 @@ while [ $# -gt 0 ]; do
     # this is a flag rather than a silent skip, and VERSION records the
     # answer for 'ferry machines' to read.
     --without-node-image) node_image=""; shift ;;
-    *) die "usage: release/build.sh [--version vX.Y.Z] [--kubernetes-version vX.Y.Z] [--out <dir>] [--without-node-image]" ;;
+    # The other Kubernetes versions a release offers for 'ferry up
+    # --kubernetes-version'. Off only on purpose, and VERSION then says so, so
+    # a release cannot offer versions it did not publish.
+    --without-extra-kubernetes) extra_k8s=""; shift ;;
+    *) die "usage: release/build.sh [--version vX.Y.Z] [--kubernetes-version vX.Y.Z] [--out <dir>] [--without-node-image] [--without-extra-kubernetes]" ;;
   esac
 done
 
@@ -88,6 +93,24 @@ active="$(ferry_active_version)"
 [ -z "$active" ] || [ "$active" = "$k8s" ] \
   || echo "  note: this checkout is running $active; packaging $k8s, not that"
 
+# Every other version the release offers has to be complete in the store and
+# built from today's patches, checked before anything is packaged: a stale
+# kubelet in a download is the same bug as one in the tarball, found later.
+extras=""
+if [ -n "$extra_k8s" ]; then
+  for v in $FERRY_RELEASE_K8S_VERSIONS; do
+    [ "$v" = "$k8s" ] && continue
+    ferry_version_complete "$v" \
+      || die "the version store has no complete $v -- run: ./ferry build --kubernetes-version $v (or --without-extra-kubernetes)"
+    [ -f "$(ferry_version_dir "$v")/ferry-proxyd" ] \
+      || die "$v has no ferry-proxyd -- run: ./ferry build --kubernetes-version $v"
+    inputs="$(ferry_kubelet_inputs "$v")"
+    [ -z "$inputs" ] || [ "$inputs" = "$(cat "$(ferry_version_dir "$v")/kubelet.inputs" 2>/dev/null)" ] \
+      || die "kubelet $v was built from other patches -- run: ./ferry build --kubernetes-version $v"
+    extras="$extras $v"
+  done
+fi
+
 bold "packaging ferry $version"
 echo "  kubernetes  $k8s (control plane $(ferry_manifest_field "$k8s" control-plane 2>/dev/null || echo '?'), etcd $(ferry_manifest_field "$k8s" etcd 2>/dev/null || echo '?'))"
 echo "  from        $root"
@@ -100,6 +123,7 @@ mkdir -p "$dir"
 # --- the CLI and what it sources -----------------------------------------
 cp "$root/ferry" "$dir/ferry"
 chmod +x "$dir/ferry"
+cp "$root/LICENSE" "$dir/LICENSE"
 mkdir -p "$dir/lib"
 # The whole directory rather than the files ferry happens to source today. A
 # named list is a second place to remember, and the way it fails is a release
@@ -225,9 +249,11 @@ fi
 # The Swift version is recorded because a cluster spans Macs and two toolchains
 # produce two builds that are only probably the same. With a release, every Mac
 # gets the same binaries -- this says which toolchain made them.
+available="$(for v in $k8s $extras; do echo "$v"; done | sort -V | tr '\n' ' ' | sed 's/ $//')"
 cat > "$dir/VERSION" <<META
 ferry=$version
 kubernetes=$k8s
+kubernetes-available=$available
 control-plane=$(ferry_manifest_field "$k8s" control-plane 2>/dev/null || echo unknown)
 etcd=$(ferry_manifest_field "$k8s" etcd 2>/dev/null || echo unknown)
 node-image=$([ -n "$node_image" ] && echo yes || echo no)
@@ -247,6 +273,23 @@ rm -f "$tarball"
   || die "could not write $tarball"
 
 ( cd "$out" && shasum -a 256 "$(basename "$tarball")" > "$(basename "$tarball").sha256" )
+
+# --- the other Kubernetes versions, each a download of its own ------------
+# One directory, kubernetes-<version>/, holding what the store holds for it,
+# which 'ferry up --kubernetes-version' unpacks into bin/versions/.
+for v in $extras; do
+  kdir="$stage/kubernetes-$v"
+  mkdir -p "$kdir"
+  for name in $FERRY_VERSIONED_BINARIES MANIFEST kubelet.inputs; do
+    src="$(ferry_version_dir "$v")/$name"
+    [ -f "$src" ] && cp "$src" "$kdir/$name"
+  done
+  ktar="$out/ferry-$version-kubernetes-$v-darwin-arm64.tar.gz"
+  rm -f "$ktar"
+  ( cd "$stage" && tar --no-mac-metadata -czf "$ktar" "kubernetes-$v" ) || die "could not write $ktar"
+  ( cd "$out" && shasum -a 256 "$(basename "$ktar")" > "$(basename "$ktar").sha256" )
+  ok "kubernetes $v, a separate download ($(du -h "$ktar" | awk '{print $1}'))"
+done
 
 echo
 bold "built $(basename "$tarball")"

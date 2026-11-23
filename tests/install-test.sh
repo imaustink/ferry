@@ -306,6 +306,37 @@ contains "and the installer's fallback bin directory" "$agent_src" '$HOME/.local
 contains "and says so when there is no kubectl to record" "$agent_src" "will not find one either"
 echo
 
+# --- whether the installer registers the agent ----------------------------
+#
+# Opt-in, like kind and minikube, which start nothing unasked. A join keeps it
+# (a node that does not come back after a reboot is a hole in another Mac's
+# cluster), and an upgrade keeps what was already there. Run for real: start()
+# from install.sh against a stand-in ferry that records what it was asked.
+printf '\033[1m%s\033[0m\n' "the installer registers the login agent only when it should"
+install_start="$(sed -n '/^start() {/,/^}/p' "$repo/install.sh")"
+agent_case() { # registered(0|1) env... -> prints "yes" or "no"
+  local registered="$1"; shift
+  local fake; fake="$(mktemp -d)"
+  cat > "$fake/ferry" <<FAKE
+#!/bin/sh
+echo "\$*" >> "$fake/calls"
+case "\$1 \$2" in "service status") [ "$registered" = 1 ] ;; *) exit 0 ;; esac
+FAKE
+  chmod +x "$fake/ferry"
+  env -i PATH=/usr/bin:/bin HOME="$fake" "$@" sh -c '
+    bold() { :; }; ok() { :; }; warn() { :; }; die() { exit 1; }
+    ROOT="$1"; eval "$2"; start >/dev/null' _ "$fake" "$install_start"
+  if grep -q '^service install' "$fake/calls" 2>/dev/null; then echo yes; else echo no; fi
+  rm -rf "$fake"
+}
+is "a new cluster does not get one"            "$(agent_case 0)" no
+is "  unless FERRY_SERVICE=1 asks"              "$(agent_case 0 FERRY_SERVICE=1)" yes
+is "a join does"                                "$(agent_case 0 FERRY_URL=mac1:6443 FERRY_TOKEN=t)" yes
+is "  unless FERRY_SERVICE=0 says not to"       "$(agent_case 0 FERRY_URL=mac1:6443 FERRY_TOKEN=t FERRY_SERVICE=0)" no
+is "an upgrade keeps one already registered"    "$(agent_case 1)" yes
+is "FERRY_SKIP_SERVICE=1 still means no"        "$(agent_case 1 FERRY_SKIP_SERVICE=1)" no
+echo
+
 # --- joining ---------------------------------------------------------------
 printf '\033[1m%s\033[0m\n' "joining"
 join_src="$(sed -n '/^cmd_join/,/^}/p' "$repo/ferry")"
@@ -352,6 +383,7 @@ not_shipped="
   ferry-registry                                go sources
   ferry-handover                                go sources; only 'upgrade' runs it, which a release refuses
   ferry-mkimage                                 go sources; a release ships bin/ferry-mkimage instead
+  ferry-macvm                                   swift sources; a release ships bin/ferry-macvm instead
   experiments/03-vm-ceiling/fetch-kernel.sh     part of the build
   experiments/03-vm-ceiling/assets/vmlinux-arm64 the kata fallback kernel, 15MB spent on a worse cluster
   experiments/17-node-vm/stage.sh               downloads the node image's contents; build only
@@ -400,6 +432,26 @@ if grep -q 'for name in \$FERRY_VERSIONED_BINARIES' "$repo/release/build.sh"; th
 else
   bad "release/build.sh does not walk FERRY_VERSIONED_BINARIES, so kubelet, ferry-proxyd, the control plane and etcd may be missing"
 fi
+echo
+
+# --- the other Kubernetes versions -----------------------------------------
+#
+# 'ferry up --kubernetes-version' on a release downloads what the release
+# offers; a release that lists a version it did not publish fails on someone
+# else's Mac, so packaging, publishing and the cut all have to agree.
+printf '\033[1m%s\033[0m\n' "a release publishes every Kubernetes it offers"
+build_src="$(cat "$repo/release/build.sh")"
+contains "build.sh walks FERRY_RELEASE_K8S_VERSIONS" "$build_src" 'for v in $FERRY_RELEASE_K8S_VERSIONS'
+contains "  and refuses one whose kubelet predates the patches" "$build_src" "was built from other patches"
+contains "  and packages each as its own download" "$build_src" 'ferry-$version-kubernetes-$v-darwin-arm64.tar.gz'
+contains "  named the way ferry fetches it" "$(cat "$repo/ferry")" 'ferry-$release-kubernetes-$v-darwin-arm64.tar.gz'
+contains "  and unpacked from the directory ferry expects" "$build_src" 'kdir="$stage/kubernetes-$v"'
+contains "  and VERSION lists what it offers" "$build_src" 'kubernetes-available=$available'
+publish_src="$(cat "$repo/release/publish.sh")"
+contains "publish.sh uploads every version VERSION offers" "$publish_src" 'assets+=("$k" "$k.sha256")'
+contains "  and refuses when one is missing" "$publish_src" "VERSION offers Kubernetes"
+contains "cut.sh builds the offered versions before the default" \
+  "$(cat "$repo/release/cut.sh")" 'for v in $FERRY_RELEASE_K8S_VERSIONS'
 echo
 
 # --- mode 2 ----------------------------------------------------------------
@@ -500,7 +552,7 @@ contains "an existing Mac node is labelled too, not just a new one" \
 contains "and 'ferry up' asserts it once the node is Ready" \
   "$(sed -n '/^cmd_up/,/^}/p' "$repo/ferry")" 'ensure_mode_label "$NODE_NAME"'
 contains "and it is applied where the controller already has the Node" \
-  "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node)"
+  "$(cat "$repo/ferry-machined/reconcile.go")" "c.ensureModeLabel(ctx, node, modeFor(item))"
 
 # The same choice, spelled the way Kubernetes spells a runtime. Each class
 # selects the label above rather than replacing it, so the two spellings place

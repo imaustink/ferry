@@ -110,6 +110,53 @@ YAML
     "$(field ferry-e2e '.users[0].user.client-key-data' | base64 -d)" "key-e2e-recreated"
   is "without leaving a second copy of the context" \
     "$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-contexts -o name | grep -c '^ferry-e2e$')" 1
+  echo
+
+  # What 'ferry up' does: merge, then switch only where nothing real is lost.
+  printf '\033[1m%s\033[0m\n' "ferry up switches kubectl to ferry only when that is safe"
+  use() { HOME="$sandbox" FERRY_PROFILE="$1" KUBECONFIG="" "$repo/ferry" kubeconfig --merge-and-use 2>&1; }
+  current() { KUBECONFIG="$sandbox/.kube/config" kubectl config current-context 2>/dev/null; }
+  backups() { find "$sandbox/.kube" -name 'config.before-ferry.*' | wc -l | tr -d ' '; }
+  before="$(backups)"
+  out="$(use default)"
+  is "someone on another cluster stays on it" "$(current)" "minikube"
+  contains "  and is told how to switch" "$out" "kubectl config use-context ferry"
+  is "  and the file is not backed up again on every start" "$(backups)" "$before"
+  KUBECONFIG="$sandbox/.kube/config" kubectl config unset current-context >/dev/null
+  use default >/dev/null
+  is "with no current context, ferry becomes it" "$(current)" "ferry"
+  use e2e >/dev/null
+  is "from one ferry profile, another ferry profile's up takes over" "$(current)" "ferry-e2e"
+  KUBECONFIG="$sandbox/.kube/config" kubectl config set current-context gone >/dev/null
+  use default >/dev/null
+  is "a current context that no longer exists is replaced" "$(current)" "ferry"
+  rm -rf "$sandbox/.kube"
+  use default >/dev/null
+  is "with no kubeconfig at all, one is made and used" "$(current)" "ferry"
+  use e2e >/dev/null; use default >/dev/null
+
+  # The person's KUBECONFIG is where the merge goes -- including from inside
+  # 'ferry up', which exports KUBECONFIG=admin.conf long before it merges. Read
+  # at that point, the merge went to ~/.kube/config whatever the person had set.
+  other="$sandbox/other-kubeconfig"
+  HOME="$sandbox" FERRY_PROFILE=default KUBECONFIG="$other" "$repo/ferry" kubeconfig --merge-and-use >/dev/null 2>&1
+  is "a KUBECONFIG the person set is the file merged into" \
+    "$(KUBECONFIG="$other" kubectl config current-context 2>/dev/null)" "ferry"
+  for fn in cmd_kubeconfig kubeconfig_forget; do
+    lacks "  $fn never takes the target from KUBECONFIG, which ferry itself overwrites" \
+      "$(awk -v f="$fn() " 'index($0, f) == 1 {on=1} on {print} on && /^}/ {exit}' "$repo/ferry")" '${KUBECONFIG:-'
+  done
+
+  # 'ferry down --purge' takes the context back out, as 'kind delete cluster' does.
+  forget="$(sed -n '/^kubeconfig_forget() {/,/^}/p' "$repo/ferry")"
+  ( ok() { :; }; HOME="$sandbox"; FERRY_HOME="$sandbox/.ferry"; SUFFIX=""; KUBECONFIG=""
+    eval "$forget"; kubeconfig_forget )
+  contexts="$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-contexts -o name | tr '\n' ' ')"
+  lacks "--purge removes the purged profile's context" "$contexts" "ferry "
+  contains "  and leaves the other profile's" "$contexts" "ferry-e2e"
+  is "  and unsets current-context rather than choosing one" "$(current)" ""
+  is "  and its cluster entry goes too" \
+    "$(KUBECONFIG="$sandbox/.kube/config" kubectl config get-clusters | grep -cx ferry)" 0
 fi
 echo
 
@@ -123,7 +170,7 @@ cp "$repo/ferry" "$release/ferry"; cp "$repo"/lib/*.sh "$release/lib/"
 printf 'ferry=v9.9.9\nkubernetes=v1.34.0\ncontrol-plane=v1.34.11\netcd=v3.6.5\n' > "$release/VERSION"
 mkdir -p "$sandbox/.ferry"
 printf 'kubernetes=v1.37.0\ncontrol-plane=v1.37.0\netcd=v3.6.5\n' > "$sandbox/.ferry/version"
-out="$(HOME="$sandbox" FERRY_PROFILE=default "$release/ferry" version 2>&1)"
+out="$(HOME="$sandbox" FERRY_PROFILE=default FERRY_RUN="$sandbox/run" "$release/ferry" version 2>&1)"
 contains "reports the release's Kubernetes" "$out" "kubernetes    v1.34.0"
 contains "and its control plane" "$out" "control plane v1.34.11"
 lacks "not the stale cluster's, as if it were installed" "$(echo "$out" | grep -v '^  cluster')" "v1.37.0"
@@ -785,6 +832,223 @@ contains "publishing is live only with --publish; otherwise a draft" \
   "$cut_src" 'publish_args+=(--publish)'
 contains "and the README documents the one-command path" \
   "$(cat "$repo/README.md")" "./release/cut.sh --version"
+echo
+
+# --- named profiles ----------------------------------------------------------
+#
+# An installed release has no worktree to key on, so a second cluster is asked
+# for by name: minikube's -p, kind's --name.
+printf '\033[1m%s\033[0m\n' "ferry -p names a cluster"
+pf="$sandbox/profiles-home"; mkdir -p "$pf"
+pferry() { env -u FERRY_PROFILE HOME="$pf" "$release/ferry" "$@" 2>&1; }
+contains "-p before the command selects it" "$(pferry -p demo profile)" "profile demo"
+contains "--profile after it does too" "$(pferry profile --profile demo)" "profile demo"
+contains "--profile=name as well" "$(pferry --profile=demo profile)" "profile demo"
+contains "  with its own state directory" "$(pferry -p demo profile)" "$pf/.ferry-demo"
+contains "  and its own API server port" "$(pferry -p demo profile)" ":7443"
+is "a name that is not safe in a path is refused" "$(pferry -p ../x profile >/dev/null; echo $?)" 2
+contains "-p with no name says so" "$(pferry profile -p)" "needs a name"
+mkdir -p "$pf/.ferry" "$pf/.ferry-demo/etcd"; echo x > "$pf/.ferry-demo/admin.conf"
+printf 'kubernetes=v1.37.0\n' > "$pf/.ferry-demo/version"
+# What 'down --purge' leaves: certificates and admin.conf, no etcd, no version.
+pferry -p wiped profile >/dev/null; mkdir -p "$pf/.ferry-wiped"; echo x > "$pf/.ferry-wiped/admin.conf"
+ls_out="$(pferry profile ls)"
+contains "profile ls lists the default cluster" "$ls_out" "default *"
+contains "  and a named one, stopped, at its version" "$ls_out" "$(printf '%-26s %-10s %-10s' demo stopped v1.37.0)"
+contains "  and one whose data was purged, as purged" "$ls_out" "$(printf '%-26s %-10s' wiped purged)"
+pferry -p gone profile >/dev/null
+lacks "  but not a registered name with no state left" "$(pferry profile ls)" "gone"
+
+# profile rm: everything a profile owns goes, and its number is freed.
+mkdir -p "$pf/.ferry-old/etcd" "$pf/Library/LaunchAgents"
+echo x > "$pf/.ferry-old/admin.conf"
+pferry -p old profile >/dev/null
+touch "$pf/Library/LaunchAgents/dev.ferry.old.plist"
+old_index="$(awk '$2 == "old" {print $1}' "$pf/.ferry-profiles")"
+contains "profile rm asks before deleting" "$(echo n | pferry profile rm old)" "nothing deleted"
+is "  and keeps everything when told no" "$([ -d "$pf/.ferry-old" ] && echo kept)" kept
+rm_out="$(pferry profile rm old --yes)"
+contains "profile rm --yes removes it" "$rm_out" "removed old"
+is "  its state directory" "$([ -e "$pf/.ferry-old" ] && echo left || echo gone)" gone
+is "  its login agent" "$([ -e "$pf/Library/LaunchAgents/dev.ferry.old.plist" ] && echo left || echo gone)" gone
+is "  and its line in the register" "$(grep -c ' old$' "$pf/.ferry-profiles")" 0
+is "  so the next new profile gets its number" \
+  "$(pferry -p fresh profile >/dev/null; awk '$2 == "fresh" {print $1}' "$pf/.ferry-profiles")" "$old_index"
+contains "the default cluster is not removed this way" "$(pferry profile rm default --yes)" "down --purge"
+lacks "  and a name with a path in it is refused" "$(pferry profile rm ../x --yes)" "removed"
+# A running profile is refused: an etcd pid that is alive (this shell's own).
+mkdir -p "$pf/.ferry-busy"; echo $$ > "$pf/.ferry-busy/etcd.pid"; pferry -p busy profile >/dev/null
+contains "a running profile is refused" "$(pferry profile rm busy --yes)" "busy is running"
+is "  and left in place" "$([ -d "$pf/.ferry-busy" ] && echo kept)" kept
+echo
+
+# --- update notice -----------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "a newer release is mentioned, and only then"
+newer="$(sed -n '/^ferry_version_newer() {/,/^}/p' "$repo/ferry")"
+vn() { bash -c "$newer"'; ferry_version_newer "$1" "$2" && echo yes || echo no' _ "$1" "$2"; }
+is "v1.0.0 is newer than v0.16.0" "$(vn v1.0.0 v0.16.0)" yes
+is "v0.16.0 is newer than v0.9.0, numerically" "$(vn v0.16.0 v0.9.0)" yes
+is "v0.16.0 is not newer than itself" "$(vn v0.16.0 v0.16.0)" no
+is "v0.15.2 is not newer than v0.16.0" "$(vn v0.15.2 v0.16.0)" no
+un="$sandbox/update"; mkdir -p "$un/.ferry-dist"
+# A fresh cache, so nothing is fetched. 'script' gives ferry a terminal: the
+# notice is never printed into a pipe.
+notice() { # cached-version [env...]
+  echo "$1" > "$un/.ferry-dist/latest-release"; shift
+  env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$@" \
+    script -q /dev/null "$release/ferry" status </dev/null 2>&1 | tr -d '\r'
+}
+contains "a newer release is announced on 'ferry status'" "$(notice v99.0.0)" "ferry v99.0.0 is out (this is v9.9.9)"
+lacks "  but not the release already installed" "$(notice v9.9.9)" "is out"
+lacks "  and not with FERRY_NO_UPDATE_CHECK=1" "$(notice v99.0.0 FERRY_NO_UPDATE_CHECK=1)" "is out"
+lacks "  and never into a pipe" "$(echo v99.0.0 > "$un/.ferry-dist/latest-release"; env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$release/ferry" status 2>&1)" "is out"
+echo
+
+# --- choosing the Kubernetes version ----------------------------------------
+#
+# The functions 'ferry up --kubernetes-version' runs, against a fake release
+# that carries v1.37.0 and offers v1.34.0 as a download served from file://.
+printf '\033[1m%s\033[0m\n' "ferry up --kubernetes-version"
+kr="$sandbox/k8srel"; mkdir -p "$kr/lib" "$kr/dist" "$kr/home"
+cp "$repo"/lib/*.sh "$kr/lib/"
+printf 'ferry=v9.9.9\nkubernetes=v1.37.0\nkubernetes-available=v1.34.0 v1.37.0\n' > "$kr/VERSION"
+fake_version() { # dir version -- a store entry ferry_version_complete accepts
+  mkdir -p "$1"; for b in kubelet kube-apiserver kube-controller-manager kube-scheduler etcd ferry-proxyd; do
+    printf '#!/bin/sh\necho %s %s\n' "$b" "$2" > "$1/$b"; chmod +x "$1/$b"; done
+  printf 'kubernetes=%s\ncontrol-plane=%s\netcd=v3.6.5\n' "$2" "$2" > "$1/MANIFEST"
+}
+fake_version "$kr/bin/versions/v1.37.0" v1.37.0
+bundle="ferry-v9.9.9-kubernetes-v1.34.0-darwin-arm64.tar.gz"
+fake_version "$kr/stage/kubernetes-v1.34.0" v1.34.0
+( cd "$kr/stage" && tar -czf "$kr/dist/$bundle" kubernetes-v1.34.0 && cd "$kr/dist" && shasum -a 256 "$bundle" > "$bundle.sha256" )
+k8s_fns="$(for f in is_release ferry_release_version ferry_k8s_available ferry_resolve_k8s_version \
+  ferry_fetch_k8s_version ferry_place_k8s_version ferry_other_release_stores ferry_copy_k8s_version \
+  ferry_cluster_created ferry_ensure_k8s_version choose_cluster_version align_to_cluster_version; do
+  awk -v f="$f() " 'index($0, f) == 1 {on=1} on {print} on && /^}/ {exit}' "$repo/ferry"; done)"
+k8s() { # function args... -- run one of them as the fake release would ($KR: another release)
+  local r="${KR:-$kr}"
+  env FERRY_DOWNLOAD_BASE="file://$kr/dist" bash -c '
+    here="$1"; FERRY_ROOT="$1"; FERRY_HOME="$2"; shift 2
+    . "$here/lib/versions.sh"
+    ok() { echo "ok: $1"; }; bad() { echo "bad: $1"; }; warn() { echo "warn: $1"; }
+    eval "$K8S_FNS"; "$@"' _ "$r" "$r/home" "$@" 2>&1
+}
+export K8S_FNS="$k8s_fns"
+is "a minor resolves to the patch the release offers" "$(k8s ferry_resolve_k8s_version v1.34)" "v1.34.0"
+is "  'v' is optional" "$(k8s ferry_resolve_k8s_version 1.37)" "v1.37.0"
+contains "a version the release does not offer is refused" "$(k8s ferry_resolve_k8s_version v1.36)" "available: v1.34.0 v1.37.0"
+contains "  and so is an exact one it does not offer" "$(k8s ferry_resolve_k8s_version v1.34.5)" "does not offer Kubernetes v1.34.5"
+out="$(k8s choose_cluster_version v1.34)"
+contains "a new cluster at v1.34 downloads it" "$out" "ok: Kubernetes v1.34.0"
+is "  into the store, complete" "$("$kr/bin/versions/v1.34.0/kubelet")" "kubelet v1.34.0"
+contains "  and records it as the cluster's version" "$(cat "$kr/home/version")" "kubernetes=v1.34.0"
+contains "a version chosen for a cluster that never started can be chosen again" \
+  "$(k8s choose_cluster_version v1.37)" "will run Kubernetes v1.37.0"
+is "  with no previous version left for rollback" "$([ -e "$kr/home/version.previous" ] && echo left || echo none)" none
+k8s choose_cluster_version v1.34 >/dev/null
+mkdir -p "$kr/home/etcd/member"   # what the control plane's first start leaves
+contains "an existing cluster keeps its version" "$(k8s choose_cluster_version v1.37)" "already runs Kubernetes v1.34.0"
+rm -rf "$kr/bin/versions/v1.34.0" "$kr/home/version" "$kr/home/etcd"
+echo "0000000000000000000000000000000000000000000000000000000000000000  $bundle" > "$kr/dist/$bundle.sha256"
+contains "a download that fails its checksum is refused" "$(k8s choose_cluster_version v1.34)" "checksum mismatch"
+is "  and leaves nothing in the store" "$([ -e "$kr/bin/versions/v1.34.0" ] && echo left || echo clean)" clean
+is "  and no version recorded" "$([ -e "$kr/home/version" ] && echo recorded || echo none)" none
+lacks "the release's own Kubernetes needs no download" "$(k8s choose_cluster_version v1.37)" "downloading"
+# After 'ferry upgrade' the new release may offer only a newer patch of the
+# cluster's minor. The release that created the cluster still has it.
+kd="$sandbox/k8sdist/versions"; kn="$kd/ferry-v9.9.10"; mkdir -p "$kn/lib" "$kn/home/etcd/member"
+cp "$repo"/lib/*.sh "$kn/lib/"
+printf 'ferry=v9.9.10\nkubernetes=v1.37.0\nkubernetes-available=v1.36.5 v1.37.0\n' > "$kn/VERSION"
+fake_version "$kn/bin/versions/v1.37.0" v1.37.0
+printf 'kubernetes=v1.36.4\ncontrol-plane=v1.36.4\netcd=v3.6.5\n' > "$kn/home/version"
+out="$(KR="$kn" k8s align_to_cluster_version)"
+contains "a release without the cluster's patch says what it offers instead" "$out" "offers: v1.36.5 v1.37.0"
+lacks "  and does not suggest a build a release cannot run" "$out" "ferry build"
+contains "  but a second cluster or a purge" "$out" "ferry down --purge"
+fake_version "$kd/ferry-v9.9.9/bin/versions/v1.36.4" v1.36.4
+out="$(KR="$kn" k8s align_to_cluster_version)"
+contains "a release copies the cluster's version from the release that created it" "$out" "copying Kubernetes v1.36.4"
+is "  into its own store, complete" "$("$kn/bin/versions/v1.36.4/kubelet")" "kubelet v1.36.4"
+is "  and starts the cluster at it" "$(cat "$kn/bin/.active-version" 2>/dev/null)" "v1.36.4"
+contains "the version a release carries is among those it offers" \
+  " $(sed -n 's/^FERRY_RELEASE_K8S_VERSIONS="\(.*\)"$/\1/p' "$repo/lib/versions.sh") " \
+  " $(sed -n 's/^FERRY_DEFAULT_K8S_VERSION="\(.*\)"$/\1/p' "$repo/lib/versions.sh") "
+echo
+
+# --- completion --------------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "ferry completion"
+comp_dir="$sandbox/completion"; mkdir -p "$comp_dir"
+"$repo/ferry" completion bash > "$comp_dir/ferry.bash"
+"$repo/ferry" completion zsh > "$comp_dir/_ferry"
+is "the bash script parses" "$(bash -n "$comp_dir/ferry.bash" 2>&1; echo $?)" 0
+is "the zsh script parses" "$(zsh -n "$comp_dir/_ferry" 2>&1; echo $?)" 0
+# Homebrew's generate_completions_from_executable fails the install on a
+# non-zero exit, which the fish branch once had from a trailing '&&'.
+for sh in zsh bash fish; do
+  is "  'completion $sh' exits 0" "$("$repo/ferry" completion "$sh" >/dev/null 2>&1; echo $?)" 0
+done
+complete_bash() { # words... -> candidates
+  bash -c 'source "$1"; shift; COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); _ferry; echo "${COMPREPLY[*]}"' \
+    _ "$comp_dir/ferry.bash" "$@"
+}
+is "commands complete" "$(complete_bash ferry up)" "up upgrade"
+is "  after -p <name> too" "$(complete_bash ferry -p demo do)" "doctor down"
+is "subcommands complete" "$(complete_bash ferry upgrade r)" "rollback"
+is "log components complete" "$(complete_bash ferry logs ferry-cr)" "ferry-cri"
+# Every command the dispatcher runs is one completion offers, so a new one
+# cannot be added and left out.
+dispatched="$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$repo/ferry" | grep -oE '^  [a-z-]+(\|[a-z-]+)*\)' | tr -d ' )' | tr '|' '\n' | grep -v '^-' | sort -u)"
+offered="$(sed -n 's/^FERRY_COMPLETE_COMMANDS="\(.*\)"$/\1/p' "$repo/ferry" | tr ' ' '\n' | sort -u)"
+is "every dispatched command is completed" "$(comm -23 <(echo "$dispatched") <(echo "$offered") | tr '\n' ' ')" ""
+echo
+
+# --- the Homebrew formula ----------------------------------------------------
+printf '\033[1m%s\033[0m\n' "release/homebrew.sh"
+formula="$(FERRY_FORMULA_SHA256="$(printf '%064d' 0)" "$repo/release/homebrew.sh" v1.2.3 2>&1)"
+contains "it names the release's tarball" "$formula" "releases/download/v1.2.3/ferry-v1.2.3-darwin-arm64.tar.gz"
+contains "  at its version" "$formula" 'version "1.2.3"'
+contains "it runs ferry through opt/, which survives brew upgrade" "$formula" 'exec "#{opt_libexec}/ferry"'
+lacks "  rather than a symlink into the versioned Cellar" "$formula" "install_symlink"
+contains "it installs shell completion" "$formula" 'generate_completions_from_executable(libexec/"ferry", "completion")'
+if command -v ruby >/dev/null 2>&1; then
+  is "it is valid Ruby" "$(echo "$formula" | ruby -c 2>&1)" "Syntax OK"
+fi
+is "a version that is not vX.Y.Z is refused" "$("$repo/release/homebrew.sh" 1.2 >/dev/null 2>&1; echo $?)" 2
+
+# release/tap.sh, against an empty bare repository standing in for the tap.
+# Its HEAD names master, as git init's default does on CI's runners: a clone of
+# it checks nothing out, which made every run look like the first.
+tapdir="$sandbox/tap.git"; git -c init.defaultBranch=master init --quiet --bare "$tapdir"
+tap() { FERRY_TAP_REPO="$tapdir" FERRY_FORMULA_SHA256="$(printf '%064d' 0)" \
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  "$repo/release/tap.sh" "$1" 2>&1; }
+contains "tap.sh fills an empty tap" "$(tap v1.2.3)" "ferry 1.2.3"
+is "  on main" "$(git --git-dir="$tapdir" log --format=%s main 2>/dev/null)" "ferry 1.2.3"
+contains "  with the formula" "$(git --git-dir="$tapdir" show main:Formula/ferry.rb)" 'version "1.2.3"'
+contains "  and a README" "$(git --git-dir="$tapdir" show main:README.md)" "brew install imaustink/ferry/ferry"
+contains "the same version again changes nothing" "$(tap v1.2.3)" "already has ferry v1.2.3"
+tap v1.2.4 >/dev/null
+is "a new version is one more commit" "$(git --git-dir="$tapdir" rev-list --count main)" 2
+contains "cut.sh updates the tap only for a live release" \
+  "$(sed -n '/homebrew tap/,$p' "$repo/release/cut.sh")" 'if [ -n "$publish" ]; then'
+echo
+
+# --- logs --bundle -----------------------------------------------------------
+printf '\033[1m%s\033[0m\n' "ferry logs --bundle"
+lb="$sandbox/bundle"; mkdir -p "$lb/run/logs" "$lb/home/logs"
+echo "cri says hello" > "$lb/run/logs/ferry-cri.log"
+echo "etcd says hello" > "$lb/home/logs/etcd.log"
+echo "secret" > "$lb/home/admin.conf"
+bundle_out="$(cd "$lb" && env -u FERRY_PROFILE HOME="$lb" FERRY_PROFILE=bundletest FERRY_PROFILES="$lb/profiles" \
+  FERRY_RUN="$lb/run" FERRY_HOME="$lb/home" "$repo/ferry" logs --bundle out.tgz 2>&1)"
+contains "it says where it wrote the bundle" "$bundle_out" "$lb/out.tgz"
+listing="$(tar -tzf "$lb/out.tgz" 2>/dev/null)"
+contains "  with the runtime's logs" "$listing" "ferry-logs/logs/run/ferry-cri.log"
+contains "  and the control plane's" "$listing" "ferry-logs/logs/state/etcd.log"
+contains "  and ferry's own reports" "$listing" "ferry-logs/ferry-status.txt"
+contains "  and says when the API server could not be asked" "$listing" "NOT-REACHABLE.txt"
+lacks "  and never the admin credentials" "$listing" "admin.conf"
+lacks "the reports carry no colour codes" "$(tar -xzOf "$lb/out.tgz" ferry-logs/ferry-version.txt)" $'\033['
 echo
 
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"

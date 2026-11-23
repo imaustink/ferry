@@ -26,6 +26,261 @@ reaches userspace in ~0.12s, so a real Alpine pod is up in **0.33s** and answers
 ping from the Mac in 0.34ms. The 128th VM starts as fast as the first. Nothing
 is nested, and there is no node VM in the path.
 
+## Quick start
+
+Apple silicon and macOS 26 are the only requirements. No Docker, no `sudo`.
+
+```sh
+curl -sfL https://get.ferry.kurpuis.com | sh -    # installs ferry and kubectl, starts a cluster
+
+kubectl create deployment web --image=nginx --replicas=3
+kubectl expose deployment web --port=80 --type=LoadBalancer
+curl http://localhost                               # served by one of three pod VMs
+
+ferry down                                          # stop it; 'ferry up' brings it back
+```
+
+`ferry up` merges its credentials into `~/.kube/config`, so `kubectl` works the
+moment it returns. It switches your current context only when that loses
+nothing: when there is none, or it is another ferry cluster's.
+
+### Coming from kind or minikube
+
+| you want to | kind | minikube | ferry |
+|:--|:--|:--|:--|
+| start a cluster | `kind create cluster` | `minikube start` | `ferry up` |
+| a second, named one | `kind create cluster --name x` | `minikube start -p x` | `ferry -p x up` |
+| list them | `kind get clusters` | `minikube profile list` | `ferry profile ls` |
+| stop it, keeping its data | — | `minikube stop` | `ferry down` |
+| delete it | `kind delete cluster` | `minikube delete` | `ferry down --purge` |
+| pick the Kubernetes version | `--image kindest/node:v1.x` | `--kubernetes-version` | `ferry up --kubernetes-version v1.35`, for a new cluster; `ferry version` lists what is offered |
+| use a local image | `kind load docker-image x` | `minikube image load x` | `ferry image load x` |
+| build one, with no Docker | — | `minikube image build` | `ferry image build -t x .` |
+| turn on an addon | — | `minikube addons enable x` | `ferry addons enable x` |
+| reach a LoadBalancer | extra port mappings | `minikube tunnel` | nothing to do: it is on `localhost` and the LAN |
+| more nodes | config file | `minikube node add` | `ferry node add x`, or another Mac with `ferry join` |
+| logs for a bug report | `kind export logs` | `minikube logs --file` | `ferry logs --bundle` |
+| shell completion | `kind completion zsh` | `minikube completion zsh` | `ferry completion zsh` |
+| what is wrong with this machine | — | — | `ferry doctor` |
+
+## Install, in more detail
+
+```sh
+curl -sfL https://get.ferry.kurpuis.com | sh -
+```
+
+That downloads a release, puts `ferry` and a matching `kubectl` on your PATH,
+and starts a cluster. `ferry service install` makes it come back at every login.
+It needs no Swift, no Go, no Kubernetes source tree, and no `sudo`. The release
+carries the kubelet, the control plane, etcd, the runtime and the guest kernel
+already built.
+
+Adding a second Mac is one line from the first Mac's `ferry token create`:
+
+```sh
+curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10… sh -
+```
+
+A release also carries **mode 2**, where the node is the VM and pods share its
+kernel ([docs/MACHINES.md](docs/MACHINES.md)). It is off until
+`ferry machines enable`.
+
+Not sure which setup you want? `ferry init` asks what the cluster is for and
+writes the answers to a config file that `ferry config` explains and every
+`ferry up` names. The choices are a laptop you develop on, clusters a script
+creates and deletes, or an always-on node. See
+[Configuration](docs/INSTALL.md#configuration).
+
+Shell completion: `source <(ferry completion zsh)` in `~/.zshrc` (or `bash`,
+`fish`). When something goes wrong, `ferry doctor` checks the Mac and
+`ferry logs --bundle` collects everything an issue needs into one file.
+
+Details, the environment variables, and how to uninstall are in
+[docs/INSTALL.md](docs/INSTALL.md). To build ferry instead of installing it, see
+[Building from source](#building-from-source).
+
+## Try it
+
+```sh
+kubectl run demo --image=ghcr.io/linuxcontainers/alpine:3.20 --restart=Never \
+  --command -- /bin/sh -c "echo hello from a VM; sleep 3600"
+
+kubectl get pods -o wide          # each pod has its own routable address
+kubectl logs demo
+ping "$(kubectl get pod demo -o jsonpath='{.status.podIP}')"
+
+# Services route inside the pods, using kube-proxy's own rules
+kubectl run web --image=busybox --restart=Never \
+  --command -- sh -c "echo hi from a Service > /tmp/index.html; httpd -f -p 8080 -h /tmp"
+kubectl expose pod web --port 80 --target-port 8080
+kubectl run probe --image=busybox --restart=Never --command -- sleep 3600
+kubectl exec probe -- wget -qO- http://web
+
+ferry status
+ferry down
+```
+
+With machines on (`ferry machines enable`), a pod chooses between its own VM
+and a container on a shared kernel with `runtimeClassName`:
+
+```sh
+kubectl run isolated --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-vm"}}' -- sleep 3600
+kubectl run dense --image=busybox --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"ferry-shared"}}' -- sleep 3600
+
+kubectl get pods -o wide              # isolated on the Mac, dense on a machine
+kubectl get nodes -L ferry.dev/mode   # the machine was made for it
+```
+
+[docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
+Jobs, what a pod that names neither gets, and what to do when one will not
+start. It also covers [native macOS pods](docs/RUNTIMES.md#macos-pods) —
+`ferry-macos-vm`, a Darwin workload in a macOS VM of its own.
+
+`ferry doctor` explains what is missing if the machine is not ready.
+
+### Building an image, without Docker
+
+```sh
+ferry image build -t myapp:dev .      # buildkit in a pod; nothing else needed
+kubectl run myapp --image=myapp:dev --image-pull-policy=IfNotPresent
+```
+
+The builder is buildkit running as an ordinary pod. It has its own kernel, so it
+gets the namespaces and the overlayfs it wants without relaxing anything on the
+Mac. The client is `buildctl`, which talks to the pod at the address Kubernetes
+knows it by, because the Mac is on that subnet already. Nothing is forwarded and
+nothing is proxied. The result goes straight into the image store pods are
+served from, so there is no registry in the loop.
+
+That store is one node's, so every image loaded or built is also kept by
+`ferry-registry` and served read-only to every other node in the cluster. The
+other nodes on this Mac ask it before the real registry, and mode 2 machines ask
+it at their gateway. For anything it does not hold, it asks the other Macs'
+registries over TLS, and those answer only the cluster's nodes. The image
+reference does not change. Use `imagePullPolicy: IfNotPresent`. `Never` works
+on this Mac's nodes, which a load fills directly. See `FERRY_MACHINE_REGISTRY`
+in [docs/INSTALL.md](docs/INSTALL.md).
+
+It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
+does not have to be installed, let alone running.
+
+The builder speaks mutual TLS, because it has to listen on the pod's real
+address, the only path the Mac has to it, and that address is on a network
+every pod shares. A privileged build daemon anything could drive would be a way
+to run as root in a VM holding your whole build cache. ferry issues a CA, a
+server certificate and one client certificate into `~/.ferry/pki/builder` on
+the first build. The daemon requires the client certificate and the Mac has the
+only copy. A NetworkPolicy denying every pod goes on as well, though that one
+is enforced only on a kernel built by `ferry kernel`, since the stock guest
+kernel has no nftables to enforce it with.
+
+Against the workflow it replaces, `docker buildx build` and then `kind load
+docker-image`, both warm, from an edited file to a cluster that can run it:
+
+| | `ferry image build` | docker + `kind load` |
+|:--|--:|--:|
+| alpine, one COPY | **0.47 s** | 1.02 s |
+| node app, 92 MB | **1.34 s** | 2.08 s |
+| python app, 449 MB | **5.37 s** | 6.69 s |
+
+The builder stays up between builds, because its layer cache is what makes the
+second build fast, and it costs about 330 MiB of lazily-backed guest memory to
+keep. Docker Desktop's VM occupies 1,741 MiB before it has built anything.
+`ferry image build --stop` ends it. Measured in
+[experiment 25](experiments/25-build-without-docker/FINDINGS.md).
+
+### Addons
+
+```sh
+ferry addons list
+ferry addons enable registry          # localhost:5001, for the Mac and for pods
+crane copy busybox:1.36 localhost:5001/busybox:1.36
+kubectl run hi --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
+```
+
+There are eleven, each pinned to a version that has been run here and checked
+for what it is for, not only for its pods going Ready: metrics-server,
+ingress-nginx and Traefik, a registry, the Kubernetes Dashboard and Headlamp,
+cert-manager, the Gateway API CRDs and Envoy Gateway, kube-state-metrics and a
+single Prometheus. `enable` waits until the addon works and says why when it
+does not. `disable` removes exactly what was applied. Upstream manifests are
+fetched by sha256 and cached, so a second enable needs no network. Every pod is
+a VM of roughly 300 MiB, so the addons are the lean variants, and
+[addons/README.md](addons/README.md) lists each one's pods and measured memory.
+
+### Limits worth knowing
+
+- **A volume that arrives after boot has slower synced writes until the pod's
+  VM is rebuilt.** A pod VM cannot be given a disk once it is running, but
+  nothing that arrives late costs it the VM any more. An image -- a main
+  container's pulled after its sidecar started, or a `kubectl debug`
+  container's -- is mounted into the running VM in about 40 ms, and a claim
+  or emptyDir in 2-50 ms, and the container joins in place
+  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). A late volume's
+  flush is a host `fsync()`, as a boot volume disk's is, but costs about twice
+  as much (166 µs against 82).
+- **The cluster starts at login, not at boot.** `Virtualization.framework` will
+  not make a VM from a process outside a user session, so the login agent is a
+  LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
+  holds the cluster there until somebody logs in. A Mac that *joined* another
+  cluster does not come back at all, because a worker's credentials live under
+  `/tmp`. Rejoin it with a fresh token.
+- **Services** route inside each pod using kube-proxy's own rules and need no
+  privilege on the Mac. The release ships the guest kernel that makes this
+  work. A checkout has to `ferry kernel` first, or ferry falls back to a host
+  proxy that does need root. Conntrack is not reconciled. TCP and UDP are
+  verified end to end. SCTP works inside the cluster only, since macOS has no
+  SCTP for a NodePort or LoadBalancer to be served with
+  ([experiment 27](experiments/27-edge-policy-sctp/FINDINGS.md)).
+- `logs` (including `--previous`), `exec`, `port-forward`, `attach` and `cp`
+  all work. Attach needs the pod to set `stdin: true` to accept input, since
+  the stream has to be wired in when the container is created.
+- **Memory can decide how many pods fit, before the 128-VM ceiling does.** An
+  idle pod VM costs **133 MiB** of host memory before its workload does
+  anything, flat at 20 and 60 pods. It was 226 MiB until
+  [experiment 32](experiments/32-pod-memory-footprint/FINDINGS.md) found most of
+  that was read-ahead into the guest agent's binaries and a kernel carrying
+  drivers no VM has. Only the guest agent's own disk keeps the small
+  read-ahead that saving came from. A pod's image and volume disks read ahead
+  1 MiB, which triples a 64 KiB-block read of a large file (4.8 to 14.4 GB/s)
+  for 0-4 MiB on alpine, nginx or python, and 17 MiB on node, whose 120 MiB
+  binary is paged in by the window. Set `FERRY_POD_READAHEAD_KB` for the node,
+  or the `ferry.dev/read-ahead-kb` annotation for one pod. A bigger VM costs
+  about 21 MiB more per GiB it is given.
+  ferry sets `maxPods` from the machine's memory, budgeting half of it for that
+  overhead: 110 from 32 GiB up, 61 on a 16 GiB Mac, overridable with
+  `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared. Every
+  other VM, Docker Desktop included, takes one of ferry's slots. See also
+  [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
+- **A ferry-cri that dies keeps its pod network.** vmnet holds a subnet long
+  after the process that created it dies with VMs attached -- fifteen minutes
+  and more in [experiment 41](experiments/41-vmnet-owner/FINDINGS.md) -- so the
+  next start used to land on another subnet, changing every pod address, and a
+  Mac joined to others refused to start at all. `ferry-netd` now creates and
+  holds the network and outlives a ferry-cri that did not stop cleanly, so the
+  next start gets the same subnet. A clean `ferry down` releases it at once, as
+  it has since [experiment 22](experiments/22-vmnet-lifecycle/FINDINGS.md). If
+  ferry-netd itself dies, ferry-cri stops rather than leave pods nothing can
+  reach, and the cluster comes back on a new subnet. vmnet allows 32 networks
+  across the whole Mac.
+- **`ferry down` leaves the cluster's objects in etcd.** It stops processes and
+  deletes nothing. Pods come back on the next `ferry up`.
+
+## Requirements
+
+To **run** ferry, which is what `curl -sfL https://get.ferry.kurpuis.com | sh -` does:
+
+- Apple silicon, macOS 26 (Tahoe)
+
+That is the whole list. The release is built binaries, ad-hoc signed. The
+signature carries the `com.apple.security.virtualization` entitlement
+`ferry-cri` needs, and an ad-hoc signature is a hash of the binary itself, so
+it survives the trip to another Mac.
+
+## How it compares
+
 ### Against kind and minikube, on one Mac
 
 Every stack ran on **Kubernetes v1.37.0**, one after another, each on a machine
@@ -268,10 +523,13 @@ keeps running keeps the pages it has touched. Machines are off until
 
 ## Status
 
-Early, but the questions that decide whether it can work are answered.
+What has been proven, and where it was measured.
 [docs/GAPS.md](docs/GAPS.md) is what ferry does not do yet, measured against
 kind and minikube. [docs/HANDOFF.md](docs/HANDOFF.md) is the architecture and
 the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) is what stays stable across 1.x
+releases, [CHANGELOG.md](CHANGELOG.md) what changed, and
+[CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.
 
 - **Control plane runs natively on macOS.** etcd, kube-apiserver,
   kube-controller-manager and kube-scheduler run as darwin/arm64 processes. The
@@ -388,7 +646,7 @@ the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
   GPU into machines is not built. See [docs/MACHINES.md](docs/MACHINES.md).
 - **ferry installs in one line.** `curl -sfL https://get.ferry.kurpuis.com |
   sh -` downloads a release, verifies it, puts `ferry` and a matching `kubectl`
-  on the PATH, registers a login agent and starts a cluster. Apple silicon and
+  on the PATH and starts a cluster. Apple silicon and
   macOS 26 are the only requirements, with no Swift, no Go, no Kubernetes
   source tree and no `sudo`. Another Mac joins with one line carrying a token,
   so nobody copies binaries by hand any more. See [docs/INSTALL.md](docs/INSTALL.md).
@@ -483,219 +741,6 @@ bin/versions/<vX.Y.Z>/               kubelet, control plane and etcd per version
 bin/                                 build output, symlinked to a version (gitignored)
 ```
 
-## Install
-
-```sh
-curl -sfL https://get.ferry.kurpuis.com | sh -
-```
-
-That downloads a release, puts `ferry` and a matching `kubectl` on your PATH,
-registers a login agent so the cluster comes back after a reboot, and starts it.
-It needs no Swift, no Go, no Kubernetes source tree, and no `sudo`. The release
-carries the kubelet, the control plane, etcd, the runtime and the guest kernel
-already built.
-
-Adding a second Mac is one line from the first Mac's `ferry token create`:
-
-```sh
-curl -sfL https://get.ferry.kurpuis.com | FERRY_URL=mac1.local:6443 FERRY_TOKEN=F10… sh -
-```
-
-A release also carries **mode 2**, where the node is the VM and pods share its
-kernel ([docs/MACHINES.md](docs/MACHINES.md)). It is off until
-`ferry machines enable`.
-
-Not sure which setup you want? `ferry init` asks what the cluster is for and
-writes the answers to a config file that `ferry config` explains and every
-`ferry up` names. The choices are a laptop you develop on, clusters a script
-creates and deletes, or an always-on node. See
-[Configuration](docs/INSTALL.md#configuration).
-
-Details, the environment variables, and how to uninstall are in
-[docs/INSTALL.md](docs/INSTALL.md). To build ferry instead of installing it, see
-[Building from source](#building-from-source).
-
-## Try it
-
-```sh
-export KUBECONFIG=~/.ferry/admin.conf     # or: ferry kubeconfig --merge
-kubectl run demo --image=ghcr.io/linuxcontainers/alpine:3.20 --restart=Never \
-  --command -- /bin/sh -c "echo hello from a VM; sleep 3600"
-
-kubectl get pods -o wide          # each pod has its own routable address
-kubectl logs demo
-ping "$(kubectl get pod demo -o jsonpath='{.status.podIP}')"
-
-# Services route inside the pods, using kube-proxy's own rules
-kubectl run web --image=busybox --restart=Never \
-  --command -- sh -c "echo hi from a Service > /tmp/index.html; httpd -f -p 8080 -h /tmp"
-kubectl expose pod web --port 80 --target-port 8080
-kubectl run probe --image=busybox --restart=Never --command -- sleep 3600
-kubectl exec probe -- wget -qO- http://web
-
-ferry status
-ferry down
-```
-
-With machines on (`ferry machines enable`), a pod chooses between its own VM
-and a container on a shared kernel with `runtimeClassName`:
-
-```sh
-kubectl run isolated --image=busybox --restart=Never \
-  --overrides='{"spec":{"runtimeClassName":"ferry-vm"}}' -- sleep 3600
-kubectl run dense --image=busybox --restart=Never \
-  --overrides='{"spec":{"runtimeClassName":"ferry-shared"}}' -- sleep 3600
-
-kubectl get pods -o wide              # isolated on the Mac, dense on a machine
-kubectl get nodes -L ferry.dev/mode   # the machine was made for it
-```
-
-[docs/RUNTIMES.md](docs/RUNTIMES.md) is how to choose for Deployments and
-Jobs, what a pod that names neither gets, and what to do when one will not
-start. It also covers [native macOS pods](docs/RUNTIMES.md#macos-pods) —
-`ferry-macos-vm`, a Darwin workload in a macOS VM of its own.
-
-`ferry doctor` explains what is missing if the machine is not ready.
-
-### Building an image, without Docker
-
-```sh
-ferry image build -t myapp:dev .      # buildkit in a pod; nothing else needed
-kubectl run myapp --image=myapp:dev --image-pull-policy=IfNotPresent
-```
-
-The builder is buildkit running as an ordinary pod. It has its own kernel, so it
-gets the namespaces and the overlayfs it wants without relaxing anything on the
-Mac. The client is `buildctl`, which talks to the pod at the address Kubernetes
-knows it by, because the Mac is on that subnet already. Nothing is forwarded and
-nothing is proxied. The result goes straight into the image store pods are
-served from, so there is no registry in the loop.
-
-That store is one node's, so every image loaded or built is also kept by
-`ferry-registry` and served read-only to every other node in the cluster. The
-other nodes on this Mac ask it before the real registry, and mode 2 machines ask
-it at their gateway. For anything it does not hold, it asks the other Macs'
-registries over TLS, and those answer only the cluster's nodes. The image
-reference does not change. Use `imagePullPolicy: IfNotPresent`. `Never` works
-on this Mac's nodes, which a load fills directly. See `FERRY_MACHINE_REGISTRY`
-in [docs/INSTALL.md](docs/INSTALL.md).
-
-It needs `buildctl` (`brew install buildkit`) and nothing else. Docker Desktop
-does not have to be installed, let alone running.
-
-The builder speaks mutual TLS, because it has to listen on the pod's real
-address, the only path the Mac has to it, and that address is on a network
-every pod shares. A privileged build daemon anything could drive would be a way
-to run as root in a VM holding your whole build cache. ferry issues a CA, a
-server certificate and one client certificate into `~/.ferry/pki/builder` on
-the first build. The daemon requires the client certificate and the Mac has the
-only copy. A NetworkPolicy denying every pod goes on as well, though that one
-is enforced only on a kernel built by `ferry kernel`, since the stock guest
-kernel has no nftables to enforce it with.
-
-Against the workflow it replaces, `docker buildx build` and then `kind load
-docker-image`, both warm, from an edited file to a cluster that can run it:
-
-| | `ferry image build` | docker + `kind load` |
-|:--|--:|--:|
-| alpine, one COPY | **0.47 s** | 1.02 s |
-| node app, 92 MB | **1.34 s** | 2.08 s |
-| python app, 449 MB | **5.37 s** | 6.69 s |
-
-The builder stays up between builds, because its layer cache is what makes the
-second build fast, and it costs about 330 MiB of lazily-backed guest memory to
-keep. Docker Desktop's VM occupies 1,741 MiB before it has built anything.
-`ferry image build --stop` ends it. Measured in
-[experiment 25](experiments/25-build-without-docker/FINDINGS.md).
-
-### Addons
-
-```sh
-ferry addons list
-ferry addons enable registry          # localhost:5001, for the Mac and for pods
-crane copy busybox:1.36 localhost:5001/busybox:1.36
-kubectl run hi --image=localhost:5001/busybox:1.36 --restart=Never -- echo hi
-```
-
-There are eleven, each pinned to a version that has been run here and checked
-for what it is for, not only for its pods going Ready: metrics-server,
-ingress-nginx and Traefik, a registry, the Kubernetes Dashboard and Headlamp,
-cert-manager, the Gateway API CRDs and Envoy Gateway, kube-state-metrics and a
-single Prometheus. `enable` waits until the addon works and says why when it
-does not. `disable` removes exactly what was applied. Upstream manifests are
-fetched by sha256 and cached, so a second enable needs no network. Every pod is
-a VM of roughly 300 MiB, so the addons are the lean variants, and
-[addons/README.md](addons/README.md) lists each one's pods and measured memory.
-
-### Limits worth knowing
-
-- **A volume that arrives after boot has slower synced writes until the pod's
-  VM is rebuilt.** A pod VM cannot be given a disk once it is running, but
-  nothing that arrives late costs it the VM any more. An image -- a main
-  container's pulled after its sidecar started, or a `kubectl debug`
-  container's -- is mounted into the running VM in about 40 ms, and a claim
-  or emptyDir in 2-50 ms, and the container joins in place
-  ([experiment 42](experiments/42-late-disks/FINDINGS.md)). A late volume's
-  flush is a host `fsync()`, as a boot volume disk's is, but costs about twice
-  as much (166 µs against 82).
-- **The cluster starts at login, not at boot.** `Virtualization.framework` will
-  not make a VM from a process outside a user session, so the login agent is a
-  LaunchAgent rather than a LaunchDaemon. A Mac that reboots to the login window
-  holds the cluster there until somebody logs in. A Mac that *joined* another
-  cluster does not come back at all, because a worker's credentials live under
-  `/tmp`. Rejoin it with a fresh token.
-- **Services** route inside each pod using kube-proxy's own rules and need no
-  privilege on the Mac. The release ships the guest kernel that makes this
-  work. A checkout has to `ferry kernel` first, or ferry falls back to a host
-  proxy that does need root. Conntrack is not reconciled. TCP and UDP are
-  verified end to end. SCTP works inside the cluster only, since macOS has no
-  SCTP for a NodePort or LoadBalancer to be served with
-  ([experiment 27](experiments/27-edge-policy-sctp/FINDINGS.md)).
-- `logs` (including `--previous`), `exec`, `port-forward`, `attach` and `cp`
-  all work. Attach needs the pod to set `stdin: true` to accept input, since
-  the stream has to be wired in when the container is created.
-- **Memory can decide how many pods fit, before the 128-VM ceiling does.** An
-  idle pod VM costs **133 MiB** of host memory before its workload does
-  anything, flat at 20 and 60 pods. It was 226 MiB until
-  [experiment 32](experiments/32-pod-memory-footprint/FINDINGS.md) found most of
-  that was read-ahead into the guest agent's binaries and a kernel carrying
-  drivers no VM has. Only the guest agent's own disk keeps the small
-  read-ahead that saving came from. A pod's image and volume disks read ahead
-  1 MiB, which triples a 64 KiB-block read of a large file (4.8 to 14.4 GB/s)
-  for 0-4 MiB on alpine, nginx or python, and 17 MiB on node, whose 120 MiB
-  binary is paged in by the window. Set `FERRY_POD_READAHEAD_KB` for the node,
-  or the `ferry.dev/read-ahead-kb` annotation for one pod. A bigger VM costs
-  about 21 MiB more per GiB it is given.
-  ferry sets `maxPods` from the machine's memory, budgeting half of it for that
-  overhead: 110 from 32 GiB up, 61 on a 16 GiB Mac, overridable with
-  `FERRY_MAX_PODS`. The hypervisor's 128-VM ceiling is still shared. Every
-  other VM, Docker Desktop included, takes one of ferry's slots. See also
-  [experiments/13-shared-kernel-cost](experiments/13-shared-kernel-cost/FINDINGS.md).
-- **A ferry-cri that dies keeps its pod network.** vmnet holds a subnet long
-  after the process that created it dies with VMs attached -- fifteen minutes
-  and more in [experiment 41](experiments/41-vmnet-owner/FINDINGS.md) -- so the
-  next start used to land on another subnet, changing every pod address, and a
-  Mac joined to others refused to start at all. `ferry-netd` now creates and
-  holds the network and outlives a ferry-cri that did not stop cleanly, so the
-  next start gets the same subnet. A clean `ferry down` releases it at once, as
-  it has since [experiment 22](experiments/22-vmnet-lifecycle/FINDINGS.md). If
-  ferry-netd itself dies, ferry-cri stops rather than leave pods nothing can
-  reach, and the cluster comes back on a new subnet. vmnet allows 32 networks
-  across the whole Mac.
-- **`ferry down` leaves the cluster's objects in etcd.** It stops processes and
-  deletes nothing. Pods come back on the next `ferry up`.
-
-## Requirements
-
-To **run** ferry, which is what `curl -sfL https://get.ferry.kurpuis.com | sh -` does:
-
-- Apple silicon, macOS 26 (Tahoe)
-
-That is the whole list. The release is built binaries, ad-hoc signed. The
-signature carries the `com.apple.security.virtualization` entitlement
-`ferry-cri` needs, and an ad-hoc signature is a hash of the binary itself, so
-it survives the trip to another Mac.
-
 ## Building from source
 
 This is only needed to change ferry. Everything below is a *build* dependency.
@@ -776,6 +821,14 @@ ship one that is missing a piece. That includes mode 2's node image, unless it
 is told `--without-node-image`, which the release then records.
 `release/publish.sh` refuses a dirty tree, or a tarball built from a commit
 other than the tag's — the checks `cut.sh` leans on.
+
+With `--publish`, `cut.sh` then points the Homebrew tap
+([imaustink/homebrew-ferry](https://github.com/imaustink/homebrew-ferry)) at
+the release. For a draft, run that step once the draft is live:
+
+```sh
+./release/tap.sh v0.15.0
+```
 
 `install.sh` itself is served from GitHub Pages, republished from `main`
 whenever it changes, so the installer people run is the one in this repository.

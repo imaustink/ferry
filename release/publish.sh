@@ -76,15 +76,28 @@ repo="$(git -C "$root" remote get-url origin 2>/dev/null \
 ok "publishing to $repo"
 
 bold "publishing ferry $version"
+# The other Kubernetes versions the tarball says it offers, each with its
+# checksum. Every one VERSION lists has to be here: a release that offers a
+# version it did not publish fails at 'ferry up', on someone else's Mac.
+assets=("$tarball" "$tarball.sha256")
+packaged_k8s="$(tar -xOzf "$tarball" "ferry-$version/VERSION" 2>/dev/null | sed -n 's/^kubernetes=//p')"
+for v in $(tar -xOzf "$tarball" "ferry-$version/VERSION" 2>/dev/null | sed -n 's/^kubernetes-available=//p'); do
+  [ "$v" = "$packaged_k8s" ] && continue
+  k="$out/ferry-$version-kubernetes-$v-darwin-arm64.tar.gz"
+  [ -f "$k" ] && [ -f "$k.sha256" ] || die "VERSION offers Kubernetes $v but $k is missing -- rebuild with release/build.sh"
+  assets+=("$k" "$k.sha256")
+done
+ok "${#assets[@]} assets, Kubernetes $(( ${#assets[@]} / 2 )) version(s)"
+
 if gh release view "$version" --repo "$repo" >/dev/null 2>&1; then
   ok "release exists; replacing its assets"
-  gh release upload "$version" "$tarball" "$tarball.sha256" --repo "$repo" --clobber \
+  gh release upload "$version" "${assets[@]}" --repo "$repo" --clobber \
     || die "upload failed"
 else
   args=(--repo "$repo" --title "ferry $version")
   if [ -n "$notes" ]; then args+=(--notes-file "$notes"); else args+=(--generate-notes); fi
   [ -n "$draft" ] && args+=(--draft)
-  gh release create "$version" "$tarball" "$tarball.sha256" "${args[@]}" \
+  gh release create "$version" "${assets[@]}" "${args[@]}" \
     || die "could not create the release"
 fi
 

@@ -22,8 +22,10 @@ ferry and an unreasonable thing to ask of someone trying it.
 4. Links `ferry` into the first writable of `/usr/local/bin` then
    `~/.local/bin`, and says so if that directory is not on your `PATH`.
 5. Installs a matching `kubectl` there if you do not already have one.
-6. Registers a LaunchAgent so the cluster starts at login.
-7. Runs `ferry up`, or `ferry join` if `FERRY_URL` and `FERRY_TOKEN` are set.
+6. Runs `ferry up`, or `ferry join` if `FERRY_URL` and `FERRY_TOKEN` are set.
+7. Registers a LaunchAgent so the cluster starts at login, only if you ask
+   (`FERRY_SERVICE=1`), if this Mac is joining a cluster, or if an earlier
+   install already registered one. Otherwise nothing starts unless you run it.
 
 ## The install paths
 
@@ -36,12 +38,16 @@ curl -sfL https://get.ferry.kurpuis.com | sh -
 ```
 
 The default. Downloads the latest release, verifies it, links `ferry` and
-`kubectl`, registers the login agent, and starts a cluster.
+`kubectl`, and starts a cluster. To have it come back at every login as well:
+
+```sh
+curl -sfL https://get.ferry.kurpuis.com | FERRY_SERVICE=1 sh -
+```
 
 ### Install without starting anything
 
 ```sh
-curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 FERRY_SKIP_SERVICE=1 sh -
+curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 sh -
 ```
 
 Nothing binds a port, claims a vmnet subnet, or touches `~/.ferry`. Useful on a
@@ -83,6 +89,26 @@ curl -sfL https://get.ferry.kurpuis.com | \
 Installs, then joins instead of starting a cluster of its own. See
 [Adding nodes](#adding-nodes). Run it from a Terminal window on that Mac, not
 over SSH.
+
+### Homebrew
+
+```sh
+brew install imaustink/ferry/ferry
+ferry up
+```
+
+The same release tarball, installed under Homebrew's prefix with shell
+completion for zsh, bash and fish, and `kubectl` from `kubernetes-cli`. It
+starts nothing: `ferry up` is the next step, and `ferry service install` makes
+the cluster start at every login. `brew upgrade ferry` is the upgrade.
+Homebrew 7 asks you to trust a third-party tap before it uses it; naming the
+formula in full, as above, is enough.
+
+`bin/ferry` is a two-line script that runs
+`$(brew --prefix)/opt/ferry/libexec/ferry` rather than a symlink into the
+versioned Cellar, so the login agent keeps working across `brew upgrade`. Use
+one install method per Mac: both put a `ferry` on the `PATH`, and the first one
+wins.
 
 ### Build from source
 
@@ -353,7 +379,8 @@ in the installer.
 | `FERRY_INSTALL_DIR` | `~/.ferry-dist` | where releases are unpacked |
 | `FERRY_BIN_DIR` | `/usr/local/bin`, else `~/.local/bin` | where `ferry` is linked |
 | `FERRY_SKIP_START` | unset | `1` to install without starting a cluster |
-| `FERRY_SKIP_SERVICE` | unset | `1` to not register the login agent |
+| `FERRY_SERVICE` | off; on for a join; kept on upgrade | `1` to register the login agent that starts the cluster at login, `0` never to. `ferry service install` does the same later |
+| `FERRY_SKIP_SERVICE` | unset | `1`, the older spelling of `FERRY_SERVICE=0` |
 | `FERRY_SKIP_KUBECTL` | unset | `1` to not install kubectl even if missing |
 | `FERRY_DOWNLOAD_BASE` | the release's GitHub URL | where to fetch the tarball; needs `FERRY_VERSION` |
 | `FERRY_REPO` | `imaustink/ferry` | which repository to install from |
@@ -445,6 +472,9 @@ own.
 | `FERRY_MAC_IMAGE` | — | **override** for the golden **macOS** VM bundle cloned for `spec.os: darwin` machines — what makes [macOS pods](RUNTIMES.md#macos-pods) schedulable. Normally you don't set this: `ferry mac-image bake` (or `ferry machines enable --mac-image`) caches the bundle at `$FERRY_HOME/mac-image/golden-node` and ferry finds it automatically. Set it only to point at a bundle kept elsewhere. `ferry mac-image status` shows what is in use. Building the bundle is [experiment 39](../experiments/39-macos-pods/FINDINGS.md), and [RUNTIMES.md](RUNTIMES.md#building-the-image) has the steps |
 | `FERRY_MACHINE_SUBNET` | `192.168.<200+index>.0/24` | the one vmnet network every machine sits on |
 | `FERRY_MACHINE_DURABILITY` | the config file's `machineDurability` | what a machine's disk survives, for a Machine whose spec does not say: `power-loss`, `os-crash` or `process-crash`. Unset follows the cluster's durability. Also what provisioned machines carry, as the FerryNodeClass's `durability` |
+| `FERRY_MERGE_KUBECONFIG` | the config file's `mergeKubeconfig`, else on | `0` to stop `ferry up` merging into `~/.kube/config` for this run. See [kubeconfig](#kubeconfig) |
+| `FERRY_NO_UPDATE_CHECK` | unset | `1` to stop `ferry up` and `ferry status` saying when a newer release is out. It is never said off a terminal. The check is one anonymous request to GitHub's releases API, made in the background at most once a day |
+| `FERRY_UPDATE_CACHE` | `~/.ferry-dist/latest-release` | where that check keeps the latest version it saw |
 | `FERRY_DEFAULT_RUNTIME` | the config file's `defaultRuntime`, else `none` | where a pod that names no RuntimeClass runs, for this run: `ferry-vm`, `ferry-shared` or `none`. See [Configuration](#configuration) |
 | `FERRY_MACHINE_DNS_IP` | `10.96.0.10` | the ClusterIP machines resolve through |
 | `FERRY_KUBE_PROXY_IMAGE` | `registry.k8s.io/kube-proxy:v1.34.11` | kube-proxy inside machines |
@@ -457,6 +487,7 @@ own.
 | `FERRY_MACHINE_IMAGE` | unset | node disk for provisioned machines, if it should differ from `FERRY_NODE_DISK`. Rarely wanted |
 | `FERRY_NODE_VERBOSE` | unset | set to print a machine's whole console, kernel included, into `ferry logs ferry-node`. The first thing to reach for when a machine never goes Ready |
 | `FERRY_NODE_NO_CONFIG` | unset | set to boot a machine without its generated config disk. For debugging the image itself |
+| `FERRY_NODE_MAC_DEBUG` | unset | `1` to honour the runtime's `ferry.dev/debug-*` annotations on the macOS machines this ferry-node boots. Each lets a pod remove its own isolation, so leave it off outside debugging |
 | `FERRY_MACHINE_REGISTRY` | `1` | `0` to stop sharing loaded images between nodes. With it on, `ferry-registry` keeps what `ferry image load` and `ferry image build` load in `$FERRY_HOME/registry` and serves it read-only to every node that is not the one it was loaded on: `ferry-cri` on every node of this Mac asks it before the real registry, every machine's containerd does the same at the machine network's gateway, and it asks the other Macs' registries for any name it does not hold. Anything not stored falls through to the real registry. `ferry image load` also loads into the other nodes on this Mac, so `imagePullPolicy: Never` works on them; machines and other Macs need `IfNotPresent` |
 | `FERRY_MACHINE_REGISTRY_PORT` | `5050` + profile shift | the port it serves this Mac on: loopback and the machine network only. Not 5000, which macOS's AirPlay receiver holds |
 | `FERRY_REGISTRY_PEER_PORT` | `5051` + profile shift | the port it serves the cluster's other Macs on, over TLS. Both ends present their node's kubelet certificate, and only a certificate the cluster CA signed in group `system:nodes` is answered, so the LAN and pods are refused. The same number on every Mac of a cluster: each works out the others' from its own |
@@ -521,8 +552,8 @@ to.
 These are not all read in the same place, which is why the list drifted before.
 `ferry` and `install.sh` read most of them in shell, `control-plane/up.sh` reads
 `SERVICE_CIDR` and the etcd ports, and the Swift binaries read
-`FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`, `FERRY_NODE_VERBOSE` and
-`FERRY_NODE_NO_CONFIG` through `ProcessInfo.environment`, where grepping the
+`FERRY_ALLOW_OFF_SLICE`, `FERRY_CRI_TRACE`, `FERRY_NODE_VERBOSE`,
+`FERRY_NODE_NO_CONFIG` and `FERRY_NODE_MAC_DEBUG` through `ProcessInfo.environment`, where grepping the
 shell does not find them.
 
 To check nothing has been added without being written down:
@@ -542,7 +573,8 @@ ferry service install
 ferry service uninstall
 ```
 
-The installer registers this for you. It is a LaunchAgent, not a LaunchDaemon,
+The installer registers this only when asked (`FERRY_SERVICE=1`), when the Mac
+joins a cluster, or when it was registered already. It is a LaunchAgent, not a LaunchDaemon,
 for two reasons:
 
 - `Virtualization.framework` will not create a VM from a process outside a user
@@ -687,13 +719,28 @@ ferry kubeconfig            # prints the path
 ferry kubeconfig --merge    # adds it to ~/.kube/config as context "ferry"
 ```
 
-The merge leaves your current context where it was, and gives each profile
-its own cluster, user and context name (`ferry-e2e` for the `e2e` profile), so
-two clusters on one Mac cannot end up sharing one API server's entry.
+`ferry up` merges for you, so `kubectl` works as soon as it returns, the way
+it does after `kind create cluster`. Each profile gets its own cluster, user
+and context name (`ferry-e2e` for the `e2e` profile), so two clusters on one
+Mac cannot end up sharing one API server's entry.
 
-Merging is offered rather than done. `~/.kube/config` usually points at clusters
-that matter, and an installer that rewrites it uninvited will eventually break
-one. `--merge` backs the file up first, and uses kubectl's own merge.
+It switches kubectl to the new context only when that cannot take you off
+something that matters:
+
+| current context before `ferry up` | after |
+|---|---|
+| none, or one that no longer exists | ferry's |
+| another ferry profile's | ferry's |
+| anything else (a cloud cluster, kind, minikube) | unchanged; `ferry up` prints the `use-context` line |
+
+The first merge backs `~/.kube/config` up as `config.before-ferry.<time>`; a
+plain `ferry kubeconfig --merge` backs it up every time. Merging uses kubectl's
+own merge. To leave `~/.kube/config` alone entirely:
+
+```sh
+ferry config set mergeKubeconfig false     # or FERRY_MERGE_KUBECONFIG=0 for one run
+export KUBECONFIG=$(ferry kubeconfig)
+```
 
 ## Upgrading ferry
 
@@ -702,12 +749,37 @@ Run the installer again. It unpacks the new release beside the old one and moves
 being relinked. That is why `current` exists, and why ferry stops resolving
 symlinks there rather than pinning itself to the version directory.
 
-That also moves **Kubernetes**, because a release carries one: the kubelet,
-`ferry-proxyd`, the control plane and etcd, built and tested as a set. This is
-k3s' model, and here it is forced: `ferry upgrade apply` compiles a kubelet
-from a patched Kubernetes tree, and a release carries neither the tree nor a
-toolchain. In a release, `ferry upgrade` says so and stops, rather than finding
-out several minutes in.
+A cluster keeps the Kubernetes it was created with across a ferry upgrade.
+If the new release does not carry that version in its tarball, it downloads it
+the first time the cluster starts, as long as the release still offers it.
+New clusters start at the version the new release carries.
+
+`ferry upgrade apply`, which moves a running cluster to another Kubernetes
+while keeping its data, needs a checkout. It compiles a kubelet from a patched
+Kubernetes tree, and a release carries neither the tree nor a toolchain. In a
+release, `ferry upgrade` says so and stops, rather than finding out several
+minutes in. To try a cluster on another version, create one beside it:
+`ferry -p next up --kubernetes-version v1.37`.
+
+## Choosing the Kubernetes version
+
+```sh
+ferry version                                   # what this ferry offers
+ferry up --kubernetes-version v1.35             # a new cluster at v1.35
+ferry -p old up --kubernetes-version v1.34      # another, beside the first
+```
+
+A minor (`v1.35`) picks the newest patch offered for it. The version is
+chosen when a cluster is created and recorded beside its data. Every later
+`ferry up` starts it at that version, and asking an existing cluster for a
+different one is refused rather than silently ignored. A release carries one
+Kubernetes in its tarball and publishes each other version it offers as a
+separate download (about 150 MB), fetched and checksummed the first time a
+cluster asks for it. A checkout builds the version instead, which takes
+minutes because the kubelet compiles from source.
+
+`kubectl` warns when it is more than one minor away from the server. That is
+upstream's skew policy, not ferry's, and is harmless for most commands.
 
 In a checkout, where any version is a build input,
 `ferry upgrade plan|apply|nodes|rollback` works as documented in
