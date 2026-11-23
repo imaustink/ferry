@@ -50,6 +50,11 @@ struct PodRootfsLayout: Sendable {
     /// Host directories every known container shares over virtiofs, put in the
     /// VM's share from the start so a boot-time container need not change it.
     var shares: [String: Bool] = [:]
+    /// Where images that arrive after boot are put on the Mac, this pod's
+    /// alone, and the guest helper that mounts them. Nil leaves a late image
+    /// to cost the VM, as it always did. See PodRootfsProvider.attachLate.
+    var lateDirectory: String?
+    var loopHelper: String?
 
     /// Underscores cannot appear in a Kubernetes volume name, so these never
     /// collide with an emptyDir's pod volume, which is named after the volume.
@@ -117,6 +122,60 @@ struct PodRootfsLayout: Sendable {
     }
 }
 
+/// Things mounted into a running VM after boot, each under a name of its own
+/// and each mounted once.
+///
+/// PodRuntime is an actor, and it re-enters at every await of an attach, so
+/// two CreateContainer calls for one pod can overlap. The index that names an
+/// attachment's file and mountpoint is taken from a counter that only grows,
+/// so no two attempts share one -- not even a failed attempt and its retry,
+/// whose mount may yet complete after its timeout. And callers attaching the
+/// same key await the one attach in flight instead of starting a second.
+final class LateAttachments: Sendable {
+    private let next = Atomic<Int>(0)
+    private let state = Mutex<(done: [String: String], inFlight: [String: Task<String, any Error>])>(([:], [:]))
+
+    /// A fresh index, never handed out before.
+    func reserveIndex() -> Int { next.wrappingAdd(1, ordering: .relaxed).oldValue }
+
+    /// Where `key` is mounted, once its attach has finished.
+    func mounted(_ key: String) -> String? { state.withLock { $0.done[key] } }
+
+    var isEmpty: Bool { state.withLock { $0.done.isEmpty } }
+    var mounts: [String] { state.withLock { Array($0.done.values) } }
+    func removeAll() { state.withLock { $0.done.removeAll() } }
+
+    /// Attaches `key` once: `body`, given a fresh index, mounts it and returns
+    /// where. A caller that arrives while it runs awaits the same result; one
+    /// that arrives after it failed tries again with a new index.
+    @discardableResult
+    func attach(_ key: String, _ body: @escaping @Sendable (Int) async throws -> String) async throws -> String {
+        let found: (done: String?, task: Task<String, any Error>?) = state.withLock { state in
+            if let done = state.done[key] { return (done, nil) }
+            if let running = state.inFlight[key] { return (nil, running) }
+            let index = reserveIndex()
+            let task = Task<String, any Error> { try await body(index) }
+            state.inFlight[key] = task
+            return (nil, task)
+        }
+        if let done = found.done { return done }
+        guard let task = found.task else { preconditionFailure("neither mounted nor attaching") }
+        do {
+            let mountpoint = try await task.value
+            state.withLock { state in
+                state.done[key] = mountpoint
+                state.inFlight[key] = nil
+            }
+            return mountpoint
+        } catch {
+            state.withLock { state in
+                if state.inFlight[key] == task { state.inFlight[key] = nil }
+            }
+            throw error
+        }
+    }
+}
+
 /// Installs the provider on the VM instance the pod makes, and seeds the
 /// VM's virtiofs share with the directories already known.
 struct PodRootfsExtension: VZInstanceExtension {
@@ -156,8 +215,17 @@ final class PodRootfsProvider: HotplugProvider {
     /// The next of the scratch disk's ready-made upper directories. A fresh
     /// disk comes with every VM, so the count starts at zero with it.
     private let nextSlot = Atomic<Int>(0)
-    /// Each container's upper directory, and the image beneath it.
-    private let uppers = Mutex<[String: (base: String, lower: String)]>([:])
+    /// The directory on the scratch disk holding each container's upper and
+    /// work directories.
+    private let uppers = Mutex<[String: String]>([:])
+    /// Numbers discard's helper processes, whose ids must be unique.
+    private let nextDiscard = Atomic<Int>(0)
+    /// Images mounted after boot by attachLate: the image's disk on the Mac ->
+    /// where it is mounted in the VM.
+    private let late = LateAttachments()
+    /// Block volumes mounted after boot by attachLateVolume: pod volume name ->
+    /// where it is mounted in the VM.
+    private let lateVolumes = LateAttachments()
 
     init(instance: VZVirtualMachineInstance, layout: PodRootfsLayout) {
         self.instance = instance
@@ -165,7 +233,12 @@ final class PodRootfsProvider: HotplugProvider {
     }
 
     func hotplug(_ rootfs: Containerization.Mount, id: String) async throws -> AttachedFilesystem {
-        guard let image = layout.images[rootfs.source], let scratch = layout.scratch else {
+        if id.hasPrefix(Self.podVolumePrefix) {
+            return try await attachVolumeDevice(rootfs, name: String(id.dropFirst(Self.podVolumePrefix.count)))
+        }
+        guard let scratch = layout.scratch,
+              let lower = layout.images[rootfs.source].map(PodRootfsLayout.guestPath)
+                ?? late.mounted(rootfs.source) else {
             throw ContainerizationError(.unsupported, message: "image \(rootfs.source) is not attached to this pod")
         }
         // A slot made when the disk was formatted costs nothing here; past
@@ -187,11 +260,176 @@ final class PodRootfsProvider: HotplugProvider {
                 throw error
             }
         }
-        uppers.withLock { $0[id] = (base, PodRootfsLayout.guestPath(image)) }
+        uppers.withLock { $0[id] = base }
         return AttachedFilesystem(
             type: "overlay", source: "overlay", destination: rootfs.destination,
-            options: ["lowerdir=\(PodRootfsLayout.guestPath(image))",
-                      "upperdir=\(base)/upper", "workdir=\(base)/work"])
+            options: ["lowerdir=\(lower)", "upperdir=\(base)/upper", "workdir=\(base)/work"])
+    }
+
+    /// Whether this VM can take a container of `image` without a new device.
+    func has(image: String) -> Bool {
+        layout.images[image] != nil || late.mounted(image) != nil
+    }
+
+    /// Mounts an image the VM was not booted with, so a container of it can
+    /// join the running pod instead of costing the pod its VM.
+    ///
+    /// Virtualization.framework cannot add a disk to a running VM, but the
+    /// VM's virtiofs share can grow (hotplugVirtioFS). So the image's disk is
+    /// cloned -- free on APFS -- into this pod's late directory, the directory
+    /// is shared, and ferry-loop, run as a root-of-VM process with
+    /// CAP_SYS_ADMIN, puts a read-only loop device under it and mounts it in
+    /// PID 1's mount namespace, where container roots are assembled. Reads run
+    /// at 2.6-4.2 GB/s against 3.2-12 for a disk attached at boot
+    /// (experiments/42-late-disks), which an image's start-up does not notice.
+    ///
+    /// The loop device is autoclear and goes with the VM; the directory on
+    /// the Mac goes with the sandbox (removeLateDirectory).
+    func attachLate(image: String) async throws {
+        guard layout.images[image] == nil else { return }
+        guard let directory = layout.lateDirectory, layout.loopHelper != nil else {
+            throw ContainerizationError(.unsupported, message: "late images are off for this pod")
+        }
+        try await late.attach(image) { [self] index in
+            let fm = FileManager.default
+            try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            let file = "late-\(index).ext4"
+            let hostFile = (directory as NSString).appendingPathComponent(file)
+            try? fm.removeItem(atPath: hostFile)
+            try fm.copyItem(atPath: image, toPath: hostFile)   // clonefile on APFS
+            let shared = try await shareReadOnly()
+            let mountpoint = PodRootfsLayout.guestPath("ferry_late_\(index)")
+            try await runHelper([shared.helper, "\(shared.directory)/\(file)", mountpoint, "ro"],
+                                id: "ferry-late-\(index)")
+            return mountpoint
+        }
+    }
+
+    /// Puts ferry-loop in this pod's late directory and shares the directory
+    /// read-only, returning where both are in the VM. The helper runs as VM
+    /// root with CAP_SYS_ADMIN, so it is only ever run from this share, which
+    /// nothing in the guest can write -- never from the read-write one.
+    private func shareReadOnly() async throws -> (directory: String, helper: String) {
+        guard let directory = layout.lateDirectory, let helper = layout.loopHelper else {
+            throw ContainerizationError(.unsupported, message: "late mounts are off for this pod")
+        }
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let hostHelper = (directory as NSString).appendingPathComponent("ferry-loop")
+        if !fm.fileExists(atPath: hostHelper) {
+            // Copied beside and renamed into place, so a concurrent attach
+            // never sees half a binary.
+            let partial = hostHelper + ".\(UUID().uuidString)"
+            try fm.copyItem(atPath: helper, toPath: partial)
+            if rename(partial, hostHelper) != 0 {
+                let reason = String(cString: strerror(errno))
+                try? fm.removeItem(atPath: partial)
+                throw RuntimeFailure.invalid("cannot place \(hostHelper): \(reason)")
+            }
+        }
+        let share = try Containerization.Mount.share(source: directory, destination: "/", options: ["ro"])
+        try await hotplugVirtioFS([share], id: "late")
+        let guestDirectory = "/run/virtiofs/\(try share.tagHash)"
+        return (guestDirectory, "\(guestDirectory)/ferry-loop")
+    }
+
+    /// The hotplug id LinuxPod.attachVolume gives a disk-image volume.
+    static let podVolumePrefix = "pod-volume-"
+    /// Loop devices for late volumes are /dev/loop<base + index>: numbered by
+    /// ferry-cri, so it knows the device without reading the helper's
+    /// output, and far above the low numbers LOOP_CTL_GET_FREE hands late
+    /// images.
+    static let volumeDeviceBase = 512
+    /// The index attachVolume reserved for each volume being attached, read
+    /// back by the hotplug call LinuxPod makes in the middle of it.
+    private let volumeIndex = Mutex<[String: Int]>([:])
+
+    /// Mounts a volume the VM was not booted with, through LinuxPod's own
+    /// attachVolume (Containerization #1022), so LinuxPod mounts it where a
+    /// boot volume goes (/run/volumes/<name>), accepts containers' shared
+    /// mounts of it, and unmounts it when the pod stops -- after its
+    /// containers, which writes back what they did not sync. Without that
+    /// unmount, unsynced writes were lost: a VM stopped 650 ms after 4 MiB
+    /// was written left a volume with no such file (experiments/42-late-disks).
+    ///
+    /// A memory volume is a tmpfs, which attachVolume mounts itself. A
+    /// disk-image volume comes back here as a hotplug; see attachVolumeDevice.
+    /// Concurrent calls for one volume share one attach.
+    func attachVolume(_ volume: LinuxPod.PodVolume, to pod: LinuxPod) async throws {
+        try await lateVolumes.attach(volume.name) { [self] index in
+            volumeIndex.withLock { $0[volume.name] = index }
+            defer { volumeIndex.withLock { _ = $0.removeValue(forKey: volume.name) } }
+            try await pod.attachVolume(volume)
+            return "/run/volumes/\(volume.name)"
+        }
+    }
+
+    /// The device under a late disk-image volume, which LinuxPod then mounts.
+    ///
+    /// The volume is written to, so it cannot be a clone. Its own file is hard
+    /// linked into rw/ under the late directory, which is shared read-write;
+    /// sharing the volume's real directory instead would show the pod every
+    /// other volume beside it. ferry-loop, from the read-only share, puts it
+    /// under a loop device. A flush in the guest arrives as a host fsync(),
+    /// which is what a volume disk attached at boot gets
+    /// (VZDiskImageSynchronizationMode.fsync), and nothing synced is lost when
+    /// the VM is killed. Synced writes cost about twice as much until a
+    /// rebuild attaches the volume as a disk.
+    private func attachVolumeDevice(_ mount: Containerization.Mount, name: String) async throws -> AttachedFilesystem {
+        guard let base = layout.lateDirectory, layout.loopHelper != nil,
+              let index = volumeIndex.withLock({ $0[name] }) else {
+            throw ContainerizationError(.unsupported, message: "late volumes are off for this pod")
+        }
+        let fm = FileManager.default
+        let directory = (base as NSString).appendingPathComponent("rw")
+        try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let file = "\(name).ext4"
+        let hostFile = (directory as NSString).appendingPathComponent(file)
+        try? fm.removeItem(atPath: hostFile)
+        // A hard link, not a copy: the guest writes the volume itself. Fails
+        // across file systems, and the caller falls back to a rebuild.
+        try fm.linkItem(atPath: mount.source, toPath: hostFile)
+        // The helper comes from the read-only share; only the volume's file
+        // is in this one, which the guest can write.
+        let shared = try await shareReadOnly()
+        let share = try Containerization.Mount.share(source: directory, destination: "/", options: [])
+        try await hotplugVirtioFS([share], id: "late-rw")
+        let readOnly = mount.options.contains("ro")
+        let device = Self.volumeDeviceBase + index
+        try await runHelper([shared.helper, "attach", "/run/virtiofs/\(try share.tagHash)/\(file)",
+                             readOnly ? "ro" : "rw", "\(device)"], id: "ferry-late-vol-\(index)")
+        return AttachedFilesystem(type: mount.type, source: "/dev/loop\(device)",
+                                  destination: mount.destination, options: mount.options)
+    }
+
+    /// Runs ferry-loop as a root-of-VM process with CAP_SYS_ADMIN: in the VM's
+    /// own root and PID 1's mount namespace, where container roots are put
+    /// together, and not in any container's.
+    private func runHelper(_ args: [String], id: String) async throws {
+        var process = ContainerizationOCI.Process(
+            args: args,
+            env: ["PATH=/usr/bin:/bin"],
+            capabilities: Containerization.LinuxCapabilities(capabilities: [.sysAdmin]).toOCI())
+        process.user = ContainerizationOCI.User(uid: 0, gid: 0)
+        let agent = try await instance.dialAgent()
+        do {
+            // containerID nil: a process in the VM's own root and namespaces,
+            // not in any container's (Containerization 0.51, #1020).
+            try await agent.createProcess(id: id, containerID: nil, stdinPort: nil, stdoutPort: nil,
+                                          stderrPort: nil, ociRuntimePath: nil,
+                                          configuration: ContainerizationOCI.Spec(process: process), options: nil)
+            _ = try await agent.startProcess(id: id, containerID: nil)
+            let status = try await agent.waitProcess(id: id, containerID: nil, timeoutInSeconds: 30)
+            try? await agent.deleteProcess(id: id, containerID: nil)
+            try? await agent.close()
+            guard status.exitCode == 0 else {
+                throw ContainerizationError(.internalError, message: "ferry-loop exited \(status.exitCode): \(args.dropFirst().joined(separator: " "))")
+            }
+        } catch {
+            try? await agent.deleteProcess(id: id, containerID: nil)
+            try? await agent.close()
+            throw error
+        }
     }
 
     func registerMounts(id: String, rootfs: AttachedFilesystem, additionalMounts: [Containerization.Mount]) throws {
@@ -218,57 +456,20 @@ final class PodRootfsProvider: HotplugProvider {
     /// pod was deleted: one that writes 100 MiB before it dies filled 16 GiB in
     /// a day of backoff, and then every container in the pod was out of space.
     ///
-    /// The guest agent can make a directory but not remove one, so this runs
-    /// `rm` in a short-lived container of the image the container ran -- which
-    /// has an `rm` far more often than not -- with the upper directory bound
-    /// at /tmp. Its root is that image under a tmpfs overlay, since vmexec
-    /// has to make /proc and /dev in whatever root it is given, and the tmpfs
-    /// goes when it is done. An image without an `rm` keeps its garbage, as
-    /// before, and says so.
+    /// The guest agent can make a directory but not remove one, so ferry-loop
+    /// does, as a root-of-VM process (Containerization #1020) run from the
+    /// read-only late share. This used to run `rm` in a short-lived container
+    /// of the image the container ran, so a distroless or scratch image, with
+    /// no `rm`, kept every crash-looping attempt's writes until the pod went.
     func discard(id: String) async {
-        guard let (base, lower) = uppers.withLock({ $0.removeValue(forKey: id) }) else { return }
-        let janitor = "rm-\(id)"
-        let work = "/run/ferry-rm/\(id)"
-        var process = ContainerizationOCI.Process(
-            args: ["/bin/rm", "-rf", "/tmp/upper", "/tmp/work"],
-            env: ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"],
-            capabilities: Containerization.LinuxCapabilities.allCapabilities.toOCI())
-        process.user = ContainerizationOCI.User(uid: 0, gid: 0)
-        let spec = ContainerizationOCI.Spec(
-            process: process,
-            mounts: [ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc", options: []),
-                     ContainerizationOCI.Mount(type: "devtmpfs", source: "none", destination: "/dev",
-                                               options: ["nosuid", "mode=755"]),
-                     ContainerizationOCI.Mount(type: "none", source: base, destination: "/tmp", options: ["bind"])],
-            root: ContainerizationOCI.Root(path: "\(work)/root", readonly: false),
-            linux: ContainerizationOCI.Linux(
-                cgroupsPath: "/container/ferry-rm/\(id)",
-                namespaces: [.init(type: .mount), .init(type: .pid), .init(type: .ipc), .init(type: .uts)]))
-        var agent: Vminitd?
+        guard let base = uppers.withLock({ $0.removeValue(forKey: id) }) else { return }
         do {
-            let dialed = try await instance.dialAgent()
-            agent = dialed
-            try await dialed.mount(ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: work,
-                                                              options: ["size=16m"]))
-            try await dialed.mkdir(path: "\(work)/upper", all: true, perms: 0o755)
-            try await dialed.mkdir(path: "\(work)/work", all: true, perms: 0o755)
-            try await dialed.mount(ContainerizationOCI.Mount(
-                type: "overlay", source: "overlay", destination: "\(work)/root",
-                options: ["lowerdir=\(lower)", "upperdir=\(work)/upper", "workdir=\(work)/work"]))
-            try await dialed.createProcess(id: janitor, containerID: janitor, stdinPort: nil, stdoutPort: nil,
-                                           stderrPort: nil, ociRuntimePath: nil, configuration: spec, options: nil)
-            _ = try await dialed.startProcess(id: janitor, containerID: janitor)
-            let status = try await dialed.waitProcess(id: janitor, containerID: janitor, timeoutInSeconds: 60)
-            if status.exitCode != 0 { throw ContainerizationError(.internalError, message: "rm exited \(status.exitCode)") }
+            let shared = try await shareReadOnly()
+            try await runHelper([shared.helper, "rm", base], id: "ferry-rm-\(nextDiscard.wrappingAdd(1, ordering: .relaxed).oldValue)")
         } catch {
             FileHandle.standardError.write(
                 "warning: what \(id) wrote stays on its pod's scratch disk: \(error)\n".data(using: .utf8)!)
         }
-        guard let agent else { return }
-        try? await agent.deleteProcess(id: janitor, containerID: janitor)
-        try? await agent.umount(path: "\(work)/root", flags: 0)
-        try? await agent.umount(path: work, flags: 0)
-        try? await agent.close()
     }
 
     /// Adds any directory the VM does not already share to its one virtiofs
