@@ -31,6 +31,15 @@ case "$tap" in
   *)        gh repo clone "$tap" "$work/tap" -- --quiet 2>/dev/null || die "could not clone $tap" ;;
 esac
 cd "$work/tap"
+# Work on main whatever the clone's HEAD names. An empty repository, or one
+# whose HEAD points at a branch that does not exist (git init's default is
+# master on some machines), checks nothing out, and every run would then look
+# like the first and push a commit with no parent.
+if git rev-parse --verify --quiet origin/main >/dev/null; then
+  git checkout --quiet -B main origin/main
+else
+  git checkout --quiet --orphan main 2>/dev/null || true
+fi
 
 mkdir -p Formula
 if [ -f Formula/ferry.rb ] && [ "$(cat Formula/ferry.rb)" = "$formula" ]; then
