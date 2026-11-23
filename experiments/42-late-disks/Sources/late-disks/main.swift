@@ -149,7 +149,7 @@ func say(_ title: String, _ code: Int32) {
 // 8. What ferry-cri's flush saves (CONTROL_ONLY=1, CONTROL_FLUSH=0|1). A
 // late ext4 volume gets 4 MiB written without syncing, and the VM is stopped
 // at once the way LinuxPod.stop does it -- with CONTROL_FLUSH=1, after the
-// guest's sync and an unmount, as PodRootfsProvider.flushLateVolumes does.
+// guest's sync and an unmount, as LinuxPod.stop unmounts an attached volume.
 // Then a second VM boots with the volume attached as a disk, as the next pod
 // would, and reads the file: its kernel replays the journal, which the EXT4
 // reader on the Mac would not.

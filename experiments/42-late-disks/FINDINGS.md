@@ -128,28 +128,32 @@ but not yet acknowledged.
 
 ## Late block volumes in ferry-cri
 
-`PodRootfsProvider.attachLateVolume`, called when a booted VM lacks block
-volumes the container mounts:
+A late volume goes through Containerization's `LinuxPod.attachVolume` (#1022),
+called by `PodRootfsProvider.attachVolume` when a booted VM lacks volumes the
+container mounts. LinuxPod mounts it where a boot volume goes,
+`/run/volumes/<name>`, so the container's shared mounts and subPaths are the
+same, and unmounts it in `stop()` after the containers. That unmount is what
+writes back what was never synced (see the control below). For a disk-image
+volume, attachVolume asks the VM's hotplug provider for a device, and ferry's:
 
-1. hard-link the volume's own image (a claim's `disk.ext4`, an emptyDir's
+1. hard-links the volume's own image (a claim's `disk.ext4`, an emptyDir's
    `.ferry-disk.ext4`) into `<state>/late/<sandbox>/rw/`. A clone would not see
    the guest's writes, and sharing the volume's real directory would show the
    pod every other volume beside it;
-2. share `rw/` read-write;
-3. `ferry-loop FILE /run/volumes/<name> rw`: where LinuxPod mounts a volume
-   attached at boot, so the container's bind mounts and subPaths are the same;
-4. create the subPaths the container names, with the volume root's mode.
+2. shares `rw/` read-write;
+3. runs `ferry-loop attach FILE rw N` from the read-only late share, which puts
+   the file under `/dev/loopN`. ferry-cri picks N (512 plus a reserved
+   index), so it knows the device without reading the helper's output, and
+   hands it back for LinuxPod to mount.
 
-A `medium: Memory` emptyDir needs no file: `attachLateMemory` has the guest
-agent mount a tmpfs at `/run/volumes/<name>`, the mount LinuxPod makes at
-boot, and it is carried across a later rebuild like any memory volume.
+ferry-cri then creates the subPaths the container names, with the volume
+root's mode. A `medium: Memory` emptyDir is attachVolume's own tmpfs, carried
+across a later rebuild like any memory volume.
 
-LinuxPod.stop unmounts the volumes it was made with, which writes back what
-was never synced. It does not know of late ones. So before every stop of a
-pod VM that has any (pod deletion, rebuild, ferry-cri's own shutdown),
-ferry-cri stops the pod's containers, as the pod's stop would a moment
-later, then runs the guest's `sync` and unmounts each one. Stopping them
-first means nothing writes between the sync and the end.
+The first version did LinuxPod's part itself: its own mount, and before each
+of three stop paths, stopping the pod's containers, a guest `sync`, and an
+unmount of each late volume. attachVolume made all of that unnecessary. The
+measurements below were taken on both versions.
 
 | | before | now |
 |---|---|---|
@@ -166,7 +170,7 @@ the volume attached as a disk, as the next pod would be:
 | | runs | the next VM reads |
 |---|---|---|
 | stopped as LinuxPod.stop does | 5 | journal recovered, **the file does not exist** |
-| guest `sync` and unmount first, as ferry-cri does | 4 | the file, md5 matching, no recovery |
+| guest `sync` and unmount first, as LinuxPod.stop unmounts an attached volume | 4 | the file, md5 matching, no recovery |
 
 ## What this leaves
 
