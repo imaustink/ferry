@@ -2,7 +2,7 @@
 # Print the Homebrew formula for a release, to commit to the tap
 # (github.com/imaustink/homebrew-ferry, as Formula/ferry.rb):
 #
-#   release/homebrew.sh v1.0.0 > ../homebrew-ferry/Formula/ferry.rb
+#   release/homebrew.sh v1.0.0      # print it; release/tap.sh commits it
 #   brew install imaustink/ferry/ferry
 #
 # The sha256 is read from dist/ when the release was built on this Mac, and

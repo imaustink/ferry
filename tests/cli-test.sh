@@ -943,6 +943,21 @@ if command -v ruby >/dev/null 2>&1; then
   is "it is valid Ruby" "$(echo "$formula" | ruby -c 2>&1)" "Syntax OK"
 fi
 is "a version that is not vX.Y.Z is refused" "$("$repo/release/homebrew.sh" 1.2 >/dev/null 2>&1; echo $?)" 2
+
+# release/tap.sh, against an empty bare repository standing in for the tap.
+tapdir="$sandbox/tap.git"; git init --quiet --bare "$tapdir"
+tap() { FERRY_TAP_REPO="$tapdir" FERRY_FORMULA_SHA256="$(printf '%064d' 0)" \
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  "$repo/release/tap.sh" "$1" 2>&1; }
+contains "tap.sh fills an empty tap" "$(tap v1.2.3)" "ferry 1.2.3"
+is "  on main" "$(git --git-dir="$tapdir" log --format=%s main 2>/dev/null)" "ferry 1.2.3"
+contains "  with the formula" "$(git --git-dir="$tapdir" show main:Formula/ferry.rb)" 'version "1.2.3"'
+contains "  and a README" "$(git --git-dir="$tapdir" show main:README.md)" "brew install imaustink/ferry/ferry"
+contains "the same version again changes nothing" "$(tap v1.2.3)" "already has ferry v1.2.3"
+tap v1.2.4 >/dev/null
+is "a new version is one more commit" "$(git --git-dir="$tapdir" rev-list --count main)" 2
+contains "cut.sh updates the tap only for a live release" \
+  "$(sed -n '/homebrew tap/,$p' "$repo/release/cut.sh")" 'if [ -n "$publish" ]; then'
 echo
 
 # --- logs --bundle -----------------------------------------------------------

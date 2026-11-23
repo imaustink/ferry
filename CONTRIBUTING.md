@@ -67,8 +67,8 @@ See [Cutting a release](README.md#cutting-a-release). Before publishing:
    `FERRY_VERSION=<new> FERRY_DOWNLOAD_BASE=file://$PWD/dist sh install.sh`
    and check the workload is still there and `kubectl` still reaches it.
 3. `CHANGELOG.md` has the release's section.
-4. After publishing, update the tap:
-   `./release/homebrew.sh <version> > ../homebrew-ferry/Formula/ferry.rb`.
+4. `cut.sh --publish` updates the Homebrew tap. After making a draft live,
+   run `./release/tap.sh <version>` yourself.
 
 ## License
 
