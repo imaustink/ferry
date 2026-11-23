@@ -323,6 +323,17 @@ func TestFollowerServesItsNodesAndKeepsThemWhenTheControlPlaneGoes(t *testing.T)
 		t.Fatal("a held caller was not woken by an upstream change")
 	}
 
+	// The change touched both nodes, and the follower has one long poll per
+	// node, so node a's half can wake the caller above while node b's is still
+	// on its way. Reading the generation before b's lands made the check below
+	// fail whenever it landed in the next few milliseconds (seen on CI): the
+	// generation moved, not because anything was published while the control
+	// plane was down, but because this was published before it went.
+	eventually(t, "both nodes have the change", func() bool {
+		body, _, _ := local(t, rules, 0)
+		return strings.Count(body, "10.244.0.9, 10.244.1.9") == 2
+	})
+
 	// The control plane goes away. Nothing is published, so the last rules
 	// stay what every caller is given, and a caller that has them is held.
 	_, before, _ := local(t, rules, 0)
