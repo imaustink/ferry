@@ -90,3 +90,18 @@ swiftc -O probe.swift -o probe
 codesign --force --sign - --entitlements entitlements.plist ./probe
 ./probe cycle        # or: ./probe hold, ./probe leak
 ```
+
+## Later probes: handing a network to another process
+
+Written while looking for a way round the leak, and the groundwork for
+[experiment 41](../41-vmnet-owner/FINDINGS.md), where ferry-netd owns the
+network and ferry-cri joins it by its serialization. Built like `probe`.
+
+| probe | asks |
+|---|---|
+| `share.swift` | can a network be serialized and rehydrated, is it the same subnet, and is a plain create of that subnet then refused? |
+| `kind.swift` | what XPC type `vmnet_network_copy_serialization` returns |
+| `owner.swift` `SUBNET FILE` | creates a network, writes its serialization's bytes to FILE, and holds it |
+| `joiner.swift` `FILE` | rehydrates that network in a different process |
+| `bridge.swift` | which interfaces vmnet can bridge onto, and whether a bridged network can be made with only the virtualization entitlement |
+| `vzbridge.swift` | what `VZBridgedNetworkInterface` lists, and whether its attachment can be built |

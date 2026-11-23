@@ -1,0 +1,85 @@
+# Every test that runs without a cluster, on every pull request and push to main.
+#
+# What this cannot run is a pod: GitHub's Apple-silicon runners are themselves
+# virtual machines and do not offer nested virtualization, so
+# Virtualization.framework refuses to start a guest there. tests/e2e stays a
+# thing run on a real Mac before a release (release/cut.sh). Everything else --
+# the CLI, the installer, the release packaging checks, the upgrade logic, every
+# Go module and the Swift unit tests -- runs here.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-and-go:
+    name: shell suites, go vet, go test
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+
+      # kubectl is what cli-test.sh drives the kubeconfig merge through; without
+      # it those checks are skipped rather than run.
+      - name: Install kubectl and shellcheck
+        run: brew install kubectl shellcheck
+
+      # Errors only for now. There are about thirty warnings in the tree today;
+      # gating on them is a separate cleanup, not a reason to have no gate.
+      - name: shellcheck
+        run: |
+          shellcheck -S error ferry install.sh lib/*.sh release/*.sh \
+            tests/*.sh tests/e2e/*.sh control-plane/*.sh
+
+      - name: install.sh parses as /bin/sh
+        run: sh -n install.sh
+
+      - name: tests/run.sh
+        env:
+          FERRY_TEST_SWIFT: '0'
+        run: ./tests/run.sh
+
+  swift:
+    name: swift test
+    # ferry-cri builds against Apple's Containerization package, which needs
+    # Swift 6.4 and the macOS 26 SDK. Until the hosted image carries that by
+    # default (it had 6.3.3 when this was written), the job says so and skips
+    # rather than failing every PR on the toolchain. With 6.4 present, a test
+    # failure fails the job.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        id: toolchain
+        run: |
+          swift --version
+          v="$(swift --version 2>&1 | sed -n 's/.*Swift version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+          major="${v%%.*}"; minor="${v#*.}"
+          if [ "${major:-0}" -gt 6 ] || { [ "${major:-0}" -eq 6 ] && [ "${minor:-0}" -ge 4 ]; }; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=swift test skipped::the runner has Swift $v; ferry-cri needs 6.4"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: ferry-cri
+        if: steps.toolchain.outputs.ok == 'true'
+        run: ./tests/swift.sh ferry-cri
+      - name: ferry-node
+        if: steps.toolchain.outputs.ok == 'true'
+        run: ./tests/swift.sh experiments/18-node-image

@@ -74,7 +74,11 @@ contains "the disk comes from SnapshotManager" "$runtime" \
 contains "each node runs from a hard link of its own" "$runtime" \
   'try fm.linkItem(at: shared, to: mine)'
 contains "a snapshot goes once no node links to it" "$runtime" \
-  'if Self.linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }'
+  'if linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }'
+contains "a cross-volume copy is renamed into place, never left half-written" "$runtime" \
+  'try fm.moveItem(at: partial, to: mine)'
+contains "snapshots from before they were shared are moved into the shared directory" "$runtime" \
+  'if let shared = config.snapshotsDir { Self.moveSnapshots(from: ownSnapshots, into: shared) }'
 contains "a half-written legacy disk is not adopted" "$runtime" \
   'if (try? EXT4.EXT4Reader(blockDevice: FilePath(path))) == nil {'
 contains "the identity's disk is the image's snapshot" "$runtime" \

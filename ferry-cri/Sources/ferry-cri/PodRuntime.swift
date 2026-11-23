@@ -338,8 +338,9 @@ actor PodRuntime {
         // 2 GiB every image used to get, kept for small ones. A pod attaches it
         // read-only and its containers write to an overlay on the scratch
         // disk, so nothing more is needed than the image itself.
-        self.snapshots = try SnapshotManager(path: config.snapshotsDir
-                                                 ?? config.stateDir.appending(component: Self.snapshotDirectory),
+        let ownSnapshots = config.stateDir.appending(component: Self.snapshotDirectory)
+        if let shared = config.snapshotsDir { Self.moveSnapshots(from: ownSnapshots, into: shared) }
+        self.snapshots = try SnapshotManager(path: config.snapshotsDir ?? ownSnapshots,
                                              capacityInBytes: UInt64(2.gib()))
         var commandLine = Kernel.CommandLine(debug: false, panic: 0)
         commandLine.kernelArgs += Self.podKernelArgs + config.extraKernelArgs
@@ -2849,21 +2850,53 @@ actor PodRuntime {
         // as SnapshotManager leaves them too. A .tmp is another node's unpack
         // in progress unless it is a day old: SnapshotManager clears a dead one
         // when the same image is unpacked again, and this clears the rest.
-        let directory = snapshots.path.path(percentEncoded: false)
-        let stale = Date().addingTimeInterval(-86_400)
-        for name in (try? fm.contentsOfDirectory(atPath: directory)) ?? [] {
-            let path = (directory as NSString).appendingPathComponent(name)
-            if name.hasSuffix(".ext4"), Self.linkCount(path) == 1 {
-                remove(path)
-            } else if name.hasPrefix("."), name.hasSuffix(".tmp"),
-                      let modified = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
-                      modified < stale {
-                remove(path)
-            }
+        for path in Self.unusedSnapshots(in: snapshots.path.path(percentEncoded: false)) {
+            remove(path)
         }
         if removed > 0 {
             print("    images    \(removed) unused root filesystems removed (\(freed / 1_048_576) MiB apparent)")
         }
+    }
+
+    /// The snapshots in a snapshot directory that no node links to, and the
+    /// unpacks there that died at least a day before `now`. See sweepImageDisks.
+    static func unusedSnapshots(in directory: String, now: Date = Date()) -> [String] {
+        let fm = FileManager.default
+        let stale = now.addingTimeInterval(-86_400)
+        var unused: [String] = []
+        for name in (try? fm.contentsOfDirectory(atPath: directory)) ?? [] {
+            let path = (directory as NSString).appendingPathComponent(name)
+            if name.hasSuffix(".ext4"), linkCount(path) == 1 {
+                unused.append(path)
+            } else if name.hasPrefix("."), name.hasSuffix(".tmp"),
+                      let modified = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+                      modified < stale {
+                unused.append(path)
+            }
+        }
+        return unused
+    }
+
+    /// Snapshots this node unpacked into its own state directory before they
+    /// were shared, moved into the shared directory -- or the first start
+    /// after that upgrade would unpack every image again, and the old ones
+    /// would never be swept, since the sweep looks only at the shared
+    /// directory. One the shared directory already has is dropped. Only whole
+    /// snapshots are moved: SnapshotManager renames a finished one into place,
+    /// so a .tmp is an unpack that never finished.
+    static func moveSnapshots(from old: URL, into shared: URL) {
+        let fm = FileManager.default
+        let oldPath = old.standardizedFileURL.path(percentEncoded: false)
+        guard oldPath != shared.standardizedFileURL.path(percentEncoded: false),
+              let names = try? fm.contentsOfDirectory(atPath: oldPath) else { return }
+        try? fm.createDirectory(at: shared, withIntermediateDirectories: true)
+        for name in names where name.hasSuffix(".ext4") && !name.hasPrefix(".") {
+            let target = shared.appending(component: name)
+            if !fm.fileExists(atPath: target.path(percentEncoded: false)) {
+                try? fm.moveItem(at: old.appending(component: name), to: target)
+            }
+        }
+        try? fm.removeItem(at: old)
     }
 
     func pullImage(_ reference: String) async throws -> String {
@@ -2933,8 +2966,16 @@ actor PodRuntime {
                 continue      // deleted between the unpack and the link
             } catch {
                 // Another volume: a clone is this node's own as much as a link
-                // would be, and shares the blocks the same way.
-                try fm.copyItem(at: shared, to: mine)
+                // would be, and shares the blocks the same way. Copied aside and
+                // renamed, so a copy cut short is never taken for a whole disk.
+                let partial = nodeDirectory.appending(component: ".\(key.encoded).tmp")
+                try? fm.removeItem(at: partial)
+                try fm.copyItem(at: shared, to: partial)
+                do {
+                    try fm.moveItem(at: partial, to: mine)
+                } catch CocoaError.fileWriteFileExists {
+                    try? fm.removeItem(at: partial)   // a concurrent call got there first
+                }
                 return mine
             }
         }
@@ -2975,11 +3016,15 @@ actor PodRuntime {
     /// more, and the snapshot behind it once no node links to it. Safe while a
     /// pod runs from it: its VM holds the file open.
     private func releaseDisk(_ source: String) {
+        Self.releaseDisk(source, snapshots: snapshots.path)
+    }
+
+    static func releaseDisk(_ source: String, snapshots: URL) {
         let fm = FileManager.default
         try? fm.removeItem(atPath: source)
-        let shared = snapshots.path.appending(component: (source as NSString).lastPathComponent)
+        let shared = snapshots.appending(component: (source as NSString).lastPathComponent)
             .path(percentEncoded: false)
-        if Self.linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }
+        if linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }
     }
 
     static func linkCount(_ path: String) -> UInt64? {

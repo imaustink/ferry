@@ -38,3 +38,6 @@ macos-containers-demo/hello
 experiments/40-mac-build-run/.cache/
 experiments/40-mac-build-run/build/
 experiments/40-mac-build-run/mkimage-run/mkimage-run
+
+# macOS Finder metadata.
+.DS_Store

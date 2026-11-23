@@ -55,6 +55,18 @@ FERRY_CONTROL_PLANE_BINARIES="kube-apiserver kube-controller-manager kube-schedu
 # shellcheck disable=SC2034 # read by the four scripts that source this file
 FERRY_DEFAULT_K8S_VERSION="v1.37.0"
 
+# Every Kubernetes a release offers, one per minor, oldest first. The tarball
+# carries FERRY_DEFAULT_K8S_VERSION; each of the others is a separate download
+# published beside it (ferry-<release>-kubernetes-<version>-darwin-arm64.tar.gz)
+# and fetched the first time a cluster asks for it with
+# 'ferry up --kubernetes-version'. That is what kind's --image and minikube's
+# --kubernetes-version are for: testing against the Kubernetes production runs.
+#
+# Each entry has to be one whose kubelet the patches build, so these are the
+# versions that have been: the same ladder ferry_control_plane_version pins.
+# shellcheck disable=SC2034 # read by ferry and release/build.sh
+FERRY_RELEASE_K8S_VERSIONS="v1.34.0 v1.35.8 v1.36.4 v1.37.0"
+
 # --- version arithmetic ---------------------------------------------------
 
 ferry_version_valid() { # vX.Y.Z
