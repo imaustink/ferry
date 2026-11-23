@@ -749,6 +749,15 @@ Run the installer again. It unpacks the new release beside the old one and moves
 being relinked. That is why `current` exists, and why ferry stops resolving
 symlinks there rather than pinning itself to the version directory.
 
+A cluster that is up while you upgrade keeps running the old release until it
+restarts. `ferry up` and `ferry status` say so, and name the release it is on.
+Restart it to finish the upgrade; workloads, volumes and the cluster's state
+are kept:
+
+```sh
+ferry down && ferry up
+```
+
 A cluster keeps the Kubernetes it was created with across a ferry upgrade.
 If the new release does not carry that version in its tarball, it downloads it
 the first time the cluster starts, as long as the release still offers it.

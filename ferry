@@ -643,6 +643,26 @@ ferry_release_version() {
 }
 is_release() { [ -f "$here/VERSION" ]; }
 
+# Which release started the running cluster. Re-running the installer moves
+# ~/.ferry-dist/current under a cluster that is up, and the cluster keeps
+# running the old release's processes until it is restarted -- which nothing
+# said, so an upgrade looked done when it was not. A checkout is rebuilt all the
+# time and its developer knows to restart, so this is for releases only. A
+# cluster that is up with no record was started by a release from before it.
+ferry_note_started_by() {
+  is_release || return 0
+  mkdir -p "$FERRY_RUN" 2>/dev/null
+  ferry_release_version > "$FERRY_RUN/started-by" 2>/dev/null || true
+}
+# Prints the release the running cluster is on, when it is not this one.
+ferry_started_by_other() {
+  is_release || return 1
+  local started
+  started="$(cat "$FERRY_RUN/started-by" 2>/dev/null)"
+  [ "$started" = "$(ferry_release_version)" ] && return 1
+  echo "${started:-an earlier ferry}"
+}
+
 # Whether a newer release is out, said in one line after 'ferry up' and
 # 'ferry status' on an installed ferry, the way minikube does. Never in the
 # way: the answer is read from a cache, the cache is refreshed in the
@@ -1801,6 +1821,11 @@ cmd_up() {
       [ "$running_k8s" = "$want_k8s" ] || { bad "ferry is up at Kubernetes $running_k8s, not $want_k8s"; return 1; }
     fi
     ok "ferry is already up"
+    local other
+    if other="$(ferry_started_by_other)"; then
+      warn "it is still running $other, not $(ferry_release_version); restart it onto this release:"
+      echo "      ferry down && ferry up"
+    fi
     return 0
   fi
   if running ferry-cri || running kubelet; then
@@ -2042,6 +2067,7 @@ EOF
     fi
   fi
 
+  ferry_note_started_by
   echo
   bold "ferry is up"
   # kubectl should simply work afterwards, as it does after 'kind create
@@ -6635,6 +6661,10 @@ cmd_status() {
     warn "kubernetes $cluster (this checkout is built at $active)"
   else
     echo "  kubernetes ${cluster:-${active:-not built}}"
+  fi
+  local other
+  if running kubelet && other="$(ferry_started_by_other)"; then
+    warn "running $other, not $(ferry_release_version) -- restart onto it: ferry down && ferry up"
   fi
   if [ -f "$FERRY_CONFIG" ]; then echo "  config     $FERRY_CONFIG"
   else echo "  config     none -- defaults; 'ferry init' to choose"; fi

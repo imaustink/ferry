@@ -23,6 +23,11 @@ Kubernetes v1.37.0, control plane v1.37.0, etcd v3.6.5.
   and an upgrade keeps one that is already registered.
 - **`ferry down --purge` removes the cluster's kubeconfig context**, as
   `kind delete cluster` does.
+- **An upgrade says when the running cluster still needs a restart.** Running
+  the installer under a cluster that is up leaves it on the old release until
+  it restarts. `ferry up` and `ferry status` now name the release it is still on,
+  and say to run `ferry down && ferry up`. The first upgrade from v0.16.0 or
+  earlier says "an earlier ferry", because those releases kept no record.
 - Output has no colour codes when it is not going to a terminal, or under
   `NO_COLOR`.
 
