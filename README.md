@@ -522,6 +522,9 @@ What has been proven, and where it was measured.
 [docs/GAPS.md](docs/GAPS.md) is what ferry does not do yet, measured against
 kind and minikube. [docs/HANDOFF.md](docs/HANDOFF.md) is the architecture and
 the gotchas that cost time, as they stood when `ferry-cri` first ran pods.
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) is what stays stable across 1.x
+releases, [CHANGELOG.md](CHANGELOG.md) what changed, and
+[CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.
 
 - **Control plane runs natively on macOS.** etcd, kube-apiserver,
   kube-controller-manager and kube-scheduler run as darwin/arm64 processes. The

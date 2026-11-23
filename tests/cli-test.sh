@@ -871,7 +871,7 @@ un="$sandbox/update"; mkdir -p "$un/.ferry-dist"
 notice() { # cached-version [env...]
   echo "$1" > "$un/.ferry-dist/latest-release"; shift
   env -u FERRY_PROFILE HOME="$un" FERRY_RUN="$un/run" FERRY_HOME="$un/home" "$@" \
-    script -q /dev/null "$release/ferry" status 2>&1 | tr -d '\r'
+    script -q /dev/null "$release/ferry" status </dev/null 2>&1 | tr -d '\r'
 }
 contains "a newer release is announced on 'ferry status'" "$(notice v99.0.0)" "ferry v99.0.0 is out (this is v9.9.9)"
 lacks "  but not the release already installed" "$(notice v9.9.9)" "is out"

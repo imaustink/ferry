@@ -6749,7 +6749,7 @@ cmd_logs_bundle() {
     ok "wrote $out ($(du -h "$out" | cut -f1))"
     echo "  It holds component logs and cluster state, not credentials. Look"
     echo "  through it before attaching it to an issue:"
-    echo "  https://github.com/imaustink/ferry/issues/new"
+    echo "  https://github.com/imaustink/ferry/issues/new?template=bug.yml"
   else
     rm -rf "$work"; bad "could not write $out"; return 1
   fi
