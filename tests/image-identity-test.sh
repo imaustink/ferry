@@ -70,9 +70,17 @@ lacks "the unpack guard no longer asks about the name" "$runtime" \
 # file renamed into place, so a ferry-cri killed mid-unpack leaves no half disk
 # behind under the real name.
 contains "the disk comes from SnapshotManager" "$runtime" \
-  'return try await snapshots.unpack(image, for: platform)'
-contains "an existing snapshot is reused without unpacking" "$runtime" \
-  'if let existing = try await snapshots.get(image, for: platform) { return existing }'
+  'let shared = try await snapshots.unpack(image, for: platform)'
+contains "each node runs from a hard link of its own" "$runtime" \
+  'try fm.linkItem(at: shared, to: mine)'
+contains "a snapshot goes once no node links to it" "$runtime" \
+  'if linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }'
+contains "a cross-volume copy is renamed into place, never left half-written" "$runtime" \
+  'try fm.moveItem(at: partial, to: mine)'
+contains "snapshots from before they were shared are moved into the shared directory" "$runtime" \
+  'if let shared = config.snapshotsDir { Self.moveSnapshots(from: ownSnapshots, into: shared) }'
+contains "a half-written legacy disk is not adopted" "$runtime" \
+  'if (try? EXT4.EXT4Reader(blockDevice: FilePath(path))) == nil {'
 contains "the identity's disk is the image's snapshot" "$runtime" \
   'let disk = try await snapshotDisk(image, platform: platform)'
 lacks "the ext4 path is no longer derived from the index" "$runtime" \
@@ -114,7 +122,7 @@ lacks "removal does not drop another image's names that share the disk" "$runtim
 contains "removal gives the disk back once nothing unpacks to it" "$runtime" \
   'if !rootfsCache.values.contains(where: { $0.source == mount.source }) {'
 contains "removal gives the disk back" "$runtime" \
-  'try? FileManager.default.removeItem(atPath: mount.source)'
+  'releaseDisk(mount.source)'
 
 echo
 echo "a pod address is not reused while the Mac remembers it"

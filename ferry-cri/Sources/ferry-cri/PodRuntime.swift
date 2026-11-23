@@ -15,6 +15,7 @@ import ContainerizationOS
 import Foundation
 import NIOPosix
 import Synchronization
+import SystemPackage
 
 struct RuntimeConfig: Sendable {
     var stateDir: URL
@@ -26,6 +27,9 @@ struct RuntimeConfig: Sendable {
     /// bin/ferry-loop, the guest helper that mounts an image arriving after a
     /// pod VM booted. Nil: such an image costs the pod its VM, as before.
     var loopHelper: String? = nil
+    /// Where images are unpacked, shared by every node on this Mac so each
+    /// image is unpacked once. Nil: <state>/snapshots, this node's own.
+    var snapshotsDir: URL? = nil
     var initImage: String
     var defaultCPUs: Int
     var defaultMemoryBytes: UInt64
@@ -246,7 +250,9 @@ actor PodRuntime {
     /// one build tagged twice -- share a disk; written to a temporary file and renamed into place, so a
     /// ferry-cri killed mid-unpack never leaves half a disk that a later start
     /// takes for a whole one; and locked per snapshot, so concurrent pulls of
-    /// one image unpack it once.
+    /// one image unpack it once -- across processes, so every node on this
+    /// Mac shares one directory (--snapshots) and unpacks each image once.
+    /// Each node runs from a hard link of its own; see nodeDisk.
     private let snapshots: SnapshotManager
     private let kernel: Kernel
     private var initfs: Containerization.Mount!
@@ -332,7 +338,9 @@ actor PodRuntime {
         // 2 GiB every image used to get, kept for small ones. A pod attaches it
         // read-only and its containers write to an overlay on the scratch
         // disk, so nothing more is needed than the image itself.
-        self.snapshots = try SnapshotManager(path: config.stateDir.appending(component: Self.snapshotDirectory),
+        let ownSnapshots = config.stateDir.appending(component: Self.snapshotDirectory)
+        if let shared = config.snapshotsDir { Self.moveSnapshots(from: ownSnapshots, into: shared) }
+        self.snapshots = try SnapshotManager(path: config.snapshotsDir ?? ownSnapshots,
                                              capacityInBytes: UInt64(2.gib()))
         var commandLine = Kernel.CommandLine(debug: false, panic: 0)
         commandLine.kernelArgs += Self.podKernelArgs + config.extraKernelArgs
@@ -2830,22 +2838,65 @@ actor PodRuntime {
         where name.hasPrefix("image-") && name.hasSuffix(".ext4") {
             remove((state as NSString).appendingPathComponent(name))
         }
-        // Snapshots no image resolves to any more, and what a fill that died
-        // left. Nothing else unpacks into this directory: it is this node's,
-        // and this runs before the kubelet can ask for a pull.
-        let directory = snapshots.path.path(percentEncoded: false)
-        for name in (try? fm.contentsOfDirectory(atPath: directory)) ?? [] {
-            let path = (directory as NSString).appendingPathComponent(name)
-            if name.hasSuffix(".ext4"), !live.contains(path) {
-                remove(path)
-                try? fm.removeItem(atPath: String(path.dropLast(".ext4".count)) + ".lock")
-            } else if name.hasPrefix("."), name.hasSuffix(".tmp") {
-                remove(path)
-            }
+        // This node's links that no image here resolves to any more.
+        let mine = config.stateDir.appending(component: Self.nodeDiskDirectory).path(percentEncoded: false)
+        for name in (try? fm.contentsOfDirectory(atPath: mine)) ?? [] where name.hasSuffix(".ext4") {
+            let path = (mine as NSString).appendingPathComponent(name)
+            if !live.contains(path) { remove(path) }
+        }
+        // Snapshots that no node links to. The directory may be shared with
+        // every node on this Mac, so what is in use is the link count, not
+        // this node's images. A .lock stays, since another node may hold it,
+        // as SnapshotManager leaves them too. A .tmp is another node's unpack
+        // in progress unless it is a day old: SnapshotManager clears a dead one
+        // when the same image is unpacked again, and this clears the rest.
+        for path in Self.unusedSnapshots(in: snapshots.path.path(percentEncoded: false)) {
+            remove(path)
         }
         if removed > 0 {
             print("    images    \(removed) unused root filesystems removed (\(freed / 1_048_576) MiB apparent)")
         }
+    }
+
+    /// The snapshots in a snapshot directory that no node links to, and the
+    /// unpacks there that died at least a day before `now`. See sweepImageDisks.
+    static func unusedSnapshots(in directory: String, now: Date = Date()) -> [String] {
+        let fm = FileManager.default
+        let stale = now.addingTimeInterval(-86_400)
+        var unused: [String] = []
+        for name in (try? fm.contentsOfDirectory(atPath: directory)) ?? [] {
+            let path = (directory as NSString).appendingPathComponent(name)
+            if name.hasSuffix(".ext4"), linkCount(path) == 1 {
+                unused.append(path)
+            } else if name.hasPrefix("."), name.hasSuffix(".tmp"),
+                      let modified = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+                      modified < stale {
+                unused.append(path)
+            }
+        }
+        return unused
+    }
+
+    /// Snapshots this node unpacked into its own state directory before they
+    /// were shared, moved into the shared directory -- or the first start
+    /// after that upgrade would unpack every image again, and the old ones
+    /// would never be swept, since the sweep looks only at the shared
+    /// directory. One the shared directory already has is dropped. Only whole
+    /// snapshots are moved: SnapshotManager renames a finished one into place,
+    /// so a .tmp is an unpack that never finished.
+    static func moveSnapshots(from old: URL, into shared: URL) {
+        let fm = FileManager.default
+        let oldPath = old.standardizedFileURL.path(percentEncoded: false)
+        guard oldPath != shared.standardizedFileURL.path(percentEncoded: false),
+              let names = try? fm.contentsOfDirectory(atPath: oldPath) else { return }
+        try? fm.createDirectory(at: shared, withIntermediateDirectories: true)
+        for name in names where name.hasSuffix(".ext4") && !name.hasPrefix(".") {
+            let target = shared.appending(component: name)
+            if !fm.fileExists(atPath: target.path(percentEncoded: false)) {
+                try? fm.moveItem(at: old.appending(component: name), to: target)
+            }
+        }
+        try? fm.removeItem(at: old)
     }
 
     func pullImage(_ reference: String) async throws -> String {
@@ -2881,26 +2932,104 @@ actor PodRuntime {
         return config.stateDir.appending(component: "image-\(safe).ext4")
     }
 
-    /// The image's snapshot, unpacking it if there is none. A disk an older
-    /// ferry-cri unpacked -- named by the manifest digest, or before that the
-    /// index digest -- is moved into place rather than unpacked again, or the
-    /// first start after an upgrade would re-expand every image before the
-    /// kubelet got an answer. A pod running from the old name holds the file
-    /// open and does not notice.
+    /// This node's hard links to the snapshots it uses.
+    static let nodeDiskDirectory = "images"
+
+    /// The image's disk for this node: a hard link, in <state>/images, to its
+    /// snapshot, unpacking the snapshot if there is none.
+    ///
+    /// The link is what lets nodes share the snapshot directory. A node that
+    /// no longer needs a disk removes only its own link, and a snapshot is
+    /// deleted once its link count says no node holds it (releaseDisk,
+    /// sweepImageDisks). No node needs to know which images another uses, and
+    /// a race costs nothing but time: a node that links a snapshot as another
+    /// deletes it keeps the file through its link, and one whose link finds
+    /// the snapshot already gone unpacks it again.
     private func snapshotDisk(_ image: Containerization.Image,
                               platform: ContainerizationOCI.Platform) async throws -> URL {
-        if let existing = try await snapshots.get(image, for: platform) { return existing }
         let key = try await SnapshotManager.key(of: image, for: platform)
-        let entry = snapshots.path.appending(component: "\(key.encoded).ext4")
+        let fm = FileManager.default
+        let nodeDirectory = config.stateDir.appending(component: Self.nodeDiskDirectory)
+        try fm.createDirectory(at: nodeDirectory, withIntermediateDirectories: true)
+        let mine = nodeDirectory.appending(component: "\(key.encoded).ext4")
+        if fm.fileExists(atPath: mine.path(percentEncoded: false)) { return mine }
+        try await adoptLegacyDisk(image, platform: platform,
+                                  as: snapshots.path.appending(component: "\(key.encoded).ext4"))
+        for _ in 0..<3 {
+            let shared = try await snapshots.unpack(image, for: platform)
+            do {
+                try fm.linkItem(at: shared, to: mine)
+                return mine
+            } catch CocoaError.fileWriteFileExists {
+                return mine   // a concurrent call for the same image linked it
+            } catch let error as CocoaError where error.code == .fileNoSuchFile {
+                continue      // deleted between the unpack and the link
+            } catch {
+                // Another volume: a clone is this node's own as much as a link
+                // would be, and shares the blocks the same way. Copied aside and
+                // renamed, so a copy cut short is never taken for a whole disk.
+                let partial = nodeDirectory.appending(component: ".\(key.encoded).tmp")
+                try? fm.removeItem(at: partial)
+                try fm.copyItem(at: shared, to: partial)
+                do {
+                    try fm.moveItem(at: partial, to: mine)
+                } catch CocoaError.fileWriteFileExists {
+                    try? fm.removeItem(at: partial)   // a concurrent call got there first
+                }
+                return mine
+            }
+        }
+        throw RuntimeFailure.invalid("the snapshot of \(image.reference) kept disappearing before it could be linked")
+    }
+
+    /// A disk an older ferry-cri unpacked -- named by the manifest digest, or
+    /// before that the index digest -- moved to the snapshot's name rather
+    /// than unpacked again, or the first start after an upgrade would
+    /// re-expand every image before the kubelet got an answer.
+    ///
+    /// Only a whole one. The unpacker wrote straight to that name and an
+    /// older ferry-cri took any file there for a finished disk, so one killed
+    /// mid-unpack left half of one. The formatter writes the superblock last,
+    /// so a disk whose superblock does not read is half of one, and is
+    /// removed for the snapshot to be unpacked properly.
+    private func adoptLegacyDisk(_ image: Containerization.Image, platform: ContainerizationOCI.Platform,
+                                 as entry: URL) async throws {
+        let fm = FileManager.default
         let manifest = try? await image.descriptor(for: platform).digest
         for digest in [manifest, image.digest].compactMap({ $0 }) where !digest.isEmpty {
             let legacy = legacyImageDisk(digest)
-            if FileManager.default.fileExists(atPath: legacy.path(percentEncoded: false)),
-               (try? FileManager.default.moveItem(at: legacy, to: entry)) != nil {
-                return entry
+            let path = legacy.path(percentEncoded: false)
+            guard fm.fileExists(atPath: path) else { continue }
+            if (try? EXT4.EXT4Reader(blockDevice: FilePath(path))) == nil {
+                print("    images    \(legacy.lastPathComponent) was never finished; unpacking \(image.reference) again")
+                try? fm.removeItem(at: legacy)
+                continue
             }
+            if !fm.fileExists(atPath: entry.path(percentEncoded: false)) {
+                try? fm.moveItem(at: legacy, to: entry)
+            }
+            return
         }
-        return try await snapshots.unpack(image, for: platform)
+    }
+
+    /// Gives back this node's disk for an image no name here resolves to any
+    /// more, and the snapshot behind it once no node links to it. Safe while a
+    /// pod runs from it: its VM holds the file open.
+    private func releaseDisk(_ source: String) {
+        Self.releaseDisk(source, snapshots: snapshots.path)
+    }
+
+    static func releaseDisk(_ source: String, snapshots: URL) {
+        let fm = FileManager.default
+        try? fm.removeItem(atPath: source)
+        let shared = snapshots.appending(component: (source as NSString).lastPathComponent)
+            .path(percentEncoded: false)
+        if linkCount(shared) == 1 { try? fm.removeItem(atPath: shared) }
+    }
+
+    static func linkCount(_ path: String) -> UInt64? {
+        var st = stat()
+        return stat(path, &st) == 0 ? UInt64(st.st_nlink) : nil
     }
 
     /// Unpacks an image to a root filesystem and records it where the kubelet
@@ -2967,7 +3096,7 @@ actor PodRuntime {
                     imageConfigs.removeValue(forKey: key)
                     pulledImages.removeValue(forKey: key)
                 }
-                try? FileManager.default.removeItem(atPath: stale.source)
+                releaseDisk(stale.source)
             }
         }
         // The digest is now `identity` above, so it is a key on every path
@@ -3101,7 +3230,7 @@ actor PodRuntime {
         // made and holds it open, so removing the path does not take the disk
         // away from it.
         if !rootfsCache.values.contains(where: { $0.source == mount.source }) {
-            try? FileManager.default.removeItem(atPath: mount.source)
+            releaseDisk(mount.source)
         }
     }
 
