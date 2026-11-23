@@ -1025,10 +1025,7 @@ actor PodRuntime {
             containers[containerID]?.state = .exited
             containers[containerID]?.finishedAt = Self.now()
         }
-        if wasBooted {
-            await flushLateVolumes(id, record.pod)
-            try? await record.pod.stop()
-        }
+        if wasBooted { try? await record.pod.stop() }
         // After the stop, not before: the VM has to have let go of the image
         // before another pod's VM may attach it.
         releaseBlockVolumes(sandboxID: id)
@@ -1580,8 +1577,7 @@ actor PodRuntime {
         // most containers that arrive late, look like. Otherwise it needs a
         // device the VM cannot be given, and so a VM it can.
         // An image or a volume the VM was not booted with is mounted into it
-        // instead (PodRootfsProvider.attachLate, attachLateVolume,
-        // attachLateMemory).
+        // instead (PodRootfsProvider.attachLate, attachVolume).
         if let current = sandboxes[sandboxID], current.booted, current.ready, !current.needsRecreate,
            current.rootfsLayout.lateDirectory != nil {
             // A suffix of blockVolumes: the ones claimed since the VM booted.
@@ -1612,12 +1608,7 @@ actor PodRuntime {
                         }
                     }
                     for volume in missing {
-                        if let bytes = volume.tmpfsBytes {
-                            try await provider.attachLateMemory(mountpoint: volume.guestPath, bytes: bytes)
-                        } else {
-                            try await provider.attachLateVolume(name: volume.name, image: volume.image,
-                                                                mountpoint: volume.guestPath)
-                        }
+                        try await provider.attachVolume(volume.podVolume, to: pod)
                         guard stillPod() else { throw RuntimeFailure.unsupported("pod VM replaced during attach") }
                         if sandboxes[sandboxID]?.podVolumes.contains(volume) == false {
                             sandboxes[sandboxID]?.podVolumes.append(volume)
@@ -1929,24 +1920,6 @@ actor PodRuntime {
         sandboxes[sandboxID]?.blockVolumes.append(volume)
     }
 
-    /// Writes back and unmounts the block volumes mounted into a pod's VM after
-    /// boot, which LinuxPod.stop does not know to unmount. Called before every
-    /// stop of a booted pod; a no-op for a pod without any.
-    ///
-    /// The pod's containers are stopped first, as the pod's stop would a
-    /// moment later: a container still running after the sync could write
-    /// something that the stop then throws away.
-    private func flushLateVolumes(_ sandboxID: String, _ pod: LinuxPod) async {
-        let provider = try? await pod.withVirtualMachineInstance { vm in
-            (vm as? VZVirtualMachineInstance)?.hotplugProvider as? PodRootfsProvider
-        }
-        guard let provider, provider.hasLateVolumes else { return }
-        for id in containers.values.filter({ $0.sandboxID == sandboxID }).map(\.id) {
-            try? await pod.stopContainer(id)
-        }
-        await provider.flushLateVolumes()
-    }
-
     /// Hands back every block volume a sandbox holds. Only once its VM has
     /// stopped -- the callers see to that -- since the claim is what lets
     /// another pod's VM attach the image.
@@ -2220,7 +2193,6 @@ actor PodRuntime {
                 """)
         }
         await carryMemoryVolumes(sandboxID)
-        await flushLateVolumes(sandboxID, sandbox.pod)
         try? await sandbox.pod.stop()
         // The old containers keep their records, and with them their exit
         // codes and log paths: the kubelet reads the previous attempt's status
@@ -3133,7 +3105,6 @@ actor PodRuntime {
     /// the same subnet fails with VMNET_FAILURE.
     func shutdown() async {
         for record in sandboxes.values {
-            await flushLateVolumes(record.id, record.pod)
             try? await record.pod.stop()
             releaseBlockVolumes(sandboxID: record.id)
             network.releaseInterface(record.id)
