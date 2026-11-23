@@ -215,8 +215,11 @@ final class PodRootfsProvider: HotplugProvider {
     /// The next of the scratch disk's ready-made upper directories. A fresh
     /// disk comes with every VM, so the count starts at zero with it.
     private let nextSlot = Atomic<Int>(0)
-    /// Each container's upper directory, and the image beneath it.
-    private let uppers = Mutex<[String: (base: String, lower: String)]>([:])
+    /// The directory on the scratch disk holding each container's upper and
+    /// work directories.
+    private let uppers = Mutex<[String: String]>([:])
+    /// Numbers discard's helper processes, whose ids must be unique.
+    private let nextDiscard = Atomic<Int>(0)
     /// Images mounted after boot by attachLate: the image's disk on the Mac ->
     /// where it is mounted in the VM.
     private let late = LateAttachments()
@@ -257,7 +260,7 @@ final class PodRootfsProvider: HotplugProvider {
                 throw error
             }
         }
-        uppers.withLock { $0[id] = (base, lower) }
+        uppers.withLock { $0[id] = base }
         return AttachedFilesystem(
             type: "overlay", source: "overlay", destination: rootfs.destination,
             options: ["lowerdir=\(lower)", "upperdir=\(base)/upper", "workdir=\(base)/work"])
@@ -453,57 +456,20 @@ final class PodRootfsProvider: HotplugProvider {
     /// pod was deleted: one that writes 100 MiB before it dies filled 16 GiB in
     /// a day of backoff, and then every container in the pod was out of space.
     ///
-    /// The guest agent can make a directory but not remove one, so this runs
-    /// `rm` in a short-lived container of the image the container ran -- which
-    /// has an `rm` far more often than not -- with the upper directory bound
-    /// at /tmp. Its root is that image under a tmpfs overlay, since vmexec
-    /// has to make /proc and /dev in whatever root it is given, and the tmpfs
-    /// goes when it is done. An image without an `rm` keeps its garbage, as
-    /// before, and says so.
+    /// The guest agent can make a directory but not remove one, so ferry-loop
+    /// does, as a root-of-VM process (Containerization #1020) run from the
+    /// read-only late share. This used to run `rm` in a short-lived container
+    /// of the image the container ran, so a distroless or scratch image, with
+    /// no `rm`, kept every crash-looping attempt's writes until the pod went.
     func discard(id: String) async {
-        guard let (base, lower) = uppers.withLock({ $0.removeValue(forKey: id) }) else { return }
-        let janitor = "rm-\(id)"
-        let work = "/run/ferry-rm/\(id)"
-        var process = ContainerizationOCI.Process(
-            args: ["/bin/rm", "-rf", "/tmp/upper", "/tmp/work"],
-            env: ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"],
-            capabilities: Containerization.LinuxCapabilities.allCapabilities.toOCI())
-        process.user = ContainerizationOCI.User(uid: 0, gid: 0)
-        let spec = ContainerizationOCI.Spec(
-            process: process,
-            mounts: [ContainerizationOCI.Mount(type: "proc", source: "proc", destination: "/proc", options: []),
-                     ContainerizationOCI.Mount(type: "devtmpfs", source: "none", destination: "/dev",
-                                               options: ["nosuid", "mode=755"]),
-                     ContainerizationOCI.Mount(type: "none", source: base, destination: "/tmp", options: ["bind"])],
-            root: ContainerizationOCI.Root(path: "\(work)/root", readonly: false),
-            linux: ContainerizationOCI.Linux(
-                cgroupsPath: "/container/ferry-rm/\(id)",
-                namespaces: [.init(type: .mount), .init(type: .pid), .init(type: .ipc), .init(type: .uts)]))
-        var agent: Vminitd?
+        guard let base = uppers.withLock({ $0.removeValue(forKey: id) }) else { return }
         do {
-            let dialed = try await instance.dialAgent()
-            agent = dialed
-            try await dialed.mount(ContainerizationOCI.Mount(type: "tmpfs", source: "tmpfs", destination: work,
-                                                              options: ["size=16m"]))
-            try await dialed.mkdir(path: "\(work)/upper", all: true, perms: 0o755)
-            try await dialed.mkdir(path: "\(work)/work", all: true, perms: 0o755)
-            try await dialed.mount(ContainerizationOCI.Mount(
-                type: "overlay", source: "overlay", destination: "\(work)/root",
-                options: ["lowerdir=\(lower)", "upperdir=\(work)/upper", "workdir=\(work)/work"]))
-            try await dialed.createProcess(id: janitor, containerID: janitor, stdinPort: nil, stdoutPort: nil,
-                                           stderrPort: nil, ociRuntimePath: nil, configuration: spec, options: nil)
-            _ = try await dialed.startProcess(id: janitor, containerID: janitor)
-            let status = try await dialed.waitProcess(id: janitor, containerID: janitor, timeoutInSeconds: 60)
-            if status.exitCode != 0 { throw ContainerizationError(.internalError, message: "rm exited \(status.exitCode)") }
+            let shared = try await shareReadOnly()
+            try await runHelper([shared.helper, "rm", base], id: "ferry-rm-\(nextDiscard.wrappingAdd(1, ordering: .relaxed).oldValue)")
         } catch {
             FileHandle.standardError.write(
                 "warning: what \(id) wrote stays on its pod's scratch disk: \(error)\n".data(using: .utf8)!)
         }
-        guard let agent else { return }
-        try? await agent.deleteProcess(id: janitor, containerID: janitor)
-        try? await agent.umount(path: "\(work)/root", flags: 0)
-        try? await agent.umount(path: work, flags: 0)
-        try? await agent.close()
     }
 
     /// Adds any directory the VM does not already share to its one virtiofs
