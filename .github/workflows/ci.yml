@@ -56,17 +56,30 @@ jobs:
 
   swift:
     name: swift test
-    # ferry-cri builds against Apple's Containerization package, which needs the
-    # macOS 26 SDK and Swift 6.4. Kept non-blocking until the hosted image
-    # carries that toolchain by default; the job says which Swift it found.
+    # ferry-cri builds against Apple's Containerization package, which needs
+    # Swift 6.4 and the macOS 26 SDK. Until the hosted image carries that by
+    # default (it had 6.3.3 when this was written), the job says so and skips
+    # rather than failing every PR on the toolchain. With 6.4 present, a test
+    # failure fails the job.
     runs-on: macos-26
-    continue-on-error: true
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
-        run: swift --version && xcode-select -p
+        id: toolchain
+        run: |
+          swift --version
+          v="$(swift --version 2>&1 | sed -n 's/.*Swift version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+          major="${v%%.*}"; minor="${v#*.}"
+          if [ "${major:-0}" -gt 6 ] || { [ "${major:-0}" -eq 6 ] && [ "${minor:-0}" -ge 4 ]; }; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=swift test skipped::the runner has Swift $v; ferry-cri needs 6.4"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: ferry-cri
+        if: steps.toolchain.outputs.ok == 'true'
         run: ./tests/swift.sh ferry-cri
       - name: ferry-node
+        if: steps.toolchain.outputs.ok == 'true'
         run: ./tests/swift.sh experiments/18-node-image
