@@ -721,7 +721,8 @@ actor PodRuntime {
                 var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
                                nil, 0, NI_NUMERICHOST) == 0 {
-                    addresses.insert(String(cString: host))
+                    let bytes = host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                    addresses.insert(String(decoding: bytes, as: UTF8.self))
                 }
             }
             cursor = entry.pointee.ifa_next

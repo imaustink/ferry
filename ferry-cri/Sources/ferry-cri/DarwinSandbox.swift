@@ -240,15 +240,19 @@ final class DarwinSandbox: @unchecked Sendable {
 
     /// Retry the agent port until it answers, then resolve. Runs on `queue`.
     private func waitForAgent(_ cont: CheckedContinuation<Void, Error>) {
-        guard let dev = socket else {
+        guard let socket else {
             cont.resume(throwing: NSError(domain: "ferry.darwin", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "no vsock device"]))
             return
         }
-        func attempt(_ tries: Int) {
+        // Virtualization's objects are not Sendable, and are only ever touched
+        // on `queue` -- which the compiler cannot see through these callbacks.
+        nonisolated(unsafe) let dev = socket
+        @Sendable func attempt(_ tries: Int) {
             dev.connect(toPort: darwinAgentPort) { r in
                 switch r {
-                case .success(let conn):
+                case .success(let connection):
+                    nonisolated(unsafe) let conn = connection
                     self.queue.async {
                         self.connections.append(conn)
                         cont.resume()
@@ -281,11 +285,13 @@ final class DarwinSandbox: @unchecked Sendable {
                     return
                 }
                 dev.connect(toPort: darwinAgentPort) { r in
-                    guard case .success(let conn) = r else {
+                    guard case .success(let connection) = r else {
                         cont.resume(throwing: NSError(domain: "ferry.darwin", code: 5,
                             userInfo: [NSLocalizedDescriptionKey: "agent connect: \(r)"]))
                         return
                     }
+                    // Held only to keep the fd open until the reader is done.
+                    nonisolated(unsafe) let conn = connection
                     let fd = conn.fileDescriptor
                     var line = (try? JSONEncoder().encode(req)) ?? Data()
                     line.append(0x0A)
@@ -311,7 +317,8 @@ final class DarwinSandbox: @unchecked Sendable {
                             }
                         }
                         withExtendedLifetime(conn) {}
-                        self.queue.async { cont.resume(returning: status) }
+                        let exitStatus = status
+                        self.queue.async { cont.resume(returning: exitStatus) }
                     }.start()
                 }
             }
@@ -411,10 +418,12 @@ final class DarwinSandbox: @unchecked Sendable {
                         userInfo: [NSLocalizedDescriptionKey: "sandbox not booted"])); return
                 }
                 dev.connect(toPort: Self.interactiveAgentPort) { r in
-                    guard case .success(let conn) = r else {
+                    guard case .success(let connection) = r else {
                         cont.resume(throwing: NSError(domain: "ferry.darwin", code: 7,
                             userInfo: [NSLocalizedDescriptionKey: "interactive agent connect: \(r)"])); return
                     }
+                    // Held only to keep the fd open until the reader is done.
+                    nonisolated(unsafe) let conn = connection
                     let fd = conn.fileDescriptor
                     var line = (try? JSONEncoder().encode(InteractiveRequest(argv: argv, env: env, chroot: chroot, tty: tty))) ?? Data()
                     line.append(0x0A)
@@ -499,15 +508,18 @@ final class DarwinSandbox: @unchecked Sendable {
     func shutdown() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async {
-                guard let machine = self.vm, let dev = self.socket, !self.stopped else {
+                guard let vm = self.vm, let dev = self.socket, !self.stopped else {
                     self.cleanup(); cont.resume(); return
                 }
+                // Only touched on `queue`, below; see waitForAgent.
+                nonisolated(unsafe) let machine = vm
                 self.delegate?.onStop = {
                     self.queue.async { self.cleanup(); cont.resume() }
                 }
                 if let line = try? JSONEncoder().encode(DarwinRunRequest(argv: ["/sbin/shutdown", "-h", "now"])) {
                     dev.connect(toPort: darwinAgentPort) { r in
-                        guard case .success(let conn) = r else { return }
+                        guard case .success(let connection) = r else { return }
+                        nonisolated(unsafe) let conn = connection
                         var l = line; l.append(0x0A)
                         _ = l.withUnsafeBytes { write(conn.fileDescriptor, $0.baseAddress, $0.count) }
                         self.queue.async { self.connections.append(conn) }

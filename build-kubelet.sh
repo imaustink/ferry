@@ -44,8 +44,16 @@ mkdir -p "$(dirname "$out")"
 
 if [ ! -d "$src" ]; then
   echo "==> cloning kubernetes $K8S_VERSION"
-  git clone --depth 1 --branch "$K8S_VERSION" --single-branch \
-    https://github.com/kubernetes/kubernetes.git "$src"
+  # Quiet: the progress meter, the detached-HEAD lecture and "refs/tags/... is
+  # not a commit" (a tag clone of an annotated tag) are all expected, and were
+  # most of what a release build printed. Errors still come through.
+  if ! clone_out="$(git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$K8S_VERSION" \
+      --single-branch https://github.com/kubernetes/kubernetes.git "$src" 2>&1)"; then
+    echo "$clone_out" >&2
+    echo "could not clone kubernetes $K8S_VERSION" >&2
+    exit 1
+  fi
+  printf '%s\n' "$clone_out" | grep -v -e '^$' -e "^warning: refs/tags/.* is not a commit!$" >&2 || true
 else
   echo "==> reusing source at $src"
   git -C "$src" checkout -- . 2>/dev/null || true

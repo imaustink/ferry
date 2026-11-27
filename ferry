@@ -1064,26 +1064,39 @@ build_kubernetes_binaries() { # version
   # predate any patch; it is rebuilt once to find out.
   local inputs; inputs="$(ferry_kubelet_inputs "$version")"
   local built; built="$(cat "$dir/kubelet.inputs" 2>/dev/null || true)"
+  local rebuilt=0
   if [ ! -x "$dir/kubelet" ] || [ "${FERRY_REBUILD:-}" = "1" ]; then
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    rebuilt=1
   elif [ -n "$inputs" ] && [ "$inputs" != "$built" ]; then
     echo "==> kubelet $version was built from other patches; rebuilding"
     K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    rebuilt=1
   else
     echo "==> kubelet present, $version (--rebuild to force)"
   fi
   echo
 
-  # kube-proxy's own rule generation, built for darwin from the patched tree.
+  # kube-proxy's own rule generation, built for darwin from the patched tree --
+  # the same tree, and so the same patches, as the kubelet beside it. It is
+  # built when the kubelet was, and otherwise left alone: the source under
+  # $TMPDIR is shared by every checkout on this Mac, so a kubelet that is
+  # current says nothing about what that tree holds now. Rebuilding from it
+  # anyway could pair a current kubelet with another checkout's proxyd, and
+  # its absence used to print "source missing" over a build that was fine.
   echo "==> ferry-proxyd"
-  local src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${version}}"
-  if [ -d "$src" ]; then
+  if [ "$rebuilt" = 0 ] && [ -x "$dir/ferry-proxyd" ]; then
+    echo "==> ferry-proxyd present, $version"
+  else
+    if [ "$rebuilt" = 0 ]; then
+      echo "==> no ferry-proxyd for $version; preparing its source"
+      K8S_VERSION="$version" "$here/build-kubelet.sh" || return 1
+    fi
+    local src="${K8S_SRC:-${TMPDIR:-/tmp}/ferry-kubernetes-${version}}"
     rm -f "$dir/ferry-proxyd"
     ( cd "$src" && GOFLAGS=-mod=vendor GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
         go build -o "$dir/ferry-proxyd" ./cmd/ferry-proxyd ) || return 1
     echo "==> $dir/ferry-proxyd"
-  else
-    warn "kubernetes source missing; run build-kubelet.sh first"
   fi
   echo
 
@@ -1091,7 +1104,93 @@ build_kubernetes_binaries() { # version
   K8S_VERSION="$version" "$here/control-plane/fetch-binaries.sh" || return 1
 }
 
+# One piece of 'ferry build'. Each is independent of every other, which is what
+# lets ferry_build_steps run them at once.
+ferry_build_step() { # name
+  case "$1" in
+    ferry-cri) ( cd "$here/ferry-cri" && ./build.sh ) ;;
+    ferry-gpud) echo "==> ferry-gpud"; ( cd "$here/ferry-gpud" && ./build.sh ) ;;
+    # What RUN runs in, when a darwin Dockerfile has one: ferry-mkimage cannot
+    # execute a Darwin binary itself (still no Darwin to run one on), so it
+    # spawns this as a coprocess -- a macOS VM cloned from the golden image, one
+    # exec request per COPY or RUN. See docs/RUNTIMES.md#building-the-image.
+    ferry-macvm) echo "==> ferry-macvm"; ( cd "$here/ferry-macvm" && ./build.sh ) ;;
+    ferry-node)
+      echo "==> ferry-node"
+      OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" ;;
+    # ferry-cni and the upstream plugins it runs, in both architectures.
+    ferry-cni) "$here/ferry-cni/build.sh" ;;
+    # nft, for applying Service rules inside pods.
+    nft) "$here/guest/build-nft.sh" ;;
+    go)
+      # The Go binaries, one after another: each 'go build' already spreads
+      # across every core, and they share one build cache.
+      #   ferry-handover  holds the API server's port while 'ferry upgrade'
+      #                   replaces it, so nothing is refused
+      #   ferry-machined  mode 2: turns a Machine into a node. The node *image*
+      #                   it boots is built separately, by 'ferry node-image'
+      #   ferry-registry  serves locally loaded images to machines
+      #   ferry-mkimage   the darwin image packager 'ferry image build --os
+      #                   darwin' runs: FROM macos plus COPY, written straight
+      #                   to an OCI layout
+      #   ferry-karpenter Karpenter with ferry as its cloud provider. It needs a
+      #                   newer Go (the library requires 1.26.6), which Go
+      #                   fetches on demand rather than raising ferry's floor
+      local name
+      for name in ferry-proxy ferry-netpol ferry-handover ferry-storage ferry-streamer \
+                  ferry-machined ferry-registry ferry-mkimage ferry-karpenter; do
+        echo "==> $name"
+        ( cd "$here/$name" && go build -o "$here/bin/$name" . ) || return 1
+        echo "==> $here/bin/$name"
+        echo
+      done
+      # Runs inside a pod VM, so linux/arm64 and static: it mounts an image that
+      # arrives after the VM booted (guest/ferry-loop/main.go).
+      echo "==> ferry-loop"
+      ( cd "$here/guest/ferry-loop" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+          go build -trimpath -ldflags='-s -w' -o "$here/bin/ferry-loop" . ) || return 1
+      echo "==> $here/bin/ferry-loop" ;;
+    *) bad "no build step named $1"; return 1 ;;
+  esac
+}
+
+# Runs the named steps at once, each into its own log, and prints each log whole
+# as its step finishes, in the order named. Every step is waited for even after
+# one fails, so a failure never leaves a compiler running behind the prompt.
+ferry_build_steps() { # name...
+  local name
+  if [ "${FERRY_BUILD_JOBS:-}" = 1 ]; then
+    for name in "$@"; do ferry_build_step "$name" || return 1; echo; done
+    return 0
+  fi
+  local logs; logs="$(mktemp -d "${TMPDIR:-/tmp}/ferry-build.XXXXXX")" || return 1
+  local started; started="$(date +%s)"
+  echo "==> building $* at once"
+  echo
+  for name in "$@"; do
+    ( ferry_build_step "$name" > "$logs/$name.log" 2>&1; echo $? > "$logs/$name.rc"
+      date +%s > "$logs/$name.done" ) &
+    echo $! > "$logs/$name.pid"
+  done
+  local failed="" rc
+  for name in "$@"; do
+    wait "$(cat "$logs/$name.pid")" 2>/dev/null
+    cat "$logs/$name.log"
+    rc="$(cat "$logs/$name.rc" 2>/dev/null || echo 1)"
+    if [ "$rc" = 0 ]; then
+      ok "$name ($(( $(cat "$logs/$name.done") - started ))s)"
+    else
+      bad "$name failed"
+      failed="${failed:+$failed }$name"
+    fi
+    echo
+  done
+  rm -rf "$logs"
+  [ -z "$failed" ] || { bad "the build failed: $failed"; return 1; }
+}
+
 cmd_build() {
+  local kubernetes_only=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --kubernetes-version)
@@ -1099,7 +1198,8 @@ cmd_build() {
         K8S_VERSION="$2"; shift 2 ;;
       --kubernetes-version=*) K8S_VERSION="${1#*=}"; shift ;;
       --rebuild) FERRY_REBUILD=1; shift ;;
-      *) bad "usage: ferry build [--kubernetes-version <vX.Y.Z>] [--rebuild]"; return 2 ;;
+      --kubernetes-only) kubernetes_only=1; shift ;;
+      *) bad "usage: ferry build [--kubernetes-version <vX.Y.Z>] [--kubernetes-only] [--rebuild]"; return 2 ;;
     esac
   done
   ferry_version_valid "$K8S_VERSION" || {
@@ -1123,6 +1223,18 @@ cmd_build() {
     return 1
   fi
 
+  # Just the version store's half: kubelet, ferry-proxyd and the control plane
+  # for one Kubernetes, without making it this checkout's active version and
+  # without the runtime, which does not depend on the Kubernetes version. What
+  # release/cut.sh wants for each version a release offers as a download --
+  # building all of ferry for each one compiled the same Swift four times.
+  if [ -n "$kubernetes_only" ]; then
+    bold "building Kubernetes $K8S_VERSION"
+    echo "  control plane $(ferry_control_plane_version "$K8S_VERSION"), etcd $(ferry_etcd_version "$K8S_VERSION")"
+    build_kubernetes_binaries "$K8S_VERSION" || return 1
+    return 0
+  fi
+
   bold "building ferry"
   echo "  kubernetes $K8S_VERSION (control plane $(ferry_control_plane_version "$K8S_VERSION"), etcd $(ferry_etcd_version "$K8S_VERSION"))"
   "$here/experiments/03-vm-ceiling/fetch-kernel.sh" || return 1
@@ -1137,86 +1249,13 @@ cmd_build() {
   # version it was already on rather than on half of a new one.
   ferry_activate_version "$K8S_VERSION" || return 1
   echo
-  ( cd "$here/ferry-cri" && ./build.sh ) || return 1
-  echo
-  echo "==> ferry-proxy"
-  ( cd "$here/ferry-proxy" && go build -o "$here/bin/ferry-proxy" . ) || return 1
-  echo "==> $here/bin/ferry-proxy"
-  echo
-  echo "==> ferry-netpol"
-  ( cd "$here/ferry-netpol" && go build -o "$here/bin/ferry-netpol" . ) || return 1
-  echo "==> $here/bin/ferry-netpol"
-  echo
-  # What holds the API server's port while 'ferry upgrade' replaces it, so that
-  # nothing is refused. Standard library only; a second to build.
-  echo "==> ferry-handover"
-  ( cd "$here/ferry-handover" && go build -o "$here/bin/ferry-handover" . ) || return 1
-  echo "==> $here/bin/ferry-handover"
-  echo
-  # ferry-cni and the upstream plugins it runs, in both architectures.
-  "$here/ferry-cni/build.sh" || return 1
-  echo
-  echo "==> ferry-storage"
-  ( cd "$here/ferry-storage" && go build -o "$here/bin/ferry-storage" . ) || return 1
-  echo "==> $here/bin/ferry-storage"
-  echo
-  echo "==> ferry-gpud"
-  ( cd "$here/ferry-gpud" && ./build.sh ) || return 1
-  echo
-  echo "==> ferry-streamer"
-  ( cd "$here/ferry-streamer" && go build -o "$here/bin/ferry-streamer" . ) || return 1
-  echo "==> $here/bin/ferry-streamer"
-  echo
-  # Mode 2: the controller that turns a Machine into a node, and the tool that
-  # makes the VM for it. Both are quick. The node *image* they boot is not, and
-  # is built separately by 'ferry node-image' -- it builds itself with
-  # 'ferry image build', which needs a running cluster, the same bargain
-  # 'ferry kernel' makes.
-  echo "==> ferry-machined"
-  ( cd "$here/ferry-machined" && go build -o "$here/bin/ferry-machined" . ) || return 1
-  echo "==> $here/bin/ferry-machined"
-  echo
-  # What serves locally loaded images to machines, when FERRY_MACHINE_REGISTRY
-  # asks for it. Standard library only, so it costs a second to build.
-  echo "==> ferry-registry"
-  ( cd "$here/ferry-registry" && go build -o "$here/bin/ferry-registry" . ) || return 1
-  echo "==> $here/bin/ferry-registry"
-  echo
-  # The darwin image packager `ferry image build --os darwin` runs. A darwin
-  # image is FROM macos plus COPY -- the node is the base, nothing to run -- so
-  # buildkit, which executes build steps on a Linux worker, is the wrong tool;
-  # this writes the OCI layout directly. Standard library only.
-  echo "==> ferry-mkimage"
-  ( cd "$here/ferry-mkimage" && go build -o "$here/bin/ferry-mkimage" . ) || return 1
-  echo "==> $here/bin/ferry-mkimage"
-  echo
-  # What RUN runs in, when a darwin Dockerfile has one: ferry-mkimage cannot
-  # execute a Darwin binary itself (still no Darwin to run one on), so it
-  # spawns this as a coprocess -- a macOS VM cloned from the golden image, one
-  # exec request per COPY or RUN. See docs/RUNTIMES.md#building-the-image.
-  echo "==> ferry-macvm"
-  ( cd "$here/ferry-macvm" && ./build.sh ) || return 1
-  echo
-  # Karpenter, with ferry as its cloud provider. It needs a newer Go than the
-  # rest of this tree -- the library requires 1.26.6 -- which Go fetches on
-  # demand rather than failing, so this does not raise ferry's own toolchain
-  # floor.
-  echo "==> ferry-karpenter"
-  ( cd "$here/ferry-karpenter" && go build -o "$here/bin/ferry-karpenter" . ) || return 1
-  echo "==> $here/bin/ferry-karpenter"
-  echo
-  echo "==> ferry-node"
-  OUT="$here/bin/ferry-node" "$here/experiments/18-node-image/rebuild-tool.sh" || return 1
-  echo
-  # nft, for applying those rules inside pods.
-  "$here/guest/build-nft.sh" || return 1
-  echo
-  # Runs inside a pod VM, so linux/arm64 and static: it mounts an image that
-  # arrives after the VM booted (guest/ferry-loop/main.go).
-  echo "==> ferry-loop"
-  ( cd "$here/guest/ferry-loop" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-      go build -trimpath -ldflags='-s -w' -o "$here/bin/ferry-loop" . ) || return 1
-  echo "==> $here/bin/ferry-loop"
+  # Everything below depends on nothing above but the source, and on nothing
+  # in itself, so it builds at once: ferry-cri and ferry-node were each about two
+  # minutes of a compiler using a third of this Mac, one after the other.
+  # Each step's output goes to its own log and is printed whole, in the order
+  # here, as it finishes -- interleaved it would be unreadable.
+  # FERRY_BUILD_JOBS=1 builds one at a time, printing as it goes, as before.
+  ferry_build_steps ferry-cri go ferry-cni ferry-gpud ferry-macvm ferry-node nft || return 1
   echo
   bold "built -- run: ferry up"
   if [ ! -d "$NODE_IMAGE_LAYOUT" ]; then
@@ -7201,7 +7240,7 @@ ferry_complete_sub() { # command -> its subcommands or flags
     up)         echo "--kubernetes-version --disposable --durability --mac-image" ;;
     down)       echo "--purge" ;;
     uninstall)  echo "--purge" ;;
-    build)      echo "--kubernetes-version --rebuild" ;;
+    build)      echo "--kubernetes-version --kubernetes-only --rebuild" ;;
     init)       echo "--purpose --yes --force" ;;
     config)     echo "show get set unset path" ;;
     logs)       echo "--bundle $FERRY_LOG_COMPONENTS" ;;

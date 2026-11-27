@@ -244,7 +244,8 @@ contains "and containerd reads that directory" \
 contains "loading an image also stores it for machines" \
   "$(sed -n '/^cmd_image_load()/,/^}/p' "$repo/ferry")" 'machine_registry_add "$layout"'
 contains "and ferry build builds the registry" \
-  "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-registry"'
+  "$(sed -n '/^ferry_build_step()/,/^}/p' "$repo/ferry")" 'ferry-registry '
+contains "  in a step ferry build runs" "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'ferry_build_steps ferry-cri go'
 echo
 
 # --- NetworkPolicy on a kernel without nf_tables ------------------------------
@@ -774,7 +775,8 @@ build_out="$("$repo/ferry" image build --os bogus "$darwin_ctx" 2>&1)"; build_rc
 is "an unknown --os is refused" "$build_rc" 2
 contains "and it names the two it knows" "$build_out" "linux or darwin"
 contains "ferry build compiles the darwin packager" \
-  "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'go build -o "$here/bin/ferry-mkimage"'
+  "$(sed -n '/^ferry_build_step()/,/^}/p' "$repo/ferry")" 'ferry-mkimage '
+contains "  in a step ferry build runs" "$(sed -n '/^cmd_build()/,/^}/p' "$repo/ferry")" 'ferry_build_steps ferry-cri go'
 contains "a darwin build refuses to run on ferry-cri, which is Linux" \
   "$(sed -n '/^ferry_image_build_darwin()/,/^}/p' "$repo/ferry")" "ferry-registry"
 echo
@@ -1066,6 +1068,41 @@ contains "  and ferry's own reports" "$listing" "ferry-logs/ferry-status.txt"
 contains "  and says when the API server could not be asked" "$listing" "NOT-REACHABLE.txt"
 lacks "  and never the admin credentials" "$listing" "admin.conf"
 lacks "the reports carry no colour codes" "$(tar -xzOf "$lb/out.tgz" ferry-logs/ferry-version.txt)" $'\033['
+echo
+
+printf '\033[1m%s\033[0m\n' "ferry build runs its steps at once, and reports them in order"
+# The real steps are compilers; these stand in for them. 'slow' finishes last
+# but is named first, so its log must still come first; 'broken' fails, and
+# 'after' -- named after it -- must still run rather than be abandoned.
+eval "$(sed -n '/^ferry_build_steps()/,/^}/p' "$repo/ferry")"
+steps="$sandbox/steps"; mkdir -p "$steps"
+ferry_build_step() {
+  case "$1" in
+    slow) sleep 1; echo "slow's log" ;;
+    broken) echo "broken's log"; return 3 ;;
+    after) echo "after's log"; : > "$steps/after-ran" ;;
+  esac
+}
+saved_ok="$(declare -f ok)"; saved_bad="$(declare -f bad)"
+ok() { echo "OK $1"; }; bad() { echo "BAD $1"; }
+s=$(date +%s)
+out="$(TMPDIR="$steps" ferry_build_steps slow broken after 2>&1)"; rc=$?
+took=$(( $(date +%s) - s ))
+eval "$saved_ok"; eval "$saved_bad"
+[ "$rc" -ne 0 ] && ok "a failed step fails the build" || bad "a failed step did not fail the build"
+[ -f "$steps/after-ran" ] && ok "the steps after it still ran" || bad "a failure abandoned the steps after it"
+first="$(echo "$out" | grep -n "slow's log" | cut -d: -f1)"; second="$(echo "$out" | grep -n "broken's log" | cut -d: -f1)"
+[ -n "$first" ] && [ -n "$second" ] && [ "$first" -lt "$second" ] \
+  && ok "logs print in the order the steps are named" || bad "logs printed out of order: $out"
+contains "and the failure is named" "$out" "BAD the build failed: broken"
+[ "$(ls "$steps" | grep -c '^ferry-build')" = 0 ] && ok "its logs are cleaned up" || bad "it left its logs behind"
+rm -f "$steps/after-ran"
+out="$(FERRY_BUILD_JOBS=1 TMPDIR="$steps" ferry_build_steps slow broken after 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$steps/after-ran" ] \
+  && ok "FERRY_BUILD_JOBS=1 builds one at a time and stops at the first failure" \
+  || bad "FERRY_BUILD_JOBS=1 did not stop at the failure"
+[ "$took" -lt 3 ] && ok "they ran at once (${took}s for a 1s step)" || bad "they did not run at once (${took}s)"
+unset -f ferry_build_step
 echo
 
 printf '\033[1m%s\033[0m\n' "$pass passed$([ "$fail" -gt 0 ] && echo ", $fail failed")"

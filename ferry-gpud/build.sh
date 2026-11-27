@@ -15,7 +15,11 @@ cd "$here"
 # pieces of the developer tools, and a half-applied update leaves them
 # disagreeing -- which fails in the manifest, before any of this code is read.
 SWIFT="${SWIFT:-swift}"
-"$SWIFT" build -c release
+# The Command Line Tools have no Developer/usr/lib or Developer/Library/Frameworks,
+# and SwiftPM passes both to the linker anyway: two "search path not found"
+# warnings per product on every build, about nothing. Only those two go.
+"$SWIFT" build -c release 2>&1 \
+  | { grep -v "ld: warning: search path '/Library/Developer/CommandLineTools/Developer/[^']*' not found$" || true; }
 mkdir -p ../bin
 rm -f ../bin/ferry-gpud
 cp "$("$SWIFT" build -c release --show-bin-path)/ferry-gpud" ../bin/ferry-gpud

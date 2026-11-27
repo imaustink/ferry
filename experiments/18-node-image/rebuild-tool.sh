@@ -10,7 +10,11 @@ SWIFT="${SWIFT:-swift}"
 # macOS kills at launch, which is the same rule ferry-cri's build follows.
 OUT="${OUT:-$here/build/ferry-node}"
 mkdir -p "$(dirname "$OUT")"
-"$SWIFT" build -c release
+# The Command Line Tools have no Developer/usr/lib or Developer/Library/Frameworks,
+# and SwiftPM passes both to the linker anyway: two "search path not found"
+# warnings per product on every build, about nothing. Only those two go.
+"$SWIFT" build -c release 2>&1 \
+  | { grep -v "ld: warning: search path '/Library/Developer/CommandLineTools/Developer/[^']*' not found$" || true; }
 rm -f "$OUT"
 cp "$("$SWIFT" build -c release --show-bin-path)/ferry-node" "$OUT"
 codesign --force --sign - --entitlements entitlements.plist "$OUT"

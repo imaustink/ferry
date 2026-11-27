@@ -125,17 +125,37 @@ fi
 
 # --- build, package, tag, publish -----------------------------------------
 if [ -z "$skip_build" ]; then
-  # The other Kubernetes versions the release offers first, and the one it
-  # carries last, so that is the version this checkout is left active at.
-  # build_kubernetes_binaries only rebuilds a kubelet whose patches changed,
-  # so after the first cut these are quick.
+  # The other Kubernetes versions the release offers, each into the version
+  # store and none made active (--kubernetes-only: the runtime does not depend
+  # on the Kubernetes version, and building all of ferry for each one compiled
+  # ferry-cri and ferry-node four times per cut). They build in the background
+  # while 'ferry build' does the rest: separate directories, separate source
+  # trees, and a Go build cache that is safe to share. Each logs to a file,
+  # printed when it is done.
+  klogs="$(mktemp -d "${TMPDIR:-/tmp}/ferry-cut.XXXXXX")" || die "no temporary directory"
+  kpids=""
   for v in $FERRY_RELEASE_K8S_VERSIONS; do
     [ "$v" = "$k8s" ] && continue
-    echo; bold "building Kubernetes $v (offered as a download)"
-    ( cd "$root" && ./ferry build --kubernetes-version "$v" ) || die "ferry build --kubernetes-version $v failed"
+    ( cd "$root" && ./ferry build --kubernetes-version "$v" --kubernetes-only ) > "$klogs/$v.log" 2>&1 &
+    kpids="$kpids $v:$!"
   done
+  [ -z "$kpids" ] || { echo; bold "building Kubernetes$(for p in $kpids; do printf ' %s' "${p%%:*}"; done) in the background (offered as downloads)"; }
   echo; bold "building binaries (ferry build)"
-  ( cd "$root" && ./ferry build --kubernetes-version "$k8s" ) || die "ferry build failed"
+  ( cd "$root" && ./ferry build --kubernetes-version "$k8s" ); main_rc=$?
+  kfailed=""
+  for p in $kpids; do
+    v="${p%%:*}"
+    if wait "${p#*:}"; then
+      ok "Kubernetes $v built"
+    else
+      echo; cat "$klogs/$v.log"; echo
+      echo "  ✗ Kubernetes $v failed (its log is above)" >&2
+      kfailed="$kfailed $v"
+    fi
+  done
+  rm -rf "$klogs"
+  [ "$main_rc" = 0 ] || die "ferry build failed"
+  [ -z "$kfailed" ] || die "ferry build --kubernetes-only failed for$kfailed"
 fi
 
 echo; bold "packaging the tarball"

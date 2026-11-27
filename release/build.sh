@@ -101,12 +101,12 @@ if [ -n "$extra_k8s" ]; then
   for v in $FERRY_RELEASE_K8S_VERSIONS; do
     [ "$v" = "$k8s" ] && continue
     ferry_version_complete "$v" \
-      || die "the version store has no complete $v -- run: ./ferry build --kubernetes-version $v (or --without-extra-kubernetes)"
+      || die "the version store has no complete $v -- run: ./ferry build --kubernetes-version $v --kubernetes-only (or --without-extra-kubernetes)"
     [ -f "$(ferry_version_dir "$v")/ferry-proxyd" ] \
-      || die "$v has no ferry-proxyd -- run: ./ferry build --kubernetes-version $v"
+      || die "$v has no ferry-proxyd -- run: ./ferry build --kubernetes-version $v --kubernetes-only"
     inputs="$(ferry_kubelet_inputs "$v")"
     [ -z "$inputs" ] || [ "$inputs" = "$(cat "$(ferry_version_dir "$v")/kubelet.inputs" 2>/dev/null)" ] \
-      || die "kubelet $v was built from other patches -- run: ./ferry build --kubernetes-version $v"
+      || die "kubelet $v was built from other patches -- run: ./ferry build --kubernetes-version $v --kubernetes-only"
     extras="$extras $v"
   done
 fi
@@ -267,12 +267,6 @@ ok "VERSION"
 mkdir -p "$out"
 tarball="$out/ferry-$version-darwin-arm64.tar.gz"
 rm -f "$tarball"
-# --no-mac-metadata keeps bsdtar from writing ._ AppleDouble members, which are
-# noise on every other system and carry the quarantine flag on this one.
-( cd "$stage" && tar --no-mac-metadata -czf "$tarball" "ferry-$version" ) \
-  || die "could not write $tarball"
-
-( cd "$out" && shasum -a 256 "$(basename "$tarball")" > "$(basename "$tarball").sha256" )
 
 # --- the other Kubernetes versions, each a download of its own ------------
 # One directory, kubernetes-<version>/, holding what the store holds for it,
@@ -284,10 +278,27 @@ for v in $extras; do
     src="$(ferry_version_dir "$v")/$name"
     [ -f "$src" ] && cp "$src" "$kdir/$name"
   done
+  rm -f "$out/ferry-$version-kubernetes-$v-darwin-arm64.tar.gz"
+done
+
+# Every tarball at once. gzip uses one core, so writing the four one after
+# another left the rest of the Mac idle for most of a minute.
+# --no-mac-metadata keeps bsdtar from writing ._ AppleDouble members, which are
+# noise on every other system and carry the quarantine flag on this one.
+pack() { # tarball directory
+  ( cd "$stage" && tar --no-mac-metadata -czf "$1" "$2" ) \
+    && ( cd "$out" && shasum -a 256 "$(basename "$1")" > "$(basename "$1").sha256" )
+}
+pids=""
+pack "$tarball" "ferry-$version" & pids="$pids $!"
+for v in $extras; do
+  pack "$out/ferry-$version-kubernetes-$v-darwin-arm64.tar.gz" "kubernetes-$v" & pids="$pids $!"
+done
+failed=""
+for pid in $pids; do wait "$pid" || failed=1; done
+[ -z "$failed" ] || die "could not write every tarball into $out"
+for v in $extras; do
   ktar="$out/ferry-$version-kubernetes-$v-darwin-arm64.tar.gz"
-  rm -f "$ktar"
-  ( cd "$stage" && tar --no-mac-metadata -czf "$ktar" "kubernetes-$v" ) || die "could not write $ktar"
-  ( cd "$out" && shasum -a 256 "$(basename "$ktar")" > "$(basename "$ktar").sha256" )
   ok "kubernetes $v, a separate download ($(du -h "$ktar" | awk '{print $1}'))"
 done
 
