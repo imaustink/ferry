@@ -91,6 +91,41 @@ ip addr add "$ADDRESS" dev eth0
 printf 'nameserver %s\n' "${DNS:-1.1.1.1}" > /etc/resolv.conf
 log "address $ADDRESS via ${GATEWAY:-none} ($(elapsed)ms)"
 
+# Keep to the Mac's clock. The guest's counter stops while the Mac sleeps, so a
+# machine that is up across a sleep wakes behind by however long it lasted --
+# 826s, on the cluster that found this -- and stays there, because nothing else
+# in here keeps time. Every pod on it then disagrees with the Mac about now:
+# signed webhooks refused as stale, a JWT accepted after it expired. ferry-node
+# answers on vsock port 7100 (ClockService.swift) with the Mac's time as
+# <seconds>.<microseconds>; this asks every few seconds and steps the clock
+# when it is two seconds or more out -- whole seconds on both sides, so one
+# would step a clock that is right whenever the two reads straddle a tick. A step rather than a slew, because the
+# error arrives all at once on wake and a slew would take hours to close it.
+#
+# Quiet when ferry-node is older than the service or the image has no socat:
+# the connection fails and the loop tries again.
+CLOCK_PORT=7100
+(
+  checked=
+  while :; do
+    host=$(socat -T2 -u "VSOCK-CONNECT:2:$CLOCK_PORT" - 2>/dev/null)
+    case "$host" in
+      [0-9]*.[0-9]*)
+        drift=$(( ${host%%.*} - $(date +%s) ))
+        if [ "$drift" -ge 2 ] || [ "$drift" -le -2 ]; then
+          if date -u -s "@$host" >/dev/null 2>&1; then
+            log "clock stepped ${drift}s to the Mac's"
+          fi
+        elif [ -z "$checked" ]; then
+          checked=1
+          log "clock in step with the Mac"
+        fi
+        ;;
+    esac
+    sleep 5
+  done
+) &
+
 # The images this Mac has loaded, served by ferry-registry on the gateway. The
 # Mac's own runtime has them and this containerd does not, so a pod whose image
 # was built or loaded locally could not start here: ErrImageNeverPull.
