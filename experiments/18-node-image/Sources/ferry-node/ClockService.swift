@@ -51,8 +51,13 @@ final class ClockService: NSObject, VZVirtioSocketListenerDelegate {
         var tv = timeval()
         gettimeofday(&tv, nil)
         let line = Array(clockReading(tv).utf8)
-        _ = line.withUnsafeBytes { write(connection.fileDescriptor, $0.baseAddress, $0.count) }
-        connection.close()
+        // The connection is only the delegate's once it returns true, so the
+        // write and close happen after that -- and off the VM's queue, since
+        // write blocks. The closure keeps the connection alive until then.
+        DispatchQueue.global().async {
+            _ = line.withUnsafeBytes { write(connection.fileDescriptor, $0.baseAddress, $0.count) }
+            connection.close()
+        }
         return true
     }
 }
