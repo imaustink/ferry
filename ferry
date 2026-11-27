@@ -6632,7 +6632,10 @@ kubeconfig_forget() {
   target="${target%%:*}"
   [ "$target" = "$FERRY_HOME/admin.conf" ] && target="$HOME/.kube/config"
   [ -f "$target" ] || return 0
-  KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$context" || return 0
+  # grep reads the whole list rather than -q: under pipefail, grep -q quitting at
+  # the first match can kill kubectl with SIGPIPE mid-list, and the pipeline
+  # then reads as "no such context" and nothing is removed.
+  KUBECONFIG="$target" kubectl config get-contexts -o name 2>/dev/null | grep -xF "$context" >/dev/null || return 0
   if [ "$(KUBECONFIG="$target" kubectl config current-context 2>/dev/null)" = "$context" ]; then
     KUBECONFIG="$target" kubectl config unset current-context >/dev/null 2>&1
   fi

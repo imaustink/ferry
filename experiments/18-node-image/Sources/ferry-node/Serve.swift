@@ -202,6 +202,9 @@ final class RunningMachine {
     let console: Console
     let address: String
     let gateway: String
+    /// Held for as long as the machine is: the socket device does not keep its
+    /// listener's delegate alive.
+    let clockService: ClockService?
     /// USB disks attached to the running VM, by image path, each with the
     /// lock on its volume directory (see VolumeDisk). Touched only on `queue`,
     /// which is the VM's.
@@ -284,12 +287,14 @@ final class RunningMachine {
         usb.removeAll()
     }
 
-    init(vm: VZVirtualMachine, queue: DispatchQueue, console: Console, address: String, gateway: String) {
+    init(vm: VZVirtualMachine, queue: DispatchQueue, console: Console, address: String, gateway: String,
+         clockService: ClockService? = nil) {
         self.vm = vm
         self.queue = queue
         self.console = console
         self.address = address
         self.gateway = gateway
+        self.clockService = clockService
     }
 
     func stop() {
@@ -381,8 +386,13 @@ func boot(spec: MachineSpec, network: MachineNetwork, kernelPath: String,
         }
     }
 
+    // The guest's init asks this for the Mac's time; see ClockService.swift.
+    let clockService = ClockService()
+    queue.sync { clockService.attach(to: vm) }
+
     booted = true
-    return RunningMachine(vm: vm, queue: queue, console: console, address: address, gateway: gateway)
+    return RunningMachine(vm: vm, queue: queue, console: console, address: address,
+                          gateway: gateway, clockService: clockService)
 }
 
 enum Failure: Error, CustomStringConvertible {

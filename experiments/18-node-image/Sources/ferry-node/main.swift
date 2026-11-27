@@ -152,6 +152,8 @@ func run() throws {
         fail("failed to start: timed out")
     }
     print("==> started in \(String(format: "%.2f", Date().timeIntervalSince(clock)))s")
+    let clockService = ClockService()
+    queue.sync { clockService.attach(to: vm) }
 
     // The node says so itself, on the console, and the host prints it as it
     // arrives -- a machine that fails to join should say why without anyone
@@ -174,7 +176,7 @@ func run() throws {
     }
 
     // Hold the machine up; the caller stops the process when it is done.
-    while true { sleep(3600) }
+    withExtendedLifetime(clockService) { while true { sleep(3600) } }
 }
 
 /// Machines boot with an xHCI controller, and `ferry-node serve` attaches the
@@ -376,6 +378,10 @@ func machineConfiguration(
     // containerd that had booted in forty-five milliseconds. It is one line and
     // it moves the whole early boot.
     config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+    // The guest asks the Mac for the time over this, because its own clock
+    // falls behind by however long the Mac sleeps. See ClockService.swift.
+    config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
     // A USB controller, which is the one place Virtualization.framework can
     // attach storage to a VM that is already running (experiment 26).

@@ -54,4 +54,11 @@ Kubernetes v1.37.0, control plane v1.37.0, etcd v3.6.5.
 
 ### Fixed
 
+- **Machines keep to the Mac's clock after it sleeps.** A machine (mode 2 node)
+  that was up across a sleep fell behind by however long the Mac slept and
+  stayed there, so its pods disagreed with the Mac about the time: signed
+  webhooks were refused as stale and expired tokens were accepted. Its init now
+  asks ferry-node for the Mac's time over vsock every 5 seconds and steps the
+  clock when it is 2 or more seconds out. Machines booted from an earlier node
+  image need rebuilding (`ferry node-image`) and recreating to get it.
 - `ferry completion fish` exited 1.
