@@ -44,6 +44,23 @@ ferry_swift_build_toolchains() {
     "${ferry_swift_build_descriptions%/*}/$id.xcbuilddata/build-request.json" 2>/dev/null || true
 }
 
+# Pass the accepted build's output on while it runs: every complete line of
+# $1 as it appears, through the filter, then whatever is left once $2 exits.
+# Whole lines only, so the filter never sees one in two pieces. (bash 3.2 and
+# BSD tail: no tail --pid, so poll.)
+ferry_swift_build_stream() { # output-file pid
+  local done=0 n
+  while kill -0 "$2" 2>/dev/null; do
+    n="$(wc -l < "$1" | tr -d ' ')"
+    if [ "$n" -gt "$done" ]; then
+      sed -n "$((done + 1)),${n}p" "$1" | ferry_swift_build_filter
+      done="$n"
+    fi
+    sleep 0.1
+  done
+  sed -n "$((done + 1)),\$p" "$1" | ferry_swift_build_filter
+}
+
 ferry_swift_build_lines() {
   if [ -f "$ferry_swift_build_descriptions" ]; then wc -l < "$ferry_swift_build_descriptions" | tr -d ' '; else echo 0; fi
 }
@@ -92,11 +109,12 @@ ferry_swift_build() { # [extra swift build arguments...]
       attempt=$((attempt + 1))
       continue
     fi
+    # Accepted: what it printed while planning, and the rest as it comes.
+    ferry_swift_build_stream "$out" "$pid"
     rc=0; wait "$pid" || rc=$?
     break
   done
 
-  ferry_swift_build_filter < "$out"
   rm -f "$out"
   if [ "$rc" = 0 ]; then
     got="$(ferry_swift_build_toolchains)"

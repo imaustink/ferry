@@ -57,7 +57,7 @@ if ($last ne $draw) { open($fh, '>>', "$data/prior-build-descriptions.txt") or d
 sleep 0.2;                                   # the description is recorded before any task
 print "Building for production...\n";
 print "[1\x{e2}\x{80}\x{af}/\x{e2}\x{80}\x{af}2] Compiling\n";
-sleep 0.4;
+sleep($ENV{STUB_COMPILE} // 0.4);           # a long compile, when asked for
 print "x: ld: warning: search path '/Library/Developer/CommandLineTools/Developer/usr/lib' not found\n";
 if (($ENV{STUB_FAIL} // '') eq '1') { note("failed $draw"); print "error: boom\n"; exit 1 }
 note("built $draw");
@@ -112,6 +112,26 @@ bold "a failing build fails, with its output"
 STUB_FAIL=1 build B
 is "the failure comes back" "$rc $log" "1 failed B"
 contains "with what the compiler said" "$out" "error: boom"
+
+bold "a long build's output is passed on as it comes, not at the end"
+# Two draws: A is interrupted (nothing of it may show), then B compiles for
+# three seconds. Its "[1/2]" line must be out while it is still compiling.
+printf '%s\n' A B > "$sandbox/draws"; : > "$sandbox/log"; : > "$sandbox/stream"
+(cd "$pkg" && SWIFT="$sandbox/swift" STUB_DRAWS="$sandbox/draws" STUB_LOG="$sandbox/log" STUB_COMPILE=3 \
+  ferry_swift_build > "$sandbox/stream" 2>&1) &
+bg=$!
+waited=0
+while ! grep -q 'Compiling' "$sandbox/stream" && [ "$waited" -lt 250 ]; do sleep 0.01; waited=$((waited + 1)); done
+seen="$(cat "$sandbox/stream")"; log_then="$(cat "$sandbox/log")"
+rc=0; wait "$bg" || rc=$?
+contains "the compile line shows while it compiles" "$seen" "Compiling"
+is "and the build had not finished yet" "$log_then" "interrupted A"
+is "it then finishes, with B" "$rc $(tr '\n' ' ' < "$sandbox/log" | sed 's/ $//')" "0 interrupted A built B"
+stream="$(cat "$sandbox/stream")"
+is "the interrupted draw printed only why" \
+  "$(grep -c 'Building for production' <<<"$stream") $(grep -c 'asking again' <<<"$stream")" "1 1"
+contains "everything after it still comes through" "$stream" "Build complete!"
+lacks "still without the linker's noise" "$stream" "ld: warning: search path"
 
 bold "the four Swift build scripts build through it"
 for script in ferry-cri/build.sh ferry-macvm/build.sh ferry-gpud/build.sh experiments/18-node-image/rebuild-tool.sh; do
