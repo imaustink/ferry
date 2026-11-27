@@ -77,13 +77,12 @@ build() {
     ferry_swift_build 2>&1)"; rc=$?
   log="$(tr '\n' ' ' < "$sandbox/log" | sed 's/ $//')"
 }
-marker() { cat "$pkg/.build/ferry-toolchains" 2>/dev/null; }
 newest() { tail -1 "$pkg/.build/out/Intermediates.noindex/XCBuildData/prior-build-descriptions.txt"; }
 
-bold "the first build has nothing to keep to, and records what it drew"
+bold "the first build has nothing to keep to, and its description is what later builds keep"
 build A
 is "it built, with A"            "$rc $log"   "0 built A"
-is "A is what later builds keep" "$(marker)"  'A $(inherited)'
+is "A is what later builds keep" "$(cd "$pkg" && ferry_swift_build_toolchains)" 'A $(inherited)'
 contains "its output is passed on" "$out" "Build complete!"
 lacks "without the linker's noise" "$out" "ld: warning: search path"
 
@@ -96,7 +95,7 @@ bold "a build that draws the other one is stopped before it compiles, and asked 
 build B B A
 is "B twice interrupted, then built with A" "$rc $log" "0 interrupted B interrupted B built A"
 contains "says why"                           "$out" "TOOLCHAINS=B \$(inherited), not A \$(inherited)"
-is "the expectation stays A"                  "$(marker)" 'A $(inherited)'
+is "the expectation stays A"                  "$(cd "$pkg" && ferry_swift_build_toolchains)" 'A $(inherited)'
 is "the interrupted draws' records are taken back" "$(newest)" "A"
 is "so the description log ends where it began" \
   "$(tr '\n' ' ' < "$pkg/.build/out/Intermediates.noindex/XCBuildData/prior-build-descriptions.txt")" "A "
@@ -104,7 +103,7 @@ is "so the description log ends where it began" \
 bold "after enough tries it builds with what it gets, and keeps to that"
 FERRY_SWIFT_BUILD_TRIES=3 build B B B
 is "two interrupted, the third built with B" "$rc $log" "0 interrupted B interrupted B built B"
-is "B is now what later builds keep" "$(marker)" 'B $(inherited)'
+is "B is now what later builds keep" "$(cd "$pkg" && ferry_swift_build_toolchains)" 'B $(inherited)'
 build B
 is "and the next B is left alone" "$rc $log" "0 built B"
 
@@ -112,6 +111,23 @@ bold "a failing build fails, with its output"
 STUB_FAIL=1 build B
 is "the failure comes back" "$rc $log" "1 failed B"
 contains "with what the compiler said" "$out" "error: boom"
+
+bold "a swift build run outside ferry_swift_build is kept to as well"
+# .build was last built with B. A plain swift build draws A and finishes, so
+# .build now holds A, and the next build must not be forced back onto B.
+printf '%s\n' A > "$sandbox/draws"; : > "$sandbox/log"
+(cd "$pkg" && STUB_DRAWS="$sandbox/draws" STUB_LOG="$sandbox/log" "$sandbox/swift" build -c release > /dev/null 2>&1)
+is "the plain swift build built with A" "$(cat "$sandbox/log")" "built A"
+build A B
+is "the next A is left alone" "$rc $log" "0 built A"
+lacks "nothing is retried" "$out" "asking again"
+
+bold "a build that failed is still what .build holds, so the next build keeps to it"
+FERRY_SWIFT_BUILD_TRIES=1 STUB_FAIL=1 build B
+is "a build that drew B failed" "$rc $log" "1 failed B"
+build B A
+is "the next B is left alone" "$rc $log" "0 built B"
+lacks "nothing is retried" "$out" "asking again"
 
 bold "a long build's output is passed on as it comes, not at the end"
 # Two draws: A is interrupted (nothing of it may show), then B compiles for

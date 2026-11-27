@@ -19,11 +19,13 @@
 #
 # Both answers are cached as separate build descriptions, and a build records
 # the one it chose in prior-build-descriptions.txt before it runs a single task.
-# So: remember the TOOLCHAINS of the last build that finished, and when a new
-# build plans with the other one, interrupt it before it compiles and ask again.
-# A wrong draw costs about a second instead of minutes. Nothing here changes
-# what is built or how; with a toolchain that always answers the same, the first
-# build records the answer and every later one is a plain swift build.
+# The newest entry there is what .build was last planned with, whoever ran that
+# build (this helper, a plain swift build, one that failed). So: take the
+# TOOLCHAINS of that description, and when a new build plans with the other
+# one, interrupt it before it compiles, take back the entry it appended, and ask
+# again. A wrong draw costs about a second instead of minutes. Nothing here
+# changes what is built or how; with a toolchain that always answers the same,
+# every build is a plain swift build.
 
 # The two "search path not found" linker warnings the Command Line Tools produce
 # on every link (they have no Developer/usr/lib or Developer/Library/Frameworks,
@@ -66,9 +68,11 @@ ferry_swift_build_lines() {
 }
 
 ferry_swift_build() { # [extra swift build arguments...]
-  local swift="${SWIFT:-swift}" marker=.build/ferry-toolchains
-  local want="" got out pid rc=0 attempt=1 tries="${FERRY_SWIFT_BUILD_TRIES:-12}" lines
-  want="$(cat "$marker" 2>/dev/null || true)"
+  local swift="${SWIFT:-swift}"
+  local want got out pid rc=0 attempt=1 tries="${FERRY_SWIFT_BUILD_TRIES:-12}" lines
+  # What .build holds now. Interrupted attempts take their entries back, so
+  # this stays the newest description for every attempt below.
+  want="$(ferry_swift_build_toolchains)"
   out="$(mktemp "${TMPDIR:-/tmp}/ferry-swift-build.XXXXXX")" || return 1
 
   while :; do
@@ -116,9 +120,5 @@ ferry_swift_build() { # [extra swift build arguments...]
   done
 
   rm -f "$out"
-  if [ "$rc" = 0 ]; then
-    got="$(ferry_swift_build_toolchains)"
-    [ -z "$got" ] || [ "$got" = "$want" ] || printf '%s\n' "$got" > "$marker"
-  fi
   return "$rc"
 }
