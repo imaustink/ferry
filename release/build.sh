@@ -282,12 +282,18 @@ for v in $extras; do
 done
 
 # Every tarball at once. gzip uses one core, so writing the four one after
-# another left the rest of the Mac idle for most of a minute.
+# another left the rest of the Mac idle for most of a minute. The main tarball
+# is most of the bytes and still takes one core most of the packaging time; with
+# pigz (brew install pigz) it is compressed on every core instead, into the same
+# gzip format at the same level.
 # --no-mac-metadata keeps bsdtar from writing ._ AppleDouble members, which are
 # noise on every other system and carry the quarantine flag on this one.
 pack() { # tarball directory
-  ( cd "$stage" && tar --no-mac-metadata -czf "$1" "$2" ) \
-    && ( cd "$out" && shasum -a 256 "$(basename "$1")" > "$(basename "$1").sha256" )
+  if command -v pigz >/dev/null 2>&1; then
+    ( cd "$stage" && tar --no-mac-metadata -cf - "$2" | pigz > "$1" )
+  else
+    ( cd "$stage" && tar --no-mac-metadata -czf "$1" "$2" )
+  fi && ( cd "$out" && shasum -a 256 "$(basename "$1")" > "$(basename "$1").sha256" )
 }
 pids=""
 pack "$tarball" "ferry-$version" & pids="$pids $!"
