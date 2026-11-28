@@ -5,6 +5,18 @@ described in their [GitHub release notes](https://github.com/imaustink/ferry/rel
 From v1.0.0, what may and may not change between releases is in
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
+## Unreleased
+
+### Fixed
+
+- **`ferry up --help` prints help instead of starting the cluster.** `ferry up`
+  ignored any flag it did not know, so `--help`, `-h` and a misspelt flag such
+  as `--kubernetes-verison` brought the cluster up with the defaults. It now
+  refuses an unknown flag with exit 2. `ferry upgrade nodes` had the same
+  problem and would have run the upgrade; it is fixed the same way. Every
+  command now answers `--help` or `-h` with its usage and does nothing else.
+- **`ferry up --durability` with no value is refused** instead of hanging.
+
 ## v1.0.1
 
 Kubernetes v1.37.0, control plane v1.37.0, etcd v3.6.5.

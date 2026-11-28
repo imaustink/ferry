@@ -840,6 +840,25 @@ Environment:
 EOF
 }
 
+# The lines of usage() about one command, for '<command> --help'. Taken from
+# usage() rather than written again per command so the two cannot disagree.
+# Tries the longest name first -- 'upgrade nodes' before 'upgrade' -- and falls
+# back to the whole of usage() when nothing there names the command.
+usage_for() { # command [subcommand]
+  local words out
+  for words in "${1:-} ${2:-}" "${1:-}"; do
+    words="${words% }"
+    [ -n "$words" ] || continue
+    # A matching entry, and the lines indented under it that carry on its text.
+    out="$(usage | awk -v w="ferry $words" '
+      index($0, "  " w " ") == 1 || $0 == "  " w { on = 1; print; next }
+      on && /^                  / && $1 != "ferry" { print; next }
+      { on = 0 }')"
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  done
+  usage
+}
+
 # Binaries the kernel will refuse to run.
 #
 # Copying a file over one that is currently executing leaves the copy
@@ -1823,14 +1842,22 @@ cmd_up() {
         [ -n "${2:-}" ] || { bad "--kubernetes-version needs a value, such as v1.36"; return 2; }
         asked_k8s="$2"; shift 2 ;;
       --kubernetes-version=*) asked_k8s="${1#*=}"; shift ;;
-      --durability) asked_durability="${2:-}"; shift 2 ;;
+      --durability)
+        [ -n "${2:-}" ] || { bad "--durability needs a value: power-loss or process-crash"; return 2; }
+        asked_durability="$2"; shift 2 ;;
       --durability=*) asked_durability="${1#*=}"; shift ;;
       --disposable) asked_durability=process-crash; shift ;;
       --fast) asked_durability=process-crash
               warn "--fast is now --disposable: the same setting, named for what it gives up"
               shift ;;
       --mac-image) bake_mac=1; shift ;;
-      *) shift ;;
+      # Everything else stops here, before anything starts. This used to be a
+      # catch-all that dropped what it did not know, so 'ferry up --help'
+      # brought a stopped cluster up, and so did a misspelt flag -- with the
+      # defaults the flag was meant to change.
+      -h|--help) usage_for up; return 0 ;;
+      -*) bad "unknown flag $1 (ferry up --help lists them)"; return 2 ;;
+      *) bad "ferry up takes no arguments, only flags (got '$1')"; return 2 ;;
     esac
   done
   if [ -n "$asked_durability" ]; then
@@ -4781,11 +4808,19 @@ cmd_upgrade_nodes() {
   for a in "$@"; do args+=("$a"); done
   while [ $# -gt 0 ]; do
     case "$1" in
-      --to) target="${2:-}"; shift 2 || shift ;;
+      --to) [ -n "${2:-}" ] || { bad "--to needs a version"; return 2; }; target="$2"; shift 2 ;;
       --to=*) target="${1#*=}"; shift ;;
-      *) shift ;;
+      --force) shift ;;  # for each 'upgrade node', which the args are passed on to
+      # Not a catch-all: one that dropped what it did not know turned
+      # 'ferry upgrade nodes --help' into an upgrade of every node.
+      -h|--help) usage_for upgrade nodes; return 0 ;;
+      -*) bad "unknown flag $1 -- usage: ferry upgrade nodes [--to vX.Y.Z] [--force]"; return 2 ;;
+      *) bad "usage: ferry upgrade nodes [--to vX.Y.Z] [--force]  ('upgrade node $1' for one node)"; return 2 ;;
     esac
   done
+  if [ -n "$target" ] && ! ferry_version_valid "$target"; then
+    bad "--to $target is not a version like v1.34.0"; return 2
+  fi
   require_cluster || return 1
   [ -n "$target" ] || target="$(ferry_default_node_version)"
   bold "rolling every node on this Mac to $target"
@@ -7356,6 +7391,25 @@ EOF
       [ -z "${1:-}" ] && return 0; return 2 ;;
   esac
 }
+
+# '<command> --help' prints that command's part of usage() and does nothing
+# else, for every command, before the command sees its arguments. Most of them
+# never looked for --help, and the ones that drop what they do not know went
+# ahead and did their work -- 'ferry up --help' started a cluster. The two with
+# a fuller help of their own keep it.
+if [ $# -ge 2 ]; then
+  case "$1 $2" in
+    "image build"|"mac-image bake") ;;
+    *)
+      for a in "${@:2}"; do
+        case "$a" in
+          -h|--help)
+            case "$2" in -*) usage_for "$1" ;; *) usage_for "$1" "$2" ;; esac
+            exit 0 ;;
+        esac
+      done ;;
+  esac
+fi
 
 case "${1:-}" in
   doctor)     shift; cmd_doctor "$@" ;;
